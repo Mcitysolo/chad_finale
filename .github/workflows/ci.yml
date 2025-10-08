@@ -9,7 +9,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE: ghcr.io/${{ toLower(github.repository) }}
   TAG: ${{ github.sha }}
 
 jobs:
