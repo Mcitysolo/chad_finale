@@ -1,0 +1,75 @@
+name: ci
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  TAG: ${{ github.sha }}
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build & load locally for health test
+      - name: Build (local load)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.hardened
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test /healthz
+        run: |
+          docker run -d -p 8000:8000 --name chad $IMAGE:$TAG
+          for i in {1..20}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/healthz || true)
+            if [ "$code" = "200" ]; then echo "health OK"; break; fi
+            sleep 1
+            if [ "$i" = "20" ]; then echo "health check failed"; exit 1; fi
+          done
+          docker rm -f chad
+
+      - name: Push to GHCR
+        run: |
+          docker push $IMAGE:$TAG
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+        id: push
+
+      - name: Trivy scan (image in GHCR)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.TAG }}
+          format: 'table'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Publish digest artifact
+        run: echo "${{ steps.push.outputs.digest }}" > image-digest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt

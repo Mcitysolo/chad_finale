@@ -1,0 +1,20 @@
+# keep the build context lean
+.git/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+
+# large data & artifacts
+data/
+logs/
+outputs/
+*.ndjson
+*.ndjson.*.gz
+
+# local env / secrets
+secrets/
+.env
+.env.*
+audits/

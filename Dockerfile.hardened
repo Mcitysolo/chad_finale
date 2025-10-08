@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+# Non-root user
+RUN useradd -u 10001 -m appuser
+
+# Minimal OS deps
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.backend.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy source AFTER deps for better cache
+COPY . /app
+
+# Drop privileges
+USER appuser
+
+# Healthcheck (expects /healthz on port 8000)
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=2).getcode()==200 else 1)"
+
+EXPOSE 8000
+# Example: uvicorn for FastAPI app; adjust if needed
+CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
