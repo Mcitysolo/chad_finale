@@ -60,6 +60,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: false
+      - name: Import check (backend.app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo ">>> Importing backend.app inside the image to surface real errors"
+          docker run --rm "${IMAGE}:${TAG}" python - <<'PY'
+import traceback, sys
+try:
+    import backend.app  # noqa: F401
+    print("OK: backend.app import succeeded")
+except Exception as e:
+    print("IMPORT ERROR:", e, file=sys.stderr)
+    traceback.print_exc()
+    sys.exit(1)
+PY
 
       # Simple /healthz smoke test with cleanup even on failure
       - name: Smoke test /healthz
