@@ -1,45 +1,45 @@
 FROM python:3.12-slim
 
-# -----------------------------------------------------------------------------
-# OS deps (minimal) + non-root user
-# -----------------------------------------------------------------------------
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user and app dir
+# Create non-root user
 RUN useradd -u 10001 -m appuser
+
+# Minimal OS deps
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Workdir
 WORKDIR /app
 
-# Ensure Python can import top-level packages from /app
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app
-
-# -----------------------------------------------------------------------------
-# Dependencies
-# -----------------------------------------------------------------------------
+# Python deps first (cache-friendly)
 COPY requirements.backend.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# -----------------------------------------------------------------------------
-# App source (after deps for better layer caching)
-# -----------------------------------------------------------------------------
+# App source
 COPY . /app
 
-# Permissions for non-root
+# Make 'backend' importable everywhere
+ENV PYTHONPATH=/app
+
+# Sanity check at build-time: fail build if backend.app is not importable
+RUN python - <<'PY'
+import sys, importlib, os
+sys.path.insert(0, "/app")
+importlib.import_module("backend.app")
+print("import backend.app ✅")
+PY
+
+# Drop privileges
 RUN chown -R appuser:appuser /app
 USER appuser
 
-# -----------------------------------------------------------------------------
-# Healthcheck: expects FastAPI route at /healthz on port 8000
-# -----------------------------------------------------------------------------
+# Healthcheck (expects /healthz on 8000)
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).getcode()==200 else 1)"
+  CMD python - <<'PY' || exit 1
+import urllib.request
+r = urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)
+exit(0 if r.getcode()==200 else 1)
+PY
 
 EXPOSE 8000
 
-# -----------------------------------------------------------------------------
-# Entrypoint: uvicorn loads backend.app:app (now importable via PYTHONPATH=/app)
-# -----------------------------------------------------------------------------
-CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Robust Uvicorn launch (no path surprises)
+CMD ["python","-c","import sys; sys.path.insert(0,'/app'); import uvicorn; uvicorn.run('backend.app:app', host='0.0.0.0', port=8000)"]
