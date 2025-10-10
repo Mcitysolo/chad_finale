@@ -5,19 +5,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-# Least-privilege + GHCR push
 permissions:
   contents: read
   packages: write
 
-# Avoid duplicate runs on same ref
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-# Base env (IMAGE will be normalized to lowercase in a step below)
 env:
-  IMAGE: ghcr.io/${{ github.repository }}   # may contain uppercase until normalized
+  # Force lowercase to satisfy OCI tag rules
+  IMAGE: ghcr.io/${{ toLower(github.repository) }}
   TAG: ${{ github.sha }}
 
 jobs:
@@ -27,19 +21,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Normalize IMAGE to lowercase safely (prevents "repository name must be lowercase")
-      - name: Normalize IMAGE to lowercase
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-          echo "Using IMAGE=$IMAGE"
-          echo "TAG=${{ env.TAG }}"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          install: true
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -47,9 +30,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-          logout: true
 
-      # Build & load locally to the runner's Docker engine for the health check
       - name: Build (local load)
         uses: docker/build-push-action@v6
         with:
@@ -59,65 +40,45 @@ jobs:
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          push: false
-      - name: Import check (backend.app)
-        shell: bash
+
+      # Early, explicit import check inside the built image
+      - name: Import check (backend.app inside image)
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
-          echo ">>> Importing backend.app inside the image to surface real errors"
-          docker run --rm "${IMAGE}:${TAG}" python - <<'PY'
-import traceback, sys
-try:
-    import backend.app  # noqa: F401
-    print("OK: backend.app import succeeded")
-except Exception as e:
-    print("IMPORT ERROR:", e, file=sys.stderr)
-    traceback.print_exc()
-    sys.exit(1)
-PY
+          docker run --rm -e PYTHONPATH=/app "$IMAGE:$TAG" \
+            python -c "import sys, importlib; sys.path.insert(0,'/app'); importlib.import_module('backend.app'); print('backend.app import ✅')"
 
-      # Simple /healthz smoke test with cleanup even on failure
+      # Run a short, safe health check with explicit env
       - name: Smoke test /healthz
-        shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
           CID=""
-          cleanup() {
-            if [ -n "${CID:-}" ]; then docker rm -f "$CID" >/dev/null 2>&1 || true; fi
-          }
+          cleanup(){ [ -n "${CID:-}" ] && docker rm -f "$CID" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-
-          # Run container detached on 8000
-          CID=$(docker run -d -p 8000:8000 --name chad "${IMAGE}:${TAG}")
-
-          # Poll /healthz up to 20s
-          for i in $(seq 1 20); do
+          CID=$(docker run -d -e PYTHONPATH=/app -e MODE=shadow -p 8000:8000 --name chad "$IMAGE:$TAG")
+          for i in $(seq 1 25); do
             code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/healthz || true)
-            if [ "$code" = "200" ]; then
-              echo "health OK"
-              exit 0
-            fi
+            if [ "$code" = "200" ]; then echo "health OK"; exit 0; fi
             sleep 1
           done
-
           echo "health check failed"
-          # Print last logs for debugging before failing
           docker logs "$CID" || true
           exit 1
 
-      # Push only after passing health
       - name: Push to GHCR
-        id: push
-        shell: bash
         run: |
           set -euo pipefail
-          docker push "${IMAGE}:${TAG}"
-          # capture digest for artifact + later scanners
-          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${TAG}" | cut -d'@' -f2)"
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "Pushed ${IMAGE}@${DIGEST}"
+          docker push $IMAGE:$TAG
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+        id: push
 
-      # Vulnerability scan against the image in GHCR
       - name: Trivy scan (image in GHCR)
         uses: aquasecurity/trivy-action@0.24.0
         with:
@@ -127,13 +88,9 @@ PY
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      # Publish the pushed digest as an artifact
       - name: Publish digest artifact
-        shell: bash
         run: echo "${{ steps.push.outputs.digest }}" > image-digest.txt
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: image-digest
           path: image-digest.txt
