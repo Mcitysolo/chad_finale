@@ -10,7 +10,6 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ toLower(github.repository) }}
   TAG: ${{ github.sha }}
 
 jobs:
@@ -19,6 +18,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Normalize IMAGE to lowercase
+        run: |
+          set -euo pipefail
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "Using IMAGE=$IMAGE"
+          echo "TAG=${TAG}"  # expose for shell visibility
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -43,13 +49,13 @@ jobs:
       - name: Import check (backend.app inside image)
         run: |
           set -euo pipefail
-          docker run --rm -e PYTHONPATH=/app ${{ env.IMAGE }}:${{ env.TAG }} \
+          docker run --rm -e PYTHONPATH=/app "$IMAGE:$TAG" \
             python -c "import sys, importlib; sys.path.insert(0,'/app'); importlib.import_module('backend.app'); print('backend.app import ✅')"
 
       - name: Smoke test /healthz
         run: |
           set -euo pipefail
-          CID=$(docker run -d -e PYTHONPATH=/app -e MODE=shadow -p 8000:8000 ${{ env.IMAGE }}:${{ env.TAG }})
+          CID=$(docker run -d -e PYTHONPATH=/app -e MODE=shadow -p 8000:8000 "$IMAGE:$TAG")
           for i in $(seq 1 25); do
             code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/healthz || true)
             [ "$code" = "200" ] && echo "health OK" && exit 0
@@ -63,9 +69,9 @@ jobs:
         id: push
         run: |
           set -euo pipefail
-          docker push ${{ env.IMAGE }}:${{ env.TAG }}
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE }}:${{ env.TAG }} | cut -d'@' -f2)
-          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          docker push "$IMAGE:$TAG"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG" | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Trivy scan (image in GHCR)
         uses: aquasecurity/trivy-action@0.24.0
