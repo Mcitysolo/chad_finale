@@ -19,9 +19,9 @@ COPY . /app
 # Make 'backend' importable everywhere
 ENV PYTHONPATH=/app
 
-# Sanity check at build-time: fail build if backend.app is not importable
+# Build-time import sanity check (fail early if imports break)
 RUN python - <<'PY'
-import sys, importlib, os
+import sys, importlib
 sys.path.insert(0, "/app")
 importlib.import_module("backend.app")
 print("import backend.app ✅")
@@ -31,15 +31,10 @@ PY
 RUN chown -R appuser:appuser /app
 USER appuser
 
-# Healthcheck (expects /healthz on 8000)
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD python - <<'PY' || exit 1
-import urllib.request
-r = urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)
-exit(0 if r.getcode()==200 else 1)
-PY
+# Healthcheck (expects /healthz on port 8000)
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).getcode()==200 else 1)"
 
 EXPOSE 8000
 
-# Robust Uvicorn launch (no path surprises)
+# Robust Uvicorn launch (explicit sys.path to avoid env quirks)
 CMD ["python","-c","import sys; sys.path.insert(0,'/app'); import uvicorn; uvicorn.run('backend.app:app', host='0.0.0.0', port=8000)"]
