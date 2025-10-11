@@ -10,7 +10,6 @@ permissions:
   packages: write
 
 env:
-  # Force lowercase to satisfy OCI tag rules
   IMAGE: ghcr.io/${{ toLower(github.repository) }}
   TAG: ${{ github.sha }}
 
@@ -41,30 +40,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Early, explicit import check inside the built image
       - name: Import check (backend.app inside image)
-        env:
-          IMAGE: ${{ env.IMAGE }}
-          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
-          docker run --rm -e PYTHONPATH=/app "$IMAGE:$TAG" \
+          docker run --rm -e PYTHONPATH=/app ${{ env.IMAGE }}:${{ env.TAG }} \
             python -c "import sys, importlib; sys.path.insert(0,'/app'); importlib.import_module('backend.app'); print('backend.app import ✅')"
 
-      # Run a short, safe health check with explicit env
       - name: Smoke test /healthz
-        env:
-          IMAGE: ${{ env.IMAGE }}
-          TAG: ${{ env.TAG }}
         run: |
           set -euo pipefail
-          CID=""
-          cleanup(){ [ -n "${CID:-}" ] && docker rm -f "$CID" >/dev/null 2>&1 || true; }
-          trap cleanup EXIT
-          CID=$(docker run -d -e PYTHONPATH=/app -e MODE=shadow -p 8000:8000 --name chad "$IMAGE:$TAG")
+          CID=$(docker run -d -e PYTHONPATH=/app -e MODE=shadow -p 8000:8000 ${{ env.IMAGE }}:${{ env.TAG }})
           for i in $(seq 1 25); do
             code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/healthz || true)
-            if [ "$code" = "200" ]; then echo "health OK"; exit 0; fi
+            [ "$code" = "200" ] && echo "health OK" && exit 0
             sleep 1
           done
           echo "health check failed"
@@ -72,12 +60,12 @@ jobs:
           exit 1
 
       - name: Push to GHCR
+        id: push
         run: |
           set -euo pipefail
-          docker push $IMAGE:$TAG
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:$TAG | cut -d'@' -f2)
+          docker push ${{ env.IMAGE }}:${{ env.TAG }}
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.IMAGE }}:${{ env.TAG }} | cut -d'@' -f2)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-        id: push
 
       - name: Trivy scan (image in GHCR)
         uses: aquasecurity/trivy-action@0.24.0
@@ -90,6 +78,7 @@ jobs:
 
       - name: Publish digest artifact
         run: echo "${{ steps.push.outputs.digest }}" > image-digest.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: image-digest
