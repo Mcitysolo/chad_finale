@@ -9,6 +9,7 @@ permissions:
   contents: read
   packages: write
 
+# Keep only TAG here; compute IMAGE at runtime to avoid unsupported functions
 env:
   TAG: ${{ github.sha }}
 
@@ -19,12 +20,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Compute lowercase IMAGE using bash and export to GITHUB_ENV
       - name: Normalize IMAGE to lowercase
         run: |
-          set -euo pipefail
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          set -eo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "Using IMAGE=$IMAGE"
-          echo "TAG=${TAG}"  # expose for shell visibility
+          echo "TAG=${TAG}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -36,6 +39,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build and load locally so we can health-check before push
       - name: Build (local load)
         uses: docker/build-push-action@v6
         with:
@@ -46,15 +50,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Sanity import test inside the built image
       - name: Import check (backend.app inside image)
         run: |
           set -euo pipefail
           docker run --rm -e PYTHONPATH=/app "$IMAGE:$TAG" \
             python -c "import sys, importlib; sys.path.insert(0,'/app'); importlib.import_module('backend.app'); print('backend.app import ✅')"
 
+      # Verify the app actually serves /healthz
       - name: Smoke test /healthz
         run: |
           set -euo pipefail
+          CID=""
+          cleanup(){ [ -n "${CID:-}" ] && docker rm -f "$CID" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
           CID=$(docker run -d -e PYTHONPATH=/app -e MODE=shadow -p 8000:8000 "$IMAGE:$TAG")
           for i in $(seq 1 25); do
             code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/healthz || true)
