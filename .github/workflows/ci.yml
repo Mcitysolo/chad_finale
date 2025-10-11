@@ -25,6 +25,8 @@ jobs:
         run: |
           set -eo pipefail
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          # if bash `,,` ever fails, uncomment fallback:
+          # IMAGE="ghcr.io/$(printf '%s\n' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
           echo "Using IMAGE=$IMAGE"
           echo "TAG=${TAG}"
