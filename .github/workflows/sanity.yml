@@ -1,0 +1,17 @@
+name: sanity
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  echo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: |
+          set -euo pipefail
+          echo "Hello from $(uname -a)"
+          echo "Repo: ${{ github.repository }}"
+          echo "SHA:  ${{ github.sha }}"
