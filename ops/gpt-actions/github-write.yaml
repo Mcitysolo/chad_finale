@@ -3,25 +3,17 @@ info:
   title: CHAD GitHub Control Plane (Phase-4)
   version: "1.0.0"
   description: |
-    Minimal, tightly-scoped endpoints for the agent to implement Phase 4 *only via GitHub PRs*.
-    No EC2, no broker access. The agent may:
-      - Create/update files in a PR branch
-      - Update PR title/body
-      - Read CI status for that PR
+    Private, write-enabled endpoints for the CHAD Phase-4 builder agent.
+    Scope: create/update files on a PR branch, update PR body, and read CI status.
 servers:
   - url: https://api.github.com
-security:
-  - ApiKeyAuth: []
 components:
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
       in: header
       name: Authorization
-      description: |
-        Use a fine-grained GitHub PAT with scopes: repo, workflow.
-        Format: "Bearer <PAT>" or "token <PAT>"
-
+      description: 'Use a GitHub PAT with scopes: repo, workflow. Format: "token <PAT>" or "Bearer <PAT>"'
   schemas:
     FileCommitRequest:
       type: object
@@ -30,10 +22,10 @@ components:
         message: { type: string, minLength: 3 }
         content:
           type: string
-          description: Base64-encoded file contents (RFC4648, no newlines)
+          description: Base64-encoded file contents (RFC4648)
         sha:
           type: string
-          description: Optional: current blob SHA if updating existing file (to avoid race)
+          description: Optional blob SHA when updating an existing path
         committer:
           type: object
           properties:
@@ -41,19 +33,20 @@ components:
             email: { type: string }
     FileCommitResponse:
       type: object
-      required: [content]
       properties:
         content:
           type: object
           properties:
             path: { type: string }
             sha:  { type: string }
-
     PRUpdateRequest:
       type: object
       properties:
         title: { type: string }
         body:  { type: string }
+
+security:
+  - ApiKeyAuth: []
 
 paths:
   /repos/{owner}/{repo}/contents/{path}:
@@ -69,19 +62,14 @@ paths:
           name: repo
           required: true
           schema: { type: string }
-        - in: query
-          name: message
-          required: false
-          schema: { type: string }
-          description: Deprecated; use body.message
-        - in: query
-          name: branch
-          required: true
-          schema: { type: string, default: "phase4_exec_and_risk_spec" }
         - in: path
           name: path
           required: true
           schema: { type: string }
+        - in: query
+          name: branch
+          required: true
+          schema: { type: string, default: "phase4_exec_and_risk_spec" }
       requestBody:
         required: true
         content:
@@ -130,7 +118,7 @@ paths:
   /repos/{owner}/{repo}/commits/{ref}/status:
     get:
       operationId: getCommitStatus
-      summary: Get combined CI status for a commit (use the PR head SHA)
+      summary: Get combined CI status for a commit (use PR head SHA)
       parameters:
         - in: path
           name: owner
@@ -146,7 +134,7 @@ paths:
           schema: { type: string }
       responses:
         "200":
-          description: Combined status (success/pending/failure)
+          description: Combined status (success/pending/failure/error)
           content:
             application/json:
               schema:
@@ -158,6 +146,6 @@ paths:
                     items:
                       type: object
                       properties:
-                        context: { type: string }
-                        state:   { type: string }
+                        context:    { type: string }
+                        state:      { type: string }
                         target_url: { type: string }
