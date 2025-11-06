@@ -1,0 +1,163 @@
+openapi: 3.1.0
+info:
+  title: CHAD GitHub Control Plane (Phase-4)
+  version: "1.0.0"
+  description: |
+    Minimal, tightly-scoped endpoints for the agent to implement Phase 4 *only via GitHub PRs*.
+    No EC2, no broker access. The agent may:
+      - Create/update files in a PR branch
+      - Update PR title/body
+      - Read CI status for that PR
+servers:
+  - url: https://api.github.com
+security:
+  - ApiKeyAuth: []
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        Use a fine-grained GitHub PAT with scopes: repo, workflow.
+        Format: "Bearer <PAT>" or "token <PAT>"
+
+  schemas:
+    FileCommitRequest:
+      type: object
+      required: [message, content]
+      properties:
+        message: { type: string, minLength: 3 }
+        content:
+          type: string
+          description: Base64-encoded file contents (RFC4648, no newlines)
+        sha:
+          type: string
+          description: Optional: current blob SHA if updating existing file (to avoid race)
+        committer:
+          type: object
+          properties:
+            name: { type: string }
+            email: { type: string }
+    FileCommitResponse:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: object
+          properties:
+            path: { type: string }
+            sha:  { type: string }
+
+    PRUpdateRequest:
+      type: object
+      properties:
+        title: { type: string }
+        body:  { type: string }
+
+paths:
+  /repos/{owner}/{repo}/contents/{path}:
+    put:
+      operationId: putFile
+      summary: Create or update a file in a PR branch
+      parameters:
+        - in: path
+          name: owner
+          required: true
+          schema: { type: string }
+        - in: path
+          name: repo
+          required: true
+          schema: { type: string }
+        - in: query
+          name: message
+          required: false
+          schema: { type: string }
+          description: Deprecated; use body.message
+        - in: query
+          name: branch
+          required: true
+          schema: { type: string, default: "phase4_exec_and_risk_spec" }
+        - in: path
+          name: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileCommitRequest'
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileCommitResponse' }
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileCommitResponse' }
+
+  /repos/{owner}/{repo}/pulls/{pull_number}:
+    patch:
+      operationId: updatePr
+      summary: Update PR title/body
+      parameters:
+        - in: path
+          name: owner
+          required: true
+          schema: { type: string }
+        - in: path
+          name: repo
+          required: true
+          schema: { type: string }
+        - in: path
+          name: pull_number
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PRUpdateRequest'
+      responses:
+        "200":
+          description: PR updated
+
+  /repos/{owner}/{repo}/commits/{ref}/status:
+    get:
+      operationId: getCommitStatus
+      summary: Get combined CI status for a commit (use the PR head SHA)
+      parameters:
+        - in: path
+          name: owner
+          required: true
+          schema: { type: string }
+        - in: path
+          name: repo
+          required: true
+          schema: { type: string }
+        - in: path
+          name: ref
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Combined status (success/pending/failure)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [success, pending, failure, error] }
+                  statuses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        context: { type: string }
+                        state:   { type: string }
+                        target_url: { type: string }
