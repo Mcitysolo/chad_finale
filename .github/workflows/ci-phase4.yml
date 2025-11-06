@@ -1,0 +1,70 @@
+name: phase4-ci
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "specs/PHASE4_EXECUTION_AND_RISK_SPEC.md"
+      - "adapters/**"
+      - "services/**"
+      - "data/**"
+      - "bin/**"
+      - "tests/**"
+      - "config/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - ".github/workflows/ci-phase4.yml"
+
+jobs:
+  build-test:
+    name: Type, Lint, Test (Python 3.12)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install deps (project + tools)
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install mypy ruff pytest pytest-cov
+
+      - name: Print versions
+        run: |
+          python --version
+          pip list | grep -E 'mypy|ruff|pytest'
+
+      - name: Mypy (strict on new/phase4 modules if present)
+        run: |
+          set -e
+          TARGETS=""
+          for p in adapters services data bin; do
+            [ -d "$p" ] && TARGETS="$TARGETS $(git ls-files "$p" | tr '\n' ' ')"
+          done
+          if [ -n "$TARGETS" ]; then
+            python -m mypy --strict $TARGETS
+          else
+            echo "No Phase-4 python modules yet; skipping mypy."
+          fi
+
+      - name: Ruff lint (project)
+        run: |
+          ruff --version
+          ruff check .
+
+      - name: Pytest (with coverage if tests exist)
+        run: |
+          if [ -d tests ]; then
+            pytest -q --maxfail=1 --disable-warnings
+          else
+            echo "No tests directory yet; skipping pytest."
+          fi
