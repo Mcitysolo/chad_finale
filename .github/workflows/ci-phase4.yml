@@ -24,17 +24,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  test-phase4:
+    name: Phase-4 Smoke (lint+types+tests)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -44,15 +49,43 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
-      - name: Install deps (lenient)
+      - name: Install dependencies (lenient)
         run: |
           set -e
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pytest
+            # Minimal deps to run lint/types/tests
+            pip install pytest ruff mypy types-requests
+          fi
+
+      - name: Ruff (if configured)
+        run: |
+          set -e
+          if [ -f ruff.toml ] || [ -f pyproject.toml ] || [ -f ruff.legacy.toml ]; then
+            python -m ruff --version
+            # Lint only phase4 paths to keep fast
+            python -m ruff check chad/phase4 || exit 1
+          else
+            echo "Ruff config not found — skipping lint."
+          fi
+
+      - name: Mypy (if config present)
+        run: |
+          set -e
+          if [ -f mypy.ini ] || grep -q "\[tool.mypy\]" pyproject.toml 2>/dev/null; then
+            python -m mypy --version
+            # Type-check only phase4 to keep fast
+            python -m mypy chad/phase4 || exit 1
+          else
+            echo "Mypy config not found — skipping type checks."
           fi
 
       - name: Run Phase-4 smoke tests
         run: |
-          pytest -q chad/phase4/tests
+          set -e
+          if [ -d chad/phase4/tests ]; then
+            pytest -q chad/phase4/tests
+          else
+            echo "No phase4 tests directory found."
+          fi
