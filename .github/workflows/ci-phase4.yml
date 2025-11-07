@@ -28,6 +28,9 @@ jobs:
     name: Phase-4 Smoke (lint+types+tests)
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    env:
+      # Ensure Python can import the 'chad' package from the repo root in CI
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout
@@ -84,8 +87,4 @@ jobs:
       - name: Run Phase-4 smoke tests
         run: |
           set -e
-          if [ -d chad/phase4/tests ]; then
-            pytest -q chad/phase4/tests
-          else
-            echo "No phase4 tests directory found."
-          fi
+          pytest -q chad/phase4/tests
