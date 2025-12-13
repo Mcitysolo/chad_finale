@@ -1,0 +1,423 @@
+"""
+Trade Stats Engine (Phase 5 – Metrics for Shadow Confidence Router)
+
+This module reads CHAD's tamper-evident trade history logs and computes
+rolling performance metrics for use by:
+
+    * Shadow Confidence Router (SCR)
+    * ML retrainer
+    * Weekly reports / coach summaries
+
+Data source
+-----------
+It consumes NDJSON files produced by `chad.analytics.trade_result_logger`:
+
+    data/trades/trade_history_YYYYMMDD.ndjson
+
+Each line in those files is a JSON object:
+
+    {
+      "timestamp_utc": "...",
+      "sequence_id":   <int>,
+      "payload":       {... TradeResult ...},
+      "prev_hash":     "<sha256 or 'GENESIS'>",
+      "record_hash":   "<sha256(prev_hash | compact_payload)>"
+    }
+
+We treat these as authoritative records of per-trade outcomes.
+
+Public API (summary)
+--------------------
+* load_recent_trades(max_trades: int = 500, days_back: int = 30) -> list[dict]
+    - Reads up to `max_trades` most recent trade records over the last `days_back` days.
+
+* compute_stats(trades: list[dict]) -> dict
+    - Computes aggregated metrics (win rate, Sharpe-ish ratio, max drawdown, etc.)
+      from a list of normalized trade dicts.
+
+* load_and_compute(max_trades: int = 500, days_back: int = 30) -> dict
+    - Convenience helper: load recent trades + compute stats in a single call.
+
+The SCR and coach modules can call these functions to obtain the current
+"confidence snapshot" of CHAD's trading performance.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import mean, pstdev
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+TRADE_DIR = Path("data") / "trades"
+TRADE_PREFIX = "trade_history_"
+TIMESTAMP_FMT = "%Y%m%d"
+
+
+@dataclass(frozen=True)
+class NormalizedTrade:
+    """
+    Lightweight, normalized view of a trade result extracted from the logger.
+
+    We only keep fields required for statistics:
+        * strategy, symbol, side
+        * notional, pnl
+        * entry_time, exit_time
+        * is_live
+    """
+
+    strategy: str
+    symbol: str
+    side: str
+    notional: float
+    pnl: float
+    entry_time: datetime
+    exit_time: datetime
+    is_live: bool
+
+
+def _parse_iso_utc(ts: str) -> datetime:
+    """
+    Parse an ISO 8601 timestamp into a timezone-aware UTC datetime.
+
+    If parsing fails, we fall back to "now" but stats will still work.
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _normalize_trade_record(record: Dict[str, Any]) -> Optional[NormalizedTrade]:
+    """
+    Convert a raw trade history record line into a NormalizedTrade.
+
+    If required fields are missing or invalid, returns None.
+    """
+    payload = record.get("payload", {})
+    try:
+        strategy = str(payload["strategy"])
+        symbol = str(payload["symbol"])
+        side = str(payload["side"]).upper()
+        notional = float(payload["notional"])
+        pnl = float(payload["pnl"])
+        is_live = bool(payload.get("is_live", False))
+
+        entry_time_utc = str(payload["entry_time_utc"])
+        exit_time_utc = str(payload["exit_time_utc"])
+
+        entry_time = _parse_iso_utc(entry_time_utc)
+        exit_time = _parse_iso_utc(exit_time_utc)
+
+        return NormalizedTrade(
+            strategy=strategy,
+            symbol=symbol,
+            side=side,
+            notional=notional,
+            pnl=pnl,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            is_live=is_live,
+        )
+    except Exception:
+        return None
+
+
+def _iter_trade_files(days_back: int) -> List[Path]:
+    """
+    Return trade history files for the last `days_back` days, newest first.
+
+    Missing days are ignored; only existing files are included.
+    """
+    now = datetime.now(timezone.utc)
+    paths: List[Tuple[datetime, Path]] = []
+
+    for i in range(days_back + 1):
+        day = now - timedelta(days=i)
+        stamp = day.strftime(TIMESTAMP_FMT)
+        path = TRADE_DIR / f"{TRADE_PREFIX}{stamp}.ndjson"
+        if path.exists():
+            paths.append((day, path))
+
+    # Sort newest first
+    paths.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in paths]
+
+
+def _load_trades_from_file(path: Path) -> List[NormalizedTrade]:
+    """
+    Load and normalize trades from a single NDJSON trade history file.
+    """
+    trades: List[NormalizedTrade] = []
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+
+                normalized = _normalize_trade_record(record)
+                if normalized is not None:
+                    trades.append(normalized)
+    except Exception:
+        # Any file-level issue just means "no trades from this file"
+        return trades
+
+    return trades
+
+
+def load_recent_trades(
+    max_trades: int = 500,
+    days_back: int = 30,
+    include_paper: bool = True,
+    include_live: bool = True,
+) -> List[NormalizedTrade]:
+    """
+    Load up to `max_trades` most recent trades from the last `days_back` days.
+
+    Args:
+        max_trades:
+            Maximum number of trades to return. The newest trades are preferred.
+        days_back:
+            How many calendar days back we search for trade history files.
+        include_paper:
+            Whether to include trades where is_live == False.
+        include_live:
+            Whether to include trades where is_live == True.
+
+    Returns:
+        List[NormalizedTrade] ordered from oldest to newest (chronological).
+        The SCR or other components may further filter or slice.
+    """
+    files = _iter_trade_files(days_back=days_back)
+    all_trades: List[NormalizedTrade] = []
+
+    for path in files:
+        trades = _load_trades_from_file(path)
+        all_trades.extend(trades)
+
+    # Oldest → newest for time-based processing
+    all_trades.sort(key=lambda t: t.exit_time)
+
+    # Filter by live/paper flags
+    filtered: List[NormalizedTrade] = []
+    for t in all_trades:
+        if t.is_live and not include_live:
+            continue
+        if not t.is_live and not include_paper:
+            continue
+        filtered.append(t)
+
+    # Take only the most recent `max_trades`
+    if len(filtered) > max_trades:
+        filtered = filtered[-max_trades:]
+
+    return filtered
+
+
+def _compute_equity_curve(trades: Iterable[NormalizedTrade]) -> List[float]:
+    """
+    Compute a cumulative equity curve from an iterable of trades.
+
+    We simply accumulate PnL over time, starting at 0.0.
+    """
+    equity: List[float] = []
+    total = 0.0
+    for t in trades:
+        total += t.pnl
+        equity.append(total)
+    return equity
+
+
+def _compute_max_drawdown(equity_curve: List[float]) -> float:
+    """
+    Compute max drawdown from a cumulative equity curve.
+
+    Returns:
+        The maximum peak-to-trough loss (negative number or 0.0).
+    """
+    if not equity_curve:
+        return 0.0
+
+    peak = equity_curve[0]
+    max_dd = 0.0
+
+    for value in equity_curve:
+        if value > peak:
+            peak = value
+        drawdown = value - peak  # negative or zero
+        if drawdown < max_dd:
+            max_dd = drawdown
+
+    return float(max_dd)
+
+
+def _compute_sharpe(
+    pnl_series: List[float],
+    risk_free_rate: float = 0.0,
+) -> float:
+    """
+    Compute a simple Sharpe-like ratio on trade-level PnL.
+
+    We treat each trade's PnL as a "return". This is a simplification but
+    sufficient for gating decisions in SCR.
+
+    Returns:
+        sharpe_ratio or 0.0 if variance is zero or series is empty.
+    """
+    if not pnl_series:
+        return 0.0
+
+    # Treat mean(PnL) as "return", and use population std-dev.
+    mu = mean(pnl_series)
+    sigma = pstdev(pnl_series) if len(pnl_series) > 1 else 0.0
+
+    if sigma <= 0:
+        return 0.0
+
+    excess = mu - risk_free_rate
+    return float(excess / sigma)
+
+
+def compute_stats(trades: List[NormalizedTrade]) -> Dict[str, Any]:
+    """
+    Compute aggregate performance statistics over the given trades.
+
+    Args:
+        trades: List of NormalizedTrade objects, typically ordered by time.
+
+    Returns:
+        A dict with keys:
+            total_trades: int
+            winners: int
+            losers: int
+            win_rate: float (0..1)
+            avg_pnl: float
+            total_pnl: float
+            sharpe_like: float
+            max_drawdown: float (<= 0)
+            live_trades: int
+            paper_trades: int
+            per_strategy: {
+                "alpha": { ...same metrics subset... },
+                ...
+            }
+    """
+    if not trades:
+        return {
+            "total_trades": 0,
+            "winners": 0,
+            "losers": 0,
+            "win_rate": 0.0,
+            "avg_pnl": 0.0,
+            "total_pnl": 0.0,
+            "sharpe_like": 0.0,
+            "max_drawdown": 0.0,
+            "live_trades": 0,
+            "paper_trades": 0,
+            "per_strategy": {},
+        }
+
+    total_trades = len(trades)
+    pnl_series = [t.pnl for t in trades]
+    winners = sum(1 for t in trades if t.pnl > 0)
+    losers = sum(1 for t in trades if t.pnl < 0)
+    total_pnl = float(sum(pnl_series))
+    avg_pnl = float(total_pnl / total_trades)
+
+    win_rate = float(winners / total_trades) if total_trades > 0 else 0.0
+    sharpe_like = _compute_sharpe(pnl_series)
+
+    equity_curve = _compute_equity_curve(trades)
+    max_drawdown = _compute_max_drawdown(equity_curve)
+
+    live_trades = sum(1 for t in trades if t.is_live)
+    paper_trades = sum(1 for t in trades if not t.is_live)
+
+    # Per-strategy breakdown
+    per_strategy: Dict[str, Dict[str, Any]] = {}
+    by_strategy: Dict[str, List[NormalizedTrade]] = {}
+    for t in trades:
+        by_strategy.setdefault(t.strategy, []).append(t)
+
+    for strat, strat_trades in by_strategy.items():
+        s_total = len(strat_trades)
+        s_pnls = [t.pnl for t in strat_trades]
+        s_winners = sum(1 for t in strat_trades if t.pnl > 0)
+        s_losers = sum(1 for t in strat_trades if t.pnl < 0)
+        s_total_pnl = float(sum(s_pnls))
+        s_avg_pnl = float(s_total_pnl / s_total) if s_total > 0 else 0.0
+        s_win_rate = float(s_winners / s_total) if s_total > 0 else 0.0
+        s_sharpe = _compute_sharpe(s_pnls)
+        s_equity = _compute_equity_curve(strat_trades)
+        s_max_dd = _compute_max_drawdown(s_equity)
+
+        per_strategy[strat] = {
+            "total_trades": s_total,
+            "winners": s_winners,
+            "losers": s_losers,
+            "win_rate": s_win_rate,
+            "avg_pnl": s_avg_pnl,
+            "total_pnl": s_total_pnl,
+            "sharpe_like": s_sharpe,
+            "max_drawdown": s_max_dd,
+        }
+
+    return {
+        "total_trades": total_trades,
+        "winners": winners,
+        "losers": losers,
+        "win_rate": win_rate,
+        "avg_pnl": avg_pnl,
+        "total_pnl": total_pnl,
+        "sharpe_like": sharpe_like,
+        "max_drawdown": max_drawdown,
+        "live_trades": live_trades,
+        "paper_trades": paper_trades,
+        "per_strategy": per_strategy,
+    }
+
+
+def load_and_compute(
+    max_trades: int = 500,
+    days_back: int = 30,
+    include_paper: bool = True,
+    include_live: bool = True,
+) -> Dict[str, Any]:
+    """
+    Convenience function: load recent trades and compute stats in one call.
+
+    This is the primary interface that SCR and the coach will typically use.
+
+    Args:
+        max_trades:
+            Maximum number of trades to include in the analysis.
+        days_back:
+            How many days back to look for history files.
+        include_paper:
+            Include paper trades if True.
+        include_live:
+            Include live trades if True.
+
+    Returns:
+        A stats dict as returned by compute_stats().
+    """
+    trades = load_recent_trades(
+        max_trades=max_trades,
+        days_back=days_back,
+        include_paper=include_paper,
+        include_live=include_live,
+    )
+    return compute_stats(trades)

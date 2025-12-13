@@ -1,0 +1,213 @@
+CHAD — Phase 8 GO-LIVE Plan (Design & Checklist)
+Host: Ubuntu 24.04 EC2 — user: ubuntu
+Repo: /home/ubuntu/chad_finale
+Runtime root: /home/ubuntu/CHAD FINALE
+Backend port: 9618 (backend.app -> backend.api_gateway)
+Shadow status: 9619 (chad.web.status_server)
+
+Phase-7 Baseline (Already Implemented, DO NOT CHANGE HERE)
+----------------------------------------------------------
+Execution mode & safety layers:
+
+1) ExecutionConfig (adapter-level)
+   - get_execution_config() currently returns:
+       mode          : ExecutionMode.DRY_RUN
+       ibkr_enabled  : True
+       ibkr_dry_run  : True
+   - This means IBKR adapter is hard-locked to WHAT-IF / DRY_RUN.
+   - CHAD_EXECUTION_MODE="ibkr_live" still maps to DRY_RUN in this build.
+
+2) Global mode (CHAD_MODE)
+   - Read via chad.core.mode.get_chad_mode()
+   - Exposed in:
+       - chad/core/show_risk_state.py
+       - backend/api_gateway.py (/health, /risk-state, /live-gate)
+   - Normalized values:
+       - DRY_RUN (default, safe)
+       - LIVE    (intent only in Phase 7)
+   - In Phase 7, CHAD_MODE is informational; it does NOT override DRY_RUN lock.
+
+3) Shadow Confidence Router (SCR) + Shadow Router
+   - Implemented in:
+       - chad/analytics/shadow_confidence_router.py
+       - chad/analytics/shadow_router.py
+   - Current state:
+       - state       : WARMUP
+       - paper_only  : True
+       - sizing      : 0.1
+   - Behaviour:
+       - paper_only=True or state=PAUSED => live trading blocked.
+       - route_orders(...) enforces this (live_allowed=0 in Shadow summary).
+
+4) LiveGate (API-level decision)
+   - Implemented in backend/api_gateway.py as _evaluate_live_gate().
+   - Exposed via /live-gate on 9618.
+   - CURRENT guarantees (Phase 7):
+       - allow_ibkr_live  : False
+       - allow_ibkr_paper : True
+       - reasons include:
+           * ExecutionConfig hard-locked DRY_RUN.
+           * CHAD_MODE not LIVE (or live_enabled=False).
+           * ShadowState.paper_only=True.
+
+5) Operator live-mode file (intent only)
+   - File: /home/ubuntu/chad_finale/runtime/live_mode.json
+   - Managed via:
+       - chad/core/live_mode.py
+       - chad/core/set_live_mode.py (CLI)
+   - Example CLI usage (already tested):
+       - Show state:
+           PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.set_live_mode show
+       - Mark LIVE intent:
+           python -m chad.core.set_live_mode live --reason "operator_go_live_test"
+       - Mark STOP intent:
+           python -m chad.core.set_live_mode stop --reason "operator_stop_test"
+   - IMPORTANT:
+       - In Phase 7, this flag is INTENT ONLY.
+       - Execution remains DRY_RUN regardless of live_mode["live"].
+
+6) Backend / API surface
+   - chad-backend.service (systemd) runs:
+       uvicorn backend.app:app --host 0.0.0.0 --port 9618
+   - backend/app.py (Phase 7) is a thin wrapper that:
+       - Mounts backend.api_gateway:app at "/".
+       - Exposes /__backend__ for diagnostics.
+   - backend/api_gateway.py:
+       - Read-only, risk-aware API.
+       - Endpoints:
+           * GET /health
+           * GET /risk-state
+           * GET /live-gate
+           * GET /shadow
+           * POST /orders  => 403 (disabled in Phase 7)
+   - Confirmed behaviour (as of this doc):
+       - /health:
+           service            : "CHAD API Gateway"
+           healthy            : true
+           details.execution  : ibkr_dry_run=true, exec_mode="dry_run"
+           details.mode       : chad_mode="DRY_RUN", live_enabled=false
+           details.shadow     : state="WARMUP", paper_only=true
+       - /live-gate:
+           allow_ibkr_live    : false
+           allow_ibkr_paper   : true
+           reasons            : DRY_RUN lock + non-LIVE mode + paper_only=True
+       - /orders:
+           HTTP 403, "Order submission via HTTP is disabled in Phase 7..."
+
+Phase-8 Live Trading Design (Planned, Not Yet Implemented)
+----------------------------------------------------------
+GOAL:
+Turn on real trading in a tightly controlled way so that ALL of the
+following are simultaneously true:
+
+    1) IBKR adapter is allowed to place real orders.
+    2) CHAD global intent is LIVE.
+    3) LiveMode file indicates live=True with an explicit reason.
+    4) SCR / Shadow Router say paper_only=False and state not PAUSED.
+    5) LiveGate (/live-gate) returns allow_ibkr_live=True.
+
+If ANY of these fails, CHAD must remain DRY_RUN-only.
+
+Planned control layers:
+
+1) Operator controls (human intent)
+   - live_mode.json:
+       - live: True | False
+       - reason: free-form string
+   - CHAD_MODE:
+       - DRY_RUN: safe default
+       - LIVE: only set when the operator is ready to permit live trades.
+   - BOTH must be in LIVE state for live execution to be even considered.
+
+2) Technical controls (system intent)
+   - ExecutionConfig / CHAD_EXECUTION_MODE:
+       - Only IBKR_PAPER / IBKR_LIVE values allowed to enable non-dry behaviour.
+       - All other modes fall back to DRY_RUN.
+   - Phase 8 change:
+       - get_execution_config() will STOP hard-locking all modes to DRY_RUN.
+       - Instead, it will reflect CHAD_EXECUTION_MODE exactly, with extra safety
+         checks before enabling IBKR_LIVE.
+
+3) Performance / safety controls (SCR + LiveGate)
+   - SCR thresholds (to be encoded in Phase 8):
+       * Minimum number of trades (e.g. >= 50).
+       * Max allowed drawdown (e.g. < 10–15%).
+       * Minimum Sharpe-like metric (e.g. > 0.5).
+       * Win rate and total_pnl sanity checks.
+   - LiveGate decision rule (conceptual):
+       allow_ibkr_live == True only if ALL of:
+
+       - ExecutionConfig.ibkr_enabled is True.
+       - ExecutionConfig.ibkr_dry_run is False (adapter no longer in dry-run).
+       - CHAD_MODE == LIVE and live_mode["live"] == True.
+       - SCR.paper_only is False.
+       - SCR.state != "PAUSED".
+
+   - This logic will remain centralised in one place:
+       - backend/api_gateway.py (/live-gate)
+       - and mirrored in a core helper (e.g. chad/core/live_gate.py) used
+         by IBKR execution runner.
+
+Phase-8 Execution Steps (High-Level, Not To Be Run Yet)
+-------------------------------------------------------
+These are the FUTURE steps to go live. They are documented now so the
+code changes in Phase 8 can be implemented to match this plan.
+
+1) IBKR connectivity and credentials (off-thread)
+   - Stable IB Gateway or TWS setup.
+   - Valid IBKR API keys / client ID.
+   - Confirmed paper-trading account readiness.
+
+2) Code changes (to be implemented in Phase 8)
+   - Update chad.execution.execution_config:
+       - Allow CHAD_EXECUTION_MODE=ibkr_live to map to ExecutionMode.IBKR_LIVE.
+       - Ensure IBKR adapter only runs in non-dry mode when:
+           * LiveGate allows live, AND
+           * live_mode["live"] == True, AND
+           * CHAD_MODE == LIVE.
+   - Update chad.core.ibkr_execution_runner:
+       - Before any call to IBKRExecutor:
+           * Query LiveGate (internal helper, not HTTP).
+           * If allow_ibkr_live=False => run WHAT-IF or skip IBKR entirely.
+           * If allow_ibkr_live=True  => execute a limited, capped set of
+             live orders respecting dynamic caps and per-strategy limits.
+
+3) Operational GO-LIVE procedure (once Phase 8 code is in place)
+   - PRECHECKS:
+       - pytest -q  (full test suite green)
+       - /health    => healthy=true, DRY_RUN-only message gone or updated.
+       - /live-gate => allow_ibkr_live must be True and reasons empty or positive.
+   - HUMAN STEPS:
+       - Set CHAD_MODE=LIVE via environment for relevant services.
+       - Set live_mode to LIVE with explicit reason:
+           python -m chad.core.set_live_mode live --reason "go_live_yymmdd"
+       - Confirm:
+           python -m chad.core.set_live_mode show
+       - Confirm /live-gate shows:
+           allow_ibkr_live=true, allow_ibkr_paper=true.
+   - SWITCH:
+       - Only after all above are green AND IBKR connectivity is confirmed,
+         switch ExecutionConfig to IBKR_LIVE via CHAD_EXECUTION_MODE and
+         restart the IBKR execution services.
+
+4) Emergency STOP procedure (Phase 8)
+   - Should be implementable via ANY ONE of:
+       - live_mode["live"]=False via:
+           python -m chad.core.set_live_mode stop --reason "emergency_stop"
+       - CHAD_MODE=DRY_RUN for all services.
+       - ExecutionConfig forced back to DRY_RUN for IBKR.
+       - SCR.state set to PAUSED (automatic or manual override).
+   - After any stop signal, LiveGate MUST immediately return:
+       - allow_ibkr_live=False
+       - allow_ibkr_paper=True
+
+NOTE:
+====
+This Phase-8 plan document is **design only**.
+Actual code changes to enable live trading must:
+    - Preserve ALL existing Phase-7 safety guarantees by default.
+    - Be covered by new tests (pytest) that ensure:
+          * Live trading cannot be enabled accidentally.
+          * All five layers (ExecutionConfig, CHAD_MODE, live_mode.json,
+            SCR, LiveGate) must agree before any live order is sent.
+    - Be reviewed carefully before deployment to production.
