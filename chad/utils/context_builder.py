@@ -37,6 +37,7 @@ from chad.types import (
     Position,
 )
 from chad.utils.legend_loader import load_legend, LegendLoaderError
+from chad.market_data.service import MarketDataService, MarketDataError
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,12 @@ class ContextBuilderConfig:
     root_dir: Path = Path(__file__).resolve().parents[2]
     feeds_rel_path: Path = Path("data/feeds")
 
+    # Fetch prices for the top-N legend symbols so BETA signals have prices.
+    # Keep this small to avoid rate limits; increase only if needed.
+    legend_price_top_n: int = 10
+
+    # Best-effort local cache (seconds) to avoid refetching legend prices every cycle.
+    price_cache_ttl_seconds: int = 60
     @property
     def feeds_dir(self) -> Path:
         return (self.root_dir / self.feeds_rel_path).resolve()
@@ -106,7 +113,72 @@ class ContextBuilder:
         legend = self._load_legend()
         portfolio = self._build_portfolio_snapshot(now)
 
-        prices = {sym: tick.price for sym, tick in ticks.items()}
+        # Prices start with tick-derived values (SPY/QQQ from Polygon NDJSON).
+        # We then enrich with top legend symbols so BETA/Legend signals have prices.
+        # A small runtime cache prevents hammering the provider every loop.
+        runtime_dir = self._config.root_dir / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = runtime_dir / "price_cache.json"
+
+        prices: Dict[str, float] = {}
+
+        # Best-effort cache load
+        try:
+            if cache_path.is_file():
+                import json as _json
+                from datetime import datetime as _dt, timezone as _tz
+
+                cached = _json.loads(cache_path.read_text(encoding="utf-8"))
+                as_of = cached.get("as_of_iso")
+                cached_prices = cached.get("prices", {}) or {}
+                if isinstance(as_of, str) and isinstance(cached_prices, dict):
+                    as_of_dt = _dt.fromisoformat(as_of)
+                    if as_of_dt.tzinfo is None:
+                        as_of_dt = as_of_dt.replace(tzinfo=_tz.utc)
+                    age_s = (now - as_of_dt.astimezone(_tz.utc)).total_seconds()
+                    if age_s <= float(self._config.price_cache_ttl_seconds):
+                        for k, v in cached_prices.items():
+                            try:
+                                prices[str(k)] = float(v)
+                            except Exception:
+                                continue
+        except Exception:
+            # Cache is optional; ignore any cache failure.
+            pass
+
+        # Tick prices override cache (most recent local feed)
+        for sym, tick in ticks.items():
+            prices[sym] = float(tick.price)
+
+        # Enrich: top legend symbols not already priced
+        try:
+            svc = MarketDataService()
+            items = sorted(legend.weights.items(), key=lambda kv: kv[1], reverse=True)
+            for sym, _w in items[: int(self._config.legend_price_top_n)]:
+                if sym in prices:
+                    continue
+                try:
+                    snap = svc.get_price_snapshot(sym)
+                    if snap and float(snap.price) > 0:
+                        prices[sym] = float(snap.price)
+                except MarketDataError:
+                    continue
+                except Exception:
+                    continue
+
+            # Best-effort cache write
+            try:
+                import json as _json
+                cache_path.write_text(
+                    _json.dumps({"as_of_iso": now.isoformat(), "prices": prices}, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        except Exception:
+            # Market data enrichment is best-effort.
+            pass
+
 
         # Phase 3 baseline: zero notional (no positions yet).
         current_symbol_notional: Dict[str, float] = {}
