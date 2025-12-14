@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+runtime/
+logs/
+data/
+reports/
+backups/
+shared/
+secrets/
+control/
+*.log
+shadow_status_server.log
+status_server.log
