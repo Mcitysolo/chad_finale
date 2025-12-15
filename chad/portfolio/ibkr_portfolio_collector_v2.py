@@ -73,7 +73,7 @@ class IBKRConnectionConfig:
 class IBKRPortfolioCollector:
     """
     Reads NetLiquidation from IBKR via ib_insync and writes it into
-    runtime/portfolio_snapshot.json as ibkr_equity, preserving coinbase_equity.
+    runtime/portfolio_snapshot.json as ibkr_equity, preserving coinbase_equity and kraken_equity.
 
     This collector is read-only: it does NOT place orders or move funds.
     """
@@ -192,9 +192,16 @@ class IBKRPortfolioCollector:
         except (TypeError, ValueError):
             coinbase_equity = 0.0
 
+        kraken_raw = data.get("kraken_equity", 0.0)
+        try:
+            kraken_equity = float(kraken_raw)
+        except (TypeError, ValueError):
+            kraken_equity = 0.0
+
         new_payload: Dict[str, Any] = {
             "ibkr_equity": float(ibkr_equity),
             "coinbase_equity": coinbase_equity,
+            "kraken_equity": kraken_equity,
         }
 
         path.parent.mkdir(parents=True, exist_ok=True)
