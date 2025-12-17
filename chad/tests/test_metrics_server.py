@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
-from chad.ops.metrics_server import MetricLine, _escape_label, _render_prometheus, _safe_read_json
+from chad.ops.metrics_server import MetricLine, _escape_label, _normalize_trade_record, _paper_rollup_metrics
 
 
 def test_escape_label_prometheus_safe() -> None:
@@ -19,40 +20,42 @@ def test_metricline_render_with_labels_sorted_and_escaped() -> None:
         value=1.5,
     )
     rendered = ln.render()
-    # Labels are sorted by key, and values are escaped.
-    assert rendered.startswith('chad_test_metric{')
+    assert rendered.startswith("chad_test_metric{")
     assert 'a="1"' in rendered
     assert 'z="x\\"y"' in rendered
     assert rendered.endswith(" 1.5")
 
 
-def test_render_prometheus_includes_help_type_and_metrics() -> None:
-    lines = [
-        MetricLine("chad_metrics_server_up", {}, 1.0),
-        MetricLine("chad_systemd_unit_active", {"unit": "x"}, 1.0),
+def test_normalize_trade_record_excludes_paper_sim() -> None:
+    rec = {"payload": {"tags": ["paper_sim"], "strategy": "x", "symbol": "y", "pnl": 1, "notional": 1, "is_live": False}}
+    assert _normalize_trade_record(rec) is None
+
+
+def test_rollup_metrics_eliminate_nan_and_inf(tmp_path: Path, monkeypatch) -> None:
+    # Create a fake trades dir and write an NDJSON file with:
+    # - one NaN pnl
+    # - one inf pnl
+    # - one valid pnl
+    trades_dir = tmp_path / "data" / "trades"
+    trades_dir.mkdir(parents=True, exist_ok=True)
+    f = trades_dir / "trade_history_20990101.ndjson"
+
+    def env(payload):
+        return {"timestamp_utc": "2099-01-01T00:00:00+00:00", "sequence_id": 1, "payload": payload, "prev_hash": "GENESIS", "record_hash": "x"}
+
+    rows = [
+        env({"strategy": "manual", "symbol": "EUR", "side": "BUY", "notional": 1.0, "pnl": float("nan"), "exit_time_utc": "2099-01-01T00:00:01+00:00", "entry_time_utc": "2099-01-01T00:00:00+00:00", "is_live": False, "tags": [], "extra": {}}),
+        env({"strategy": "manual", "symbol": "EUR", "side": "BUY", "notional": 1.0, "pnl": float("inf"), "exit_time_utc": "2099-01-01T00:00:02+00:00", "entry_time_utc": "2099-01-01T00:00:00+00:00", "is_live": False, "tags": [], "extra": {}}),
+        env({"strategy": "manual", "symbol": "EUR", "side": "BUY", "notional": 1.0, "pnl": -0.5, "exit_time_utc": "2099-01-01T00:00:03+00:00", "entry_time_utc": "2099-01-01T00:00:00+00:00", "is_live": False, "tags": [], "extra": {}}),
     ]
-    body = _render_prometheus(lines)
-    assert "# HELP chad_metrics_server_up" in body
-    assert "# TYPE chad_metrics_server_up gauge" in body
-    assert 'chad_systemd_unit_active{unit="x"} 1.0' in body
-    assert "chad_metrics_server_up 1.0" in body
+    f.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
+    # Monkeypatch cwd-based discovery by calling rollup directly
+    lines = _paper_rollup_metrics(trades_dir)
 
-def test_safe_read_json_missing_returns_none(tmp_path: Path) -> None:
-    p = tmp_path / "missing.json"
-    assert _safe_read_json(p) is None
-
-
-def test_safe_read_json_invalid_returns_none(tmp_path: Path) -> None:
-    p = tmp_path / "bad.json"
-    p.write_text("{not json", encoding="utf-8")
-    assert _safe_read_json(p) is None
-
-
-def test_safe_read_json_valid_returns_dict(tmp_path: Path) -> None:
-    p = tmp_path / "ok.json"
-    payload = {"a": 1, "b": {"c": True}}
-    p.write_text(json.dumps(payload), encoding="utf-8")
-    out = _safe_read_json(p)
-    assert isinstance(out, dict)
-    assert out == payload
+    m = {ln.name: ln.value for ln in lines if not ln.labels}
+    assert m["chad_paper_trades_total"] == 3.0
+    assert m["chad_paper_pnl_nonfinite_count"] == 2.0
+    # totals/avg must be finite
+    assert math.isfinite(m["chad_paper_total_pnl"])
+    assert math.isfinite(m["chad_paper_avg_pnl"])
