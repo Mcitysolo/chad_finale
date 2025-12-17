@@ -30,6 +30,8 @@ Typical usage:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal
 
@@ -104,6 +106,57 @@ class ShadowState:
 
 DEFAULT_CONFIG = SCRConfig()
 
+RUNTIME_SCR_CONFIG_PATH = Path("/home/ubuntu/CHAD FINALE") / "runtime" / "scr_config.json"
+
+
+def _safe_float(v, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def load_scr_config(path: Path = RUNTIME_SCR_CONFIG_PATH) -> SCRConfig:
+    """
+    Load SCRConfig from a runtime JSON file. Safe-by-default:
+    - Missing/invalid file => DEFAULT_CONFIG.
+    - Partial file => defaults for missing keys.
+    """
+    try:
+        if not path.is_file():
+            return DEFAULT_CONFIG
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return DEFAULT_CONFIG
+    except Exception:
+        return DEFAULT_CONFIG
+
+    d = raw
+    base = DEFAULT_CONFIG
+
+    return SCRConfig(
+        warmup_min_trades=_safe_int(d.get("warmup_min_trades", base.warmup_min_trades), base.warmup_min_trades),
+        confident_min_win_rate=_safe_float(d.get("confident_min_win_rate", base.confident_min_win_rate), base.confident_min_win_rate),
+        confident_min_sharpe=_safe_float(d.get("confident_min_sharpe", base.confident_min_sharpe), base.confident_min_sharpe),
+        confident_max_drawdown=_safe_float(d.get("confident_max_drawdown", base.confident_max_drawdown), base.confident_max_drawdown),
+        cautious_min_win_rate=_safe_float(d.get("cautious_min_win_rate", base.cautious_min_win_rate), base.cautious_min_win_rate),
+        cautious_min_sharpe=_safe_float(d.get("cautious_min_sharpe", base.cautious_min_sharpe), base.cautious_min_sharpe),
+        cautious_max_drawdown=_safe_float(d.get("cautious_max_drawdown", base.cautious_max_drawdown), base.cautious_max_drawdown),
+        warmup_sizing_factor=_safe_float(d.get("warmup_sizing_factor", base.warmup_sizing_factor), base.warmup_sizing_factor),
+        confident_sizing_factor=_safe_float(d.get("confident_sizing_factor", base.confident_sizing_factor), base.confident_sizing_factor),
+        cautious_sizing_factor=_safe_float(d.get("cautious_sizing_factor", base.cautious_sizing_factor), base.cautious_sizing_factor),
+        paused_sizing_factor=_safe_float(d.get("paused_sizing_factor", base.paused_sizing_factor), base.paused_sizing_factor),
+        warmup_allow_live=bool(d.get("warmup_allow_live", base.warmup_allow_live)),
+    )
+
+
 
 def _extract_metric(stats: Dict[str, Any], key: str, default: float = 0.0) -> float:
     """
@@ -118,7 +171,7 @@ def _extract_metric(stats: Dict[str, Any], key: str, default: float = 0.0) -> fl
 
 def evaluate_confidence(
     stats: Dict[str, Any],
-    config: SCRConfig = DEFAULT_CONFIG,
+    config: SCRConfig | None = None,
 ) -> ShadowState:
     """
     Evaluate CHAD's current confidence band based on aggregate trade stats.
@@ -133,6 +186,10 @@ def evaluate_confidence(
         ShadowState describing confidence band, sizing, and paper/live gating.
     """
     reasons: List[str] = []
+
+    if config is None:
+        config = load_scr_config()
+
 
     total_trades = int(stats.get("total_trades", 0))
     win_rate = _extract_metric(stats, "win_rate", 0.0)

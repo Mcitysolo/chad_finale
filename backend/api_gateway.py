@@ -489,7 +489,7 @@ async def orders_disabled() -> None:
     raise HTTPException(
         status_code=403,
         detail=(
-            "Order submission via HTTP is disabled. "
+            "Order submission via HTTP is disabled in Phase 7. "
             "CHAD is operating in DRY_RUN-only mode; live trading must be "
             "explicitly enabled in a future phase with additional review."
         ),
