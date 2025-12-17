@@ -4,40 +4,62 @@ IBKR Paper Ledger Watcher (Production-Safe, Disabled by Default)
 
 Goal
 ----
-Create TradeResult records ONLY when *real* paper-account position lifecycles occur,
-without placing orders and without fabricating results.
+Create tamper-evident TradeResult NDJSON records ONLY when *real* paper-account position
+lifecycles occur (open -> close), without placing orders and without fabricating results.
 
 Safety guarantees
 -----------------
 - This module NEVER places orders.
-- It is DISABLED by default unless explicitly enabled in a runtime config file.
-- It only writes TradeResult entries when it can prove:
-    - a position was opened (non-zero qty)
-    - and later closed (qty returns to zero)
+- DISABLED by default unless explicitly enabled in a runtime config file.
 - If disabled, it only emits a preview artifact.
+- When enabled, it records open positions into a state file, then on close writes TradeResult.
 
-Design
-------
-We maintain a small state file tracking open positions. On each run:
-- read current IBKR positions (paper account)
-- detect opens/closes vs prior state
-- on close: compute realizedPnL delta via PnLSingle and write TradeResult
+Critical PnL hygiene (bug fix)
+------------------------------
+IBKR's reqPnLSingle.realizedPnL can sometimes return an "unset/sentinel" (e.g., ~1.79e308)
+or non-finite values. Those MUST NOT be treated as real PnL.
 
-This is the “writer” missing from Step 22.
+This watcher now:
+- Treats non-finite or absurdly large realizedPnL values as invalid.
+- If invalid baseline/current realizedPnL is detected:
+  - It writes the TradeResult with pnl=0.0
+  - Adds tag "pnl_untrusted"
+  - Records raw values + reason under TradeResult.extra for later forensic correction
+
+This prevents corrupt PnL from poisoning SCR/analytics while still proving the lifecycle.
+
+Runtime config
+--------------
+Default path: /home/ubuntu/CHAD FINALE/runtime/ibkr_paper_ledger.json
+
+Example:
+{
+  "enabled": true,
+  "default_strategy": "manual",
+  "ibkr": {"host":"127.0.0.1","port":4002,"client_id":9003}
+}
+
+Artifacts
+---------
+- State:   /home/ubuntu/CHAD FINALE/runtime/ibkr_paper_ledger_state.json
+- Preview: /home/ubuntu/CHAD FINALE/reports/ledger/IBKR_PAPER_LEDGER_PREVIEW_*.json
+- Runs:    /home/ubuntu/CHAD FINALE/reports/ledger/IBKR_PAPER_LEDGER_RUN_*.json
+- Ledger:  data/trades/trade_history_YYYYMMDD.ndjson  (via TradeResult logger)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from chad.analytics.trade_result_logger import TradeResult, log_trade_result
-
 
 # -------------------------------
 # Paths / defaults
@@ -69,8 +91,6 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
 @dataclass(frozen=True)
 class LedgerConfig:
     enabled: bool
-    # Strict allowlist: only trades tagged as CHAD are eligible for SCR later.
-    # For now, we still log, but we mark strategy="manual" when unknown.
     default_strategy: str = "manual"
 
     ibkr_host: str = "127.0.0.1"
@@ -176,22 +196,51 @@ def _positions_by_symbol(ib) -> Dict[Tuple[str, str], Dict[str, Any]]:
     return out
 
 
-def _req_realized_pnl(ib, *, account_id: str, con_id: int, sleep_s: float) -> float:
+# -------------------------------
+# Realized PnL hygiene
+# -------------------------------
+
+# Any realizedPnL magnitude above this is treated as invalid/sentinel.
+_PNL_ABSURD_ABS_THRESHOLD = 1e100
+
+
+def _coerce_float(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+        return v
+    except Exception:
+        return None
+
+
+def _is_valid_realized_pnl(v: Optional[float]) -> bool:
+    if v is None:
+        return False
+    if not math.isfinite(v):
+        return False
+    if abs(v) >= _PNL_ABSURD_ABS_THRESHOLD:
+        return False
+    return True
+
+
+def _req_realized_pnl(ib, *, account_id: str, con_id: int, sleep_s: float) -> Optional[float]:
     """
     Use reqPnLSingle to read realizedPnL (cumulative for day). Caller must delta it.
+
+    Returns:
+      float realizedPnL if valid, else None.
     """
     if not account_id or con_id <= 0:
-        return 0.0
-    pnl = ib.reqPnLSingle(account_id, "", con_id)
-    ib.sleep(sleep_s)
-    val = getattr(pnl, "realizedPnL", 0.0)
+        return None
+
+    pnl_obj = ib.reqPnLSingle(account_id, "", con_id)
     try:
-        return float(val)
-    except Exception:
-        return 0.0
+        ib.sleep(max(0.0, float(sleep_s)))
+        raw = getattr(pnl_obj, "realizedPnL", None)
+        v = _coerce_float(raw)
+        return v if _is_valid_realized_pnl(v) else None
     finally:
         try:
-            ib.cancelPnLSingle(pnl)
+            ib.cancelPnLSingle(pnl_obj)
         except Exception:
             pass
 
@@ -205,7 +254,7 @@ def run_once(cfg: LedgerConfig) -> Dict[str, Any]:
     state = _load_state(cfg.state_path)
     open_state: Dict[str, Any] = state.get("open", {})  # key -> info
 
-    # Always produce a small report (even when disabled) for auditability.
+    # Always produce a report (even when disabled) for auditability.
     report: Dict[str, Any] = {
         "generated_at_utc": now.isoformat(),
         "enabled": cfg.enabled,
@@ -219,7 +268,6 @@ def run_once(cfg: LedgerConfig) -> Dict[str, Any]:
         report["preview_path"] = str(out)
         return report
 
-    # Enabled path: connect and evaluate real positions.
     ib = _connect_ib(host=cfg.ibkr_host, port=cfg.ibkr_port, client_id=cfg.ibkr_client_id)
     try:
         account_id = _get_account_id(ib)
@@ -230,10 +278,12 @@ def run_once(cfg: LedgerConfig) -> Dict[str, Any]:
             k = _state_key(sym, cur)
             if k in open_state:
                 continue
+
             con_id = int(info.get("conId", 0) or 0)
             baseline_realized = _req_realized_pnl(
                 ib, account_id=account_id, con_id=con_id, sleep_s=cfg.pnl_sleep_seconds
             )
+
             open_state[k] = {
                 "symbol": sym,
                 "currency": cur,
@@ -241,7 +291,7 @@ def run_once(cfg: LedgerConfig) -> Dict[str, Any]:
                 "qty": float(info["qty"]),
                 "avg_cost": float(info["avg_cost"]),
                 "conId": con_id,
-                "baseline_realized_pnl": float(baseline_realized),
+                "baseline_realized_pnl": baseline_realized,  # may be None if invalid
                 "strategy": cfg.default_strategy,
                 "tags": ["ibkr_paper", "manual"],
                 "account_id": account_id,
@@ -257,16 +307,50 @@ def run_once(cfg: LedgerConfig) -> Dict[str, Any]:
             cur = str(rec.get("currency", "USD")).upper()
             con_id = int(rec.get("conId", 0) or 0)
 
-            baseline = float(rec.get("baseline_realized_pnl", 0.0))
+            baseline_raw = rec.get("baseline_realized_pnl", None)
+            baseline = _coerce_float(baseline_raw)
+            baseline_ok = _is_valid_realized_pnl(baseline)
+
             current_realized = _req_realized_pnl(
                 ib, account_id=str(rec.get("account_id", "")), con_id=con_id, sleep_s=cfg.pnl_sleep_seconds
             )
-            pnl = float(current_realized - baseline)
+            current_ok = _is_valid_realized_pnl(current_realized)
+
+            pnl_untrusted_reason = ""
+            if baseline_ok and current_ok and baseline is not None and current_realized is not None:
+                pnl_val = float(current_realized - baseline)
+                pnl_ok = _is_valid_realized_pnl(pnl_val)
+                if pnl_ok:
+                    pnl_logged = pnl_val
+                else:
+                    pnl_logged = 0.0
+                    pnl_untrusted_reason = "computed_pnl_invalid"
+            else:
+                pnl_logged = 0.0
+                if not baseline_ok and not current_ok:
+                    pnl_untrusted_reason = "baseline_and_current_invalid"
+                elif not baseline_ok:
+                    pnl_untrusted_reason = "baseline_invalid"
+                else:
+                    pnl_untrusted_reason = "current_invalid"
 
             qty = float(rec.get("qty", 0.0))
             avg_cost = float(rec.get("avg_cost", 0.0))
             side = "BUY" if qty > 0 else "SELL"
             notional = abs(qty) * avg_cost
+
+            tags = list(rec.get("tags", []))
+            extra: Dict[str, Any] = {
+                "source": "ibkr_paper_ledger_watcher",
+                "currency": cur,
+                "conId": con_id,
+                "baseline_realized_pnl": baseline_raw,
+                "current_realized_pnl": current_realized,
+            }
+            if pnl_untrusted_reason:
+                tags.append("pnl_untrusted")
+                extra["pnl_untrusted"] = True
+                extra["pnl_untrusted_reason"] = pnl_untrusted_reason
 
             tr = TradeResult(
                 strategy=str(rec.get("strategy", cfg.default_strategy)),
@@ -275,36 +359,27 @@ def run_once(cfg: LedgerConfig) -> Dict[str, Any]:
                 quantity=abs(qty),
                 fill_price=avg_cost,
                 notional=notional,
-                pnl=pnl,
+                pnl=float(pnl_logged),
                 entry_time_utc=str(rec.get("opened_at_utc", now.isoformat())),
                 exit_time_utc=now.isoformat(),
                 is_live=False,
                 broker="ibkr",
                 account_id=str(rec.get("account_id", "")) or None,
                 regime=None,
-                tags=list(rec.get("tags", [])),
-                extra={
-                    "source": "ibkr_paper_ledger_watcher",
-                    "currency": cur,
-                    "conId": con_id,
-                    "baseline_realized_pnl": baseline,
-                    "current_realized_pnl": current_realized,
-                },
+                tags=tags,
+                extra=extra,
             )
 
             log_path = log_trade_result(tr)
             report["writes"]["trade_results"] += 1
             report["writes"]["details"].append(
-                {"symbol": sym, "pnl": pnl, "log_path": str(log_path)}
+                {"symbol": sym, "pnl": float(pnl_logged), "log_path": str(log_path), "pnl_untrusted_reason": pnl_untrusted_reason or None}
             )
 
-            # remove closed
             open_state.pop(k, None)
 
-        # Persist state
         _atomic_write_json(cfg.state_path, {"open": open_state, "last_run_utc": now.isoformat()})
 
-        # Persist run report
         cfg.reports_dir.mkdir(parents=True, exist_ok=True)
         out = cfg.reports_dir / f"IBKR_PAPER_LEDGER_RUN_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
         _atomic_write_json(out, report)
