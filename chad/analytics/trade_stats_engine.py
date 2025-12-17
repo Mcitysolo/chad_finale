@@ -124,7 +124,11 @@ def _normalize_trade_record(record: Dict[str, Any]) -> Optional[NormalizedTrade]
         symbol = str(payload["symbol"])
         side = str(payload["side"]).upper()
         notional = float(payload["notional"])
+        if not math.isfinite(notional):
+            return None
         pnl = float(payload["pnl"])
+        if not math.isfinite(pnl):
+            return None
         is_live = bool(payload.get("is_live", False))
 
         entry_time_utc = str(payload["entry_time_utc"])
