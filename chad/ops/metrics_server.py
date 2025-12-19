@@ -429,20 +429,42 @@ def _iter_runtime_files(runtime_dir: Path) -> List[Path]:
 
 
 def _paper_rollup_metrics(trades_dir: Path) -> List[MetricLine]:
+    """
+    Paper performance rollups.
+
+    We emit TWO totals:
+      * chad_paper_trades_total_raw  = raw parsed paper records (includes NaN/Inf PnL rows)
+      * chad_paper_trades_total      = "lean" count (finite PnL only), aligned with SCR/trade_stats_engine
+
+    All aggregate stats (PnL, win_rate, sharpe_like, max_drawdown, notional, per-strategy)
+    are computed on the LEAN set (finite PnL) to match SCR behavior and avoid NaN pollution.
+    """
     now_dt = datetime.now(timezone.utc)
     max_trades = _env_int("CHAD_ROLLUP_MAX_TRADES", ROLLUP_MAX_TRADES_DEFAULT)
     days_back = _env_int("CHAD_ROLLUP_DAYS_BACK", ROLLUP_DAYS_BACK_DEFAULT)
 
-    trades = _load_recent_paper_trades(trades_dir, max_trades=max_trades, days_back=days_back)
+    trades_raw = _load_recent_paper_trades(trades_dir, max_trades=max_trades, days_back=days_back)
 
-    total_trades = len(trades)
-    winners = sum(1 for t in trades if float(t["pnl"]) > 0)
-    losers = sum(1 for t in trades if float(t["pnl"]) < 0)
+    # RAW: all parsed paper trades in-window (may include NaN/Inf PnL rows).
+    total_trades_raw = float(len(trades_raw))
 
-    # Sanitize PnL for sums/means/sharpe/dd
-    raw_pnls = [float(t["pnl"]) for t in trades]
-    pnl_series = [p for p in raw_pnls if math.isfinite(p)]
+    # Extract PnL list (best-effort); keep parallel indexing with trades_raw.
+    raw_pnls: List[float] = []
+    for t in trades_raw:
+        try:
+            raw_pnls.append(float(t.get("pnl", 0.0)))
+        except Exception:
+            raw_pnls.append(float("nan"))
+
+    pnl_series: List[float] = [p for p in raw_pnls if math.isfinite(p)]
     pnl_nonfinite_count = float(len(raw_pnls) - len(pnl_series))
+
+    finite_trades: List[Dict[str, Any]] = [t for (t, p) in zip(trades_raw, raw_pnls) if math.isfinite(p)]
+
+    # LEAN: finite-PnL only (align with SCR).
+    total_trades = float(len(pnl_series))
+    winners = sum(1 for p in pnl_series if p > 0.0)
+    losers = sum(1 for p in pnl_series if p < 0.0)
 
     total_pnl = float(sum(pnl_series)) if pnl_series else 0.0
     avg_pnl = float(total_pnl / len(pnl_series)) if pnl_series else 0.0
@@ -451,16 +473,27 @@ def _paper_rollup_metrics(trades_dir: Path) -> List[MetricLine]:
     sharpe_like = _compute_sharpe_like(pnl_series)
     max_dd = _compute_max_drawdown(pnl_series)
 
-    total_notional = float(sum(float(t["notional"]) for t in trades)) if trades else 0.0
-    pnl_untrusted_count = float(sum(1 for t in trades if bool(t.get("pnl_untrusted", False))))
+    # Notional and untrusted counts computed on the LEAN set.
+    total_notional = 0.0
+    for t in finite_trades:
+        try:
+            n = float(t.get("notional", 0.0))
+        except Exception:
+            continue
+        if math.isfinite(n):
+            total_notional += n
+
+    pnl_untrusted_count = float(sum(1 for t in finite_trades if bool(t.get("pnl_untrusted", False))))
 
     last_age = 0.0
-    if trades:
-        last_exit = trades[-1].get("exit_time")
+    if finite_trades:
+        last_exit = finite_trades[-1].get("exit_time")
         if isinstance(last_exit, datetime):
             last_age = float(max(0.0, (now_dt - last_exit).total_seconds()))
 
     lines: List[MetricLine] = []
+    # Raw vs Lean totals
+    lines.append(MetricLine("chad_paper_trades_total_raw", {}, float(total_trades_raw)))
     lines.append(MetricLine("chad_paper_trades_total", {}, float(total_trades)))
     lines.append(MetricLine("chad_paper_trades_winners", {}, float(winners)))
     lines.append(MetricLine("chad_paper_trades_losers", {}, float(losers)))
@@ -474,24 +507,27 @@ def _paper_rollup_metrics(trades_dir: Path) -> List[MetricLine]:
     lines.append(MetricLine("chad_paper_pnl_nonfinite_count", {}, float(pnl_nonfinite_count)))
     lines.append(MetricLine("chad_paper_last_trade_age_seconds", {}, float(last_age)))
 
-    # Per-strategy (finite-only sums)
-    by_strat: Dict[str, List[Dict[str, Any]]] = {}
-    for t in trades:
-        by_strat.setdefault(str(t["strategy"]), []).append(t)
+    # Per-strategy rollups (LEAN set)
+    by_strategy: Dict[str, List[float]] = {}
+    by_strategy_total: Dict[str, int] = {}
+    for t, p in zip(trades_raw, raw_pnls):
+        if not math.isfinite(p):
+            continue
+        strat = str(t.get("strategy", "")).strip().lower() or "unknown"
+        by_strategy.setdefault(strat, []).append(float(p))
+        by_strategy_total[strat] = by_strategy_total.get(strat, 0) + 1
 
-    for strat, items in sorted(by_strat.items(), key=lambda kv: kv[0].lower()):
-        s_total = len(items)
-        s_raw = [float(x["pnl"]) for x in items]
-        s_clean = [p for p in s_raw if math.isfinite(p)]
-        s_total_pnl = float(sum(s_clean)) if s_clean else 0.0
-        s_winners = sum(1 for x in items if float(x["pnl"]) > 0)
-        s_win_rate = float(s_winners / s_total) if s_total > 0 else 0.0
-        lines.append(MetricLine("chad_paper_strategy_trades_total", {"strategy": strat}, float(s_total)))
-        lines.append(MetricLine("chad_paper_strategy_total_pnl", {"strategy": strat}, float(s_total_pnl)))
-        lines.append(MetricLine("chad_paper_strategy_win_rate", {"strategy": strat}, float(s_win_rate)))
+    for strat in sorted(by_strategy_total.keys()):
+        pnls = by_strategy.get(strat, [])
+        st_total = float(by_strategy_total[strat])
+        st_total_pnl = float(sum(pnls)) if pnls else 0.0
+        st_winners = sum(1 for x in pnls if x > 0.0)
+        st_win_rate = float(st_winners / st_total) if st_total > 0 else 0.0
+        lines.append(MetricLine("chad_paper_strategy_trades_total", {"strategy": strat}, float(st_total)))
+        lines.append(MetricLine("chad_paper_strategy_total_pnl", {"strategy": strat}, float(st_total_pnl)))
+        lines.append(MetricLine("chad_paper_strategy_win_rate", {"strategy": strat}, float(st_win_rate)))
 
     return lines
-
 
 def _collect_metrics(root_dir: Path, repo_dir: Path, trades_dir: Path, rollup_cache: RollupCache) -> List[MetricLine]:
     runtime_dir = root_dir / "runtime"
@@ -605,7 +641,9 @@ def _render_prometheus(lines: Iterable[MetricLine]) -> str:
     out.append("# TYPE chad_ibkr_last_ok_age_seconds gauge")
 
     # Rollups
-    out.append("# HELP chad_paper_trades_total Total number of paper trades in rollup window.")
+    out.append("# HELP chad_paper_trades_total_raw Total number of paper trade records (raw; includes NaN/Inf rows).")
+# TYPE chad_paper_trades_total_raw gauge
+# HELP chad_paper_trades_total Total number of paper trades in rollup window.")
     out.append("# TYPE chad_paper_trades_total gauge")
     out.append("# HELP chad_paper_win_rate Win-rate over paper trades in rollup window.")
     out.append("# TYPE chad_paper_win_rate gauge")

@@ -54,7 +54,12 @@ def test_rollup_metrics_eliminate_nan_and_inf(tmp_path: Path, monkeypatch) -> No
     lines = _paper_rollup_metrics(trades_dir)
 
     m = {ln.name: ln.value for ln in lines if not ln.labels}
-    assert m["chad_paper_trades_total"] == 3.0
+    # RAW includes NaN/Inf rows; LEAN excludes them (aligns with SCR/trade_stats_engine).
+    assert m["chad_paper_trades_total_raw"] == 3.0
+    assert m["chad_paper_trades_total"] == 1.0
+    assert m["chad_paper_pnl_nonfinite_count"] == 2.0
+    assert m["chad_paper_total_pnl"] == -0.5
+    assert m["chad_paper_avg_pnl"] == -0.5
     assert m["chad_paper_pnl_nonfinite_count"] == 2.0
     # totals/avg must be finite
     assert math.isfinite(m["chad_paper_total_pnl"])
