@@ -24,6 +24,11 @@ It combines:
         - sizing_factor
         - reasons
 
+    * STOP (stop_state.json):
+        - stop (True/False)
+        - reason
+        - updated_at_utc
+
 IMPORTANT (Phase 7/early Phase 8):
     - ExecutionConfig is currently hard-locked to DRY_RUN for IBKR, so
       allow_ibkr_live will always be False until ExecutionConfig is
@@ -36,12 +41,13 @@ IMPORTANT (Phase 7/early Phase 8):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import List, Set
 
 from chad.analytics.trade_stats_engine import load_and_compute
 from chad.analytics.shadow_confidence_router import evaluate_confidence, ShadowState
-from chad.core.mode import get_chad_mode, CHADMode
-from chad.core.live_mode import load_live_mode, LiveModeState
+from chad.core.live_mode import LiveModeState, load_live_mode
+from chad.core.mode import CHADMode, get_chad_mode
+from chad.core.stop_state import load_stop_state
 from chad.execution.execution_config import get_execution_config
 
 
@@ -58,6 +64,8 @@ class LiveGateContext:
     live_intent: bool
     live_reason: str
     shadow_state: ShadowState
+    stop_enabled: bool
+    stop_reason: str
 
 
 @dataclass(frozen=True)
@@ -76,7 +84,7 @@ class LiveGateDecision:
                 - shadow_state.state in {"CONFIDENT", "CAUTIOUS"}
 
         allow_ibkr_paper:
-            True iff ibkr_enabled (paper / what-if is always allowed).
+            True iff ibkr_enabled (paper / what-if is allowed) AND STOP is not enabled.
 
         reasons:
             List of human-readable messages explaining why live is
@@ -89,9 +97,7 @@ class LiveGateDecision:
     allow_ibkr_live: bool
     allow_ibkr_paper: bool
     reasons: List[str] = field(default_factory=list)
-    context: LiveGateContext = field(
-        default_factory=lambda: _build_default_context()
-    )
+    context: LiveGateContext = field(default_factory=lambda: _build_default_context())
 
 
 def _build_default_context() -> LiveGateContext:
@@ -110,14 +116,17 @@ def _build_default_context() -> LiveGateContext:
     )
     shadow_state = evaluate_confidence(stats)
     live_state = load_live_mode()
+    stop_state = load_stop_state()
     return LiveGateContext(
         chad_mode=CHADMode.DRY_RUN,
         exec_mode="unknown",
         ibkr_enabled=False,
         ibkr_dry_run=True,
-        live_intent=live_state.live,
-        live_reason=live_state.reason,
+        live_intent=bool(live_state.live),
+        live_reason=str(live_state.reason),
         shadow_state=shadow_state,
+        stop_enabled=bool(stop_state.stop),
+        stop_reason=str(stop_state.reason),
     )
 
 
@@ -146,7 +155,12 @@ def evaluate_live_gate() -> LiveGateDecision:
     # --- Operator live intent (live_mode.json) ---
     live_state: LiveModeState = load_live_mode()
     live_intent = bool(live_state.live)
-    live_reason = live_state.reason
+    live_reason = str(live_state.reason)
+
+    # --- STOP (authoritative DENY_ALL) ---
+    stop_state = load_stop_state()
+    stop_enabled = bool(stop_state.stop)
+    stop_reason = str(stop_state.reason)
 
     # --- SCR (Shadow Confidence) ---
     stats = load_and_compute(
@@ -166,13 +180,27 @@ def evaluate_live_gate() -> LiveGateDecision:
         live_intent=live_intent,
         live_reason=live_reason,
         shadow_state=shadow_state,
+        stop_enabled=stop_enabled,
+        stop_reason=stop_reason,
     )
+
+    # --- STOP enforcement (authoritative DENY_ALL) ---
+    if stop_enabled:
+        reasons.append(
+            f"STOP is ENABLED (DENY_ALL). reason={stop_reason!r}. "
+            "All trading actions are blocked (no live, no paper)."
+        )
+        return LiveGateDecision(
+            allow_ibkr_live=False,
+            allow_ibkr_paper=False,
+            reasons=reasons,
+            context=ctx,
+        )
 
     # --- Base paper allowance ---
     allow_ibkr_paper = ibkr_enabled
 
     # --- Compute allow_ibkr_live with layered conditions ---
-    # Start pessimistic; only lift to True if we pass all gates.
     allow_ibkr_live = False
 
     # 1) IBKR must be enabled at all.
@@ -237,7 +265,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             context=ctx,
         )
 
-    allowed_states = {"CONFIDENT", "CAUTIOUS"}
+    allowed_states: Set[str] = {"CONFIDENT", "CAUTIOUS"}
     if shadow_state.state not in allowed_states:
         reasons.append(
             f"SCR state={shadow_state.state} not in allowed LIVE band {allowed_states}."
@@ -249,7 +277,6 @@ def evaluate_live_gate() -> LiveGateDecision:
             context=ctx,
         )
 
-    # If we reach here, all gates passed.
     allow_ibkr_live = True
     reasons.append(
         "All live gates passed: IBKR enabled, IBKR not hard-locked to DRY_RUN, "

@@ -35,6 +35,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from chad.execution.execution_config import get_execution_config
+from chad.core.stop_state import load_stop_state
 from chad.core.mode import get_chad_mode, is_live_mode_enabled
 from chad.analytics.trade_stats_engine import load_and_compute
 from chad.analytics.shadow_confidence_router import evaluate_confidence, ShadowState
@@ -90,13 +91,22 @@ class ModeSnapshot(BaseModel):
 
 
 class ShadowStats(BaseModel):
+    # Raw counts (everything parsed)
     total_trades: int
+    live_trades: int
+    paper_trades: int
+
+    # Effective sample (what SCR actually trusts)
+    effective_trades: int
+    excluded_manual: int
+    excluded_untrusted: int
+    excluded_nonfinite: int
+
+    # Performance metrics over effective sample
     win_rate: float
     total_pnl: float
     max_drawdown: float
     sharpe_like: float
-    live_trades: int
-    paper_trades: int
 
 
 class ShadowSnapshot(BaseModel):
@@ -205,15 +215,18 @@ def _build_shadow_snapshot() -> ShadowSnapshot:
     shadow_state: ShadowState = evaluate_confidence(stats_raw)
 
     stats_model = ShadowStats(
-        total_trades=int(stats_raw.get("total_trades", 0)),
-        win_rate=float(stats_raw.get("win_rate", 0.0)),
-        total_pnl=float(stats_raw.get("total_pnl", 0.0)),
-        max_drawdown=float(stats_raw.get("max_drawdown", 0.0)),
-        sharpe_like=float(stats_raw.get("sharpe_like", 0.0)),
-        live_trades=int(stats_raw.get("live_trades", 0)),
-        paper_trades=int(stats_raw.get("paper_trades", 0)),
+        total_trades=int(stats_raw.get('total_trades', 0)),
+        live_trades=int(stats_raw.get('live_trades', 0)),
+        paper_trades=int(stats_raw.get('paper_trades', 0)),
+        effective_trades=int(stats_raw.get('effective_trades', 0)),
+        excluded_manual=int(stats_raw.get('excluded_manual', 0)),
+        excluded_untrusted=int(stats_raw.get('excluded_untrusted', 0)),
+        excluded_nonfinite=int(stats_raw.get('excluded_nonfinite', 0)),
+        win_rate=float(stats_raw.get('win_rate', 0.0)),
+        total_pnl=float(stats_raw.get('total_pnl', 0.0)),
+        max_drawdown=float(stats_raw.get('max_drawdown', 0.0)),
+        sharpe_like=float(stats_raw.get('sharpe_like', 0.0)),
     )
-
     return ShadowSnapshot(
         state=str(shadow_state.state),
         sizing_factor=float(shadow_state.sizing_factor),
@@ -302,6 +315,22 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
         and not shadow_snapshot.paper_only
         and shadow_snapshot.state.upper() != "PAUSED"
     )
+
+    # --- STOP enforcement (authoritative DENY_ALL) ---
+    stop_state = load_stop_state()
+    if bool(getattr(stop_state, 'stop', False)):
+        reasons.append(
+            f"STOP is ENABLED (DENY_ALL). reason={getattr(stop_state, 'reason', 'unknown')!r}. "
+            "All trading actions are blocked (no live, no paper)."
+        )
+        return LiveGateSnapshot(
+            execution=execution_snapshot,
+            mode=mode_snapshot,
+            shadow=shadow_snapshot,
+            allow_ibkr_live=False,
+            allow_ibkr_paper=False,
+            reasons=reasons,
+        )
 
     # Paper / what-if execution is allowed whenever IBKR is logically enabled.
     allow_ibkr_paper = execution_snapshot.ibkr_enabled

@@ -1,45 +1,36 @@
+#!/usr/bin/env python3
 """
-Trade Stats Engine (Phase 5 – Metrics for Shadow Confidence Router)
+CHAD — Trade Stats Engine (Production)
 
-This module reads CHAD's tamper-evident trade history logs and computes
-rolling performance metrics for use by:
+Computes aggregate performance stats used by:
+- /live-gate endpoint
+- SCR (Shadow Confidence Router)
+- Telegram coach, status server, metrics rollups
 
-    * Shadow Confidence Router (SCR)
-    * ML retrainer
-    * Weekly reports / coach summaries
+Core Rules
+----------
+Trades included for performance metrics (win_rate, sharpe_like, drawdown, total_pnl) only if:
+- pnl and notional are finite
+- trade is NOT tagged manual
+- trade is NOT tagged pnl_untrusted
 
-Data source
------------
-It consumes NDJSON files produced by `chad.analytics.trade_result_logger`:
+This build also supports a separate enrichment ledger:
+  data/trades/trade_history_enriched.ndjson
 
-    data/trades/trade_history_YYYYMMDD.ndjson
+When both raw + enriched Kraken records exist for the same txid:
+- enriched record wins
+- raw record is excluded from effective calculations
 
-Each line in those files is a JSON object:
+Output fields (important)
+------------------------
+- total_trades: all parsed trades (including excluded)
+- effective_trades: trades that count toward performance evaluation
+- excluded_manual
+- excluded_untrusted
+- excluded_nonfinite
+- live_trades / paper_trades
+- win_rate, total_pnl, sharpe_like, max_drawdown
 
-    {
-      "timestamp_utc": "...",
-      "sequence_id":   <int>,
-      "payload":       {... TradeResult ...},
-      "prev_hash":     "<sha256 or 'GENESIS'>",
-      "record_hash":   "<sha256(prev_hash | compact_payload)>"
-    }
-
-We treat these as authoritative records of per-trade outcomes.
-
-Public API (summary)
---------------------
-* load_recent_trades(max_trades: int = 500, days_back: int = 30) -> list[dict]
-    - Reads up to `max_trades` most recent trade records over the last `days_back` days.
-
-* compute_stats(trades: list[dict]) -> dict
-    - Computes aggregated metrics (win rate, Sharpe-ish ratio, max drawdown, etc.)
-      from a list of normalized trade dicts.
-
-* load_and_compute(max_trades: int = 500, days_back: int = 30) -> dict
-    - Convenience helper: load recent trades + compute stats in a single call.
-
-The SCR and coach modules can call these functions to obtain the current
-"confidence snapshot" of CHAD's trading performance.
 """
 
 from __future__ import annotations
@@ -49,396 +40,317 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from statistics import mean, pstdev
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-TRADE_DIR = Path("data") / "trades"
-TRADE_PREFIX = "trade_history_"
-TIMESTAMP_FMT = "%Y%m%d"
+ROOT = Path(__file__).resolve().parents[2]
+DATA_TRADES = ROOT / "data" / "trades"
+ENRICH_LEDGER = DATA_TRADES / "trade_history_enriched.ndjson"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        f = float(x)
+        if not math.isfinite(f):
+            return default
+        return f
+    except Exception:
+        return default
+
+
+def _is_manual(tags: List[str]) -> bool:
+    return any(str(t).lower() == "manual" for t in tags)
+
+
+def _is_untrusted(tags: List[str], extra: Dict[str, Any]) -> bool:
+    if any(str(t).lower() == "pnl_untrusted" for t in tags):
+        return True
+    if bool(extra.get("pnl_untrusted")):
+        return True
+    return False
+
+
+def _is_unfilled_ibkr_paper(t: "TradeRow") -> bool:
+    """Return True if this TradeRow is an IBKR PAPER record with no fill proof.
+
+    Rationale:
+      - CHAD logs paper order intent metadata for traceability.
+      - SCR must ONLY count filled trades as performance sample, otherwise we
+        inflate effective_trades with unfilled placeholders.
+      - Filled proof is detected via:
+          * 'filled' tag, OR
+          * fill_price > 0, OR
+          * extra.fill_price_used / extra.filled_quantity_used > 0
+    """
+    try:
+        if str(getattr(t, "broker", "") or "").strip().lower() != "ibkr":
+            return False
+        if bool(getattr(t, "is_live", False)):
+            return False  # only applies to paper
+        tags = [str(x).strip().lower() for x in (getattr(t, "tags", []) or [])]
+        if "filled" in tags:
+            return False
+
+        fp = 0.0
+        try:
+            fp = float(getattr(t, "fill_price", 0.0) or 0.0)
+        except Exception:
+            fp = 0.0
+        if fp > 0.0:
+            return False
+
+        extra = getattr(t, "extra", {}) or {}
+        if not isinstance(extra, dict):
+            extra = {}
+
+        fp2 = 0.0
+        fq2 = 0.0
+        try:
+            fp2 = float(extra.get("fill_price_used") or 0.0)
+        except Exception:
+            fp2 = 0.0
+        try:
+            fq2 = float(extra.get("filled_quantity_used") or 0.0)
+        except Exception:
+            fq2 = 0.0
+
+        if fp2 > 0.0 or fq2 > 0.0:
+            return False
+
+        # No fill proof => exclude from SCR sample.
+        return True
+    except Exception:
+        # Fail-safe: do not exclude if we cannot evaluate.
+        return False
+
+
+
+
+def _kraken_txid(payload: Dict[str, Any]) -> Optional[str]:
+    extra = payload.get("extra") or {}
+    txid = extra.get("txid")
+    if txid:
+        return str(txid)
+    return None
 
 
 @dataclass(frozen=True)
-class NormalizedTrade:
-    """
-    Lightweight, normalized view of a trade result extracted from the logger.
-
-    We only keep fields required for statistics:
-        * strategy, symbol, side
-        * notional, pnl
-        * entry_time, exit_time
-        * is_live
-    """
-
+class ParsedTrade:
+    broker: str
+    is_live: bool
     strategy: str
     symbol: str
-    side: str
-    notional: float
     pnl: float
-    entry_time: datetime
-    exit_time: datetime
-    is_live: bool
+    notional: float
+    tags: List[str]
+    extra: Dict[str, Any]
+    source: str  # "raw" or "enriched"
+    txid: Optional[str] = None
 
 
-def _parse_iso_utc(ts: str) -> datetime:
-    """
-    Parse an ISO 8601 timestamp into a timezone-aware UTC datetime.
-
-    If parsing fails, we fall back to "now" but stats will still work.
-    """
-    try:
-        dt = datetime.fromisoformat(ts)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
+def _iter_day_trade_files(days_back: int) -> List[Path]:
+    out: List[Path] = []
+    now = _utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(max(0, int(days_back)) + 1):
+        ymd = (now - timedelta(days=i)).strftime("%Y%m%d")
+        p = DATA_TRADES / f"trade_history_{ymd}.ndjson"
+        if p.is_file():
+            out.append(p)
+    if not out:
+        out = sorted(DATA_TRADES.glob("trade_history_*.ndjson"))
+    return out
 
 
-def _normalize_trade_record(record: Dict[str, Any]) -> Optional[NormalizedTrade]:
-    """
-    Convert a raw trade history record line into a NormalizedTrade.
-
-    If required fields are missing or invalid, returns None.
-    """
-    payload = record.get("payload", {})
-    # --- CHAD safety: ignore simulated warmup rows in performance stats ---
-    # These can be generated by tooling (e.g., ibkr_execution_runner --log-paper)
-    # and must NEVER affect SCR win_rate/sharpe gating.
-    tags = payload.get("tags") or []
-    if not isinstance(tags, list):
-        tags = []
-    tags_norm = [str(x).strip().lower() for x in tags]
-    extra = payload.get("extra") or {}
-    source = ""
-    if isinstance(extra, dict):
-        source = str(extra.get("source", "")).strip().lower()
-    # Exclude explicit paper simulation markers.
-    if "paper_sim" in tags_norm:
-        return None
-    # Exclude warmup rows emitted by runner tooling (belt + suspenders).
-    if ("warmup" in tags_norm) and (source == "ibkr_execution_runner"):
-        return None
-    try:
-        strategy = str(payload["strategy"])
-        symbol = str(payload["symbol"])
-        side = str(payload["side"]).upper()
-        notional = float(payload["notional"])
-        if not math.isfinite(notional):
-            return None
-        pnl = float(payload["pnl"])
-        if not math.isfinite(pnl):
-            return None
+def _parse_lines(path: Path, source: str) -> List[ParsedTrade]:
+    out: List[ParsedTrade] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        payload = rec.get("payload") or {}
+        broker = str(payload.get("broker") or "")
+        if not broker:
+            continue
+        tags = list(payload.get("tags") or [])
+        extra = dict(payload.get("extra") or {})
+        pnl = _safe_float(payload.get("pnl"), float("nan"))
+        notional = _safe_float(payload.get("notional"), float("nan"))
         is_live = bool(payload.get("is_live", False))
-
-        entry_time_utc = str(payload["entry_time_utc"])
-        exit_time_utc = str(payload["exit_time_utc"])
-
-        entry_time = _parse_iso_utc(entry_time_utc)
-        exit_time = _parse_iso_utc(exit_time_utc)
-
-        return NormalizedTrade(
-            strategy=strategy,
-            symbol=symbol,
-            side=side,
-            notional=notional,
-            pnl=pnl,
-            entry_time=entry_time,
-            exit_time=exit_time,
+        pt = ParsedTrade(
+            broker=broker,
             is_live=is_live,
+            strategy=str(payload.get("strategy") or ""),
+            symbol=str(payload.get("symbol") or ""),
+            pnl=pnl,
+            notional=notional,
+            tags=tags,
+            extra=extra,
+            source=source,
+            txid=_kraken_txid(payload) if broker == "kraken" else None,
         )
-    except Exception:
-        return None
+        out.append(pt)
+    return out
 
 
-def _iter_trade_files(days_back: int) -> List[Path]:
-    """
-    Return trade history files for the last `days_back` days, newest first.
+def _load_all_trades(days_back: int) -> List[ParsedTrade]:
+    trades: List[ParsedTrade] = []
 
-    Missing days are ignored; only existing files are included.
-    """
-    now = datetime.now(timezone.utc)
-    paths: List[Tuple[datetime, Path]] = []
+    # Raw daily ledgers
+    for f in _iter_day_trade_files(days_back):
+        trades.extend(_parse_lines(f, source="raw"))
 
-    for i in range(days_back + 1):
-        day = now - timedelta(days=i)
-        stamp = day.strftime(TIMESTAMP_FMT)
-        path = TRADE_DIR / f"{TRADE_PREFIX}{stamp}.ndjson"
-        if path.exists():
-            paths.append((day, path))
-
-    # Sort newest first
-    paths.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in paths]
-
-
-def _load_trades_from_file(path: Path) -> List[NormalizedTrade]:
-    """
-    Load and normalize trades from a single NDJSON trade history file.
-    """
-    trades: List[NormalizedTrade] = []
-
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    record = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-
-                normalized = _normalize_trade_record(record)
-                if normalized is not None:
-                    trades.append(normalized)
-    except Exception:
-        # Any file-level issue just means "no trades from this file"
-        return trades
+    # Enrichment ledger (optional)
+    if ENRICH_LEDGER.is_file():
+        trades.extend(_parse_lines(ENRICH_LEDGER, source="enriched"))
 
     return trades
 
 
-def load_recent_trades(
-    max_trades: int = 500,
-    days_back: int = 30,
-    include_paper: bool = True,
-    include_live: bool = True,
-) -> List[NormalizedTrade]:
+def _dedupe_kraken(trades: List[ParsedTrade]) -> List[ParsedTrade]:
     """
-    Load up to `max_trades` most recent trades from the last `days_back` days.
-
-    Args:
-        max_trades:
-            Maximum number of trades to return. The newest trades are preferred.
-        days_back:
-            How many calendar days back we search for trade history files.
-        include_paper:
-            Whether to include trades where is_live == False.
-        include_live:
-            Whether to include trades where is_live == True.
-
-    Returns:
-        List[NormalizedTrade] ordered from oldest to newest (chronological).
-        The SCR or other components may further filter or slice.
+    If both raw+enriched exist for same kraken txid, keep enriched only.
     """
-    files = _iter_trade_files(days_back=days_back)
-    all_trades: List[NormalizedTrade] = []
+    enriched_by_txid: Dict[str, ParsedTrade] = {}
+    raw_by_txid: Dict[str, ParsedTrade] = {}
 
-    for path in files:
-        trades = _load_trades_from_file(path)
-        all_trades.extend(trades)
-
-    # Oldest → newest for time-based processing
-    all_trades.sort(key=lambda t: t.exit_time)
-
-    # Filter by live/paper flags
-    filtered: List[NormalizedTrade] = []
-    for t in all_trades:
-        if t.is_live and not include_live:
-            continue
-        if not t.is_live and not include_paper:
-            continue
-        filtered.append(t)
-
-    # Take only the most recent `max_trades`
-    if len(filtered) > max_trades:
-        filtered = filtered[-max_trades:]
-
-    return filtered
-
-
-def _compute_equity_curve(trades: Iterable[NormalizedTrade]) -> List[float]:
-    """
-    Compute a cumulative equity curve from an iterable of trades.
-
-    We simply accumulate PnL over time, starting at 0.0.
-    """
-    equity: List[float] = []
-    total = 0.0
+    others: List[ParsedTrade] = []
     for t in trades:
-        total += t.pnl
-        equity.append(total)
-    return equity
+        if t.broker != "kraken" or not t.txid:
+            others.append(t)
+            continue
+        if t.source == "enriched":
+            enriched_by_txid[t.txid] = t
+        else:
+            raw_by_txid[t.txid] = t
+
+    kept: List[ParsedTrade] = []
+    # Add deduped kraken trades: enriched wins
+    for txid, t_en in enriched_by_txid.items():
+        kept.append(t_en)
+    # Add raw only if no enriched exists
+    for txid, t_raw in raw_by_txid.items():
+        if txid not in enriched_by_txid:
+            kept.append(t_raw)
+
+    return others + kept
 
 
-def _compute_max_drawdown(equity_curve: List[float]) -> float:
-    """
-    Compute max drawdown from a cumulative equity curve.
-
-    Returns:
-        The maximum peak-to-trough loss (negative number or 0.0).
-    """
-    if not equity_curve:
-        return 0.0
-
-    peak = equity_curve[0]
+def _compute_max_drawdown(equity_curve: Sequence[float]) -> float:
+    peak = float("-inf")
     max_dd = 0.0
-
-    for value in equity_curve:
-        if value > peak:
-            peak = value
-        drawdown = value - peak  # negative or zero
-        if drawdown < max_dd:
-            max_dd = drawdown
-
+    for x in equity_curve:
+        peak = max(peak, x)
+        dd = x - peak
+        max_dd = min(max_dd, dd)
     return float(max_dd)
 
 
-def _compute_sharpe(
-    pnl_series: List[float],
-    risk_free_rate: float = 0.0,
-) -> float:
-    """
-    Compute a simple Sharpe-like ratio on trade-level PnL.
-
-    We treat each trade's PnL as a "return". This is a simplification but
-    sufficient for gating decisions in SCR.
-
-    Returns:
-        sharpe_ratio or 0.0 if variance is zero or series is empty.
-    """
+def _compute_sharpe_like(pnl_series: Sequence[float]) -> float:
     if not pnl_series:
         return 0.0
-
-    # Treat mean(PnL) as "return", and use population std-dev.
-    mu = mean(pnl_series)
-    sigma = pstdev(pnl_series) if len(pnl_series) > 1 else 0.0
-
-    if sigma <= 0:
+    mean = sum(pnl_series) / len(pnl_series)
+    # population stdev
+    var = sum((x - mean) ** 2 for x in pnl_series) / len(pnl_series)
+    sd = math.sqrt(var)
+    if sd < 1e-12:
         return 0.0
-
-    excess = mu - risk_free_rate
-    return float(excess / sigma)
-
-
-def compute_stats(trades: List[NormalizedTrade]) -> Dict[str, Any]:
-    """
-    Compute aggregate performance statistics over the given trades.
-
-    Args:
-        trades: List of NormalizedTrade objects, typically ordered by time.
-
-    Returns:
-        A dict with keys:
-            total_trades: int
-            winners: int
-            losers: int
-            win_rate: float (0..1)
-            avg_pnl: float
-            total_pnl: float
-            sharpe_like: float
-            max_drawdown: float (<= 0)
-            live_trades: int
-            paper_trades: int
-            per_strategy: {
-                "alpha": { ...same metrics subset... },
-                ...
-            }
-    """
-    if not trades:
-        return {
-            "total_trades": 0,
-            "winners": 0,
-            "losers": 0,
-            "win_rate": 0.0,
-            "avg_pnl": 0.0,
-            "total_pnl": 0.0,
-            "sharpe_like": 0.0,
-            "max_drawdown": 0.0,
-            "live_trades": 0,
-            "paper_trades": 0,
-            "per_strategy": {},
-        }
-
-    total_trades = len(trades)
-    pnl_series = [t.pnl for t in trades]
-    winners = sum(1 for t in trades if t.pnl > 0)
-    losers = sum(1 for t in trades if t.pnl < 0)
-    total_pnl = float(sum(pnl_series))
-    avg_pnl = float(total_pnl / total_trades)
-
-    win_rate = float(winners / total_trades) if total_trades > 0 else 0.0
-    sharpe_like = _compute_sharpe(pnl_series)
-
-    equity_curve = _compute_equity_curve(trades)
-    max_drawdown = _compute_max_drawdown(equity_curve)
-
-    live_trades = sum(1 for t in trades if t.is_live)
-    paper_trades = sum(1 for t in trades if not t.is_live)
-
-    # Per-strategy breakdown
-    per_strategy: Dict[str, Dict[str, Any]] = {}
-    by_strategy: Dict[str, List[NormalizedTrade]] = {}
-    for t in trades:
-        by_strategy.setdefault(t.strategy, []).append(t)
-
-    for strat, strat_trades in by_strategy.items():
-        s_total = len(strat_trades)
-        s_pnls = [t.pnl for t in strat_trades]
-        s_winners = sum(1 for t in strat_trades if t.pnl > 0)
-        s_losers = sum(1 for t in strat_trades if t.pnl < 0)
-        s_total_pnl = float(sum(s_pnls))
-        s_avg_pnl = float(s_total_pnl / s_total) if s_total > 0 else 0.0
-        s_win_rate = float(s_winners / s_total) if s_total > 0 else 0.0
-        s_sharpe = _compute_sharpe(s_pnls)
-        s_equity = _compute_equity_curve(strat_trades)
-        s_max_dd = _compute_max_drawdown(s_equity)
-
-        per_strategy[strat] = {
-            "total_trades": s_total,
-            "winners": s_winners,
-            "losers": s_losers,
-            "win_rate": s_win_rate,
-            "avg_pnl": s_avg_pnl,
-            "total_pnl": s_total_pnl,
-            "sharpe_like": s_sharpe,
-            "max_drawdown": s_max_dd,
-        }
-
-    return {
-        "total_trades": total_trades,
-        "winners": winners,
-        "losers": losers,
-        "win_rate": win_rate,
-        "avg_pnl": avg_pnl,
-        "total_pnl": total_pnl,
-        "sharpe_like": sharpe_like,
-        "max_drawdown": max_drawdown,
-        "live_trades": live_trades,
-        "paper_trades": paper_trades,
-        "per_strategy": per_strategy,
-    }
+    val = mean / sd
+    if not math.isfinite(val):
+        return 0.0
+    return float(val)
 
 
 def load_and_compute(
+    *,
     max_trades: int = 500,
     days_back: int = 30,
     include_paper: bool = True,
     include_live: bool = True,
 ) -> Dict[str, Any]:
     """
-    Convenience function: load recent trades and compute stats in one call.
-
-    This is the primary interface that SCR and the coach will typically use.
-
-    Args:
-        max_trades:
-            Maximum number of trades to include in the analysis.
-        days_back:
-            How many days back to look for history files.
-        include_paper:
-            Include paper trades if True.
-        include_live:
-            Include live trades if True.
-
-    Returns:
-        A stats dict as returned by compute_stats().
+    Compute trade stats from ledgers.
     """
-    trades = load_recent_trades(
-        max_trades=max_trades,
-        days_back=days_back,
-        include_paper=include_paper,
-        include_live=include_live,
-    )
-    return compute_stats(trades)
+    all_trades = _dedupe_kraken(_load_all_trades(days_back))
+
+    # truncate for safety
+    if max_trades > 0:
+        all_trades = all_trades[-max_trades:]
+
+    total_trades = len(all_trades)
+    live_trades = 0
+    paper_trades = 0
+
+    excluded_manual = 0
+    excluded_untrusted = 0
+    excluded_nonfinite = 0
+
+    pnls: List[float] = []
+
+    for t in all_trades:
+        if t.is_live:
+            live_trades += 1
+        else:
+            paper_trades += 1
+
+        # filter by include flags
+        if t.is_live and not include_live:
+            continue
+        if (not t.is_live) and not include_paper:
+            continue
+
+        if _is_manual(t.tags):
+            excluded_manual += 1
+            continue
+                # Exclude unfilled IBKR PAPER placeholders from SCR sample
+        if _is_unfilled_ibkr_paper(t):
+            excluded_untrusted += 1
+            continue
+
+        if _is_untrusted(t.tags, t.extra):
+            excluded_untrusted += 1
+            continue
+        if not (math.isfinite(t.pnl) and math.isfinite(t.notional)):
+            excluded_nonfinite += 1
+            continue
+
+        pnls.append(float(t.pnl))
+
+    effective_trades = len(pnls)
+    winners = sum(1 for x in pnls if x > 0.0)
+    win_rate = float(winners / effective_trades) if effective_trades > 0 else 0.0
+    total_pnl = float(sum(pnls)) if pnls else 0.0
+
+    equity = []
+    running = 0.0
+    for x in pnls:
+        running += float(x)
+        equity.append(running)
+
+    max_dd = _compute_max_drawdown(equity) if equity else 0.0
+    sharpe_like = _compute_sharpe_like(pnls)
+
+    return {
+        "total_trades": int(total_trades),
+        "effective_trades": int(effective_trades),
+        "excluded_manual": int(excluded_manual),
+        "excluded_untrusted": int(excluded_untrusted),
+        "excluded_nonfinite": int(excluded_nonfinite),
+        "win_rate": float(win_rate),
+        "total_pnl": float(total_pnl),
+        "max_drawdown": float(max_dd),
+        "sharpe_like": float(sharpe_like),
+        "live_trades": int(live_trades),
+        "paper_trades": int(paper_trades),
+    }
+
+
+if __name__ == "__main__":
+    stats = load_and_compute(max_trades=5000, days_back=60, include_paper=True, include_live=True)
+    print(json.dumps(stats, indent=2, sort_keys=True))

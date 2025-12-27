@@ -1,3 +1,41 @@
+#!/usr/bin/env python3
+"""
+CHAD — Kraken API Client (Production-grade)
+
+This client is used by:
+- Kraken portfolio collector (balances snapshot)
+- Kraken trade router / executor (AddOrder validate-only + live)
+
+Upgrades included (for weekend productivity)
+-------------------------------------------
+This file adds private endpoints required to compute real fills / PnL later:
+- QueryOrders
+- ClosedOrders
+- TradesHistory
+
+It also supports public GET endpoints (e.g., AssetPairs) safely.
+
+Safety / Correctness
+--------------------
+- All private endpoints use Kraken's API-Key / API-Sign HMAC scheme.
+- Retries with bounded exponential backoff for transient failures + rate-limit errors.
+- Strict error handling: any Kraken "error" list triggers KrakenAPIError.
+- POST for private endpoints; GET for public endpoints; both supported.
+
+Environment variables
+---------------------
+Required:
+- KRAKEN_API_KEY
+- KRAKEN_API_SECRET
+
+Optional:
+- KRAKEN_API_URL (default: https://api.kraken.com)
+- KRAKEN_TIMEOUT_SECONDS (default: 15)
+- KRAKEN_RETRY_MAX (default: 4)
+- KRAKEN_RETRY_BASE_SECONDS (default: 0.6)
+
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -7,217 +45,270 @@ import hmac
 import json
 import os
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
-
-import requests
-from requests import Response, Session
+from typing import Any, Dict, Optional, Tuple
 
 
-class KrakenAPIError(Exception):
-    """Raised when Kraken returns an error array with one or more errors."""
+# ----------------------------
+# Exceptions
+# ----------------------------
+
+class KrakenConfigError(RuntimeError):
+    pass
 
 
-class KrakenConfigError(Exception):
-    """Raised when the Kraken client is misconfigured (e.g., missing keys)."""
+class KrakenAPIError(RuntimeError):
+    pass
 
+
+# ----------------------------
+# Config
+# ----------------------------
 
 @dataclass(frozen=True)
 class KrakenClientConfig:
-    """
-    Immutable configuration for KrakenClient.
-
-    Attributes:
-        api_key: Public API key obtained from Kraken Pro.
-        api_secret: Base64-encoded API private key (secret) from Kraken Pro.
-        base_url: Base URL for the Kraken REST API.
-    """
-
     api_key: str
-    api_secret: str
-    base_url: str = "https://api.kraken.com"
+    api_secret: str  # base64
+    api_url: str = "https://api.kraken.com"
+    timeout_seconds: float = 15.0
+    retry_max: int = 4
+    retry_base_seconds: float = 0.6
 
-    @classmethod
-    def from_env(cls) -> "KrakenClientConfig":
-        """
-        Build config from environment variables.
-
-        Required environment variables:
-            KRAKEN_API_KEY
-            KRAKEN_API_SECRET
-        """
-        key = os.getenv("KRAKEN_API_KEY")
-        secret = os.getenv("KRAKEN_API_SECRET")
-
+    @staticmethod
+    def from_env() -> "KrakenClientConfig":
         missing = []
-        if not key:
+        api_key = (os.environ.get("KRAKEN_API_KEY") or "").strip()
+        api_secret = (os.environ.get("KRAKEN_API_SECRET") or "").strip()
+        if not api_key:
             missing.append("KRAKEN_API_KEY")
-        if not secret:
+        if not api_secret:
             missing.append("KRAKEN_API_SECRET")
-
         if missing:
-            raise KrakenConfigError(
-                f"Missing Kraken API env vars: {', '.join(missing)}"
-            )
+            raise KrakenConfigError(f"Missing Kraken API env vars: {', '.join(missing)}")
 
-        return cls(api_key=key, api_secret=secret)
+        api_url = (os.environ.get("KRAKEN_API_URL") or "https://api.kraken.com").strip()
 
+        def _f(name: str, default: float) -> float:
+            v = (os.environ.get(name) or "").strip()
+            if not v:
+                return default
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        def _i(name: str, default: int) -> int:
+            v = (os.environ.get(name) or "").strip()
+            if not v:
+                return default
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        return KrakenClientConfig(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_url=api_url,
+            timeout_seconds=_f("KRAKEN_TIMEOUT_SECONDS", 15.0),
+            retry_max=max(0, _i("KRAKEN_RETRY_MAX", 4)),
+            retry_base_seconds=max(0.05, _f("KRAKEN_RETRY_BASE_SECONDS", 0.6)),
+        )
+
+
+# ----------------------------
+# Client
+# ----------------------------
 
 class KrakenClient:
     """
-    Low-level client for the Kraken REST API (Spot / Margin).
+    Minimal Kraken REST client with:
+      - public GET endpoints
+      - private POST endpoints with signing
 
-    This client handles:
-        * HMAC-SHA512 signing for private endpoints.
-        * Nonce generation.
-        * Error handling and JSON parsing.
-
-    It deliberately exposes only a small, safe surface area that CHAD needs:
-        * get_balances()
-        * query_open_orders()
-        * add_order()
-        * cancel_order()
+    Returns:
+      dict with keys: error (list), result (dict)
+    Raises:
+      KrakenAPIError on Kraken-reported errors or non-JSON failures.
     """
 
-    def __init__(self, config: KrakenClientConfig, session: Optional[Session] = None) -> None:
-        self._config = config
-        self._session = session or requests.Session()
+    def __init__(self, cfg: KrakenClientConfig) -> None:
+        self._cfg = cfg
+        # Pre-decode secret once
+        try:
+            self._secret_bytes = base64.b64decode(cfg.api_secret)
+        except Exception as exc:
+            raise KrakenConfigError(f"KRAKEN_API_SECRET is not valid base64: {exc}") from exc
 
-    # ------------------------------------------------------------------ #
-    # Core request machinery                                             #
-    # ------------------------------------------------------------------ #
+    # --------
+    # Signing
+    # --------
+
+    def _nonce(self) -> str:
+        # Kraken requires increasing nonce. Use ms timestamp.
+        return str(int(time.time() * 1000))
+
+    def _sign(self, url_path: str, data: Dict[str, Any]) -> str:
+        """
+        Kraken API-Sign:
+        - sha256(nonce + postdata)
+        - HMAC-SHA512(secret, url_path + sha256_digest)
+        - base64 encode
+        """
+        postdata = urllib.parse.urlencode({k: str(v) for k, v in data.items()})
+        nonce = str(data.get("nonce", ""))
+        sha256_digest = hashlib.sha256((nonce + postdata).encode("utf-8")).digest()
+        msg = url_path.encode("utf-8") + sha256_digest
+        mac = hmac.new(self._secret_bytes, msg, hashlib.sha512).digest()
+        return base64.b64encode(mac).decode("utf-8")
+
+    # -------------
+    # HTTP execution
+    # -------------
+
+    def _do_http(
+        self,
+        method: str,
+        url_path: str,
+        *,
+        data: Optional[Dict[str, Any]] = None,
+        private: bool = False,
+    ) -> Dict[str, Any]:
+        base = self._cfg.api_url.rstrip("/")
+        url = base + url_path
+
+        headers: Dict[str, str] = {
+            "User-Agent": "CHAD-KrakenClient/1.0",
+            "Accept": "application/json",
+        }
+
+        body: Optional[bytes] = None
+        if method.upper() == "GET":
+            if data:
+                url += "?" + urllib.parse.urlencode({k: str(v) for k, v in data.items()})
+            req = urllib.request.Request(url, method="GET", headers=headers)
+        else:
+            # POST
+            post_data = dict(data or {})
+            if private:
+                post_data["nonce"] = self._nonce()
+                headers["API-Key"] = self._cfg.api_key
+                headers["API-Sign"] = self._sign(url_path, post_data)
+            encoded = urllib.parse.urlencode({k: str(v) for k, v in post_data.items()}).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            body = encoded
+            req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self._cfg.timeout_seconds) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            raise KrakenAPIError(f"HTTP {method} {url_path} failed: {type(exc).__name__}: {exc}") from exc
+
+        try:
+            j = json.loads(raw)
+        except Exception as exc:
+            raise KrakenAPIError(f"Non-JSON response from Kraken ({url_path}): {raw[:200]}") from exc
+
+        errs = j.get("error") or []
+        if errs:
+            raise KrakenAPIError("; ".join([str(e) for e in errs]))
+
+        if "result" not in j:
+            raise KrakenAPIError(f"Kraken response missing 'result' for {url_path}: {j}")
+
+        return j
 
     def _request(
         self,
         method: str,
-        path: str,
+        url_path: str,
         *,
-        data: Optional[Mapping[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
         private: bool = False,
-        timeout: float = 10.0,
     ) -> Dict[str, Any]:
         """
-        Perform an HTTP request to the Kraken API.
-
-        Args:
-            method: "GET" or "POST".
-            path: e.g. "/0/public/Time" or "/0/private/Balance".
-            data: Optional dict of POST fields.
-            private: If True, send signed headers.
-            timeout: Request timeout in seconds.
-
-        Returns:
-            Parsed JSON response as a dict.
-
-        Raises:
-            KrakenAPIError: If Kraken returns error messages.
-            requests.RequestException: On network problems.
-            ValueError: On JSON parsing issues.
+        Retrying wrapper around _do_http.
+        Retries on:
+          - transient HTTP/transport failures (raised KrakenAPIError)
+          - rate limiting signals in message
         """
-        url = f"{self._config.base_url}{path}"
-        headers: Dict[str, str] = {}
+        max_attempts = max(1, int(self._cfg.retry_max) + 1)
+        base_sleep = float(self._cfg.retry_base_seconds)
 
-        post_data: Dict[str, Any] = {}
-        if data:
-            post_data.update(data)
-
-        if private:
-            nonce = str(int(time.time() * 1000))
-            post_data["nonce"] = nonce
-            body = self._build_private_body(path, post_data)
-            headers.update(
-                {
-                    "API-Key": self._config.api_key,
-                    "API-Sign": body,
-                    "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                }
-            )
-
-        if method.upper() != "POST":
-            # Kraken private endpoints are POST-only; public ones usually support GET.
-            raise ValueError("KrakenClient currently supports POST-only endpoints.")
-
-        resp: Response = self._session.post(
-            url,
-            data=post_data,
-            headers=headers,
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-
-        try:
-            payload = resp.json()
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Failed to parse JSON from Kraken: {resp.text[:200]}") from exc
-
-        # Kraken wraps errors in "error": [] and data in "result": {}
-        errors = payload.get("error") or []
-        if errors:
-            # Kraken errors are strings; join them for now.
-            raise KrakenAPIError("; ".join(errors))
-
-        if "result" not in payload:
-            raise ValueError(f"Unexpected Kraken payload (no 'result'): {payload}")
-
-        result = payload["result"]
-        if not isinstance(result, dict):
-            # Some endpoints return list etc., but for our usage we expect dict.
-            return {"result": result}
-
-        return result
-
-    def _build_private_body(self, path: str, data: Mapping[str, Any]) -> str:
-        """
-        Build the API-Sign value for private endpoints.
-
-        According to Kraken docs:
-            API-Sign = base64(hmac_sha512(uri_path + sha256(nonce + postdata), decoded_secret))
-
-        Where:
-            uri_path is e.g. "/0/private/Balance"
-            postdata is URL-encoded query string of fields (including nonce)
-        """
-        postdata = "&".join(f"{key}={data[key]}" for key in data)  # stable order not required
-        sha256 = hashlib.sha256()
-        sha256.update((data["nonce"] + postdata).encode("utf-8"))
-        sha256_digest = sha256.digest()
-
-        message = path.encode("utf-8") + sha256_digest
-
-        secret_decoded = base64.b64decode(self._config.api_secret)
-        hmac_digest = hmac.new(secret_decoded, message, hashlib.sha512).digest()
-        return base64.b64encode(hmac_digest).decode("ascii")
-
-    # ------------------------------------------------------------------ #
-    # Public wrapper methods                                             #
-    # ------------------------------------------------------------------ #
-
-    def get_balances(self) -> Dict[str, float]:
-        """
-        Fetch account balances for all assets.
-
-        Returns:
-            Mapping of asset symbol (e.g., "XXBT", "ZUSD") to float balance.
-        """
-        result = self._request("POST", "/0/private/Balance", private=True)
-        balances: Dict[str, float] = {}
-        for asset, amount_str in result.items():
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
             try:
-                balances[asset] = float(amount_str)
-            except (TypeError, ValueError):
-                continue
-        return balances
+                return self._do_http(method, url_path, data=data, private=private)
+            except KrakenAPIError as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                # Retry only on transient-ish signals
+                transient = any(
+                    s in msg
+                    for s in [
+                        "timed out",
+                        "timeout",
+                        "temporarily",
+                        "connection",
+                        "bad gateway",
+                        "service unavailable",
+                        "rate limit",
+                        "eapi:rate limit exceeded",
+                        "try again",
+                    ]
+                )
+                if attempt >= max_attempts or not transient:
+                    raise
+                sleep_s = base_sleep * (2 ** (attempt - 1))
+                # bounded
+                sleep_s = min(sleep_s, 6.0)
+                time.sleep(sleep_s)
 
-    def query_open_orders(self) -> Dict[str, Any]:
-        """
-        Fetch all open orders.
+        # should never hit
+        if last_exc:
+            raise last_exc
+        raise KrakenAPIError("unknown kraken request failure")
 
-        Returns:
-            Kraken 'open' orders structure.
+    # ----------------------------
+    # Public endpoints (GET)
+    # ----------------------------
+
+    def asset_pairs(self, *, pair: Optional[str] = None) -> Dict[str, Any]:
         """
-        result = self._request("POST", "/0/private/OpenOrders", private=True)
-        # Kraken returns {'open': {...}, 'count': N}
-        return result
+        /0/public/AssetPairs
+        """
+        data = {"pair": pair} if pair else None
+        j = self._request("GET", "/0/public/AssetPairs", data=data, private=False)
+        return j.get("result") or {}
+
+    def ticker(self, *, pair: str) -> Dict[str, Any]:
+        j = self._request("GET", "/0/public/Ticker", data={"pair": pair}, private=False)
+        return j.get("result") or {}
+
+    # ----------------------------
+    # Private endpoints (POST)
+    # ----------------------------
+
+    def balance(self) -> Dict[str, Any]:
+        """
+        /0/private/Balance
+        """
+        j = self._request("POST", "/0/private/Balance", data={}, private=True)
+        return j.get("result") or {}
+
+
+    def get_balances(self) -> Dict[str, Any]:
+        """Backward-compatible alias for older collectors (calls balance())."""
+        return self.balance()
+    def open_orders(self) -> Dict[str, Any]:
+        """
+        /0/private/OpenOrders
+        """
+        j = self._request("POST", "/0/private/OpenOrders", data={}, private=True)
+        return j.get("result") or {}
 
     def add_order(
         self,
@@ -227,96 +318,91 @@ class KrakenClient:
         ordertype: str,
         volume: float,
         price: Optional[float] = None,
-        timeinforce: Optional[str] = None,
-        validate_only: bool = False,
-        extra_fields: Optional[Mapping[str, Any]] = None,
+        validate_only: bool = True,
     ) -> Dict[str, Any]:
         """
-        Place a new order.
+        /0/private/AddOrder
 
-        Args:
-            pair: Trading pair (e.g., "XBTUSD" / "XBT/USDT" style depending on Kraken notation).
-            side: "buy" or "sell".
-            ordertype: e.g. "market" or "limit".
-            volume: Amount of base currency to trade.
-            price: Limit price (required for limit orders).
-            timeinforce: Optional time-in-force (e.g. "GTC", "IOC"), depending on Kraken support.
-            validate_only: If True, Kraken validates but does not execute.
-            extra_fields: Optional additional fields (e.g., "leverage": "2:1").
-
-        Returns:
-            Kraken AddOrder result dict.
+        validate_only=True -> validate order only (no execution)
+        validate_only=False -> real order
         """
         data: Dict[str, Any] = {
             "pair": pair,
             "type": side,
             "ordertype": ordertype,
-            "volume": str(volume),
+            "volume": f"{float(volume):.8f}",
         }
         if price is not None:
-            data["price"] = str(price)
-        if timeinforce:
-            data["timeinforce"] = timeinforce
+            data["price"] = str(float(price))
         if validate_only:
-            data["validate"] = True
-        if extra_fields:
-            data.update(extra_fields)
+            data["validate"] = "true"
 
-        result = self._request("POST", "/0/private/AddOrder", data=data, private=True)
-        return result
+        j = self._request("POST", "/0/private/AddOrder", data=data, private=True)
+        return j.get("result") or {}
 
-    def cancel_order(self, txid: str) -> Dict[str, Any]:
+    def query_orders(self, *, txid: str) -> Dict[str, Any]:
         """
-        Cancel an existing order by transaction ID.
-
-        Returns:
-            Kraken CancelOrder result dict.
+        /0/private/QueryOrders
         """
-        data = {"txid": txid}
-        result = self._request("POST", "/0/private/CancelOrder", data=data, private=True)
-        return result
+        j = self._request("POST", "/0/private/QueryOrders", data={"txid": txid}, private=True)
+        return j.get("result") or {}
 
+    def closed_orders(
+        self,
+        *,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        ofs: Optional[int] = None,
+        closetime: str = "close",
+    ) -> Dict[str, Any]:
+        """
+        /0/private/ClosedOrders
+        """
+        data: Dict[str, Any] = {"closetime": closetime}
+        if start is not None:
+            data["start"] = int(start)
+        if end is not None:
+            data["end"] = int(end)
+        if ofs is not None:
+            data["ofs"] = int(ofs)
 
-# --------------------------------------------------------------------------- #
-# CLI Self-Test                                                               #
-# --------------------------------------------------------------------------- #
+        j = self._request("POST", "/0/private/ClosedOrders", data=data, private=True)
+        return j.get("result") or {}
 
+    def trades_history(
+        self,
+        *,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        ofs: Optional[int] = None,
+        ttype: str = "all",
+    ) -> Dict[str, Any]:
+        """
+        /0/private/TradesHistory
+        """
+        data: Dict[str, Any] = {"type": ttype}
+        if start is not None:
+            data["start"] = int(start)
+        if end is not None:
+            data["end"] = int(end)
+        if ofs is not None:
+            data["ofs"] = int(ofs)
 
-def _cli_self_test(client: KrakenClient) -> int:
-    """
-    Run a minimal self-test:
-        * Fetch balances
-        * Fetch open orders
+        j = self._request("POST", "/0/private/TradesHistory", data=data, private=True)
+        return j.get("result") or {}
 
-    This is safe to run; no trading occurs.
-    """
-    try:
-        balances = client.get_balances()
-        open_orders = client.query_open_orders()
-    except (KrakenAPIError, KrakenConfigError, requests.RequestException, ValueError) as exc:
-        print(f"[SELF-TEST] ERROR: {exc}")
-        return 1
+    # ----------------------------
+    # CLI self-test (safe)
+    # ----------------------------
 
-    print("[SELF-TEST] Balances:")
-    if not balances:
-        print("  (No non-zero balances returned)")
-    else:
-        for asset, amount in sorted(balances.items()):
-            print(f"  {asset}: {amount}")
-
-    print("\n[SELF-TEST] Open orders:")
-    if not open_orders.get("open"):
-        print("  (No open orders)")
-    else:
-        for txid, order in open_orders["open"].items():
-            descr = order.get("descr", {})
-            pair = descr.get("pair", "")
-            side = descr.get("type", "")
-            otype = descr.get("ordertype", "")
-            vol = order.get("vol", "")
-            print(f"  {txid}: {side} {vol} {pair} ({otype})")
-
-    return 0
+    @staticmethod
+    def _cli_self_test() -> int:
+        cfg = KrakenClientConfig.from_env()
+        c = KrakenClient(cfg)
+        bal = c.balance()
+        # print only keys (no amounts) for safety in CLI
+        print("Balance keys:", sorted(bal.keys())[:30])
+        return 0
 
 
 def _build_client_from_env() -> KrakenClient:
@@ -324,45 +410,28 @@ def _build_client_from_env() -> KrakenClient:
     return KrakenClient(cfg)
 
 
-def main(argv: Optional[Tuple[str, ...]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "KrakenClient utility.\n"
-            "By default, runs a self-test (balances + open orders) using "
-            "KRAKEN_API_KEY and KRAKEN_API_SECRET from the environment."
-        )
-    )
-    subparsers = parser.add_subparsers(dest="command")
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="CHAD KrakenClient self-test")
+    p.add_argument("--self-test", action="store_true", help="Run safe private Balance call and print keys.")
+    p.add_argument("--assetpairs", action="store_true", help="Fetch public AssetPairs for XXBTZCAD and print ordermin.")
+    args = p.parse_args(argv)
 
-    subparsers.add_parser("self-test", help="Run a read-only self test.")
+    if args.self_test:
+        return KrakenClient._cli_self_test()
 
-    balance_parser = subparsers.add_parser("balances", help="Print account balances.")
-    balance_parser.set_defaults(command="balances")
-
-    args = parser.parse_args(argv)
-
-    client = _build_client_from_env()
-
-    if args.command in (None, "self-test"):
-        return _cli_self_test(client)
-
-    if args.command == "balances":
-        try:
-            balances = client.get_balances()
-        except Exception as exc:  # noqa: BLE001
-            print(f"Error fetching balances: {exc}")
-            return 1
-        print("Balances:")
-        if not balances:
-            print("  (No non-zero balances)")
-        else:
-            for asset, amount in sorted(balances.items()):
-                print(f"  {asset}: {amount}")
+    if args.assetpairs:
+        c = _build_client_from_env()
+        ap = c.asset_pairs(pair="XXBTZCAD")
+        print(ap)
+        if "XXBTZCAD" in ap:
+            info = ap["XXBTZCAD"]
+            print("ordermin:", info.get("ordermin"), "lot_decimals:", info.get("lot_decimals"), "pair_decimals:", info.get("pair_decimals"))
         return 0
 
-    parser.print_help()
+    p.print_help()
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

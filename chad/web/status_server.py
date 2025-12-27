@@ -93,11 +93,24 @@ def _load_shadow_snapshot(path: Path) -> Dict[str, Any]:
         "sizing_factor": float(sizing_factor),
         "paper_only": bool(paper_only),
         "reasons": reasons,
-        "stats": {
-            "total_trades": total_trades,
-            "win_rate": win_rate,
-            "total_pnl": total_pnl,
-        },
+"stats": {
+    # Raw counts (everything parsed)
+    "total_trades": int(stats.get("total_trades", 0)),
+    "live_trades": int(stats.get("live_trades", 0)),
+    "paper_trades": int(stats.get("paper_trades", 0)),
+
+    # Effective sample (what SCR trusts)
+    "effective_trades": int(stats.get("effective_trades", 0)),
+    "excluded_manual": int(stats.get("excluded_manual", 0)),
+    "excluded_untrusted": int(stats.get("excluded_untrusted", 0)),
+    "excluded_nonfinite": int(stats.get("excluded_nonfinite", 0)),
+
+    # Performance metrics over effective sample
+    "win_rate": float(stats.get("win_rate", 0.0)),
+    "total_pnl": float(stats.get("total_pnl", 0.0)),
+    "max_drawdown": float(stats.get("max_drawdown", 0.0)),
+    "sharpe_like": float(stats.get("sharpe_like", 0.0)),
+},
         "raw_path": str(path),
     }
 

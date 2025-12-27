@@ -15,3 +15,7 @@ control/
 *.log
 shadow_status_server.log
 status_server.log
+
+# CHAD local backup artifacts
+*.bak.*
+runtime/*.bak.*

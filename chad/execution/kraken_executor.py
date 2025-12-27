@@ -10,6 +10,8 @@ from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig
 from chad.execution.kraken_trade_router import KrakenTradeRouter, TradeRequest, TradeResponse
 from chad.risk.dynamic_risk_allocator import DynamicRiskAllocator, StrategyAllocation
 
+from chad.portfolio.kraken_trade_result_logger import KrakenTradeEvent, log_kraken_trade_event
+
 
 # --------------------------------------------------------------------------- #
 # Data models                                                                 #
@@ -22,7 +24,7 @@ class StrategyTradeIntent:
     High-level intent for a single CHAD crypto trade.
 
     Fields:
-        strategy: Strategy name, e.g. "crypto" or "alpha".
+        strategy: Strategy name, e.g. "crypto" or "alpha_crypto".
         pair: Kraken pair, e.g. "XXBTZCAD".
         side: "buy" or "sell".
         ordertype: "market" or "limit".
@@ -45,11 +47,6 @@ class StrategyTradeIntent:
 class RiskGateResult:
     """
     Result of checking a trade against dynamic caps.
-
-    Fields:
-        allowed: Whether the trade is allowed at the requested size.
-        adjusted_notional: If downsized, the new notional (<= requested).
-        reason: Explanation if rejected or adjusted.
     """
 
     allowed: bool
@@ -63,43 +60,19 @@ class RiskGateResult:
 
 
 def load_dynamic_caps(path: Path) -> Dict[str, Any]:
-    """
-    Load dynamic_caps.json as produced by DynamicRiskAllocator.
-    """
     if not path.is_file():
         raise FileNotFoundError(f"dynamic_caps.json not found at {path}")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def get_strategy_cap(caps_data: Dict[str, Any], strategy: str) -> float:
-    """
-    Look up the per-strategy dollar cap for a given strategy name.
-
-    Raises KeyError if the strategy is unknown.
-    """
     strategy_caps = caps_data.get("strategy_caps", {})
     if strategy not in strategy_caps:
         raise KeyError(f"Strategy {strategy!r} not found in dynamic caps")
     return float(strategy_caps[strategy])
 
 
-def check_risk(
-    *,
-    caps_data: Dict[str, Any],
-    intent: StrategyTradeIntent,
-) -> RiskGateResult:
-    """
-    Enforce per-strategy caps for a trade intent.
-
-    Logic:
-        * Look up per-strategy cap.
-        * If notional_estimate <= cap: allowed.
-        * If notional_estimate > cap: reject (for now) with explanation.
-
-    NOTE:
-        If you later want to allow partial sizing, you can change this to
-        downsize notional instead of rejecting.
-    """
+def check_risk(*, caps_data: Dict[str, Any], intent: StrategyTradeIntent) -> RiskGateResult:
     cap = get_strategy_cap(caps_data, intent.strategy)
     requested = float(intent.notional_estimate)
 
@@ -117,7 +90,6 @@ def check_risk(
             reason=f"Requested notional {requested:.2f} <= cap {cap:.2f}",
         )
 
-    # For now, reject if over cap. We can later implement downsizing.
     return RiskGateResult(
         allowed=False,
         adjusted_notional=cap,
@@ -141,17 +113,13 @@ def default_dynamic_caps_path() -> Path:
 class KrakenExecutor:
     """
     High-level executor that:
-
         * Reads dynamic_caps.json
         * Checks a StrategyTradeIntent against per-strategy cap
-        * If allowed, uses KrakenTradeRouter to place the order (validate or live)
+        * If allowed, uses KrakenTradeRouter to place the order (validate-only or live)
+        * If live and txids exist, logs a TradeResult record to CHAD ledger.
     """
 
-    def __init__(
-        self,
-        router: KrakenTradeRouter,
-        caps_path: Optional[Path] = None,
-    ) -> None:
+    def __init__(self, router: KrakenTradeRouter, caps_path: Optional[Path] = None) -> None:
         self._router = router
         self._caps_path = caps_path or default_dynamic_caps_path()
 
@@ -171,12 +139,28 @@ class KrakenExecutor:
             pair=intent.pair,
             side=intent.side,
             ordertype=intent.ordertype,
-            volume=intent.volume,
-            price=intent.price,
+            volume=float(intent.volume),
+            price=float(intent.price) if intent.price is not None else None,
             validate_only=not live,
         )
 
         resp = self._router.execute(req)
+
+        # If this was live, and we got txids, log them as TradeResults.
+        if live and resp and getattr(resp, "txids", None):
+            for txid in resp.txids:
+                event = KrakenTradeEvent(
+                    strategy=str(intent.strategy),
+                    pair=str(intent.pair),
+                    side=str(intent.side),
+                    ordertype=str(intent.ordertype),
+                    volume=float(intent.volume),
+                    notional_estimate=float(intent.notional_estimate),
+                    txid=str(txid),
+                    raw=dict(resp.raw),
+                )
+                log_kraken_trade_event(event)
+
         return risk_result, resp
 
 
@@ -259,32 +243,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         executor = _build_executor_from_env(caps_path=caps_path)
 
         intent = StrategyTradeIntent(
-            strategy=args.strategy,
-            pair=args.pair,
-            side=args.side,
-            ordertype=args.ordertype,
-            volume=args.volume,
-            notional_estimate=args.notional,
-            price=args.price,
+            strategy=str(args.strategy),
+            pair=str(args.pair),
+            side=str(args.side),
+            ordertype=str(args.ordertype),
+            volume=float(args.volume),
+            notional_estimate=float(args.notional),
+            price=float(args.price) if args.price is not None else None,
         )
 
-        risk_result, resp = executor.execute_with_risk(intent=intent, live=args.live)
+        risk_result, resp = executor.execute_with_risk(intent=intent, live=bool(args.live))
 
+        mode = "LIVE" if bool(args.live) else "VALIDATION ONLY"
         print("[KRAKEN EXECUTOR] Risk gate:")
-        print(f"  allowed: {risk_result.allowed}")
-        print(f"  reason:  {risk_result.reason}")
-        print(f"  adjusted_notional: {risk_result.adjusted_notional:.2f}")
+        print("  allowed:", risk_result.allowed)
+        print("  reason: ", risk_result.reason)
+        print("  adjusted_notional:", f"{risk_result.adjusted_notional:.2f}")
 
-        if not risk_result.allowed:
-            print("[KRAKEN EXECUTOR] No order sent due to risk gate.")
+        if resp is None:
+            print(f"[KRAKEN EXECUTOR] No order sent ({mode}).")
             return 0
 
-        mode = "LIVE" if args.live else "VALIDATION ONLY"
         print(f"[KRAKEN EXECUTOR] Order result ({mode}):")
-        if resp is None:
-            print("  (No TradeResponse returned; this should not happen if allowed=True)")
-            return 1
-
         if resp.txids:
             print("  txids:", ", ".join(resp.txids))
         else:
