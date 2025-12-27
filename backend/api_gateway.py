@@ -12,12 +12,16 @@ Key guarantees:
     - ExecutionConfig (ibkr_dry_run=True),
     - Global mode (CHAD_MODE),
     - Shadow Confidence Router (SCR) + paper_only flag,
-    - Shadow risk gating logic implemented here.
+    - Shadow risk gating logic implemented here,
+    - STOP (DENY_ALL) emergency freeze,
+    - Operator intent mode (Phase 10 control plane).
 * Endpoints only read CHAD’s internal state:
     - Execution configuration,
     - CHAD_MODE,
     - Shadow confidence & trade stats,
-    - Dynamic risk caps (if present on disk).
+    - Dynamic risk caps (if present on disk),
+    - STOP state,
+    - Operator intent state.
 * Phase-10 AI endpoints are strictly advisory-only: they never touch
   execution, risk limits, or DRY_RUN flags.
 
@@ -28,24 +32,94 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from chad.execution.execution_config import get_execution_config
-from chad.core.stop_state import load_stop_state
-from chad.core.mode import get_chad_mode, is_live_mode_enabled
+from chad.analytics.shadow_confidence_router import ShadowState, evaluate_confidence
 from chad.analytics.trade_stats_engine import load_and_compute
-from chad.analytics.shadow_confidence_router import evaluate_confidence, ShadowState
-from chad.intel.schemas import ResearchRequestInput, ResearchScenario
+from chad.core.mode import get_chad_mode, is_live_mode_enabled
+from chad.core.stop_state import load_stop_state
+from chad.execution.execution_config import get_execution_config
 from chad.intel.research_engine import run_research_scenario_from_request
+from chad.intel.schemas import ResearchRequestInput, ResearchScenario
 
 # Optional: dynamic caps file path used by orchestrator.
 DYNAMIC_CAPS_PATH = Path("runtime/dynamic_caps.json")
 
+# Phase 10 operator intent control plane runtime file
+OPERATOR_INTENT_PATH = Path("runtime/operator_intent.json")
+
 LOGGER = logging.getLogger("chad.api_gateway")
+
+
+# ---------------------------------------------------------------------------
+# Operator intent (Phase 10)
+# ---------------------------------------------------------------------------
+
+class OperatorMode(str):
+    ALLOW_LIVE = "ALLOW_LIVE"
+    EXIT_ONLY = "EXIT_ONLY"
+    DENY_ALL = "DENY_ALL"
+
+
+@dataclass(frozen=True)
+class OperatorIntentState:
+    mode: str
+    reason: str
+    updated_at_utc: str
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _load_operator_intent() -> OperatorIntentState:
+    """
+    Load operator intent from runtime/operator_intent.json.
+
+    Safe default is ALLOW_LIVE (meaning: do not add extra blocking beyond other gates).
+    Note: In Phase 7/8, ExecutionConfig + SCR still block real live trading.
+    """
+    if not OPERATOR_INTENT_PATH.is_file():
+        return OperatorIntentState(mode=OperatorMode.ALLOW_LIVE, reason="default_allow_live", updated_at_utc="")
+    try:
+        data = json.loads(OPERATOR_INTENT_PATH.read_text(encoding="utf-8"))
+        mode = str(data.get("mode", OperatorMode.ALLOW_LIVE)).upper()
+        reason = str(data.get("reason", "unknown"))
+        updated = str(data.get("updated_at_utc", ""))
+        if mode not in (OperatorMode.ALLOW_LIVE, OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
+            return OperatorIntentState(mode=OperatorMode.ALLOW_LIVE, reason="invalid_mode_fallback", updated_at_utc=updated)
+        return OperatorIntentState(mode=mode, reason=reason, updated_at_utc=updated)
+    except Exception:
+        return OperatorIntentState(mode=OperatorMode.ALLOW_LIVE, reason="parse_error_fallback", updated_at_utc="")
+
+
+def _save_operator_intent(state: OperatorIntentState) -> None:
+    """
+    Atomic write: tmp -> replace.
+    """
+    OPERATOR_INTENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = asdict(state)
+    tmp = OPERATOR_INTENT_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, OPERATOR_INTENT_PATH)
+
+
+class OperatorIntentResponse(BaseModel):
+    mode: str
+    reason: str
+    updated_at_utc: str
+
+
+class OperatorIntentRequest(BaseModel):
+    mode: str = Field(..., description="One of: ALLOW_LIVE, EXIT_ONLY, DENY_ALL")
+    reason: str = Field(default="operator_update", description="Audit reason for change")
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +134,6 @@ class PriceSnapshotResponse(BaseModel):
     (Telegram, web, voice) have a stable, typed representation of
     current price and simple daily moves.
     """
-
     symbol: str
     asset_class: str
     price: float
@@ -138,6 +211,12 @@ class LiveGateSnapshot(BaseModel):
     execution: ExecutionConfigSnapshot
     mode: ModeSnapshot
     shadow: ShadowSnapshot
+
+    # Phase 10 additions (operator control plane)
+    operator_mode: str
+    operator_reason: str
+    allow_exits_only: bool
+
     allow_ibkr_live: bool
     allow_ibkr_paper: bool
     reasons: List[str]
@@ -156,7 +235,6 @@ class ShadowOnlyResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
 
 def _load_dynamic_caps() -> Optional[DynamicCapsSnapshot]:
     """
@@ -215,18 +293,19 @@ def _build_shadow_snapshot() -> ShadowSnapshot:
     shadow_state: ShadowState = evaluate_confidence(stats_raw)
 
     stats_model = ShadowStats(
-        total_trades=int(stats_raw.get('total_trades', 0)),
-        live_trades=int(stats_raw.get('live_trades', 0)),
-        paper_trades=int(stats_raw.get('paper_trades', 0)),
-        effective_trades=int(stats_raw.get('effective_trades', 0)),
-        excluded_manual=int(stats_raw.get('excluded_manual', 0)),
-        excluded_untrusted=int(stats_raw.get('excluded_untrusted', 0)),
-        excluded_nonfinite=int(stats_raw.get('excluded_nonfinite', 0)),
-        win_rate=float(stats_raw.get('win_rate', 0.0)),
-        total_pnl=float(stats_raw.get('total_pnl', 0.0)),
-        max_drawdown=float(stats_raw.get('max_drawdown', 0.0)),
-        sharpe_like=float(stats_raw.get('sharpe_like', 0.0)),
+        total_trades=int(stats_raw.get("total_trades", 0)),
+        live_trades=int(stats_raw.get("live_trades", 0)),
+        paper_trades=int(stats_raw.get("paper_trades", 0)),
+        effective_trades=int(stats_raw.get("effective_trades", 0)),
+        excluded_manual=int(stats_raw.get("excluded_manual", 0)),
+        excluded_untrusted=int(stats_raw.get("excluded_untrusted", 0)),
+        excluded_nonfinite=int(stats_raw.get("excluded_nonfinite", 0)),
+        win_rate=float(stats_raw.get("win_rate", 0.0)),
+        total_pnl=float(stats_raw.get("total_pnl", 0.0)),
+        max_drawdown=float(stats_raw.get("max_drawdown", 0.0)),
+        sharpe_like=float(stats_raw.get("sharpe_like", 0.0)),
     )
+
     return ShadowSnapshot(
         state=str(shadow_state.state),
         sizing_factor=float(shadow_state.sizing_factor),
@@ -239,10 +318,6 @@ def _build_shadow_snapshot() -> ShadowSnapshot:
 def _build_execution_snapshot() -> ExecutionConfigSnapshot:
     """
     Build a snapshot of the adapter-level execution configuration.
-
-    In this Phase-7 build, ExecutionConfig is hard-locked so that:
-        - IBKR is always in DRY_RUN mode (ibkr_dry_run=True).
-        - CHAD_EXECUTION_MODE cannot enable live orders.
     """
     cfg = get_execution_config()
     return ExecutionConfigSnapshot(
@@ -272,14 +347,14 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
 
         1) ExecutionConfig (adapter-level DRY_RUN vs live),
         2) Global CHAD_MODE,
-        3) ShadowState (SCR — paper_only, state, sizing_factor).
-
-    In this Phase-7 build, the combination of ExecutionConfig and SCR ensures
-    that allow_ibkr_live is **always False**.
+        3) ShadowState (SCR — paper_only, state, sizing_factor),
+        4) STOP (DENY_ALL),
+        5) Operator intent (Phase 10): DENY_ALL / EXIT_ONLY / ALLOW_LIVE.
     """
     execution_snapshot = _build_execution_snapshot()
     mode_snapshot = _build_mode_snapshot()
     shadow_snapshot = _build_shadow_snapshot()
+    operator = _load_operator_intent()
 
     reasons: List[str] = []
 
@@ -304,9 +379,7 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
             "paper-only operation; live trading is blocked."
         )
     if shadow_snapshot.state.upper() == "PAUSED":
-        reasons.append(
-            "ShadowState.state=PAUSED. Live execution is fully halted."
-        )
+        reasons.append("ShadowState.state=PAUSED. Live execution is fully halted.")
 
     allow_ibkr_live = (
         execution_snapshot.ibkr_enabled
@@ -318,7 +391,7 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
 
     # --- STOP enforcement (authoritative DENY_ALL) ---
     stop_state = load_stop_state()
-    if bool(getattr(stop_state, 'stop', False)):
+    if bool(getattr(stop_state, "stop", False)):
         reasons.append(
             f"STOP is ENABLED (DENY_ALL). reason={getattr(stop_state, 'reason', 'unknown')!r}. "
             "All trading actions are blocked (no live, no paper)."
@@ -327,6 +400,45 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
             execution=execution_snapshot,
             mode=mode_snapshot,
             shadow=shadow_snapshot,
+            operator_mode=operator.mode,
+            operator_reason=operator.reason,
+            allow_exits_only=False,
+            allow_ibkr_live=False,
+            allow_ibkr_paper=False,
+            reasons=reasons,
+        )
+
+    # --- Operator intent enforcement (Phase 10) ---
+    # DENY_ALL => block paper and live
+    # EXIT_ONLY => block new entries (paper/live), but signal exit-only mode to downstream
+    # ALLOW_LIVE => no extra operator restriction beyond other gates
+    allow_exits_only = False
+    if operator.mode == OperatorMode.DENY_ALL:
+        reasons.append(f"OperatorIntent=DENY_ALL. reason={operator.reason!r}. Blocking all trading actions.")
+        return LiveGateSnapshot(
+            execution=execution_snapshot,
+            mode=mode_snapshot,
+            shadow=shadow_snapshot,
+            operator_mode=operator.mode,
+            operator_reason=operator.reason,
+            allow_exits_only=False,
+            allow_ibkr_live=False,
+            allow_ibkr_paper=False,
+            reasons=reasons,
+        )
+    if operator.mode == OperatorMode.EXIT_ONLY:
+        allow_exits_only = True
+        reasons.append(f"OperatorIntent=EXIT_ONLY. reason={operator.reason!r}. No new entries; exits-only permitted.")
+        # In Phase 7, we model exits-only by denying new entries (paper/live),
+        # and exposing allow_exits_only=true. Execution layers must implement
+        # exit routing explicitly in a later phase.
+        return LiveGateSnapshot(
+            execution=execution_snapshot,
+            mode=mode_snapshot,
+            shadow=shadow_snapshot,
+            operator_mode=operator.mode,
+            operator_reason=operator.reason,
+            allow_exits_only=True,
             allow_ibkr_live=False,
             allow_ibkr_paper=False,
             reasons=reasons,
@@ -345,6 +457,9 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
         execution=execution_snapshot,
         mode=mode_snapshot,
         shadow=shadow_snapshot,
+        operator_mode=operator.mode,
+        operator_reason=operator.reason,
+        allow_exits_only=allow_exits_only,
         allow_ibkr_live=bool(allow_ibkr_live),
         allow_ibkr_paper=bool(allow_ibkr_paper),
         reasons=reasons,
@@ -418,22 +533,34 @@ async def live_gate() -> LiveGateSnapshot:
     Return the full LiveGate decision snapshot.
 
     This is the **single source of truth** for whether IBKR live trading would
-    ever be allowed, even in future phases. In this Phase-7 build:
-
-        allow_ibkr_live  == False
-        allow_ibkr_paper == True
+    ever be allowed, even in future phases.
     """
     return _evaluate_live_gate()
 
 
+@app.get("/operator-intent", response_model=OperatorIntentResponse, tags=["operator"])
+async def get_operator_intent() -> OperatorIntentResponse:
+    st = _load_operator_intent()
+    return OperatorIntentResponse(mode=st.mode, reason=st.reason, updated_at_utc=st.updated_at_utc)
+
+
+@app.post("/operator-intent", response_model=OperatorIntentResponse, tags=["operator"])
+async def set_operator_intent(req: OperatorIntentRequest) -> OperatorIntentResponse:
+    mode = str(req.mode).upper().strip()
+    if mode not in (OperatorMode.ALLOW_LIVE, OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
+        raise HTTPException(status_code=400, detail=f"invalid_operator_mode: {mode!r}")
+
+    st = OperatorIntentState(
+        mode=mode,
+        reason=str(req.reason),
+        updated_at_utc=_utc_now_iso(),
+    )
+    _save_operator_intent(st)
+    return OperatorIntentResponse(mode=st.mode, reason=st.reason, updated_at_utc=st.updated_at_utc)
+
+
 @app.get("/risk-state", response_model=RiskStateResponse, tags=["risk"])
 async def risk_state() -> RiskStateResponse:
-    """
-    Return a combined view of dynamic caps + shadow confidence + global mode.
-
-    This is effectively the API equivalent of `show_risk_state`, but structured
-    as JSON instead of a CLI printout.
-    """
     mode_snapshot = _build_mode_snapshot()
     dynamic_caps = _load_dynamic_caps()
     shadow_snapshot = _build_shadow_snapshot()
@@ -447,38 +574,21 @@ async def risk_state() -> RiskStateResponse:
 
 @app.get("/shadow", response_model=ShadowOnlyResponse, tags=["shadow"])
 async def shadow() -> ShadowOnlyResponse:
-    """
-    Return the current ShadowState (SCR) and trade statistics only.
-
-    This is useful for dashboards or a Telegram coach bot that wants a clean,
-    machine-readable view of SCR without dynamic caps or execution config.
-    """
     snapshot = _build_shadow_snapshot()
     return ShadowOnlyResponse(shadow=snapshot)
 
 
 @app.get("/", include_in_schema=False)
 async def root() -> Dict[str, str]:
-    """
-    Root endpoint: point clients at /health and /risk-state.
-    """
     return {
         "service": "CHAD API Gateway",
         "message": "See /health, /risk-state, /live-gate, /shadow, and /ai/research.",
     }
+
+
 @app.get("/ai/price", response_model=PriceSnapshotResponse, tags=["ai"])
 async def ai_price(symbol: str) -> PriceSnapshotResponse:
-    """
-    Return a simple, unified price snapshot for a given symbol.
-
-    This uses CHAD's MarketDataService, which currently wraps Polygon for
-    US equities/ETFs, but is designed to support other providers (IBKR,
-    crypto exchanges) in the future.
-
-    Example:
-        GET /ai/price?symbol=AAPL
-    """
-    from chad.market_data.service import MarketDataService, MarketDataError  # local import to avoid cycles
+    from chad.market_data.service import MarketDataError, MarketDataService  # local import to avoid cycles
 
     service = MarketDataService()
     try:
@@ -509,12 +619,6 @@ async def ai_price(symbol: str) -> PriceSnapshotResponse:
 
 @app.post("/orders", include_in_schema=False)
 async def orders_disabled() -> None:
-    """
-    Intentionally disabled.
-
-    Any attempt to POST to /orders will receive a 403. This prevents accidental
-    introduction of HTTP-based trading paths that could bypass core gating.
-    """
     raise HTTPException(
         status_code=403,
         detail=(
@@ -529,28 +633,6 @@ async def orders_disabled() -> None:
 # AI / Research Endpoint (Phase-10 Global Intelligence Layer)
 # ---------------------------------------------------------------------------
 
-
 @app.post("/ai/research", response_model=ResearchScenario, tags=["ai"])
 async def ai_research(request: ResearchRequestInput) -> ResearchScenario:
-    """
-    CHAD Phase-10 — Global Intelligence Layer (Research)
-
-    This endpoint:
-      - Accepts a ResearchRequestInput (symbol, scenario_timeframe, question).
-      - Delegates to chad.intel.research_engine.run_research_scenario_from_request().
-      - Returns a validated ResearchScenario object.
-      - NEVER touches execution, SCR, live gates, or DRY_RUN flags.
-      - Saves a JSON report under /home/ubuntu/CHAD FINALE/reports/research/.
-
-    It is strictly advisory-only: outputs are for analysis, explanation, and
-    documentation, not for direct trading decisions.
-    """
-    try:
-        scenario = run_research_scenario_from_request(request)
-        return scenario
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("run_research_scenario_from_request failed: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"research_engine_error: {exc}",
-        ) from exc
+    return run_research_scenario_from_request(request)
