@@ -1,0 +1,16 @@
+[Unit]
+Description=CHAD Kraken Portfolio Collector (Balances Snapshot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/chad/kraken.env
+ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && source "/home/ubuntu/CHAD FINALE/venv/bin/activate" && exec python -m chad.portfolio.kraken_portfolio_collector collect'
+
+[Install]
+WantedBy=multi-user.target

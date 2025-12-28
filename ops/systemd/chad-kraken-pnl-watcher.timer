@@ -1,0 +1,10 @@
+[Unit]
+Description=Run CHAD Kraken PnL Watcher every 2 minutes
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=120
+Unit=chad-kraken-pnl-watcher.service
+
+[Install]
+WantedBy=timers.target

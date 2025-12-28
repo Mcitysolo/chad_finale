@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Kraken Portfolio Collector every 5 minutes
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=300s
+Unit=chad-kraken-collector.service
+
+[Install]
+WantedBy=timers.target

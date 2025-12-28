@@ -1,0 +1,13 @@
+[Unit]
+Description=CHAD Kraken PnL Watcher (enrichment ledger + FIFO PnL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/CHAD FINALE
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/chad/kraken.env
+ExecStart=/bin/bash -lc 'cd "/home/ubuntu/CHAD FINALE" && source venv/bin/activate && exec python3 -m chad.portfolio.kraken_pnl_watcher --days-back 7 --max-records 800'
