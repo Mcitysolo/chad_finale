@@ -290,3 +290,38 @@ def evaluate_confidence(stats: Dict[str, Any], config: Optional[SCRConfig] = Non
         reasons=reasons,
         stats=stats,
     )
+# --- Phase 4 audit: always print SCR decision when run as a module ---
+if __name__ == "__main__":
+    import json
+
+    from chad.analytics.trade_stats_engine import load_and_compute
+
+    stats = load_and_compute(
+        max_trades=500,
+        days_back=30,
+        include_paper=True,
+        include_live=True,
+    )
+    state = evaluate_confidence(stats)
+
+    payload = {
+        "state": getattr(state, "state", None),
+        "paper_only": bool(getattr(state, "paper_only", False)),
+        "sizing_factor": float(getattr(state, "sizing_factor", 0.0) or 0.0),
+        "reasons": list(getattr(state, "reasons", []) or []),
+        "stats": {
+            "total_trades": int(stats.get("total_trades", 0) or 0),
+            "paper_trades": int(stats.get("paper_trades", 0) or 0),
+            "live_trades": int(stats.get("live_trades", 0) or 0),
+            "effective_trades": int(stats.get("effective_trades", 0) or 0),
+            "excluded_manual": int(stats.get("excluded_manual", 0) or 0),
+            "excluded_untrusted": int(stats.get("excluded_untrusted", 0) or 0),
+            "excluded_nonfinite": int(stats.get("excluded_nonfinite", 0) or 0),
+            "win_rate": float(stats.get("win_rate", 0.0) or 0.0),
+            "total_pnl": float(stats.get("total_pnl", 0.0) or 0.0),
+            "max_drawdown": float(stats.get("max_drawdown", 0.0) or 0.0),
+            "sharpe_like": float(stats.get("sharpe_like", 0.0) or 0.0),
+        },
+    }
+
+    print(json.dumps(payload, indent=2, sort_keys=True))
