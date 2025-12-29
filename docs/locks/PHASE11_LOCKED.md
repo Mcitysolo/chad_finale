@@ -12,11 +12,12 @@ Guarantees:
 - Portfolio merge is intentionally NOT automated in this locked phase:
   - chad-portfolio-merge.timer is masked
   - merge can be run on-demand via chad-portfolio-merge.service
-  - portfolio_snapshot.json still updates (proof via mtime)
+  - portfolio_snapshot.json is still updated (proof via mtime/logs)
 
 Proof commands:
 - systemctl status chad-kraken-collector.timer chad-kraken-pnl-watcher.timer chad-legend.timer chad-portfolio-merge.timer --no-pager -n 12
-- stat -c "mtime=%y size=%s path=%n" runtime/kraken_balances.json runtime/kraken_pnl_state.json runtime/portfolio_snapshot.json
-- journalctl -u chad-kraken-collector.service -n 30 --no-pager -o cat
-- journalctl -u chad-kraken-pnl-watcher.service -n 30 --no-pager -o cat
-- systemctl cat chad-kraken-collector.service chad-kraken-pnl-watcher.service chad-legend.service chad-portfolio-merge.service
+- stat runtime/kraken_balances.json runtime/kraken_pnl_state.json runtime/portfolio_snapshot.json
+- journalctl -u chad-kraken-collector.service --no-pager -n 40 -o cat
+- journalctl -u chad-kraken-pnl-watcher.service --no-pager -n 40 -o cat
+- journalctl -u chad-legend.service --no-pager -n 40 -o cat
+- journalctl -u chad-portfolio-merge.service --no-pager -n 40 -o cat
