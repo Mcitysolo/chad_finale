@@ -10,3 +10,4 @@ Locked phases in this repo:
 - PHASE3_LOCKED.md
 - PHASE4_LOCKED.md
 - PHASE5_LOCKED.md
+- PHASE6_LOCKED.md
