@@ -14,7 +14,7 @@ pipeline as full_cycle_preview, but structured for production use:
                       -> ExecutionPlan (PlannedOrder objects)
                       -> IBKR StrategyTradeIntent preview (no network I/O)
 
-In this Phase 7 build, full_execution_cycle is **strictly DRY_RUN/preview**:
+In this Phase 7 build, full_execution_cycle is strictly DRY_RUN/preview:
 it does NOT call any broker executors. ExecutionConfig and LiveGate enforce
 that all IBKR/Kraken usage is DRY_RUN. This CLI is intended for:
 
@@ -24,6 +24,13 @@ that all IBKR/Kraken usage is DRY_RUN. This CLI is intended for:
 
 Later Phase 8+ can extend this CLI to call executors in WHAT-IF or PAPER
 mode, guarded by ExecutionConfig + LiveGate.
+
+PRODUCTION-GRADE NOTE (Phase 9+):
+This script persists runtime/full_execution_cycle_last.json. That file is used by
+paper_shadow_runner to select intents. Therefore we persist BOTH:
+- human-friendly 'summary'
+- machine-friendly 'counts' (so downstream reports don’t show zeros)
+- 'orders' + 'ibkr_intents' for deterministic execution selection
 """
 
 import argparse
@@ -44,7 +51,6 @@ from chad.strategies import register_core_strategies
 from chad.utils.context_builder import ContextBuilder
 from chad.utils.pipeline import DecisionPipeline, PipelineConfig
 from chad.utils.signal_router import SignalRouter
-
 
 RUNTIME_DIR = Path(__file__).resolve().parents[2] / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -139,9 +145,23 @@ def _write_summary_json(
     ibkr_intents: List[Any],
 ) -> None:
     """
-    Persist the summary + orders + intents to runtime/full_execution_cycle_last.json.
+    Persist the summary + counts + orders + intents to runtime/full_execution_cycle_last.json.
+
+    Downstream consumers (e.g., paper_shadow_runner) rely on this file.
+    We include a stable 'counts' object so consumers can report accurate pipeline
+    metrics without needing to rerun the pipeline.
     """
     payload: Dict[str, Any] = {
+        # Machine-friendly counts for downstream reporting (paper_shadow_runner reads this).
+        "counts": {
+            "raw_signals": int(summary.raw_signals),
+            "evaluated_signals": int(summary.evaluated_signals),
+            "routed_signals": int(summary.routed_signals),
+            "orders_count": int(summary.orders_count),
+            "ibkr_intents_count": int(summary.ibkr_intents_count),
+            "total_notional": float(summary.total_notional),
+        },
+        # Original structured summary (kept for backwards compatibility / dashboards).
         "summary": asdict(summary),
         "orders": [
             {
@@ -228,21 +248,18 @@ def _print_human_summary(
             f"currency={intent.currency}",
             f"order_type={intent.order_type}",
             f"quantity={intent.quantity}",
-            f"notional_estimate={intent.notional_estimate:.2f}",
+            f"notional_estimate={float(intent.notional_estimate):.2f}",
         )
 
-    print(
-        "\n[full_execution_cycle] NOTE: No broker calls were made. "
-        "This is a DRY_RUN logical execution cycle only."
-    )
+    print("\n[full_execution_cycle] NOTE: No broker calls were made. This is a DRY_RUN logical execution preview only.")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a single CHAD decision cycle end-to-end and emit both a "
-            "machine-readable JSON summary and a human-readable preview. "
-            "No broker calls are made in this Phase 7 build."
+            "Run a single CHAD decision cycle end-to-end (data → context → "
+            "strategies → policy → execution plan) and persist a DRY_RUN summary to runtime/. "
+            "No broker calls are made."
         )
     )
     # Reserved for future options (e.g. strategy subsets, dry-run toggles).
@@ -250,7 +267,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> NoReturn:
-    _parse_args(argv)  # kept for future flags, even if unused now
+    _parse_args(argv)  # currently unused, kept for future extensions
     _run_single_cycle()
     raise SystemExit(0)
 
