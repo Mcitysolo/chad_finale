@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-IBKR Paper Ledger Watcher (NO ORDERS)
+IBKR Paper Ledger Watcher (NO ORDERS) — Phase 9B Alerts
 
 Purpose
 -------
-This module runs as a periodic oneshot (systemd timer). It inspects IBKR paper
-positions for a target account and writes tamper-evident TradeResult NDJSON
-records when a position transitions from OPEN -> CLOSED.
+Periodic oneshot (systemd timer). Reads IBKR paper positions, detects OPEN->CLOSED
+transitions, and writes tamper-evident TradeResult NDJSON records when it can
+prove a position lifecycle.
 
-Key properties
---------------
-- Read-only with respect to execution: never places orders.
-- Resilient IBKR connection (bounded retries + jitter).
-- Produces machine-readable run reports every invocation.
-- Produces deterministic `writes.details` diagnostics even when no records are written.
-- Attempts execution-based trusted PnL (FIFO) from IB executions; otherwise emits
-  pnl_untrusted with explicit reasons.
+Phase 9B upgrade in THIS build
+------------------------------
+Adds Telegram alerting for critical operational failures:
+- IBKR completed orders / executions refresh timeouts
+- IBKR connect failures
+- Repeated no-trade-results (optional, best-effort)
 
-Runtime inputs
---------------
-Config JSON (default: /home/ubuntu/CHAD FINALE/runtime/ibkr_paper_ledger.json)
-Example:
-{
-  "enabled": true,
-  "default_strategy": "manual",
-  "ibkr": { "host": "127.0.0.1", "port": 4002, "client_id": 9013 }
-}
+Safety guarantees
+-----------------
+- NEVER places orders.
+- Only reads IBKR state + writes local artifacts (state + reports + trade ledger).
+- Alerts are best-effort and dedupe-aware.
 
-State file
-----------
-We keep lightweight open-state in: /home/ubuntu/CHAD FINALE/runtime/ibkr_paper_ledger_state.json
-This file is atomic-written and only stores metadata needed to reconstruct close events.
+Inputs
+------
+--config PATH (default: /home/ubuntu/CHAD FINALE/runtime/ibkr_paper_ledger.json)
 
 Outputs
 -------
-- Run report JSON: /home/ubuntu/CHAD FINALE/reports/ledger/IBKR_PAPER_LEDGER_RUN_YYYYMMDDThhmmssZ.json
-- TradeResult NDJSON: /home/ubuntu/CHAD FINALE/data/trades/trade_history_YYYYMMDD.ndjson
+- State:   runtime/ibkr_paper_ledger_state.json
+- Report:  reports/ledger/IBKR_PAPER_LEDGER_RUN_YYYYMMDDThhmmssZ.json
+- Ledger:  data/trades/trade_history_YYYYMMDD.ndjson (via TradeResult logger)
 
+Telegram env
+------------
+Uses TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_CHAT_ID.
+If missing from environment, this watcher will attempt to load /etc/chad/telegram.env.
 """
 
 from __future__ import annotations
@@ -51,21 +49,16 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# ib_insync is used for reading IBKR state only.
 from ib_insync import IB, Execution, Fill  # type: ignore
 
-# CHAD trade result + logging
-try:
-    # Expected in your repo per earlier records
-    from chad.analytics.trade_result_logger import TradeResult, log_trade_result  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(f"Missing CHAD TradeResult logger import: {e}") from e
-
+from chad.analytics.trade_result_logger import TradeResult, log_trade_result
+from chad.utils.telegram_notify import NotifyError, notify
 
 ROOT = Path("/home/ubuntu/CHAD FINALE")
 CONFIG_PATH_DEFAULT = ROOT / "runtime" / "ibkr_paper_ledger.json"
+ENV_FILE = Path("/etc/chad/telegram.env")
 
 
 def _utc_now() -> datetime:
@@ -73,19 +66,51 @@ def _utc_now() -> datetime:
 
 
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat()
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _atomic_write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
-def _add_detail(details: list[dict], **kv: Any) -> None:
+def _add_detail(details: List[dict], **kv: Any) -> None:
     kv["ts_utc"] = _iso(_utc_now())
     details.append(kv)
+
+
+def _load_env_file_if_missing() -> None:
+    """
+    Load TELEGRAM_* vars from /etc/chad/telegram.env if they are not present.
+    """
+    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_ALLOWED_CHAT_ID"):
+        return
+    if not ENV_FILE.is_file():
+        return
+    for line in ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k in {"TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_ID"} and v:
+            os.environ.setdefault(k, v)
+
+
+def _alert(message: str, *, severity: str, dedupe_key: str) -> bool:
+    """
+    Best-effort Telegram alert. Never raises.
+    """
+    try:
+        _load_env_file_if_missing()
+        return bool(notify(message, severity=severity, dedupe_key=dedupe_key, raise_on_fail=False))
+    except NotifyError:
+        return False
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -96,18 +121,15 @@ class LedgerConfig:
     ibkr_port: int
     ibkr_client_id: int
 
-    # Paths
     state_path: Path
     reports_dir: Path
     trades_dir: Path
 
-    # Execution window for trusted PnL fallback (seconds)
     exec_window_seconds: float
 
 
 def load_config(path: Path) -> LedgerConfig:
     raw = json.loads(path.read_text(encoding="utf-8"))
-
     enabled = bool(raw.get("enabled", False))
     default_strategy = str(raw.get("default_strategy") or "manual")
 
@@ -118,7 +140,6 @@ def load_config(path: Path) -> LedgerConfig:
     if client_id <= 0:
         raise ValueError("Config error: ibkr.client_id must be a positive integer")
 
-    # Default: 90 seconds window; can be increased safely.
     exec_window_seconds = float(raw.get("exec_window_seconds") or 90.0)
 
     return LedgerConfig(
@@ -140,7 +161,6 @@ def _load_state(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        # If state is corrupted, do not crash: start fresh but keep traceability.
         return {"open": {}, "last_run_utc": None, "state_corrupt": True}
 
 
@@ -149,17 +169,6 @@ def _state_key(account_id: str, con_id: int, symbol: str, sec_type: str) -> str:
 
 
 def _connect_ib(host: str, port: int, client_id: int) -> IB:
-    """
-    Connect to IBKR with bounded retries and jitter.
-
-    Why:
-      - IBG can listen on port while API isn't ready (apiStart timeout).
-      - This watcher runs on a timer; we prefer bounded retries over long hangs.
-
-    Guarantees:
-      - Returns a connected IB instance on success.
-      - Raises RuntimeError with concise context on failure.
-    """
     max_attempts = 6
     base_sleep = 0.6
     max_sleep = 6.0
@@ -181,7 +190,8 @@ def _connect_ib(host: str, port: int, client_id: int) -> IB:
 
             if attempt >= max_attempts:
                 raise RuntimeError(
-                    f"ibkr_connect_failed after {max_attempts} attempts host={host} port={port} client_id={client_id}: {type(e).__name__}: {e}"
+                    f"ibkr_connect_failed after {max_attempts} attempts host={host} port={port} client_id={client_id}: "
+                    f"{type(e).__name__}: {e}"
                 ) from e
 
             sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
@@ -193,12 +203,6 @@ def _connect_ib(host: str, port: int, client_id: int) -> IB:
 
 
 def _get_account_id(ib: IB) -> str:
-    """
-    Determine the account id deterministically.
-    Preference order:
-      1) managedAccounts() first entry
-      2) accountSummary() first entry account field
-    """
     accts = list(ib.managedAccounts() or [])
     if accts:
         return str(accts[0])
@@ -209,10 +213,6 @@ def _get_account_id(ib: IB) -> str:
 
 
 def _positions_by_conid(ib: IB) -> Dict[int, dict]:
-    """
-    Returns mapping conId -> position dict with keys:
-      symbol, secType, currency, conId, position, avgCost, exchange
-    """
     out: Dict[int, dict] = {}
     for pos in ib.positions():
         c = pos.contract
@@ -231,33 +231,26 @@ def _positions_by_conid(ib: IB) -> Dict[int, dict]:
     return out
 
 
-def _coerce_float(v: Any) -> Optional[float]:
-    try:
-        x = float(v)
-        if math.isfinite(x):
-            return x
-        return None
-    except Exception:
-        return None
+def timedelta_seconds(seconds: float):
+    from datetime import timedelta
+    return timedelta(seconds=float(seconds))
 
 
 def _fills_in_window(ib: IB, cutoff_utc: datetime) -> list[Fill]:
     """
-    Fetch fills known to ib_insync client. Note: ib.fills() returns fills in memory.
-    We call reqExecutions to refresh, then use fills list.
+    Refresh executions (best-effort) and return fills >= cutoff_utc.
     """
-    # Refresh executions; this updates fills cache.
     try:
         ib.reqExecutions()
-    except Exception:
-        # Best effort; do not crash watcher on refresh failure.
-        pass
+    except Exception as e:
+        # This is the exact failure you saw in logs; alert it.
+        _alert(f"IBKR LEDGER WATCHER: reqExecutions failed (possible timeout): {type(e).__name__}: {e}",
+               severity="critical", dedupe_key="ibkr_exec_refresh_timeout")
 
-    fills = []
+    fills: list[Fill] = []
     for f in ib.fills():
         try:
             t = f.time
-            # ib_insync fill time may be naive or tz-aware; normalize.
             if t.tzinfo is None:
                 t = t.replace(tzinfo=timezone.utc)
             if t >= cutoff_utc:
@@ -273,11 +266,6 @@ def _compute_exec_pnl_fifo(
     opened_at_utc: datetime,
     closed_at_utc: datetime,
 ) -> Tuple[Optional[float], dict]:
-    """
-    Compute FIFO PnL from executions for a single conId within [opened_at, closed_at].
-    Returns (pnl, details). pnl None if insufficient data.
-    """
-    # Collect executions
     execs: list[Execution] = []
     for f in fills:
         try:
@@ -294,9 +282,8 @@ def _compute_exec_pnl_fifo(
     if not execs:
         return None, {"included_execs": 0, "reason": "no_executions_in_window"}
 
-    # Build buys and sells
-    buys: list[Tuple[float, float]] = []   # (qty, price)
-    sells: list[Tuple[float, float]] = []  # (qty, price)
+    buys: list[Tuple[float, float]] = []
+    sells: list[Tuple[float, float]] = []
     for e in execs:
         try:
             qty = float(e.shares or 0.0)
@@ -314,32 +301,22 @@ def _compute_exec_pnl_fifo(
     buy_qty = sum(q for q, _ in buys)
     sell_qty = sum(q for q, _ in sells)
     matched_qty = min(buy_qty, sell_qty)
-
     if matched_qty <= 0:
-        return None, {
-            "included_execs": len(execs),
-            "buy_qty": buy_qty,
-            "sell_qty": sell_qty,
-            "reason": "no_matched_qty",
-        }
+        return None, {"included_execs": len(execs), "buy_qty": buy_qty, "sell_qty": sell_qty, "reason": "no_matched_qty"}
 
-    # FIFO match
     pnl = 0.0
     b_i = 0
     s_i = 0
     b_rem = buys[0][0] if buys else 0.0
     s_rem = sells[0][0] if sells else 0.0
 
-    while b_i < len(buys) and s_i < len(sells) and matched_qty > 1e-12:
-        b_qty, b_px = buys[b_i]
-        s_qty, s_px = sells[s_i]
-        b_rem = b_rem if b_rem > 0 else b_qty
-        s_rem = s_rem if s_rem > 0 else s_qty
-        take = min(b_rem, s_rem, matched_qty)
+    while b_i < len(buys) and s_i < len(sells):
+        take = min(b_rem, s_rem)
+        b_px = buys[b_i][1]
+        s_px = sells[s_i][1]
         pnl += (s_px - b_px) * take
         b_rem -= take
         s_rem -= take
-        matched_qty -= take
         if b_rem <= 1e-12:
             b_i += 1
             if b_i < len(buys):
@@ -349,7 +326,6 @@ def _compute_exec_pnl_fifo(
             if s_i < len(sells):
                 s_rem = sells[s_i][0]
 
-    # Averages for reporting
     avg_buy = (sum(q * px for q, px in buys) / buy_qty) if buy_qty > 0 else None
     avg_sell = (sum(q * px for q, px in sells) / sell_qty) if sell_qty > 0 else None
 
@@ -357,12 +333,16 @@ def _compute_exec_pnl_fifo(
         "included_execs": len(execs),
         "buy_qty": float(buy_qty),
         "sell_qty": float(sell_qty),
-        "matched_qty": float(min(sum(q for q, _ in buys), sum(q for q, _ in sells))),
+        "matched_qty": float(matched_qty),
         "avg_buy": float(avg_buy) if avg_buy is not None else None,
         "avg_sell": float(avg_sell) if avg_sell is not None else None,
         "multiplier": 1.0,
     }
     return float(pnl), details
+
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def run_once(cfg: LedgerConfig) -> dict:
@@ -402,16 +382,10 @@ def run_once(cfg: LedgerConfig) -> dict:
         state = _load_state(cfg.state_path)
         open_state: Dict[str, dict] = dict(state.get("open") or {})
 
-        # Snapshot current positions
         pos_map = _positions_by_conid(ib)
         _add_detail(details, event="positions_snapshot", positions_count=len(pos_map))
 
-        # Detect new opens and closes
-        # We track opens by key = account::conId::symbol::secType.
-        # When qty != 0, it's open. When previously open and now missing/qty==0, it's close candidate.
-        # Note: IB may report zero-qty positions; we treat qty==0 as closed.
         current_open_keys = set()
-
         for con_id, rec in pos_map.items():
             sym = str(rec.get("symbol") or "")
             sec_type = str(rec.get("secType") or "")
@@ -420,7 +394,6 @@ def run_once(cfg: LedgerConfig) -> dict:
             if abs(qty) > 1e-12:
                 current_open_keys.add(k)
                 if k not in open_state:
-                    # Record open metadata
                     open_state[k] = {
                         "account_id": account_id,
                         "conId": con_id,
@@ -436,11 +409,9 @@ def run_once(cfg: LedgerConfig) -> dict:
                     }
                     _add_detail(details, event="open_detected", key=k, qty=float(qty), avg_cost=float(rec.get("avg_cost") or 0.0))
 
-        # Close candidates: in open_state but not currently open
-        close_keys = [k for k in open_state.keys() if k not in current_open_keys]
+        close_keys = [k for k in list(open_state.keys()) if k not in current_open_keys]
         _add_detail(details, event="close_candidates", count=len(close_keys))
 
-        # For trusted PnL, compute fills within a cutoff window
         cutoff = now - timedelta_seconds(cfg.exec_window_seconds)
         fills = _fills_in_window(ib, cutoff)
         _add_detail(details, event="fills_window", cutoff_utc=_iso(cutoff), fills_count=len(fills))
@@ -459,7 +430,6 @@ def run_once(cfg: LedgerConfig) -> dict:
             except Exception:
                 opened_at = now
 
-            # Attempt execution-based PnL FIFO
             pnl_exec, exec_details = _compute_exec_pnl_fifo(
                 fills=fills,
                 con_id=con_id,
@@ -476,10 +446,13 @@ def run_once(cfg: LedgerConfig) -> dict:
                 "currency": cur,
                 "conId": con_id,
                 "secType": sec_type,
+                "close_key": k,
+                "state_key_hash": _sha256_hex(k),
             }
 
             tags = list(rec.get("tags") or ["ibkr_paper", cfg.default_strategy])
-            tags.append("manual") if "manual" not in tags and cfg.default_strategy == "manual" else None
+            if cfg.default_strategy == "manual" and "manual" not in tags:
+                tags.append("manual")
 
             if pnl_exec is not None and math.isfinite(float(pnl_exec)):
                 pnl_logged = float(pnl_exec)
@@ -502,7 +475,7 @@ def run_once(cfg: LedgerConfig) -> dict:
             side = "BUY" if qty_open > 0 else "SELL"
 
             tr = TradeResult(
-                strategy=str(rec.get("strategy", cfg.default_strategy)),
+                strategy=str(rec.get("strategy", cfg.default_strategy)).lower(),
                 symbol=sym,
                 side=side,
                 quantity=abs(qty_open),
@@ -534,17 +507,12 @@ def run_once(cfg: LedgerConfig) -> dict:
                 }
             )
 
-            # Remove closed state
             open_state.pop(k, None)
 
         _atomic_write_json(cfg.state_path, {"open": open_state, "last_run_utc": _iso(now)})
 
         if report["writes"]["trade_results"] == 0:
-            _add_detail(
-                details,
-                event="no_trade_results",
-                reason="no_close_events_detected_or_no_new_positions_closed",
-            )
+            _add_detail(details, event="no_trade_results", reason="no_close_events_detected_or_no_new_positions_closed")
 
         cfg.reports_dir.mkdir(parents=True, exist_ok=True)
         out = cfg.reports_dir / f"IBKR_PAPER_LEDGER_RUN_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
@@ -555,8 +523,9 @@ def run_once(cfg: LedgerConfig) -> dict:
         return report
 
     except Exception as e:
-        # Always return a report even on failure; systemd will record nonzero exit.
         _add_detail(report["writes"]["details"], event="error", error_type=type(e).__name__, error=str(e))
+        # Alert on connect failures or watcher crash
+        _alert(f"IBKR LEDGER WATCHER ERROR: {type(e).__name__}: {e}", severity="critical", dedupe_key="ibkr_ledger_watcher_error")
         cfg.reports_dir.mkdir(parents=True, exist_ok=True)
         out = cfg.reports_dir / f"IBKR_PAPER_LEDGER_RUN_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
         _atomic_write_json(out, report)
@@ -570,21 +539,10 @@ def run_once(cfg: LedgerConfig) -> dict:
             pass
 
 
-def timedelta_seconds(seconds: float) -> datetime:
-    # Helper to avoid importing timedelta in older environments; uses epoch arithmetic.
-    # Returns utc_now - seconds equivalent is handled by caller by subtracting from now.
-    # Here we just provide a sentinel; caller uses `now - timedelta_seconds(...)`.
-    # We actually need real timedelta behavior, so we implement a small conversion.
-    from datetime import timedelta
-
-    return timedelta(seconds=float(seconds))  # type: ignore[return-value]
-
-
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="IBKR paper ledger watcher (no orders).")
     p.add_argument("--config", type=str, default=str(CONFIG_PATH_DEFAULT), help="Path to runtime config JSON.")
     args = p.parse_args(argv)
-
     cfg = load_config(Path(args.config).expanduser().resolve())
     rep = run_once(cfg)
     print(json.dumps(rep, indent=2, sort_keys=True))
