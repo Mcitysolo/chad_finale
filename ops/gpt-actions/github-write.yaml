@@ -1,0 +1,186 @@
+openapi: 3.1.0
+info:
+  title: CHAD GitHub Control Plane (Phase-4)
+  version: "1.1.0"
+  description: |
+    Private, write-enabled endpoints for the CHAD Phase-4 builder agent.
+    Scope:
+      - Create/update files on a branch
+      - Create git refs (branches)
+      - Create pull requests
+      - Update PR body
+      - Read combined CI status for a commit
+servers:
+  - url: https://api.github.com
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: 'Use a GitHub PAT with scopes: repo, workflow. Format: "Bearer <PAT>" or "token <PAT>"'
+  schemas:
+    FileCommitRequest:
+      type: object
+      required: [message, content]
+      properties:
+        message: { type: string, minLength: 3 }
+        content:
+          type: string
+          description: Base64-encoded file contents (RFC4648, no newlines)
+        sha:
+          type: string
+          description: Optional blob SHA when updating an existing path
+        committer:
+          type: object
+          properties:
+            name: { type: string }
+            email: { type: string }
+    FileCommitResponse:
+      type: object
+      properties:
+        content:
+          type: object
+          properties:
+            path: { type: string }
+            sha:  { type: string }
+    CreateRefRequest:
+      type: object
+      required: [ref, sha]
+      properties:
+        ref:
+          type: string
+          description: 'Fully qualified ref, e.g., "refs/heads/phase4_scaffold_init"'
+        sha:
+          type: string
+          description: Base commit SHA to create from
+    CreatePullRequestRequest:
+      type: object
+      required: [title, head, base]
+      properties:
+        title: { type: string, minLength: 3 }
+        head:  { type: string, minLength: 1, description: 'Branch name or "owner:branch"' }
+        base:  { type: string, minLength: 1, description: 'Target branch name' }
+        body:  { type: string }
+        maintainer_can_modify: { type: boolean, default: true }
+    PRUpdateRequest:
+      type: object
+      properties:
+        title: { type: string }
+        body:  { type: string }
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /repos/{owner}/{repo}/contents/{path}:
+    put:
+      operationId: putFile
+      summary: Create or update a file in a branch
+      parameters:
+        - in: path   ; name: owner ; required: true ; schema: { type: string }
+        - in: path   ; name: repo  ; required: true ; schema: { type: string }
+        - in: path   ; name: path  ; required: true ; schema: { type: string }
+        - in: query  ; name: branch; required: true ; schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FileCommitRequest' }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/FileCommitResponse' } } } }
+        "200": { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/FileCommitResponse' } } } }
+
+  /repos/{owner}/{repo}/git/refs:
+    post:
+      operationId: createRef
+      summary: Create a git ref (branch)
+      parameters:
+        - in: path ; name: owner ; required: true ; schema: { type: string }
+        - in: path ; name: repo  ; required: true ; schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRefRequest' }
+      responses:
+        "201": { description: Ref created }
+
+  /repos/{owner}/{repo}/git/ref/{ref}:
+    get:
+      operationId: getRef
+      summary: Get a git ref
+      parameters:
+        - in: path ; name: owner ; required: true ; schema: { type: string }
+        - in: path ; name: repo  ; required: true ; schema: { type: string }
+        - in: path ; name: ref   ; required: true ; schema: { type: string, description: 'e.g., heads/main or tags/v1.0.0' }
+      responses:
+        "200":
+          description: Ref info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object:
+                    type: object
+                    properties:
+                      sha: { type: string }
+
+  /repos/{owner}/{repo}/pulls:
+    post:
+      operationId: createPullRequest
+      summary: Create a pull request
+      parameters:
+        - in: path ; name: owner ; required: true ; schema: { type: string }
+        - in: path ; name: repo  ; required: true ; schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePullRequestRequest' }
+      responses:
+        "201": { description: PR created }
+
+  /repos/{owner}/{repo}/pulls/{pull_number}:
+    patch:
+      operationId: updatePr
+      summary: Update PR title/body
+      parameters:
+        - in: path ; name: owner        ; required: true ; schema: { type: string }
+        - in: path ; name: repo         ; required: true ; schema: { type: string }
+        - in: path ; name: pull_number  ; required: true ; schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PRUpdateRequest' }
+      responses:
+        "200": { description: PR updated }
+
+  /repos/{owner}/{repo}/commits/{ref}/status:
+    get:
+      operationId: getCommitStatus
+      summary: Get combined CI status for a commit (use PR head SHA)
+      parameters:
+        - in: path ; name: owner ; required: true ; schema: { type: string }
+        - in: path ; name: repo  ; required: true ; schema: { type: string }
+        - in: path ; name: ref   ; required: true ; schema: { type: string }
+      responses:
+        "200":
+          description: Combined status (success/pending/failure/error)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: { type: string, enum: [success, pending, failure, error] }
+                  statuses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        context:    { type: string }
+                        state:      { type: string }
+                        target_url: { type: string }
