@@ -19,6 +19,8 @@ evaluates proposed signals against static limits and simple exposure snapshots.
 """
 
 from __future__ import annotations
+import json
+from pathlib import Path
 
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -123,6 +125,91 @@ class EvaluatedSignal:
 # Policy Engine
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Optional Symbol Caps (Phase 10→12 bridge)
+# Deterministic veto on NEW ENTRIES (BUY) for configured symbols.
+# - Reads config/symbol_caps.json (no secrets)
+# - Uses chad.policy_guards.symbol_trade_cap evaluator (reads ledger; deterministic)
+# - Deny-by-default when caps enabled but evaluator fails (unknown == unsafe)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]  # /home/ubuntu/CHAD FINALE
+_SYMBOL_CAPS_CONFIG = _REPO_ROOT / "config" / "symbol_caps.json"
+
+
+def _load_symbol_caps_config() -> Dict[str, Any]:
+    """
+    Load config/symbol_caps.json safely.
+
+    Expected:
+      {"enabled": true, "symbols": {"AAPL": {"max_trades_per_day": 200, "max_consecutive_losses": 8}}}
+
+    Fail-safe:
+      returns {"enabled": False, "symbols": {}} if missing/invalid.
+    """
+    try:
+        if not _SYMBOL_CAPS_CONFIG.is_file():
+            return {"enabled": False, "symbols": {}}
+        obj = json.loads(_SYMBOL_CAPS_CONFIG.read_text(encoding="utf-8", errors="ignore"))
+        if not isinstance(obj, dict):
+            return {"enabled": False, "symbols": {}}
+        enabled = bool(obj.get("enabled", False))
+        symbols = obj.get("symbols", {})
+        if not isinstance(symbols, dict):
+            symbols = {}
+        return {"enabled": enabled, "symbols": symbols}
+    except Exception:
+        return {"enabled": False, "symbols": {}}
+
+
+def _symbol_cap_check(symbol: str) -> Tuple[bool, str]:
+    """
+    Returns (allowed, reason_code).
+
+    If caps are disabled or symbol not configured -> allowed True, reason "NOT_CONFIGURED".
+    If caps enabled and evaluator denies -> allowed False with evaluator reason.
+    If caps enabled but evaluator errors -> allowed False, reason "EVAL_ERROR" (fail-closed).
+    """
+    cfg = _load_symbol_caps_config()
+    if not cfg.get("enabled"):
+        return True, "DISABLED"
+
+    symbols = cfg.get("symbols") or {}
+    if not isinstance(symbols, dict):
+        return True, "DISABLED"
+
+    sym = str(symbol).strip().upper()
+    limits = symbols.get(sym)
+    if not isinstance(limits, dict):
+        return True, "NOT_CONFIGURED"
+
+    # Defaults if config partially missing
+    max_trades = 200
+    max_losses = 8
+    try:
+        if "max_trades_per_day" in limits:
+            max_trades = int(limits["max_trades_per_day"])
+        if "max_consecutive_losses" in limits:
+            max_losses = int(limits["max_consecutive_losses"])
+    except Exception:
+        pass
+
+    try:
+        # Deterministic evaluator (reads ledger today/latest)
+        from chad.policy_guards.symbol_trade_cap import evaluate_symbol, pick_ledger_for_today_or_latest  # type: ignore
+
+        ledger = pick_ledger_for_today_or_latest()
+        decision = evaluate_symbol(
+            symbol=sym,
+            ledger_path=ledger,
+            max_trades_per_day=max_trades,
+            max_consecutive_losses=max_losses,
+        )
+        if decision.allowed:
+            return True, "OK"
+        return False, str(decision.reason_code or "DENIED")
+    except Exception:
+        return False, "EVAL_ERROR"
 
 @dataclass
 class PolicyEngine:
@@ -244,6 +331,16 @@ class PolicyEngine:
                 reason="non_positive_size",
                 adjusted_size=0.0,
             )
+        # 4.5) Symbol Caps (policy veto for NEW ENTRIES only)
+        # We only block BUY entries. SELL is allowed so exits/reductions can still happen.
+        if signal.side == signal.side.BUY:
+            allowed, reason_code = _symbol_cap_check(signal.symbol)
+            if not allowed:
+                return PolicyDecision(
+                    accepted=False,
+                    reason=f"symbol_cap_block:{signal.symbol}:{reason_code}",
+                    adjusted_size=0.0,
+                )
 
         intended_notional = float(price) * float(signal.size)
 

@@ -7,6 +7,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict
 
 logger = logging.getLogger(__name__)
@@ -217,6 +218,8 @@ class DynamicRiskAllocator:
             }
 
         return {
+            "ts_utc": _utc_now_iso(),
+            "ttl_seconds": int(DYNAMIC_CAPS_TTL_SECONDS),
             "total_equity": float(total_equity),
             "daily_risk_fraction": float(self.daily_risk_fraction),
             "portfolio_risk_cap": float(portfolio_risk_cap),
@@ -232,6 +235,12 @@ class DynamicRiskAllocator:
 # ---------------------------------------------------------------------------
 # Paths / helpers
 # ---------------------------------------------------------------------------
+
+DYNAMIC_CAPS_TTL_SECONDS = 300  # 5 minutes (caps should be refreshed frequently)
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
 
 
 def default_output_path() -> Path:
@@ -328,9 +337,12 @@ def main(argv: list[str] | None = None) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmp = output_path.with_suffix(output_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(output_path)
-
     print(f"dynamic_caps written to: {output_path}", file=sys.stderr)
     return 0
 

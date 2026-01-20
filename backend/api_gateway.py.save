@@ -120,14 +120,10 @@ def _load_operator_intent() -> OperatorIntentState:
 
         mode = str(mode_raw or OperatorMode.ALLOW_LIVE).upper().strip()
         reason = str(reason_raw or "unknown")
-        # Normalize legacy "ALLOW" to canonical "ALLOW_LIVE"
-        if mode == "ALLOW":
-            mode = OperatorMode.ALLOW_LIVE
 
         if mode not in (OperatorMode.ALLOW_LIVE, OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
             return OperatorIntentState(
-                   mode=OperatorMode.EXIT_ONLY,
-                   reason="invalid_mode_exit_only",
+                reason="invalid_mode_fallback",
                 updated_at_utc=updated_raw,
             )
 
@@ -139,8 +135,8 @@ def _load_operator_intent() -> OperatorIntentState:
 
     except Exception:
         return OperatorIntentState(
-               mode=OperatorMode.EXIT_ONLY,
-               reason="parse_error_exit_only",
+            mode=OperatorMode.ALLOW_LIVE,
+            reason="parse_error_fallback",
             updated_at_utc="",
         )
 

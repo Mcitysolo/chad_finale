@@ -384,6 +384,16 @@ def run_once(cfg: LedgerConfig) -> dict:
 
         pos_map = _positions_by_conid(ib)
         _add_detail(details, event="positions_snapshot", positions_count=len(pos_map))
+        # Export full positions snapshot for Phase 6 auditability (not just counts)
+        positions_out = cfg.state_path.parent / "positions_snapshot.json"
+        positions_payload = {
+            "ts_utc": _iso(now),
+            "account_id": account_id,
+            "positions_count": len(pos_map),
+            "positions_by_conid": pos_map,
+        }
+        _atomic_write_json(positions_out, positions_payload)
+        _add_detail(details, event="positions_snapshot_written", path=str(positions_out))
 
         current_open_keys = set()
         for con_id, rec in pos_map.items():

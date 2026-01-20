@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+KRAKEN_BALANCES_TTL_SECONDS = 300  # 5 minutes
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
 
 from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig
 
@@ -22,7 +30,10 @@ class KrakenPortfolioSnapshot:
     balances: Dict[str, float]
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"balances": self.balances}
+        return {
+        "ts_utc": _utc_now_iso(),
+        "ttl_seconds": int(KRAKEN_BALANCES_TTL_SECONDS),
+"balances": self.balances}
 
 
 class KrakenPortfolioCollector:
