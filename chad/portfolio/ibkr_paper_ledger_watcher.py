@@ -418,6 +418,32 @@ def run_once(cfg: LedgerConfig) -> dict:
                         "tags": ["ibkr_paper", cfg.default_strategy],
                     }
                     _add_detail(details, event="open_detected", key=k, qty=float(qty), avg_cost=float(rec.get("avg_cost") or 0.0))
+                else:
+                    # Sync existing open_state quantities/costs to broker snapshot
+                    prev_qty = float(open_state[k].get("qty") or 0.0)
+                    prev_avg = float(open_state[k].get("avg_cost") or 0.0)
+                    new_avg = float(rec.get("avg_cost") or prev_avg)
+
+                    changed = False
+                    if abs(prev_qty - float(qty)) > 1e-12:
+                        open_state[k]["qty"] = float(qty)
+                        changed = True
+                    # avg_cost can drift slightly; update only if meaningfully different
+                    if abs(prev_avg - float(new_avg)) > 1e-9:
+                        open_state[k]["avg_cost"] = float(new_avg)
+                        changed = True
+
+                    if changed:
+                        _add_detail(
+                            details,
+                            event="position_sync",
+                            key=k,
+                            qty=float(qty),
+                            avg_cost=float(new_avg),
+                            prev_qty=float(prev_qty),
+                            prev_avg_cost=float(prev_avg),
+                        )
+
 
         close_keys = [k for k in list(open_state.keys()) if k not in current_open_keys]
         _add_detail(details, event="close_candidates", count=len(close_keys))
