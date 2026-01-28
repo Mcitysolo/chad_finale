@@ -58,6 +58,29 @@ OPERATOR_INTENT_PATH = Path("runtime/operator_intent.json")
 # Reconciliation runtime file (advisory now; can be gating later)
 RECONCILIATION_STATE_PATH = Path("runtime/reconciliation_state.json")
 
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return int(default)
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return int(default)
+
+# Phase 8 feed freshness TTL (seconds)
+CHAD_FEED_TTL_SECONDS = _env_int("CHAD_FEED_TTL_SECONDS", 180)
+
+def _parse_utc(ts: str) -> float:
+    # Returns epoch seconds, or 0.0 on failure
+    try:
+        ts = str(ts).strip()
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return 0.0
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -77,7 +100,7 @@ def _load_reconciliation_status() -> tuple[str, int]:
         return ("ERROR", 0)
 
 def _load_feed_status() -> str:
-    # Minimal Phase-8 feed gate: file must exist and be parseable.
+    # Phase 8 feed gate: file must exist, parse, and be fresh within TTL.
     p = Path("runtime/feed_state.json")
     try:
         if not p.is_file():
@@ -85,6 +108,16 @@ def _load_feed_status() -> str:
         data = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return "ERROR"
+        ts_utc = str(data.get("ts_utc") or "")
+        t = _parse_utc(ts_utc)
+        if t <= 0.0:
+            return "ERROR"
+        age = float(datetime.now(timezone.utc).timestamp() - t)
+        if age > float(CHAD_FEED_TTL_SECONDS):
+            return "STALE"
+        return "OK"
+    except Exception:
+        return "ERROR"
         # If present, treat as OK (TTL enforcement can be added later)
         return "OK"
     except Exception:
