@@ -55,43 +55,6 @@ DYNAMIC_CAPS_PATH = Path("runtime/dynamic_caps.json")
 # Phase 10 operator intent control plane runtime file
 OPERATOR_INTENT_PATH = Path("runtime/operator_intent.json")
 
-# Reconciliation runtime file (advisory now; can be gating later)
-RECONCILIATION_STATE_PATH = Path("runtime/reconciliation_state.json")
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-def _load_reconciliation_status() -> tuple[str, int]:
-    # returns (status, mismatches)
-    try:
-        if not RECONCILIATION_STATE_PATH.is_file():
-            return ("UNKNOWN", 0)
-        rec = json.loads(RECONCILIATION_STATE_PATH.read_text(encoding="utf-8"))
-        status = str(rec.get("status") or "UNKNOWN").upper()
-        mism = int((rec.get("counts") or {}).get("mismatches") or 0)
-        return (status, mism)
-    except Exception:
-        return ("ERROR", 0)
-
-def _load_feed_status() -> str:
-    # Minimal Phase-8 feed gate: file must exist and be parseable.
-    p = Path("runtime/feed_state.json")
-    try:
-        if not p.is_file():
-            return "UNKNOWN"
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return "ERROR"
-        # If present, treat as OK (TTL enforcement can be added later)
-        return "OK"
-    except Exception:
-        return "ERROR"
-
-
-
 LOGGER = logging.getLogger("chad.api_gateway")
 
 
@@ -157,14 +120,10 @@ def _load_operator_intent() -> OperatorIntentState:
 
         mode = str(mode_raw or OperatorMode.ALLOW_LIVE).upper().strip()
         reason = str(reason_raw or "unknown")
-        # Normalize legacy "ALLOW" to canonical "ALLOW_LIVE"
-        if mode == "ALLOW":
-            mode = OperatorMode.ALLOW_LIVE
 
         if mode not in (OperatorMode.ALLOW_LIVE, OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
             return OperatorIntentState(
-                   mode=OperatorMode.EXIT_ONLY,
-                   reason="invalid_mode_exit_only",
+                reason="invalid_mode_fallback",
                 updated_at_utc=updated_raw,
             )
 
@@ -176,8 +135,8 @@ def _load_operator_intent() -> OperatorIntentState:
 
     except Exception:
         return OperatorIntentState(
-               mode=OperatorMode.EXIT_ONLY,
-               reason="parse_error_exit_only",
+            mode=OperatorMode.ALLOW_LIVE,
+            reason="parse_error_fallback",
             updated_at_utc="",
         )
 
@@ -439,20 +398,6 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
     operator = _load_operator_intent()
 
     reasons: List[str] = []
-    # Reconciliation status (positions_snapshot vs ibkr_paper_ledger_state)
-    # Advisory for Phase 7, but surfaced so operators can see mismatches.
-    try:
-        if RECONCILIATION_STATE_PATH.is_file():
-            rec = json.loads(RECONCILIATION_STATE_PATH.read_text(encoding="utf-8"))
-            status = str(rec.get("status") or "UNKNOWN").upper()
-            mism = int((rec.get("counts") or {}).get("mismatches") or 0)
-            if status != "GREEN":
-                reasons.append(f"RECONCILIATION_{status}: mismatches={mism}.")
-        else:
-            reasons.append("RECONCILIATION_UNKNOWN: runtime/reconciliation_state.json missing.")
-    except Exception as exc:
-        reasons.append(f"RECONCILIATION_ERROR: failed to load reconciliation_state.json ({type(exc).__name__}).")
-
 
     # Adapter-level lock: if ibkr_dry_run is True, we categorically forbid live.
     if execution_snapshot.ibkr_dry_run:
@@ -492,8 +437,6 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
             f"STOP is ENABLED (DENY_ALL). reason={getattr(stop_state, 'reason', 'unknown')!r}. "
             "All trading actions are blocked (no live, no paper)."
         )
-        # ##DEDUP_REASONS_PHASE8_V2##
-        reasons = list(dict.fromkeys(reasons))
         return LiveGateSnapshot(
             execution=execution_snapshot,
             mode=mode_snapshot,
@@ -513,8 +456,6 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
     allow_exits_only = False
     if operator.mode == OperatorMode.DENY_ALL:
         reasons.append(f"OperatorIntent=DENY_ALL. reason={operator.reason!r}. Blocking all trading actions.")
-        # ##DEDUP_REASONS_PHASE8_V2##
-        reasons = list(dict.fromkeys(reasons))
         return LiveGateSnapshot(
             execution=execution_snapshot,
             mode=mode_snapshot,
@@ -532,8 +473,6 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
         # In Phase 7, we model exits-only by denying new entries (paper/live),
         # and exposing allow_exits_only=true. Execution layers must implement
         # exit routing explicitly in a later phase.
-        # ##DEDUP_REASONS_PHASE8_V2##
-        reasons = list(dict.fromkeys(reasons))
         return LiveGateSnapshot(
             execution=execution_snapshot,
             mode=mode_snapshot,
@@ -548,20 +487,6 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
 
     # Paper / what-if execution is allowed whenever IBKR is logically enabled.
     allow_ibkr_paper = execution_snapshot.ibkr_enabled
-    # Phase 8 enforcement (default OFF): fail-closed on reconciliation/feed issues.
-    if _env_bool("CHAD_PHASE8_ENFORCEMENT", False):
-        rec_status, rec_mism = _load_reconciliation_status()
-        if rec_status != "GREEN":
-            reasons.append(f"RECONCILIATION_{rec_status}: mismatches={rec_mism}.")
-            allow_ibkr_paper = False
-            allow_exits_only = True
-
-        feed_status = _load_feed_status()
-        if feed_status != "OK":
-            reasons.append(f"FEED_{feed_status}")
-            allow_ibkr_paper = False
-            allow_exits_only = True
-
 
     if not reasons:
         reasons.append(
@@ -569,8 +494,6 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
             "would be permitted if the adapter were not hard-locked to DRY_RUN."
         )
 
-    # ##DEDUP_REASONS_PHASE8_V2##
-    reasons = list(dict.fromkeys(reasons))
     return LiveGateSnapshot(
         execution=execution_snapshot,
         mode=mode_snapshot,
@@ -696,42 +619,6 @@ async def shadow() -> ShadowOnlyResponse:
     return ShadowOnlyResponse(shadow=snapshot)
 
 
-
-
-# ---------------------------------------------------------------------------
-# Operator read-only runtime endpoints (Phase 7 safe)
-# ---------------------------------------------------------------------------
-
-def _read_runtime_json(path: Path) -> dict:
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"missing_runtime_file: {path}")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"runtime_json_parse_error: {path.name}") from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail=f"runtime_json_invalid_shape: {path.name}")
-    return data
-
-
-@app.get("/reconciliation-state", tags=["risk"])
-async def reconciliation_state() -> dict:
-    return _read_runtime_json(RECONCILIATION_STATE_PATH)
-
-
-@app.get("/positions-snapshot", tags=["risk"])
-async def positions_snapshot() -> dict:
-    return _read_runtime_json(Path("runtime/positions_snapshot.json"))
-
-
-@app.get("/feed-state", tags=["system"])
-async def feed_state() -> dict:
-    return _read_runtime_json(Path("runtime/feed_state.json"))
-
-
-@app.get("/portfolio-snapshot", tags=["system"])
-async def portfolio_snapshot() -> dict:
-    return _read_runtime_json(Path("runtime/portfolio_snapshot.json"))
 @app.get("/", include_in_schema=False)
 async def root() -> Dict[str, str]:
     return {

@@ -1,92 +1,132 @@
 #!/usr/bin/env python3
 """
-CHAD — IBKR Paper TradeResult Logger (Production)
+CHAD — IBKR Paper Trade Result Logger (Production)
 
-Purpose
--------
-Record CHAD strategy-originated IBKR PAPER execution events into the same
-tamper-evident TradeResult NDJSON ledger used by SCR.
+Writes append-only, fsync-safe, hash-chained NDJSON records into:
+  data/trades/trade_history_YYYYMMDD.ndjson
 
-Key upgrade (this patch)
-------------------------
-This logger now supports logging a *real fill price* and *filled quantity*
-when the caller has them (e.g., Paper Shadow Runner after a fill). This allows
-TradeResult entries to carry real pricing instead of 0.0.
-
-Notes / Guarantees
-------------------
-- This module does NOT place orders.
-- It logs already-known execution metadata for traceability + attribution.
-- PnL can remain 0.0 at entry time (realized PnL typically happens on close).
-  Downstream enrichment / close-event logic can update PnL later.
-- Strategy must NOT be "manual" (manual trades are excluded from SCR).
+Key guarantees:
+- concurrent-safe (fcntl lock)
+- deterministic hash chaining (prev_hash + canonical JSON)
+- no secrets written
+- supports realized PnL override via IBKRPaperOrderEvent.realized_pnl
 """
 
 from __future__ import annotations
 
-import math
+import datetime as _dt
+import fcntl  # Linux/Unix only; target host is Ubuntu
+import hashlib
+import json
+import os
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-from chad.analytics.trade_result_logger import TradeResult, log_trade_result
+
+ROOT = Path(__file__).resolve().parents[2]
+DATA_TRADES_DIR = ROOT / "data" / "trades"
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
-def _norm_side(side: str) -> str:
-    s = (side or "").strip().upper()
-    if s in {"BUY", "B"}:
-        return "BUY"
-    if s in {"SELL", "S"}:
-        return "SELL"
-    return s or "UNKNOWN"
+def _utc_ymd() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
 
 
-def _finite_pos(x: Optional[float]) -> Optional[float]:
-    """Return x if it is finite and > 0, else None."""
-    if x is None:
-        return None
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+
+
+def _sha256_hex(data: str) -> str:
+    return hashlib.sha256(data.encode("utf-8", errors="strict")).hexdigest()
+
+
+def _safe_str(x: Any, default: str = "") -> str:
     try:
-        v = float(x)
+        return str(x)
     except Exception:
-        return None
-    if not math.isfinite(v):
-        return None
-    if v <= 0.0:
-        return None
-    return v
+        return default
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        f = float(x)
+        if f != f or f in (float("inf"), float("-inf")):
+            return default
+        return f
+    except Exception:
+        return default
+
+
+def _ledger_path_today() -> Path:
+    DATA_TRADES_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_TRADES_DIR / f"trade_history_{_utc_ymd()}.ndjson"
+
+
+def _read_last_record_metadata(fp) -> tuple[int, str]:
+    """
+    Return (last_seq, last_hash). If empty/unreadable -> (0, genesis).
+    """
+    genesis = "0" * 64
+    try:
+        fp.seek(0, os.SEEK_END)
+        size = fp.tell()
+        if size <= 0:
+            return 0, genesis
+
+        # Read tail chunk(s) until we find at least one newline.
+        chunk_size = 8192
+        pos = size
+        buf = b""
+        while pos > 0:
+            step = min(chunk_size, pos)
+            pos -= step
+            fp.seek(pos, os.SEEK_SET)
+            buf = fp.read(step) + buf
+            if b"\n" in buf:
+                break
+
+        lines = [ln for ln in buf.splitlines() if ln.strip()]
+        if not lines:
+            return 0, genesis
+
+        last = lines[-1].decode("utf-8", errors="strict")
+        rec = json.loads(last)
+        seq = _safe_int(rec.get("sequence_id"), 0)
+        rh = _safe_str(rec.get("record_hash"), genesis) or genesis
+        if not _HASH_RE.fullmatch(rh):
+            rh = genesis
+        return seq, rh
+    except Exception:
+        return 0, genesis
 
 
 @dataclass(frozen=True)
 class IBKRPaperOrderEvent:
     """
-    Normalized order execution event for logging.
+    A single IBKR paper fill event.
 
-    Required
-    --------
-    - strategy: CHAD strategy name (e.g., "beta")
-    - symbol: trading symbol (e.g., "AAPL")
-    - side: BUY/SELL
-    - quantity: intended quantity (absolute)
-
-    Optional (recommended when known)
-    --------------------------------
-    - filled_quantity: actual filled quantity (if known)
-    - fill_price: average/actual fill price (if known)
-
-    Notes
-    -----
-    - notional_estimate is used as a fallback when fill info isn't available.
-    - order_id / perm_id help correlate with other IBKR/PnL watchers.
+    - realized_pnl: pass a float for exit/close fills to write trusted PnL.
+      For entry-only fills, leave None and optionally tag pnl_untrusted in raw_intent.
     """
-
     strategy: str
     symbol: str
     side: str
     quantity: float
+    filled_quantity: float
+    fill_price: float
     notional_estimate: float
 
     sec_type: str = "STK"
@@ -94,111 +134,110 @@ class IBKRPaperOrderEvent:
     currency: str = "USD"
     order_type: str = "MKT"
 
-    # Optional execution identifiers
     order_id: Optional[int] = None
     perm_id: Optional[int] = None
 
-    # Optional fill data (if caller has it)
-    filled_quantity: Optional[float] = None
-    fill_price: Optional[float] = None
-
-    # Raw payload for auditability
     raw_intent: Optional[Dict[str, Any]] = None
+    realized_pnl: Optional[float] = None
+    source: str = "paper_shadow_runner"
 
 
-def log_ibkr_paper_order_event(
-    event: IBKRPaperOrderEvent,
-    *,
-    account_id: Optional[str] = None,
-) -> str:
-    """
-    Write a CHAD TradeResult record for an IBKR paper execution event.
+def _build_payload(event: IBKRPaperOrderEvent) -> Dict[str, Any]:
+    strategy = _safe_str(event.strategy).strip().lower() or "unknown"
+    symbol = _safe_str(event.symbol).strip().upper() or "UNKNOWN"
+    side = _safe_str(event.side).strip().upper() or "BUY"
+    order_type = _safe_str(event.order_type).strip().upper() or "MKT"
 
-    Returns
-    -------
-    str
-        log_path returned by log_trade_result()
+    qty = _safe_float(event.quantity, 0.0)
+    filled_qty = _safe_float(event.filled_quantity, 0.0)
+    fill_price = _safe_float(event.fill_price, 0.0)
 
-    Validation rules
-    ----------------
-    - strategy required and must not be 'manual'
-    - quantity must be > 0 (uses filled_quantity if provided and valid)
-    - notional must be > 0 (prefers computed from fill if available)
-    """
-    now = _utc_now_iso()
+    used_qty = filled_qty if filled_qty > 0 else qty
+    notional_used = fill_price * used_qty if (fill_price > 0 and used_qty > 0) else _safe_float(event.notional_estimate, 0.0)
 
-    strategy = (event.strategy or "").strip()
-    if not strategy:
-        raise ValueError("strategy is required")
-    if strategy.lower() == "manual":
-        raise ValueError("refusing to log strategy='manual' as effective trade")
+    realized = None if event.realized_pnl is None else _safe_float(event.realized_pnl, 0.0)
 
-    symbol = (event.symbol or "").strip().upper() or "UNKNOWN"
-    side = _norm_side(event.side)
-
-    qty = _finite_pos(event.filled_quantity) or _finite_pos(event.quantity)
-    if qty is None:
-        raise ValueError(f"quantity must be > 0 (got quantity={event.quantity!r}, filled_quantity={event.filled_quantity!r})")
-
-    fp = _finite_pos(event.fill_price)
-    notional_from_fill: Optional[float] = None
-    if fp is not None:
-        notional_from_fill = float(qty) * float(fp)
-
-    notional = _finite_pos(notional_from_fill) or _finite_pos(event.notional_estimate)
-    if notional is None:
-        raise ValueError(
-            "notional must be > 0 (got notional_estimate={!r}, fill_price={!r}, filled_qty={!r})".format(
-                event.notional_estimate, event.fill_price, qty
-            )
-        )
-
-    tags = [
-        "ibkr_paper",
-        strategy.lower(),
-        side.lower(),
-        (event.order_type or "MKT").lower(),
-    ]
-    if fp is not None:
-        tags.append("filled")
-    else:
-        tags.append("fill_unknown")
+    tags = ["ibkr_paper", strategy, "filled", side.lower(), order_type.lower()]
 
     extra: Dict[str, Any] = {
-        "source": "paper_shadow_runner",
-        "sec_type": event.sec_type,
-        "exchange": event.exchange,
-        "currency": event.currency,
-        "order_type": event.order_type,
-        "notional_estimate": float(event.notional_estimate),
-        "notional_used": float(notional),
-        "filled_quantity_used": float(qty),
-        "fill_price_used": float(fp) if fp is not None else 0.0,
+        "currency": _safe_str(event.currency).strip().upper() or "USD",
+        "exchange": _safe_str(event.exchange).strip().upper() or "SMART",
+        "sec_type": _safe_str(event.sec_type).strip().upper() or "STK",
+        "order_type": order_type,
+        "source": _safe_str(event.source).strip() or "paper_shadow_runner",
+        "fill_price_used": fill_price,
+        "filled_quantity_used": used_qty,
+        "notional_used": notional_used,
     }
+
     if event.order_id is not None:
-        extra["order_id"] = int(event.order_id)
+        extra["order_id"] = _safe_int(event.order_id, 0)
     if event.perm_id is not None:
-        extra["perm_id"] = int(event.perm_id)
-    if event.raw_intent is not None:
-        extra["raw_intent"] = dict(event.raw_intent)
+        extra["perm_id"] = _safe_int(event.perm_id, 0)
 
-    tr = TradeResult(
-        strategy=strategy.lower(),
-        symbol=symbol,
-        side=side,
-        quantity=float(qty),
-        fill_price=float(fp) if fp is not None else 0.0,
-        notional=float(notional),
-        pnl=0.0,  # realized PnL typically arrives on close/enrichment
-        entry_time_utc=now,
-        exit_time_utc=now,
-        is_live=False,
-        broker="ibkr",
-        account_id=account_id,
-        regime=None,
-        tags=tags,
-        extra=extra,
-    )
+    if isinstance(event.raw_intent, dict):
+        extra["raw_intent"] = event.raw_intent
+        if bool(event.raw_intent.get("pnl_untrusted")):
+            extra["pnl_untrusted"] = True
+            reason = event.raw_intent.get("pnl_untrusted_reason")
+            if reason:
+                extra["pnl_untrusted_reason"] = _safe_str(reason)
 
-    path = log_trade_result(tr)
-    return str(path)
+    payload: Dict[str, Any] = {
+        "account_id": None,
+        "broker": "ibkr",
+        "symbol": symbol,
+        "strategy": strategy,
+        "side": side,
+        "quantity": float(used_qty),
+        "fill_price": float(fill_price),
+        "notional": float(notional_used),
+        "pnl": float(realized) if realized is not None else 0.0,
+        "is_live": False,
+        "entry_time_utc": _utc_now_iso(),
+        "exit_time_utc": _utc_now_iso(),
+        "regime": None,
+        "tags": tags,
+        "extra": extra,
+    }
+    return payload
+
+
+def log_ibkr_paper_order_event(event: IBKRPaperOrderEvent) -> Path:
+    """
+    Append one record to today's paper ledger.
+    Returns the ledger path written to.
+    """
+    path = _ledger_path_today()
+    payload = _build_payload(event)
+
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o640)
+    try:
+        with os.fdopen(fd, "r+", encoding="utf-8", newline="\n") as fp:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+            try:
+                last_seq, last_hash = _read_last_record_metadata(fp)
+                next_seq = int(last_seq) + 1
+                ts = _utc_now_iso()
+
+                core = {
+                    "timestamp_utc": ts,
+                    "sequence_id": next_seq,
+                    "prev_hash": last_hash,
+                    "payload": payload,
+                }
+                record_hash = _sha256_hex(last_hash + _canonical_json(core))
+                record = dict(core)
+                record["record_hash"] = record_hash
+
+                fp.seek(0, os.SEEK_END)
+                fp.write(_canonical_json(record) + "\n")
+                fp.flush()
+                os.fsync(fp.fileno())
+            finally:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+    finally:
+        # closed by context manager
+        pass
+
+    return path

@@ -49,6 +49,27 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "runtime")).resolve()
+FEED_STATE_PATH = RUNTIME_DIR / "feed_state.json"
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+def _write_feed_state(feed_name: str, last_update_ts_utc: str, freshness_seconds: float) -> None:
+    payload = {
+        "ts_utc": last_update_ts_utc,
+        "feeds": {
+            feed_name: {
+                "last_update_ts_utc": last_update_ts_utc,
+                "freshness_seconds": freshness_seconds,
+            }
+        }
+    }
+    _atomic_write_json(FEED_STATE_PATH, payload)
 from typing import Any, Dict, List, Optional
 
 from polygon import RESTClient
@@ -226,6 +247,8 @@ def main() -> None:
                     continue
 
             out_fh.flush()
+            # update feed_state freshness proof
+            _write_feed_state('polygon_stocks', __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat().replace('+00:00','Z'), 0.0)
             time.sleep(POLL_SECONDS)
     except GracefulExit as exc:
         logging.info("Graceful shutdown: %s", exc)

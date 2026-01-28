@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 """
-chad/utils/context_builder.py
+CHAD Context Builder — Institutional-Grade (Strategy Input Plane)
 
-Context builder for CHAD Phase 3.
+Deterministic, audit-friendly MarketContext construction for:
+- Phase-3 StrategyEngine
+- Phase-7 DRY_RUN full_execution_cycle (expects ContextBuilder.build() result object)
 
-This module assembles all the inputs required for a single decision cycle:
+Truth sources (local-only, no network):
+- runtime/positions_snapshot.json  (positions)
+- runtime/price_cache.json         (prices/ticks)
+- legend file (auto-detected)
 
-    - Market ticks from the latest Polygon NDJSON feed
-    - Legend consensus from data/legend_top_stocks.json
-    - A portfolio snapshot (Phase 3: conservative, zero-position baseline)
-    - Derived prices and notional exposure views
+Cash policy (explicit, fail-closed)
+-----------------------------------
+We do NOT guess broker cash.
 
-It returns:
-    - MarketContext
-    - prices (symbol -> last price)
-    - current_symbol_notional
-    - current_total_notional
+- Default cash = 0.0 (fail-closed)
+- Optional operator override via environment variables:
+    CHAD_CASH_OVERRIDE            (float)
+    CHAD_CASH_OVERRIDE_REASON     (string, required if override provided)
 
-Execution, real portfolio state, and PnL tracking are wired in later phases.
+If CHAD_CASH_OVERRIDE is set but invalid, cash remains 0.0 and evidence records error.
+
+This allows strategies like Beta (min_cash=10k) to run ONLY when you explicitly
+authorize a cash value for the strategy layer.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from chad.types import (
     AssetClass,
@@ -36,282 +44,292 @@ from chad.types import (
     PortfolioSnapshot,
     Position,
 )
-from chad.utils.legend_loader import load_legend, LegendLoaderError
-from chad.market_data.service import MarketDataService, MarketDataError
 
 
 @dataclass(frozen=True)
-class ContextBuilderConfig:
-    """
-    Configuration for ContextBuilder.
+class ContextBuildEvidence:
+    now_utc: str
+    runtime_dir: str
 
-    Phase 3:
-    - root_dir: project root containing data/, control/, etc.
-    - feeds_rel_path: relative path to NDJSON feed directory.
-    """
+    positions_path: str
+    positions_mtime_utc: Optional[str]
+    positions_count: int
+    positions_error: Optional[str]
 
-    root_dir: Path = Path(__file__).resolve().parents[2]
-    feeds_rel_path: Path = Path("data/feeds")
+    legend_path: str
+    legend_mtime_utc: Optional[str]
+    legend_symbols: int
+    legend_error: Optional[str]
 
-    # Fetch prices for the top-N legend symbols so BETA signals have prices.
-    # Keep this small to avoid rate limits; increase only if needed.
-    legend_price_top_n: int = 10
+    ticks_source: str
+    ticks_count: int
+    ticks_error: Optional[str]
 
-    # Best-effort local cache (seconds) to avoid refetching legend prices every cycle.
-    price_cache_ttl_seconds: int = 60
-    @property
-    def feeds_dir(self) -> Path:
-        return (self.root_dir / self.feeds_rel_path).resolve()
+    cash_source: str
+    cash_value: float
+    cash_error: Optional[str]
 
 
 @dataclass(frozen=True)
 class ContextBuildResult:
-    """
-    Full result for a single context build operation.
-    """
-
     context: MarketContext
-    prices: Dict[str, float]
-    current_symbol_notional: Dict[str, float]
+    prices: Mapping[str, float]
+    current_symbol_notional: Mapping[str, float]
     current_total_notional: float
 
 
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _runtime_dir() -> Path:
+    root = _repo_root()
+    return Path(os.environ.get("CHAD_RUNTIME_DIR", str(root / "runtime"))).resolve()
+
+
+def _stat_mtime_utc(p: Path) -> Optional[str]:
+    try:
+        st = p.stat()
+        return _iso(datetime.fromtimestamp(st.st_mtime, tz=timezone.utc))
+    except Exception:
+        return None
+
+
+def _load_positions(runtime_dir: Path) -> Tuple[Mapping[str, Position], int, Optional[str], Optional[str]]:
+    p = runtime_dir / "positions_snapshot.json"
+    mtime = _stat_mtime_utc(p)
+
+    if not p.is_file():
+        return {}, 0, mtime, "missing_positions_snapshot"
+
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}, 0, mtime, "positions_snapshot_not_dict"
+
+        pos_map = raw.get("positions_by_conid")
+        if not isinstance(pos_map, dict):
+            return {}, 0, mtime, "positions_by_conid_missing_or_invalid"
+
+        out: Dict[str, Position] = {}
+        for _conid, rec in pos_map.items():
+            if not isinstance(rec, dict):
+                continue
+
+            sym = str(rec.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+
+            qty = float(rec.get("qty") or 0.0)
+            avg = float(rec.get("avg_cost") or 0.0)
+            sec_type = str(rec.get("secType") or "STK").strip().upper()
+            asset_class = AssetClass.ETF if sec_type == "ETF" else AssetClass.EQUITY
+
+            out[sym] = Position(symbol=sym, asset_class=asset_class, quantity=qty, avg_price=avg)
+
+        return out, len(out), mtime, None
+
+    except Exception as exc:
+        return {}, 0, mtime, f"{type(exc).__name__}: {exc}"
+
+
+def _load_legend(runtime_dir: Path, now: datetime) -> Tuple[Optional[LegendConsensus], str, Optional[str], int, Optional[str]]:
+    root = _repo_root()
+    candidates = [
+        runtime_dir / "legend_top_stocks.json",
+        root / "data" / "legend_top_stocks.json",
+        root / "data" / "legend" / "legend_top_stocks.json",
+    ]
+
+    chosen: Optional[Path] = None
+    for c in candidates:
+        if c.is_file():
+            chosen = c
+            break
+
+    if chosen is None:
+        return None, "missing", None, 0, "legend_file_missing"
+
+    mtime = _stat_mtime_utc(chosen)
+
+    try:
+        raw = json.loads(chosen.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None, str(chosen), mtime, 0, "legend_not_dict"
+
+        weights = raw.get("weights")
+        if not isinstance(weights, dict):
+            return None, str(chosen), mtime, 0, "legend_weights_missing"
+
+        norm: Dict[str, float] = {}
+        for k, v in weights.items():
+            sym = str(k).strip().upper()
+            if not sym:
+                continue
+            try:
+                w = float(v)
+            except Exception:
+                continue
+            if w > 0.0:
+                norm[sym] = w
+
+        if not norm:
+            return None, str(chosen), mtime, 0, "legend_weights_empty"
+
+        as_of = now
+        as_of_raw = raw.get("as_of")
+        if isinstance(as_of_raw, str) and as_of_raw.strip():
+            try:
+                as_of = datetime.fromisoformat(as_of_raw.replace("Z", "+00:00"))
+                if as_of.tzinfo is None:
+                    as_of = as_of.replace(tzinfo=timezone.utc)
+            except Exception:
+                as_of = now
+
+        return LegendConsensus(as_of=as_of, weights=norm), str(chosen), mtime, len(norm), None
+
+    except Exception as exc:
+        return None, str(chosen), mtime, 0, f"{type(exc).__name__}: {exc}"
+
+
+def _load_ticks(runtime_dir: Path, now: datetime) -> Tuple[Mapping[str, MarketTick], str, int, Optional[str]]:
+    cache = runtime_dir / "price_cache.json"
+    if not cache.is_file():
+        return {}, "runtime/price_cache.json (missing)", 0, "missing_price_cache"
+
+    try:
+        raw = json.loads(cache.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}, str(cache), 0, "price_cache_not_dict"
+
+        # supports {"prices": {...}} OR flat dict OR nested dict
+        obj = raw.get("prices") if isinstance(raw.get("prices"), dict) else raw
+        if not isinstance(obj, dict):
+            return {}, str(cache), 0, "price_cache_prices_not_dict"
+
+        out: Dict[str, MarketTick] = {}
+        for sym, rec in obj.items():
+            s = str(sym).strip().upper()
+            if not s:
+                continue
+
+            if isinstance(rec, dict):
+                price = float(rec.get("price") or 0.0)
+            else:
+                price = float(rec or 0.0)
+
+            if price <= 0.0:
+                continue
+
+            out[s] = MarketTick(
+                symbol=s,
+                price=float(price),
+                size=0.0,
+                exchange=None,
+                timestamp=now,
+                source="price_cache",
+            )
+
+        return out, str(cache), len(out), None
+
+    except Exception as exc:
+        return {}, str(cache), 0, f"{type(exc).__name__}: {exc}"
+
+
+def _resolve_cash_override() -> Tuple[float, str, Optional[str]]:
+    """
+    Returns (cash_value, cash_source, cash_error).
+    """
+    raw = os.environ.get("CHAD_CASH_OVERRIDE")
+    if raw is None or not str(raw).strip():
+        return 0.0, "fail_closed_default_0", None
+
+    reason = str(os.environ.get("CHAD_CASH_OVERRIDE_REASON") or "").strip()
+    if not reason:
+        return 0.0, "fail_closed_default_0", "override_missing_reason"
+
+    try:
+        val = float(raw)
+        if not (val >= 0.0):
+            return 0.0, "fail_closed_default_0", "override_negative"
+        return float(val), f"override:{reason}", None
+    except Exception as exc:
+        return 0.0, "fail_closed_default_0", f"override_invalid:{type(exc).__name__}"
+
+
+def build_market_context(now: Optional[datetime] = None) -> Tuple[MarketContext, ContextBuildEvidence]:
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+
+    runtime = _runtime_dir()
+
+    positions, pos_count, pos_mtime, pos_err = _load_positions(runtime)
+    legend, legend_path, legend_mtime, legend_count, legend_err = _load_legend(runtime, now_dt)
+    ticks, ticks_src, ticks_count, ticks_err = _load_ticks(runtime, now_dt)
+
+    cash_value, cash_source, cash_error = _resolve_cash_override()
+
+    portfolio = PortfolioSnapshot(timestamp=now_dt, cash=float(cash_value), positions=positions)
+    ctx = MarketContext(now=now_dt, ticks=ticks, legend=legend, portfolio=portfolio)
+
+    ev = ContextBuildEvidence(
+        now_utc=_iso(now_dt),
+        runtime_dir=str(runtime),
+        positions_path=str(runtime / "positions_snapshot.json"),
+        positions_mtime_utc=pos_mtime,
+        positions_count=pos_count,
+        positions_error=pos_err,
+        legend_path=legend_path,
+        legend_mtime_utc=legend_mtime,
+        legend_symbols=legend_count,
+        legend_error=legend_err,
+        ticks_source=ticks_src,
+        ticks_count=ticks_count,
+        ticks_error=ticks_err,
+        cash_source=cash_source,
+        cash_value=float(cash_value),
+        cash_error=cash_error,
+    )
+
+    return ctx, ev
+
+
 class ContextBuilder:
-    """
-    Build MarketContext + risk inputs from on-disk data.
-
-    Responsibilities:
-      - Locate latest Polygon NDJSON file.
-      - Parse per-symbol last trade ticks.
-      - Load LegendConsensus via legend_loader.
-      - Build a conservative PortfolioSnapshot (Phase 3 baseline).
-      - Derive prices and notional exposures.
-
-    Assumptions for Phase 3:
-      - Portfolio is flat (no open positions), all cash baseline.
-        This is the safest starting point; live portfolio integration is added
-        in later phases when execution/accounting are wired.
-    """
-
-    def __init__(self, config: ContextBuilderConfig | None = None) -> None:
-        self._config = config or ContextBuilderConfig()
-
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
-
-    def build(self) -> ContextBuildResult:
-        """
-        Build a full decision context from the latest available data.
-
-        Raises:
-            RuntimeError if critical inputs are missing (no feed, no legend, etc).
-        """
-        now = datetime.now(timezone.utc)
-
-        ticks = self._load_latest_ticks()
-        legend = self._load_legend()
-        portfolio = self._build_portfolio_snapshot(now)
-
-        # Prices start with tick-derived values (SPY/QQQ from Polygon NDJSON).
-        # We then enrich with top legend symbols so BETA/Legend signals have prices.
-        # A small runtime cache prevents hammering the provider every loop.
-        runtime_dir = self._config.root_dir / "runtime"
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = runtime_dir / "price_cache.json"
+    def build(self, now: Optional[datetime] = None) -> ContextBuildResult:
+        ctx, _ev = build_market_context(now=now)
 
         prices: Dict[str, float] = {}
-
-        # Best-effort cache load
-        try:
-            if cache_path.is_file():
-                import json as _json
-                from datetime import datetime as _dt, timezone as _tz
-
-                cached = _json.loads(cache_path.read_text(encoding="utf-8"))
-                as_of = cached.get("as_of_iso")
-                cached_prices = cached.get("prices", {}) or {}
-                if isinstance(as_of, str) and isinstance(cached_prices, dict):
-                    as_of_dt = _dt.fromisoformat(as_of)
-                    if as_of_dt.tzinfo is None:
-                        as_of_dt = as_of_dt.replace(tzinfo=_tz.utc)
-                    age_s = (now - as_of_dt.astimezone(_tz.utc)).total_seconds()
-                    if age_s <= float(self._config.price_cache_ttl_seconds):
-                        for k, v in cached_prices.items():
-                            try:
-                                prices[str(k)] = float(v)
-                            except Exception:
-                                continue
-        except Exception:
-            # Cache is optional; ignore any cache failure.
-            pass
-
-        # Tick prices override cache (most recent local feed)
-        for sym, tick in ticks.items():
-            prices[sym] = float(tick.price)
-
-        # Enrich: top legend symbols not already priced
-        try:
-            svc = MarketDataService()
-            items = sorted(legend.weights.items(), key=lambda kv: kv[1], reverse=True)
-            for sym, _w in items[: int(self._config.legend_price_top_n)]:
-                if sym in prices:
-                    continue
-                try:
-                    snap = svc.get_price_snapshot(sym)
-                    if snap and float(snap.price) > 0:
-                        prices[sym] = float(snap.price)
-                except MarketDataError:
-                    continue
-                except Exception:
-                    continue
-
-            # Best-effort cache write
+        for sym, tick in ctx.ticks.items():
             try:
-                import json as _json
-                cache_path.write_text(
-                    _json.dumps({"as_of_iso": now.isoformat(), "prices": prices}, indent=2, sort_keys=True),
-                    encoding="utf-8",
-                )
+                px = float(tick.price)
             except Exception:
-                pass
-        except Exception:
-            # Market data enrichment is best-effort.
-            pass
+                continue
+            if px > 0.0:
+                prices[str(sym).strip().upper()] = px
 
-
-        # Phase 3 baseline: zero notional (no positions yet).
-        current_symbol_notional: Dict[str, float] = {}
+        current_symbol_notional: Dict[str, float] = {s: 0.0 for s in prices.keys()}
         current_total_notional = 0.0
-
-        ctx = MarketContext(
-            now=now,
-            ticks=ticks,
-            legend=legend,
-            portfolio=portfolio,
-        )
 
         return ContextBuildResult(
             context=ctx,
             prices=prices,
             current_symbol_notional=current_symbol_notional,
-            current_total_notional=current_total_notional,
+            current_total_notional=float(current_total_notional),
         )
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
 
-    def _load_latest_ticks(self) -> Dict[str, MarketTick]:
-        """
-        Load last trade ticks for each symbol from the latest NDJSON file.
-
-        We treat the most recent file by modification time as the latest feed.
-
-        Raises:
-            RuntimeError if no suitable NDJSON file is found or parsing fails.
-        """
-        feeds_dir = self._config.feeds_dir
-        if not feeds_dir.exists():
-            raise RuntimeError(f"Feeds directory not found: {feeds_dir}")
-
-        candidates = sorted(
-            feeds_dir.glob("polygon_stocks_*.ndjson"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-
-        if not candidates:
-            raise RuntimeError(f"No polygon_stocks_*.ndjson files in {feeds_dir}")
-
-        latest = candidates[0]
-
-        last_per_symbol: Dict[str, MarketTick] = {}
-        try:
-            with latest.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except Exception:
-                        continue
-
-                    symbol = payload.get("ticker")
-                    price = payload.get("price")
-                    size = payload.get("size")
-                    exchange = payload.get("exchange")
-                    ts_raw = payload.get("timestamp_utc")
-
-                    if not isinstance(symbol, str):
-                        continue
-                    try:
-                        price_f = float(price)
-                        size_f = float(size)
-                    except Exception:
-                        continue
-                    if price_f <= 0.0 or size_f <= 0.0:
-                        continue
-
-                    timestamp = self._parse_timestamp(ts_raw)
-
-                    last_per_symbol[symbol] = MarketTick(
-                        symbol=symbol,
-                        price=price_f,
-                        size=size_f,
-                        exchange=int(exchange) if isinstance(exchange, int) else None,
-                        timestamp=timestamp,
-                        source="polygon_ndjson",
-                    )
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Failed to read NDJSON feed {latest}: {exc}") from exc
-
-        if not last_per_symbol:
-            raise RuntimeError(f"No valid ticks found in latest feed: {latest}")
-
-        return last_per_symbol
-
-    @staticmethod
-    def _parse_timestamp(raw: object) -> datetime:
-        """
-        Parse an ISO 8601 timestamp string into an aware datetime.
-
-        If parsing fails or input is missing, fall back to current UTC time.
-        """
-        if isinstance(raw, str):
-            try:
-                dt = datetime.fromisoformat(raw)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except Exception:
-                pass
-        return datetime.now(timezone.utc)
-
-    def _load_legend(self) -> LegendConsensus:
-        """
-        Load LegendConsensus from the standard path using the LegendLoader.
-
-        Raises:
-            RuntimeError if the legend cannot be loaded.
-        """
-        try:
-            return load_legend()
-        except LegendLoaderError as exc:
-            raise RuntimeError(f"Failed to load legend consensus: {exc}") from exc
-
-    @staticmethod
-    def _build_portfolio_snapshot(now: datetime) -> PortfolioSnapshot:
-        """
-        Build a conservative portfolio snapshot for Phase 3:
-
-        - All cash, no positions.
-
-        Live portfolios will be wired once execution/accounting is restored.
-        """
-        return PortfolioSnapshot(
-            timestamp=now,
-            cash=100_000.0,
-            positions={},
-        )
+if __name__ == "__main__":
+    ctx, ev = build_market_context()
+    print("now:", _iso(ctx.now))
+    print("ticks:", len(ctx.ticks), "symbols:", sorted(ctx.ticks.keys()))
+    print("legend:", 0 if ctx.legend is None else len(ctx.legend.weights))
+    print("positions:", len(ctx.portfolio.positions), "symbols:", sorted(ctx.portfolio.positions.keys()))
+    print("cash:", ctx.portfolio.cash, "cash_source:", ev.cash_source, "cash_error:", ev.cash_error)
+    print("evidence:", json.dumps(dataclasses.asdict(ev), indent=2, sort_keys=True))

@@ -1,0 +1,6 @@
+{
+  "mode": "LEGEND_TOP_N",
+  "top_n": 25,
+  "static_symbols": ["SPY", "QQQ"],
+  "fallback": ["SPY", "QQQ"]
+}

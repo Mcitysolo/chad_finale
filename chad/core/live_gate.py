@@ -1,292 +1,399 @@
 """
-Live Gate Controller (Phase 8 – Unified Live/DRY_RUN Decision Layer)
+chad.core.live_gate
 
-This module centralizes the logic for deciding whether CHAD is allowed
-to *even attempt* LIVE IBKR execution.
+World-class LiveGate evaluator with:
+- deny-by-default gate chain
+- DecisionTrace emission on every evaluation
+- runtime freshness enforcement for critical state (IBKR status)
 
-It combines:
+Key guarantees:
+- Never executes trades.
+- Always returns a safe decision.
+- Deterministic gate order + reasons.
+- Writes audit-first DecisionTrace (append-only NDJSON).
+- Enforces runtime TTL freshness per CSB: stale/missing runtime => fail closed.
 
-    * ExecutionConfig (adapter-level):
-        - CHAD_EXECUTION_MODE
-        - ibkr_enabled
-        - ibkr_dry_run
-
-    * CHAD_MODE (global):
-        - DRY_RUN / LIVE
-
-    * Operator Live Intent (live_mode.json):
-        - live (True/False)
-        - reason (why the operator set this)
-
-    * Shadow Confidence State (SCR):
-        - state (WARMUP / CONFIDENT / CAUTIOUS / PAUSED)
-        - paper_only
-        - sizing_factor
-        - reasons
-
-    * STOP (stop_state.json):
-        - stop (True/False)
-        - reason
-        - updated_at_utc
-
-IMPORTANT (Phase 7/early Phase 8):
-    - ExecutionConfig is currently hard-locked to DRY_RUN for IBKR, so
-      allow_ibkr_live will always be False until ExecutionConfig is
-      relaxed in a future step.
-    - This controller is **read-only**: it does NOT execute trades or
-      talk to brokers. It only answers: "Would live be allowed if the
-      adapter were not hard-locked?"
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Set
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from chad.analytics.trade_stats_engine import load_and_compute
-from chad.analytics.shadow_confidence_router import evaluate_confidence, ShadowState
-from chad.core.live_mode import LiveModeState, load_live_mode
-from chad.core.mode import CHADMode, get_chad_mode
-from chad.core.stop_state import load_stop_state
-from chad.execution.execution_config import get_execution_config
+from chad.core.decision_trace import (
+    GateResult,
+    LiveGateDecisionTrace,
+    build_decision_trace_record,
+    default_writer,
+    new_cycle_id,
+    new_trace_id,
+)
+from chad.utils.runtime_json import read_runtime_state_json
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v.strip() != "" else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _runtime_dir() -> Path:
+    return _repo_root() / "runtime"
+
+
+# ----------------------------
+# Runtime state readers
+# ----------------------------
+
+@dataclass(frozen=True)
+class StopState:
+    stop: bool
+    reason: str
+
+
+def _load_stop_state() -> StopState:
+    p = _runtime_dir() / "stop_state.json"
+    obj = _read_json(p)
+    stop = bool(obj.get("stop", False))
+    reason = str(obj.get("reason", obj.get("stop_reason", "")))[:240]
+    return StopState(stop=stop, reason=reason)
 
 
 @dataclass(frozen=True)
-class LiveGateContext:
-    """
-    Immutable snapshot of the inputs used to make a live/DRY_RUN decision.
-    """
+class OperatorIntent:
+    mode: str
+    reason: str
 
-    chad_mode: CHADMode
-    exec_mode: str
+
+def _load_operator_intent() -> OperatorIntent:
+    p = _runtime_dir() / "operator_intent.json"
+    obj = _read_json(p)
+    mode = str(obj.get("operator_mode", obj.get("mode", "EXIT_ONLY"))).upper()
+    reason = str(obj.get("operator_reason", obj.get("reason", "")))[:240]
+    if mode not in ("EXIT_ONLY", "ALLOW", "DENY_ALL"):
+        mode = "EXIT_ONLY"
+    return OperatorIntent(mode=mode, reason=reason)
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    exec_mode: str  # "dry_run" | "paper" | "live"
     ibkr_enabled: bool
     ibkr_dry_run: bool
-    live_intent: bool
-    live_reason: str
+    kraken_enabled: bool
+
+
+def _load_execution_config_best_effort() -> ExecutionConfig:
+    exec_mode = _env_str("CHAD_EXEC_MODE", "").lower()
+    chad_mode = _env_str("CHAD_MODE", "DRY_RUN").upper()
+
+    if exec_mode in ("dry_run", "paper", "live"):
+        normalized = exec_mode
+    else:
+        normalized = "live" if chad_mode == "LIVE" else ("paper" if chad_mode == "PAPER" else "dry_run")
+
+    ibkr_enabled = _env_bool("CHAD_IBKR_ENABLED", True)
+    kraken_enabled = _env_bool("CHAD_KRAKEN_ENABLED", True)
+    ibkr_dry_run = _env_bool("CHAD_IBKR_DRY_RUN", True)
+
+    return ExecutionConfig(
+        exec_mode=normalized,
+        ibkr_enabled=ibkr_enabled,
+        ibkr_dry_run=ibkr_dry_run,
+        kraken_enabled=kraken_enabled,
+    )
+
+
+@dataclass(frozen=True)
+class ShadowState:
+    state: str
+    sizing_factor: float
+    paper_only: bool
+    reasons: List[str]
+
+
+def _load_shadow_state_best_effort() -> ShadowState:
+    try:
+        from chad.analytics.shadow_state_snapshot import load_shadow_snapshot  # type: ignore
+        snap = load_shadow_snapshot()
+        state = str(snap.get("state", "UNKNOWN"))
+        sizing = float(snap.get("sizing_factor", 0.1))
+        paper_only = bool(snap.get("paper_only", True))
+        rs = snap.get("reasons", [])
+        reasons = [str(x) for x in rs] if isinstance(rs, list) else []
+        return ShadowState(state=state, sizing_factor=sizing, paper_only=paper_only, reasons=reasons)
+    except Exception:
+        obj = _read_json(_runtime_dir() / "shadow_state.json")
+        state = str(obj.get("state", "WARMUP"))
+        sizing = float(obj.get("sizing_factor", 0.1)) if isinstance(obj.get("sizing_factor", 0.1), (int, float)) else 0.1
+        paper_only = bool(obj.get("paper_only", True))
+        rs = obj.get("reasons", [])
+        reasons = [str(x) for x in rs] if isinstance(rs, list) else []
+        return ShadowState(state=state, sizing_factor=float(sizing), paper_only=paper_only, reasons=reasons[:20])
+
+
+@dataclass(frozen=True)
+class IBKRStatus:
+    ok: bool
+    fresh_ok: bool
+    reason: str
+    age_seconds: float
+    ttl_seconds: float
+    error: Optional[str]
+    server_time_iso: Optional[str]
+
+
+def _load_ibkr_status() -> IBKRStatus:
+    path = _runtime_dir() / "ibkr_status.json"
+    obj, fr = read_runtime_state_json(path)
+    if obj is None:
+        return IBKRStatus(
+            ok=False,
+            fresh_ok=False,
+            reason=f"runtime_ibkr_status_{fr.reason}",
+            age_seconds=fr.age_seconds,
+            ttl_seconds=fr.ttl_seconds,
+            error=None,
+            server_time_iso=None,
+        )
+    ok = bool(obj.get("ok", False))
+    return IBKRStatus(
+        ok=ok,
+        fresh_ok=bool(fr.ok),
+        reason=fr.reason,
+        age_seconds=float(fr.age_seconds),
+        ttl_seconds=float(fr.ttl_seconds),
+        error=str(obj.get("error")) if obj.get("error") is not None else None,
+        server_time_iso=str(obj.get("server_time_iso")) if obj.get("server_time_iso") is not None else None,
+    )
+
+
+# ----------------------------
+# LiveGate domain objects
+# ----------------------------
+
+@dataclass(frozen=True)
+class LiveGateContext:
+    execution: ExecutionConfig
+    stop_state: StopState
+    operator_intent: OperatorIntent
     shadow_state: ShadowState
-    stop_enabled: bool
-    stop_reason: str
+    ibkr_status: IBKRStatus
+    chad_mode: str
 
 
 @dataclass(frozen=True)
 class LiveGateDecision:
-    """
-    Unified live/DRY_RUN decision for IBKR.
-
-    Fields:
-        allow_ibkr_live:
-            True iff ALL of the following are satisfied:
-                - ibkr_enabled
-                - ibkr_dry_run is False
-                - chad_mode == LIVE
-                - operator live intent (live_mode.live) is True
-                - shadow_state.paper_only is False
-                - shadow_state.state in {"CONFIDENT", "CAUTIOUS"}
-
-        allow_ibkr_paper:
-            True iff ibkr_enabled (paper / what-if is allowed) AND STOP is not enabled.
-
-        reasons:
-            List of human-readable messages explaining why live is
-            allowed or blocked.
-
-        context:
-            The LiveGateContext used for this decision.
-    """
-
+    context: LiveGateContext
+    mode: str  # "DENY_ALL" | "EXIT_ONLY" | "ALLOW_LIVE"
+    reasons: List[str]
+    allow_exits_only: bool
     allow_ibkr_live: bool
     allow_ibkr_paper: bool
-    reasons: List[str] = field(default_factory=list)
-    context: LiveGateContext = field(default_factory=lambda: _build_default_context())
 
 
 def _build_default_context() -> LiveGateContext:
-    """
-    Build a conservative default context for situations where a
-    LiveGateDecision is constructed without an explicit context.
-
-    This should not be used in normal operation; evaluate_live_gate()
-    always populates a full context.
-    """
-    stats = load_and_compute(
-        max_trades=50,
-        days_back=30,
-        include_paper=True,
-        include_live=True,
-    )
-    shadow_state = evaluate_confidence(stats)
-    live_state = load_live_mode()
-    stop_state = load_stop_state()
+    execution = _load_execution_config_best_effort()
+    stop_state = _load_stop_state()
+    operator_intent = _load_operator_intent()
+    shadow_state = _load_shadow_state_best_effort()
+    ibkr_status = _load_ibkr_status()
+    chad_mode = _env_str("CHAD_MODE", "DRY_RUN").upper()
     return LiveGateContext(
-        chad_mode=CHADMode.DRY_RUN,
-        exec_mode="unknown",
-        ibkr_enabled=False,
-        ibkr_dry_run=True,
-        live_intent=bool(live_state.live),
-        live_reason=str(live_state.reason),
+        execution=execution,
+        stop_state=stop_state,
+        operator_intent=operator_intent,
         shadow_state=shadow_state,
-        stop_enabled=bool(stop_state.stop),
-        stop_reason=str(stop_state.reason),
+        ibkr_status=ibkr_status,
+        chad_mode=chad_mode,
     )
 
 
 def evaluate_live_gate() -> LiveGateDecision:
     """
-    Evaluate whether IBKR LIVE execution is even theoretically allowed.
-
-    Returns:
-        LiveGateDecision with:
-            - allow_ibkr_live
-            - allow_ibkr_paper
-            - reasons
-            - context
+    Evaluate LiveGate with deterministic gate order.
+    Always writes a DecisionTrace record (best-effort).
     """
+    ctx = _build_default_context()
+
+    gates: List[GateResult] = []
     reasons: List[str] = []
 
-    # --- ExecutionConfig (adapter-level) ---
-    exec_cfg = get_execution_config()
-    exec_mode_str = str(getattr(exec_cfg, "mode", "unknown"))
-    ibkr_enabled = bool(getattr(exec_cfg, "ibkr_enabled", False))
-    ibkr_dry_run = bool(getattr(exec_cfg, "ibkr_dry_run", True))
-
-    # --- CHAD_MODE (global) ---
-    chad_mode = get_chad_mode()
-
-    # --- Operator live intent (live_mode.json) ---
-    live_state: LiveModeState = load_live_mode()
-    live_intent = bool(live_state.live)
-    live_reason = str(live_state.reason)
-
-    # --- STOP (authoritative DENY_ALL) ---
-    stop_state = load_stop_state()
-    stop_enabled = bool(stop_state.stop)
-    stop_reason = str(stop_state.reason)
-
-    # --- SCR (Shadow Confidence) ---
-    stats = load_and_compute(
-        max_trades=200,
-        days_back=30,
-        include_paper=True,
-        include_live=True,
-    )
-    shadow_state = evaluate_confidence(stats)
-
-    # Build context snapshot
-    ctx = LiveGateContext(
-        chad_mode=chad_mode,
-        exec_mode=exec_mode_str,
-        ibkr_enabled=ibkr_enabled,
-        ibkr_dry_run=ibkr_dry_run,
-        live_intent=live_intent,
-        live_reason=live_reason,
-        shadow_state=shadow_state,
-        stop_enabled=stop_enabled,
-        stop_reason=stop_reason,
+    # Gate 0: ExecutionConfig (adapter-level posture)
+    gates.append(
+        GateResult(
+            name="ExecutionConfig",
+            passed=True,
+            reason=f"exec_mode={ctx.execution.exec_mode} ibkr_enabled={ctx.execution.ibkr_enabled} ibkr_dry_run={ctx.execution.ibkr_dry_run}",
+            details={},
+        )
     )
 
-    # --- STOP enforcement (authoritative DENY_ALL) ---
-    if stop_enabled:
-        reasons.append(
-            f"STOP is ENABLED (DENY_ALL). reason={stop_reason!r}. "
-            "All trading actions are blocked (no live, no paper)."
-        )
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=False,
-            reasons=reasons,
-            context=ctx,
-        )
+    # Gate 1: STOP (authoritative DENY_ALL)
+    if ctx.stop_state.stop:
+        gates.append(GateResult(name="STOP", passed=False, reason="enabled", details={"reason": ctx.stop_state.reason}))
+        reasons.append(f"STOP is ENABLED (DENY_ALL). reason={ctx.stop_state.reason!r}.")
+        decision = LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, False)
+        _emit_decision_trace(ctx, gates, decision)
+        return decision
+    gates.append(GateResult(name="STOP", passed=True, reason="not_engaged", details={}))
 
-    # --- Base paper allowance ---
-    allow_ibkr_paper = ibkr_enabled
+    # Gate 2: IBKR status freshness + ok (fail closed)
+    if ctx.execution.ibkr_enabled:
+        passed = bool(ctx.ibkr_status.fresh_ok and ctx.ibkr_status.ok)
+        detail = {
+            "fresh_ok": ctx.ibkr_status.fresh_ok,
+            "ok": ctx.ibkr_status.ok,
+            "fresh_reason": ctx.ibkr_status.reason,
+            "age_seconds": ctx.ibkr_status.age_seconds,
+            "ttl_seconds": ctx.ibkr_status.ttl_seconds,
+            "error": ctx.ibkr_status.error,
+            "server_time_iso": ctx.ibkr_status.server_time_iso,
+        }
+        if not passed:
+            gates.append(GateResult(name="IBKR_STATUS", passed=False, reason="stale_or_not_ok", details=detail))
+            reasons.append("IBKR status is missing/stale or ok=false. Fail-closed for any IBKR execution path.")
+            decision = LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, False)
+            _emit_decision_trace(ctx, gates, decision)
+            return decision
+        gates.append(GateResult(name="IBKR_STATUS", passed=True, reason="fresh_ok_true_ok_true", details=detail))
+    else:
+        gates.append(GateResult(name="IBKR_STATUS", passed=True, reason="ibkr_disabled", details={}))
 
-    # --- Compute allow_ibkr_live with layered conditions ---
-    allow_ibkr_live = False
+    # Gate 3: Global CHAD_MODE (must be LIVE for live trading)
+    if ctx.chad_mode != "LIVE":
+        gates.append(GateResult(name="CHAD_MODE", passed=False, reason=f"mode={ctx.chad_mode}", details={}))
+        reasons.append("CHAD_MODE is not LIVE (or live_enabled=False). Global mode does not permit live trading.")
+    else:
+        gates.append(GateResult(name="CHAD_MODE", passed=True, reason="LIVE", details={}))
 
-    # 1) IBKR must be enabled at all.
-    if not ibkr_enabled:
-        reasons.append("IBKR disabled by ExecutionConfig (ibkr_enabled=False).")
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=allow_ibkr_paper,
-            reasons=reasons,
-            context=ctx,
-        )
+    # Gate 4: Operator intent
+    if ctx.operator_intent.mode == "DENY_ALL":
+        gates.append(GateResult(name="OperatorIntent", passed=False, reason="DENY_ALL", details={"reason": ctx.operator_intent.reason}))
+        reasons.append(f"OperatorIntent=DENY_ALL. reason={ctx.operator_intent.reason!r}.")
+        decision = LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, False)
+        _emit_decision_trace(ctx, gates, decision)
+        return decision
 
-    # 2) Adapter-level mode must not be hard-locked to DRY_RUN.
-    if ibkr_dry_run:
-        reasons.append(
-            "ExecutionConfig is hard-locked to DRY_RUN for IBKR "
-            "(ibkr_dry_run=True). LIVE execution is disabled at adapter level."
-        )
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=allow_ibkr_paper,
-            reasons=reasons,
-            context=ctx,
-        )
+    operator_exit_only = (ctx.operator_intent.mode == "EXIT_ONLY")
+    gates.append(GateResult(name="OperatorIntent", passed=True, reason=ctx.operator_intent.mode, details={"reason": ctx.operator_intent.reason}))
+    if operator_exit_only:
+        reasons.append(f"OperatorIntent=EXIT_ONLY. reason={ctx.operator_intent.reason!r}. No new entries; exits-only permitted.")
 
-    # 3) Global CHAD_MODE must be LIVE.
-    if chad_mode != CHADMode.LIVE:
-        reasons.append(
-            f"CHAD_MODE={chad_mode.value} – LIVE execution requires CHAD_MODE=LIVE."
+    # Gate 5: SCR paper_only
+    if ctx.shadow_state.paper_only:
+        gates.append(
+            GateResult(
+                name="SCR",
+                passed=False,
+                reason=f"paper_only=True state={ctx.shadow_state.state}",
+                details={"sizing_factor": ctx.shadow_state.sizing_factor, "reasons": ctx.shadow_state.reasons[:10]},
+            )
         )
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=allow_ibkr_paper,
-            reasons=reasons,
-            context=ctx,
-        )
+        reasons.append("ShadowState.paper_only is True. SCR currently requires paper-only operation; live trading is blocked.")
+        decision = LiveGateDecision(ctx, "EXIT_ONLY", reasons, True, False, False)
+        _emit_decision_trace(ctx, gates, decision)
+        return decision
 
-    # 4) Operator live intent must be True.
-    if not live_intent:
-        reasons.append(
-            f"Operator live intent is False (live_mode.live=False, "
-            f"reason={live_reason!r}). LIVE execution requires "
-            "operator approval via live_mode.json."
+    gates.append(
+        GateResult(
+            name="SCR",
+            passed=True,
+            reason=f"paper_only=False state={ctx.shadow_state.state}",
+            details={"sizing_factor": ctx.shadow_state.sizing_factor},
         )
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=allow_ibkr_paper,
-            reasons=reasons,
-            context=ctx,
-        )
-
-    # 5) SCR must not be in paper-only mode, and must be in CONFIDENT/CAUTIOUS band.
-    if shadow_state.paper_only:
-        reasons.append(
-            f"SCR is paper_only=True in state={shadow_state.state}. "
-            "LIVE execution blocked until SCR lifts paper-only mode."
-        )
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=allow_ibkr_paper,
-            reasons=reasons,
-            context=ctx,
-        )
-
-    allowed_states: Set[str] = {"CONFIDENT", "CAUTIOUS"}
-    if shadow_state.state not in allowed_states:
-        reasons.append(
-            f"SCR state={shadow_state.state} not in allowed LIVE band {allowed_states}."
-        )
-        return LiveGateDecision(
-            allow_ibkr_live=False,
-            allow_ibkr_paper=allow_ibkr_paper,
-            reasons=reasons,
-            context=ctx,
-        )
-
-    allow_ibkr_live = True
-    reasons.append(
-        "All live gates passed: IBKR enabled, IBKR not hard-locked to DRY_RUN, "
-        "CHAD_MODE=LIVE, operator live intent=True, SCR in allowed band and "
-        "not paper-only."
     )
 
-    return LiveGateDecision(
-        allow_ibkr_live=allow_ibkr_live,
-        allow_ibkr_paper=allow_ibkr_paper,
-        reasons=reasons,
-        context=ctx,
-    )
+    # Final allow decisions
+    allow_ibkr_live = bool(ctx.execution.ibkr_enabled and (not ctx.execution.ibkr_dry_run) and ctx.chad_mode == "LIVE" and (not operator_exit_only))
+    allow_ibkr_paper = bool(ctx.execution.ibkr_enabled and (not allow_ibkr_live) and (not operator_exit_only) and _env_bool("CHAD_ALLOW_IBKR_PAPER", False))
+
+    if allow_ibkr_live:
+        mode = "ALLOW_LIVE"
+        reasons.append("All gates satisfied for live trading (subject to per-order checks).")
+    elif operator_exit_only:
+        mode = "EXIT_ONLY"
+        reasons.append("Operator intent is EXIT_ONLY; entries blocked.")
+    else:
+        mode = "DENY_ALL"
+        if ctx.execution.ibkr_dry_run:
+            reasons.append("ExecutionConfig is hard-locked to DRY_RUN for IBKR (ibkr_dry_run=True). LIVE execution is disabled at adapter level.")
+
+    decision = LiveGateDecision(ctx, mode, reasons, (mode == "EXIT_ONLY"), allow_ibkr_live, allow_ibkr_paper)
+    _emit_decision_trace(ctx, gates, decision)
+    return decision
+
+
+def _emit_decision_trace(ctx: LiveGateContext, gates: List[GateResult], decision: LiveGateDecision) -> None:
+    """
+    Emit one DecisionTrace record. Never throws.
+    """
+    try:
+        tid = new_trace_id()
+        cid = new_cycle_id()
+
+        inputs: Dict[str, Any] = {
+            "operator_intent_ref": "runtime/operator_intent.json",
+            "stop_state_ref": "runtime/stop_state.json",
+            "shadow_state_ref": "runtime/shadow_state.json",
+            "ibkr_status_ref": "runtime/ibkr_status.json",
+            "execution": {
+                "exec_mode": ctx.execution.exec_mode,
+                "ibkr_enabled": ctx.execution.ibkr_enabled,
+                "ibkr_dry_run": ctx.execution.ibkr_dry_run,
+                "kraken_enabled": ctx.execution.kraken_enabled,
+                "chad_mode": ctx.chad_mode,
+            },
+        }
+
+        lg = LiveGateDecisionTrace(
+            mode=decision.mode if decision.mode in ("DENY_ALL", "EXIT_ONLY", "ALLOW_LIVE") else "DENY_ALL",
+            reasons=list(decision.reasons)[:50],
+            allow_exits_only=bool(decision.allow_exits_only),
+            allow_ibkr_live=bool(decision.allow_ibkr_live),
+            allow_ibkr_paper=bool(decision.allow_ibkr_paper),
+        )
+
+        rec = build_decision_trace_record(
+            trace_id=tid,
+            cycle_id=cid,
+            inputs=inputs,
+            gates=list(gates),
+            livegate=lg,
+            signal_intents=[],
+            execution_plans=[],
+            artifacts={"decision_trace_dir": "data/traces/"},
+        )
+
+        default_writer().append(rec)
+    except Exception:
+        return

@@ -52,6 +52,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA_TRADES = ROOT / "data" / "trades"
 RUNTIME_DIR = ROOT / "runtime"
 STATE_PATH = RUNTIME_DIR / "kraken_pnl_state.json"
+KRAKEN_PNL_STATE_TTL_SECONDS = 300  # 5 minutes
+
 ENRICH_LEDGER = DATA_TRADES / "trade_history_enriched.ndjson"
 
 
@@ -76,6 +78,8 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 def _load_state() -> Dict[str, Any]:
     if not STATE_PATH.is_file():
         return {
+            "ts_utc": _utc_now_iso().replace("+00:00", "Z"),
+            "ttl_seconds": int(KRAKEN_PNL_STATE_TTL_SECONDS),
             "generated_at_utc": _utc_now_iso(),
             "inventory": {},  # symbol -> list of lots [{qty, price}]
             "enriched_txids": {},  # txid -> enriched_record_hash
@@ -84,6 +88,9 @@ def _load_state() -> Dict[str, Any]:
 
 
 def _save_state(state: Dict[str, Any]) -> None:
+    # TTL stamp required for audit freshness
+    state["ts_utc"] = _utc_now_iso().replace("+00:00", "Z")
+    state["ttl_seconds"] = int(KRAKEN_PNL_STATE_TTL_SECONDS)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")

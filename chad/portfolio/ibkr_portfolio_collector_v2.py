@@ -4,140 +4,85 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# Runtime file freshness for portfolio snapshot (short on purpose)
+PORTFOLIO_SNAPSHOT_TTL_SECONDS = 300  # 5 minutes
 
-# ---------------------------------------------------------------------------
-# Config dataclass
-# ---------------------------------------------------------------------------
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 @dataclass(frozen=True)
 class IBKRConnectionConfig:
     """
-    Connection configuration for IBKR Gateway / TWS via ib_insync.
-
-    Environment variables:
-
-      * IBKR_HOST              (default: 127.0.0.1)
-      * IBKR_PORT              (default: 4002 – typical paper gateway)
-      * IBKR_CLIENT_ID         (required)
-      * IBKR_ACCOUNT_ID        (optional, filter specific account; else sum)
+    IBKR connection settings for paper gateway by default.
+    Reads from environment variables used across this repo.
     """
-
     host: str
     port: int
     client_id: int
-    account_id: Optional[str]
+    account_id: str
 
-    @classmethod
-    def from_env(cls) -> IBKRConnectionConfig:
+    @staticmethod
+    def from_env() -> "IBKRConnectionConfig":
         host = os.getenv("IBKR_HOST", "127.0.0.1")
-        port_str = os.getenv("IBKR_PORT", "4002")
-        client_id_str = os.getenv("IBKR_CLIENT_ID")
-        account_id = os.getenv("IBKR_ACCOUNT_ID")
-
-        missing: list[str] = []
-        if not client_id_str:
-            missing.append("IBKR_CLIENT_ID")
-
-        if missing:
-            raise RuntimeError(
-                f"Missing required IBKR env vars: {', '.join(missing)}"
-            )
-
-        try:
-            port = int(port_str)
-        except ValueError as exc:
-            raise ValueError(f"Invalid IBKR_PORT value: {port_str!r}") from exc
-
-        try:
-            client_id = int(client_id_str)
-        except ValueError as exc:
-            raise ValueError(f"Invalid IBKR_CLIENT_ID value: {client_id_str!r}") from exc
-
-        return cls(
-            host=host,
-            port=port,
-            client_id=client_id,
-            account_id=account_id,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Portfolio collector
-# ---------------------------------------------------------------------------
+        port = int(os.getenv("IBKR_PORT", "4002"))
+        client_id = int(os.getenv("IBKR_CLIENT_ID", "99"))
+        account_id = os.getenv("IBKR_ACCOUNT_ID", "").strip()
+        return IBKRConnectionConfig(host=host, port=port, client_id=client_id, account_id=account_id)
 
 
 class IBKRPortfolioCollector:
     """
-    Reads NetLiquidation from IBKR via ib_insync and writes it into
-    runtime/portfolio_snapshot.json as ibkr_equity, preserving coinbase_equity and kraken_equity.
+    Collector that reads NetLiquidation via ib_insync and writes runtime/portfolio_snapshot.json.
 
-    This collector is read-only: it does NOT place orders or move funds.
+    Contract:
+      - Never writes secrets
+      - Atomic + fsync
+      - Adds ts_utc + ttl_seconds for audit freshness
+      - Preserves other venue equities already present in the snapshot
     """
 
-    def __init__(self, config: IBKRConnectionConfig) -> None:
-        self._cfg = config
-
-    def _connect_ib(self):
-        try:
-            from ib_insync import IB  # type: ignore[import]
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "ib_insync is not installed. Install it with 'pip install ib-insync' "
-                "inside the CHAD venv."
-            ) from exc
-
-        ib = IB()
-        ib.connect(
-            host=self._cfg.host,
-            port=self._cfg.port,
-            clientId=self._cfg.client_id,
-            timeout=10.0,
-        )
-        return ib
+    def __init__(self, cfg: IBKRConnectionConfig) -> None:
+        self._cfg = cfg
 
     def get_net_liquidation(self) -> float:
         """
-        Fetch NetLiquidation in account currency for the configured account.
-
-        If IBKR_ACCOUNT_ID is set, use that account. Otherwise, sum across all.
+        Returns NetLiquidation (USD) for the configured account, or sum across accounts if not set.
         """
-        from ib_insync import IB  # type: ignore[import]  # noqa: F401
+        from ib_insync import IB  # type: ignore[import]
 
-        ib = self._connect_ib()
+        ib = IB()
         try:
-            summary = ib.accountSummary()
+            ib.connect(self._cfg.host, self._cfg.port, clientId=self._cfg.client_id, readonly=True, timeout=6.0)
 
-            if not summary:
-                # Give IBKR a moment to populate summary
-                ib.sleep(2.0)
-                summary = ib.accountSummary()
-
-            if not summary:
-                raise RuntimeError("No account summary data returned from IBKR")
-
+            # accountSummary returns a list of AccountValue(tag, value, currency, account)
+            rows = ib.accountSummary()
             values_by_account: Dict[str, float] = {}
-
-            for item in summary:
-                # item has attributes: tag, account, value, currency, etc.
-                tag = str(getattr(item, "tag", ""))
-                currency = str(getattr(item, "currency", ""))
-                value_str = str(getattr(item, "value", ""))
-                account = str(getattr(item, "account", ""))
-
-                if tag != "NetLiquidation":
-                    continue
-
-                # We accept any currency here; CHAD treats this as "base equity"
+            for r in rows:
                 try:
-                    val = float(value_str)
-                except ValueError:
+                    if str(getattr(r, "tag", "")) != "NetLiquidation":
+                        continue
+                    acct = str(getattr(r, "account", "")).strip()
+                    val = float(getattr(r, "value", "0") or 0.0)
+                    values_by_account[acct] = val
+                except Exception:
                     continue
-
-                values_by_account[account] = val
 
             if not values_by_account:
                 raise RuntimeError("No NetLiquidation values found in account summary")
@@ -145,14 +90,12 @@ class IBKRPortfolioCollector:
             if self._cfg.account_id:
                 acct = self._cfg.account_id
                 if acct not in values_by_account:
-                    raise RuntimeError(
-                        f"IBKR_ACCOUNT_ID={acct!r} not found in NetLiquidation summary"
-                    )
+                    raise RuntimeError(f"IBKR_ACCOUNT_ID={acct!r} not found in NetLiquidation summary")
                 total = values_by_account[acct]
             else:
                 total = sum(values_by_account.values())
 
-            return total
+            return float(total)
         finally:
             try:
                 ib.disconnect()
@@ -171,8 +114,8 @@ class IBKRPortfolioCollector:
     def update_snapshot(self, snapshot_path: Optional[Path] = None) -> Path:
         """
         Read existing portfolio_snapshot.json (if any), overwrite ibkr_equity
-        with the current NetLiquidation, preserve coinbase_equity, and
-        write the updated snapshot back atomically.
+        with current NetLiquidation, preserve coinbase_equity and kraken_equity,
+        write updated snapshot back atomically, TTL-stamped.
         """
         path = snapshot_path or self._default_snapshot_path()
 
@@ -186,32 +129,25 @@ class IBKRPortfolioCollector:
 
         ibkr_equity = self.get_net_liquidation()
 
-        coinbase_raw = data.get("coinbase_equity", 0.0)
-        try:
-            coinbase_equity = float(coinbase_raw)
-        except (TypeError, ValueError):
-            coinbase_equity = 0.0
+        # Preserve other venues if present
+        def _to_float(x: Any) -> float:
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
 
-        kraken_raw = data.get("kraken_equity", 0.0)
-        try:
-            kraken_equity = float(kraken_raw)
-        except (TypeError, ValueError):
-            kraken_equity = 0.0
+        coinbase_equity = _to_float(data.get("coinbase_equity", 0.0))
+        kraken_equity = _to_float(data.get("kraken_equity", 0.0))
 
         new_payload: Dict[str, Any] = {
+            "ts_utc": _utc_now_iso(),
+            "ttl_seconds": int(PORTFOLIO_SNAPSHOT_TTL_SECONDS),
             "ibkr_equity": float(ibkr_equity),
-            "coinbase_equity": coinbase_equity,
-            "kraken_equity": kraken_equity,
+            "coinbase_equity": float(coinbase_equity),
+            "kraken_equity": float(kraken_equity),
         }
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(
-            json.dumps(new_payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-
+        _atomic_write_json(path, new_payload)
         return path
 
 
@@ -219,16 +155,15 @@ class IBKRPortfolioCollector:
 # CLI
 # ---------------------------------------------------------------------------
 
-
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "IBKR Portfolio Collector v2\n"
-            "Reads NetLiquidation via ib_insync and updates "
-            "runtime/portfolio_snapshot.json with ibkr_equity, preserving "
-            "coinbase_equity."
+            "Reads NetLiquidation via ib_insync and updates runtime/portfolio_snapshot.json "
+            "with ibkr_equity, preserving coinbase_equity and kraken_equity."
         )
     )
+
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser(
@@ -249,40 +184,32 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
-    try:
-        cfg = IBKRConnectionConfig.from_env()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[IBKR PORTFOLIO] Config error: {exc}")
-        return 1
+    if args.command not in ("print", "collect"):
+        parser.print_help()
+        return 2
 
+    cfg = IBKRConnectionConfig.from_env()
     collector = IBKRPortfolioCollector(cfg)
 
     if args.command == "print":
         try:
-            netliq = collector.get_net_liquidation()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[IBKR PORTFOLIO] ERROR fetching NetLiquidation: {exc}")
+            val = collector.get_net_liquidation()
+        except Exception as exc:
+            print(f"[IBKR PORTFOLIO] Error: {exc}")
             return 1
-        print(f"[IBKR PORTFOLIO] NetLiquidation: {netliq:.2f}")
+        print(val)
         return 0
 
-    if args.command == "collect":
-        snapshot_path: Optional[Path] = None
-        if args.snapshot_path:
-            snapshot_path = Path(args.snapshot_path).expanduser().resolve()
-
-        try:
-            out_path = collector.update_snapshot(snapshot_path=snapshot_path)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[IBKR PORTFOLIO] ERROR updating snapshot: {exc}")
-            return 1
-
-        print(f"[IBKR PORTFOLIO] Updated snapshot at {out_path}")
+    # collect
+    try:
+        snapshot_path = Path(args.snapshot_path).expanduser().resolve() if args.snapshot_path else None
+        out_path = collector.update_snapshot(snapshot_path=snapshot_path)
+        print(f"[IBKR PORTFOLIO] Updated snapshot: {out_path}")
         return 0
+    except Exception as exc:
+        print(f"[IBKR PORTFOLIO] Error: {exc}")
+        return 1
 
-    parser.print_help()
-    return 0
 
-
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
