@@ -19,3 +19,5 @@ status_server.log
 # CHAD local backup artifacts
 *.bak.*
 runtime/*.bak.*
+untracked_quarantine_*/
+wip_quarantine_*/
