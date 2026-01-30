@@ -490,6 +490,101 @@ def perf_snapshot() -> Dict[str, Any]:
         "posture_summary": " | ".join(posture),
         "why_blocked_summary": why,
     }
+@router.get("/what_if_caps", tags=["whatif"])
+def what_if_caps(
+    equity: float,
+    daily_risk_fraction: float = 0.05,
+) -> Dict[str, Any]:
+    """
+    What-if caps calculator (read-only).
+
+    Given a hypothetical equity and daily_risk_fraction:
+      portfolio_risk_cap = equity * daily_risk_fraction
+
+    Then allocate per-strategy caps using the CURRENT fractions derived from
+    runtime/dynamic_caps.json (so this matches your live allocator behavior).
+
+    No broker calls. No file writes. Pure computation.
+    """
+    # Load current fractions from live runtime caps (fail-soft).
+    caps_path = REPO_DIR / "runtime" / "dynamic_caps.json"
+    caps, caps_err = _safe_json_load(caps_path)
+
+    fractions: Dict[str, float] = {}
+    if caps_err is None and isinstance(caps, dict):
+        prc = float(caps.get("portfolio_risk_cap") or 0.0)
+        sc = caps.get("strategy_caps") or {}
+        if isinstance(sc, dict) and prc > 0:
+            for k, v in sc.items():
+                try:
+                    cap = float(v or 0.0)
+                except Exception:
+                    cap = 0.0
+                frac = cap / prc
+                if frac > 0:
+                    fractions[str(k)] = float(frac)
+
+    # If fractions missing, fail-closed with empty result
+    if not fractions:
+        return {
+            "ts_utc": utc_now_iso(),
+            "schema_version": "what_if_caps.v1",
+            "ok": False,
+            "error": f"missing_strategy_fractions:{caps_err or 'unknown'}",
+            "inputs": {"equity": equity, "daily_risk_fraction": daily_risk_fraction},
+            "portfolio_risk_cap": 0.0,
+            "strategy_caps": [],
+        }
+
+    # Validate inputs
+    if equity <= 0:
+        return {
+            "ts_utc": utc_now_iso(),
+            "schema_version": "what_if_caps.v1",
+            "ok": False,
+            "error": "invalid_equity",
+            "inputs": {"equity": equity, "daily_risk_fraction": daily_risk_fraction},
+            "portfolio_risk_cap": 0.0,
+            "strategy_caps": [],
+        }
+    if daily_risk_fraction <= 0 or daily_risk_fraction > 1.0:
+        return {
+            "ts_utc": utc_now_iso(),
+            "schema_version": "what_if_caps.v1",
+            "ok": False,
+            "error": "invalid_daily_risk_fraction",
+            "inputs": {"equity": equity, "daily_risk_fraction": daily_risk_fraction},
+            "portfolio_risk_cap": 0.0,
+            "strategy_caps": [],
+        }
+
+    portfolio_risk_cap = float(equity) * float(daily_risk_fraction)
+
+    rows: List[Dict[str, Any]] = []
+    for strat in sorted(fractions.keys()):
+        frac = float(fractions[strat])
+        cap = portfolio_risk_cap * frac
+        rows.append(
+            {
+                "strategy": strat,
+                "fraction": round(frac, 6),
+                "cap_usd": cap,
+            }
+        )
+
+    return {
+        "ts_utc": utc_now_iso(),
+        "schema_version": "what_if_caps.v1",
+        "ok": True,
+        "inputs": {"equity": equity, "daily_risk_fraction": daily_risk_fraction},
+        "portfolio_risk_cap": portfolio_risk_cap,
+        "strategy_caps": rows,
+        "source_fractions": {
+            "ok": True,
+            "from": str(caps_path),
+            "count": len(fractions),
+        },
+    }
 
 @router.get("/why_blocked", response_model=WhyBlockedResponse)
 def why_blocked() -> WhyBlockedResponse:
