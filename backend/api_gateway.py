@@ -678,6 +678,89 @@ async def health() -> HealthResponse:
     )
 
 
+
+# ##CHAD_STATUS_ENDPOINT_V1##
+# ---------------------------------------------------------------------------
+# Operator status (SSOT audit snapshot)
+# ---------------------------------------------------------------------------
+
+def _runtime_file_meta(path: Path) -> Dict[str, Any]:
+    """
+    Lightweight runtime file metadata + embedded ts_utc/ttl_seconds if present.
+    Never raises; fails closed with exists=False.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return {"path": str(path), "exists": False}
+    except Exception as exc:
+        return {"path": str(path), "exists": False, "error": f"stat_error:{type(exc).__name__}"}  # type: ignore[dict-item]
+
+    meta: Dict[str, Any] = {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": int(st.st_size),
+        "mtime_epoch": float(st.st_mtime),
+    }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            if "ts_utc" in data:
+                meta["ts_utc"] = data.get("ts_utc")
+            if "ttl_seconds" in data:
+                meta["ttl_seconds"] = data.get("ttl_seconds")
+    except Exception:
+        meta["json_parse"] = "failed"
+    return meta
+
+
+@app.get("/status", tags=["system"])
+async def status() -> Dict[str, Any]:
+    """
+    Read-only operator status snapshot (audit-focused).
+    No broker calls. No mutations.
+    """
+    exec_snapshot = _build_execution_snapshot()
+    mode_snapshot = _build_mode_snapshot()
+    shadow_snapshot = _build_shadow_snapshot()
+    lg = _evaluate_live_gate()
+
+    runtime_paths = {
+        "feed_state": Path("runtime/feed_state.json"),
+        "positions_snapshot": Path("runtime/positions_snapshot.json"),
+        "reconciliation_state": RECONCILIATION_STATE_PATH,
+        "dynamic_caps": Path("runtime/dynamic_caps.json"),
+        "operator_intent": Path("runtime/operator_intent.json"),
+        "portfolio_snapshot": Path("runtime/portfolio_snapshot.json"),
+        "scr_state": Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json"),
+        "tier_state": Path("/home/ubuntu/CHAD FINALE/runtime/tier_state.json"),
+    }
+
+    files = {k: _runtime_file_meta(v) for k, v in runtime_paths.items()}
+
+    return {
+        "service": "CHAD API Gateway",
+        "ts_utc": _utc_now_iso(),
+        "execution": exec_snapshot.dict(),
+        "mode": mode_snapshot.dict(),
+        "live_gate": {
+            "operator_mode": lg.operator_mode,
+            "operator_reason": lg.operator_reason,
+            "allow_exits_only": lg.allow_exits_only,
+            "allow_ibkr_paper": lg.allow_ibkr_paper,
+            "allow_ibkr_live": lg.allow_ibkr_live,
+            "reasons": list(lg.reasons),
+        },
+        "shadow": {
+            "state": shadow_snapshot.state,
+            "paper_only": shadow_snapshot.paper_only,
+            "sizing_factor": shadow_snapshot.sizing_factor,
+            "reasons": list(shadow_snapshot.reasons),
+        },
+        "runtime_files": files,
+    }
+
+
 @app.get("/live-gate", response_model=LiveGateSnapshot, tags=["risk"])
 async def live_gate() -> LiveGateSnapshot:
     """
