@@ -291,6 +291,90 @@ def status() -> StatusResponse:
         runtime_files=files_meta,
     )
 
+@router.get("/risk_explain", tags=["risk"])
+def risk_explain() -> Dict[str, Any]:
+    """
+    Human-readable risk + capital explanation (read-only).
+
+    Sources (files only; no broker calls):
+      - repo runtime/dynamic_caps.json (or /status runtime mapping)
+      - SSOT runtime/scr_state.json
+
+    Output is stable and bounded for dashboards/Telegram.
+    """
+    caps_path = (REPO_DIR / "runtime" / "dynamic_caps.json")
+    scr_path = Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json")
+
+    caps, caps_err = _safe_json_load(caps_path)
+    scr, scr_err = _safe_json_load(scr_path)
+
+    total_equity = float((caps or {}).get("total_equity") or 0.0)
+    daily_risk_fraction = float((caps or {}).get("daily_risk_fraction") or 0.0)
+    portfolio_risk_cap = float((caps or {}).get("portfolio_risk_cap") or 0.0)
+
+    strategy_caps_raw = (caps or {}).get("strategy_caps") or {}
+    if not isinstance(strategy_caps_raw, dict):
+        strategy_caps_raw = {}
+
+    rows: List[Dict[str, Any]] = []
+    denom = portfolio_risk_cap if portfolio_risk_cap > 0 else 0.0
+    for name in sorted(strategy_caps_raw.keys()):
+        try:
+            cap = float(strategy_caps_raw.get(name) or 0.0)
+        except Exception:
+            cap = 0.0
+        pct = round((cap / denom) * 100.0, 4) if denom > 0 else None
+        rows.append(
+            {
+                "strategy": str(name),
+                "cap_usd": cap,
+                "cap_pct_of_portfolio_risk_cap": pct,
+            }
+        )
+
+    # Posture summary (operator-friendly)
+    posture: List[str] = []
+    if caps_err is None:
+        posture.append(f"total_equity=${total_equity:,.2f}")
+        posture.append(f"daily_risk_fraction={daily_risk_fraction:.4f}")
+        posture.append(f"portfolio_risk_cap≈${portfolio_risk_cap:,.2f}")
+    else:
+        posture.append(f"dynamic_caps=ERROR({caps_err})")
+
+    if scr_err is None and isinstance(scr, dict):
+        posture.append(f"SCR.state={scr.get('state')}")
+        posture.append(f"SCR.paper_only={bool(scr.get('paper_only'))}")
+        posture.append(f"SCR.sizing_factor={float(scr.get('sizing_factor') or 0.0):.4f}")
+    else:
+        posture.append(f"SCR=ERROR({scr_err})")
+
+    # Why blocked summary (bounded)
+    why: List[str] = []
+    if scr_err is None and isinstance(scr, dict):
+        if bool(scr.get("paper_only")):
+            why.append("SCR requires paper-only (paper_only=true).")
+        if str(scr.get("state") or "").upper() == "PAUSED":
+            why.append("SCR state is PAUSED (live should be halted).")
+        rs = scr.get("reasons")
+        if isinstance(rs, list) and rs:
+            why.extend([str(x) for x in rs[:6]])
+    else:
+        why.append("SCR missing → fail-closed posture assumed.")
+
+    return {
+        "ts_utc": utc_now_iso(),
+        "schema_version": "risk_explain.v1",
+        "dynamic_caps": {
+            "ok": caps_err is None,
+            "error": caps_err,
+            "total_equity": total_equity,
+            "daily_risk_fraction": daily_risk_fraction,
+            "portfolio_risk_cap": portfolio_risk_cap,
+        },
+        "strategy_caps": rows,
+        "posture_summary": " | ".join(posture),
+        "why_blocked_summary": why,
+    }
 
 @router.get("/why_blocked", response_model=WhyBlockedResponse)
 def why_blocked() -> WhyBlockedResponse:
