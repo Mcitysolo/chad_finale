@@ -30,3 +30,4 @@ def test_operator_surface_endpoints_shape() -> None:
     assert "summary" in w
     assert "operator_intent" in w
     assert "shadow" in w
+    assert "live_gate" in w
