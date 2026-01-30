@@ -331,6 +331,121 @@ def risk_explain() -> Dict[str, Any]:
                 "cap_pct_of_portfolio_risk_cap": pct,
             }
         )
+@router.get("/perf_snapshot", tags=["perf"])
+def perf_snapshot() -> Dict[str, Any]:
+    """
+    Performance + behavior snapshot (read-only).
+
+    Sources (files only; no broker calls):
+      - SSOT runtime/scr_state.json (performance stats + reasons)
+      - repo runtime/portfolio_snapshot.json (equity breakdown)
+      - optional repo runtime/decision_trace_heartbeat.json (last heartbeat proof)
+
+    Output is stable + bounded for dashboards/Telegram.
+    """
+    scr_path = Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json")
+    portfolio_path = REPO_DIR / "runtime" / "portfolio_snapshot.json"
+    heartbeat_path = REPO_DIR / "runtime" / "decision_trace_heartbeat.json"
+
+    scr, scr_err = _safe_json_load(scr_path)
+    port, port_err = _safe_json_load(portfolio_path)
+    hb, hb_err = _safe_json_load(heartbeat_path)
+
+    # Pull SCR stats safely
+    stats: Dict[str, Any] = {}
+    reasons: List[str] = []
+    state = None
+    paper_only = None
+    sizing_factor = None
+
+    if scr_err is None and isinstance(scr, dict):
+        state = scr.get("state")
+        paper_only = scr.get("paper_only")
+        sizing_factor = scr.get("sizing_factor")
+        st = scr.get("stats")
+        if isinstance(st, dict):
+            stats = st
+        rs = scr.get("reasons")
+        if isinstance(rs, list):
+            reasons = [str(x) for x in rs[:10]]
+
+    # Pull portfolio snapshot safely
+    portfolio_summary: Dict[str, Any] = {}
+    if port_err is None and isinstance(port, dict):
+        # Keep only key fields if present
+        for k in ("ibkr_equity", "kraken_equity", "coinbase_equity", "total_equity", "ts_utc", "ttl_seconds"):
+            if k in port:
+                portfolio_summary[k] = port.get(k)
+
+    # Heartbeat (optional)
+    heartbeat_summary: Dict[str, Any] = {"ok": hb_err is None}
+    if hb_err is None and isinstance(hb, dict):
+        # keep a small subset
+        for k in ("ts_utc", "trace_id", "live_gate", "notes"):
+            if k in hb:
+                heartbeat_summary[k] = hb.get(k)
+    else:
+        heartbeat_summary["error"] = hb_err
+
+    # High-level operator narrative (short + factual)
+    narrative: List[str] = []
+    if state is not None:
+        narrative.append(f"SCR.state={state}")
+    if paper_only is not None:
+        narrative.append(f"SCR.paper_only={bool(paper_only)}")
+    if sizing_factor is not None:
+        try:
+            narrative.append(f"SCR.sizing_factor={float(sizing_factor):.4f}")
+        except Exception:
+            narrative.append("SCR.sizing_factor=UNKNOWN")
+
+    # Key stats if present
+    def _num(name: str) -> Optional[float]:
+        v = stats.get(name)
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    win_rate = _num("win_rate")
+    sharpe_like = _num("sharpe_like")
+    max_dd = _num("max_drawdown")
+    total_pnl = _num("total_pnl")
+    total_trades = stats.get("total_trades")
+
+    if win_rate is not None:
+        narrative.append(f"win_rate={win_rate:.3f}")
+    if sharpe_like is not None:
+        narrative.append(f"sharpe_like={sharpe_like:.3f}")
+    if max_dd is not None:
+        narrative.append(f"max_drawdown={max_dd:.2f}")
+    if total_pnl is not None:
+        narrative.append(f"total_pnl={total_pnl:.2f}")
+    if isinstance(total_trades, (int, float)):
+        narrative.append(f"total_trades={int(total_trades)}")
+
+    return {
+        "ts_utc": utc_now_iso(),
+        "schema_version": "perf_snapshot.v1",
+        "scr": {
+            "ok": scr_err is None,
+            "error": scr_err,
+            "state": state,
+            "paper_only": paper_only,
+            "sizing_factor": sizing_factor,
+            "stats": stats,
+            "reasons": reasons,
+        },
+        "portfolio_snapshot": {
+            "ok": port_err is None,
+            "error": port_err,
+            "summary": portfolio_summary,
+        },
+        "decision_trace_heartbeat": heartbeat_summary,
+        "operator_narrative": " | ".join(narrative),
+    }
 
     # Posture summary (operator-friendly)
     posture: List[str] = []
