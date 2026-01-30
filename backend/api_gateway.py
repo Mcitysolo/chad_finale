@@ -632,6 +632,9 @@ app = FastAPI(
     ),
 )
 
+from backend.operator_surface_v2 import build_operator_router
+app.include_router(build_operator_router())
+
 
 @app.on_event("startup")
 async def _on_startup() -> None:
