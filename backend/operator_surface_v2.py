@@ -573,5 +573,131 @@ def build_operator_router(cfg: Optional[OperatorConfig] = None) -> APIRouter:
     @router.get("/op/brief")
     def op_brief() -> Dict[str, Any]:
         return svc.brief()
+    @router.get("/op/readiness")
+    def op_readiness() -> Dict[str, Any]:
+        """
+        Operator Readiness Gate (Phase 10 Part 6)
+
+        Read-only, fail-closed checklist that answers:
+          - Are we safe to proceed to next phases?
+          - What EXACT blockers remain?
+
+        This endpoint never enables live trading. It only reports readiness.
+        """
+        paths = svc.runtime_paths()
+
+        # Runtime artifacts
+        feed = read_json_dict(paths["feed_state"])
+        rec = read_json_dict(paths["reconciliation_state"])
+        scr = read_json_dict(paths["scr_state"])
+        tier = read_json_dict(paths["tier_state"])
+        caps = read_json_dict(paths["dynamic_caps"])
+        intent = read_json_dict(paths["operator_intent"])
+
+        # systemd health
+        failed = anyio.run(svc.failed_units)  # cached + bounded
+        timers: Dict[str, Any] = {}
+        for t in cfg.timers:
+            timers[t] = {
+                "enabled": anyio.run(svc.systemd_is_enabled, t),
+                "active": anyio.run(svc.systemd_is_active, t),
+            }
+
+        blockers: List[str] = []
+        warnings: List[str] = []
+
+        # 1) Failed units must be empty
+        if not bool(failed.get("ok", False)):
+            blockers.append("systemd_failed_units_check_error")
+        else:
+            fu = failed.get("failed_units") or []
+            if fu:
+                blockers.append(f"failed_units_present:{len(fu)}")
+
+        # 2) Timers must be enabled+active (SCR/Tier are core operator correctness)
+        for t, st in timers.items():
+            en = (st.get("enabled") or {}).get("state")
+            ac = (st.get("active") or {}).get("state")
+            if en != "enabled":
+                blockers.append(f"timer_not_enabled:{t}")
+            if ac != "active":
+                blockers.append(f"timer_not_active:{t}")
+
+        # 3) SCR must exist and not be stale logically
+        if not scr.ok:
+            blockers.append(f"scr_state_missing:{scr.error}")
+        else:
+            state = str(scr.data.get("state") or "")
+            if not state:
+                blockers.append("scr_state_missing_state")
+
+        # 4) Tier must exist (SSOT visibility)
+        if not tier.ok:
+            warnings.append(f"tier_state_missing:{tier.error}")
+
+        # 5) Caps must exist (risk math visibility)
+        if not caps.ok:
+            warnings.append(f"dynamic_caps_missing:{caps.error}")
+        else:
+            prc = _safe_float(caps.data.get("portfolio_risk_cap"))
+            if prc <= 0:
+                warnings.append("portfolio_risk_cap_nonpositive")
+
+        # 6) Feed state must exist and be parseable
+        if not feed.ok:
+            warnings.append(f"feed_state_missing:{feed.error}")
+        else:
+            if not feed.data.get("ts_utc"):
+                warnings.append("feed_state_missing_ts_utc")
+
+        # 7) Reconciliation should be GREEN (warn if missing; block if explicitly RED)
+        if not rec.ok:
+            warnings.append(f"reconciliation_state_missing:{rec.error}")
+        else:
+            status = str(rec.data.get("status") or "").upper()
+            if status == "RED":
+                blockers.append("reconciliation_red")
+            elif status not in ("GREEN", "UNKNOWN", "ERROR"):
+                warnings.append(f"reconciliation_unexpected:{status}")
+
+        # 8) Operator intent existence (warn only; live is still gated elsewhere)
+        if not intent.ok:
+            warnings.append(f"operator_intent_missing:{intent.error}")
+
+        ok = (len(blockers) == 0)
+
+        next_actions: List[str] = []
+        if not ok:
+            # deterministic ordering
+            for b in blockers:
+                if b.startswith("failed_units_present"):
+                    next_actions.append("Run: systemctl --failed --no-pager")
+                if b.startswith("timer_not_"):
+                    next_actions.append("Run: systemctl status chad-scr-sync.timer chad-tier-sync.timer --no-pager")
+                if b.startswith("scr_state_missing"):
+                    next_actions.append("Run: ls -lh /home/ubuntu/CHAD\\ FINALE/runtime/scr_state.json && journalctl -u chad-scr-sync.service -n 40 --no-pager")
+                if b == "reconciliation_red":
+                    next_actions.append("Run: curl -sS http://127.0.0.1:9618/reconciliation-state | python3 -m json.tool")
+            # dedupe
+            next_actions = list(dict.fromkeys(next_actions))
+
+        return {
+            "ts_utc": utc_now_iso(),
+            "schema_version": "readiness.v1",
+            "ok": ok,
+            "blockers": blockers,
+            "warnings": warnings,
+            "timers": timers,
+            "failed_units": failed,
+            "artifacts": {
+                "scr_state": {"ok": scr.ok, "error": scr.error},
+                "tier_state": {"ok": tier.ok, "error": tier.error},
+                "dynamic_caps": {"ok": caps.ok, "error": caps.error},
+                "feed_state": {"ok": feed.ok, "error": feed.error},
+                "reconciliation_state": {"ok": rec.ok, "error": rec.error},
+                "operator_intent": {"ok": intent.ok, "error": intent.error},
+            },
+            "next_actions": next_actions,
+        }
 
     return router
