@@ -58,6 +58,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from chad.execution.idempotency_store import IdempotencyStore, default_paper_db_path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 LOGGER = logging.getLogger("chad.paper_shadow_runner")
@@ -319,6 +321,31 @@ class TradeLedger:
         }
         rec_hash = sha256_hex(canonical_json(rec))
         rec["record_hash"] = rec_hash
+
+        # Exactly-once gate (Phase 11): prevent duplicate trade_id ledger writes
+
+        # Skip ONLY on proven duplicate. If the store errors, fail-open and write.
+
+        try:
+
+            repo_root = Path(__file__).resolve().parents[2]
+
+            store = IdempotencyStore(default_paper_db_path(repo_root))
+
+            payload_hash = sha256_hex(canonical_json(payload))
+
+            trade_id = str(payload.get("trade_id") or "")
+
+            m = store.mark_once(trade_id, payload_hash, meta={"source": "paper_shadow_runner", "ledger": str(path)})
+
+            if getattr(m, "reason", "") == "duplicate":
+
+                return path
+
+        except Exception:
+
+            pass
+
 
         fsync_append_line(path, canonical_json(rec) + "\n")
         return path
