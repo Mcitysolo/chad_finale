@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from backend.portfolio_surface import router as portfolio_router
 from pydantic import BaseModel, Field
 
 from chad.analytics.shadow_confidence_router import ShadowState, evaluate_confidence
@@ -631,6 +632,9 @@ app = FastAPI(
         "provide advisory-only intelligence."
     ),
 )
+
+app.include_router(portfolio_router)
+
 
 from backend.operator_surface_v2 import build_operator_router
 app.include_router(build_operator_router())

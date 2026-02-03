@@ -1,0 +1,11 @@
+{
+  "schema_version": "portfolio_profiles.v1",
+  "profiles": {
+    "BALANCED": {
+      "description": "Default balanced profile. If explicit targets are empty, targets are derived deterministically from config/universe.json tickers (or plan tick_symbols fallback) with equal weights.",
+      "max_symbols": 25,
+      "min_weight": 0.0,
+      "targets": []
+    }
+  }
+}
