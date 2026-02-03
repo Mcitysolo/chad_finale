@@ -1,48 +1,52 @@
 #!/usr/bin/env python3
 """
-CHAD Paper Shadow Runner — Institutional-Grade (IBKR-truth, fail-closed)
+CHAD Paper Shadow Runner — Production-Grade (IBKR-truth, fail-closed)
 
-WHAT THIS DOES
---------------
+Purpose
+-------
 This runner is CHAD's "paper execution truth engine" for SCR.
 
 It:
-- Reads the current orchestrator plan (runtime/full_execution_cycle_last.json by default).
-- Selects ONE safe paper trade intent (deterministic).
+- Reads the orchestrator plan (runtime/full_execution_cycle_last.json by default).
+- Selects ONE deterministic BUY intent.
 - Enforces operator intent gates (DENY_ALL / EXIT_ONLY / ALLOW_LIVE).
-- Enforces an IBKR-truth market gate (holiday + session aware) using contractDetails:
-    - tradingHours/liquidHours for the symbol/day.
-- Executes a single round-trip paper trade (BUY -> hold -> SELL) when allowed.
+- Enforces IBKR-truth market gate (holiday + session aware) using contractDetails.
+- Executes ONE paper round-trip (BUY -> HOLD -> SELL) when allowed.
 - Writes ONLY realized results to CHAD's trade ledger (append-only NDJSON + hash chain).
 - Writes a structured run report to reports/shadow/ (safe to delete).
+- Provides best-effort exactly-once semantics for ledger writes via sqlite idempotency store.
 
-CRITICAL FIX vs your prior pipeline
------------------------------------
-It never writes entry-only "BUY" records into trade_history_*.ndjson.
-That eliminates pnl_untrusted spam and stops SCR from being poisoned by
-"entry_only_no_exit" artifacts.
-
-SAFETY INVARIANTS
+Safety invariants
 -----------------
-- Preview mode: no broker connect, no orders, no ledger writes.
-- Execute mode: requires explicit --execute flag. Otherwise preview.
+- Preview mode: no connect, no orders, no ledger writes.
+- Execute mode: requires explicit --execute flag.
 - Operator DENY_ALL: hard block.
-- Operator EXIT_ONLY: blocks new entries (this runner only does entries). Hard block.
-- IBKR market CLOSED (holiday/session): hard block, no orders.
+- Operator EXIT_ONLY: blocks new entries (this runner only opens a position). Hard block.
+- Market CLOSED (IBKR liquidHours): hard block, no orders.
 - No ledger writes unless a full realized round-trip occurs.
 - One run = at most one round-trip attempt.
+- Exactly-once ledger: duplicate trade_id suppresses second write.
 
-PERFORMANCE/ROBUSTNESS
-----------------------
-- ContractDetails results are cached in runtime/calendar_state.json with TTL.
-- Connection and contractDetails have bounded retries with jitter.
-- All writes are atomic where applicable; ledger appends are fsync’d.
-- Deterministic hashing and stable trade_id for best-effort dedupe.
+Plan semantics
+--------------
+The plan may contain only SELL intents (e.g. portfolio closing).
+This runner requires a BUY intent. If none exists, it can optionally generate a
+deterministic canary BUY intent using summary.tick_symbols.
 
-NOTE
-----
-This runner is intentionally conservative. It is a safety-critical component,
-not a strategy engine.
+Environment
+-----------
+CHAD_RUNTIME_DIR                (default: <repo_root>/runtime)
+CHAD_PLANNED_ORDERS_PATH        (default: <runtime_dir>/full_execution_cycle_last.json)
+CHAD_SHADOW_HOLD_SECONDS        (default from CLI, capped)
+CHAD_SHADOW_AUTO_CANCEL_SECONDS (default from CLI)
+CHAD_SHADOW_SIZE_MULTIPLIER     (default from CLI)
+CHAD_SHADOW_CANARY_FALLBACK     ("1"/"0", default: 1)
+CHAD_SHADOW_CANARY_MAX_QTY      (default: 1.0)
+IBKR_HOST / IBKR_PORT / IBKR_CLIENT_ID
+
+Exit codes
+----------
+0  success (including clean blocks)
 """
 
 from __future__ import annotations
@@ -58,11 +62,99 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-
-from chad.execution.idempotency_store import IdempotencyStore, default_paper_db_path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from chad.execution.idempotency_store import IdempotencyStore, default_paper_db_path
+
 LOGGER = logging.getLogger("chad.paper_shadow_runner")
+# ##ARM_GATING_COMPAT_V1##
+# ---------------------------------------------------------------------------
+# Backward-compatible arming + execute gating API (TEST CONTRACT)
+# ---------------------------------------------------------------------------
+# These symbols are intentionally lightweight and must NOT import ib_insync.
+# They exist so safety gating remains auditable and stable across refactors.
+
+ARM_ENV_NAME = "CHAD_PAPER_SHADOW_ARM"
+ARM_PHRASE = "I_UNDERSTAND_PAPER_CAN_PLACE_ORDERS"
+
+
+@dataclass(frozen=True)
+class PaperShadowConfig:
+    """
+    Minimal config surface used by gating tests.
+    enabled: feature flag
+    armed:   operator-configured arming flag
+    """
+    enabled: bool = True
+    armed: bool = False
+
+
+def is_armed() -> bool:
+    """
+    True only when env var is set to the exact arming phrase.
+    Fail-safe default is False.
+    """
+    v = os.environ.get(ARM_ENV_NAME, "")
+    return str(v).strip() == ARM_PHRASE
+
+
+def should_place_paper_orders(cfg: PaperShadowConfig) -> tuple[bool, list[str]]:
+    """
+    Public gating: used by tests and callers to decide if paper orders may be placed.
+    Does not touch brokers, does not import ib_insync.
+    """
+    reasons: list[str] = []
+    if not bool(cfg.enabled):
+        reasons.append("enabled is false")
+        return False, reasons
+
+    if not is_armed():
+        reasons.append(f"{ARM_ENV_NAME} not set to arm phrase")
+        return False, reasons
+
+    reasons.append("env-armed")
+    return True, reasons
+
+
+def _should_execute_paper(cfg: PaperShadowConfig) -> tuple[bool, list[str]]:
+    """
+    Stricter gate for EXECUTE mode: requires cfg.enabled AND cfg.armed AND env phrase.
+    """
+    reasons: list[str] = []
+    if not bool(cfg.enabled):
+        reasons.append("enabled is false")
+        return False, reasons
+
+    if not bool(cfg.armed):
+        reasons.append("armed is false")
+        return False, reasons
+
+    if not is_armed():
+        reasons.append("arm phrase missing")
+        return False, reasons
+
+    reasons.append("env-armed")
+    return True, reasons
+
+
+def _live_gate_allows_paper() -> tuple[bool, str]:
+    """
+    Best-effort LiveGate probe.
+    MUST NOT raise; fail-safe returns (False, reason).
+    """
+    try:
+        import json
+        from urllib.request import Request, urlopen
+
+        url = os.environ.get("CHAD_LIVE_GATE_URL", "http://127.0.0.1:9618/live-gate")
+        req = Request(url, headers={"User-Agent": "chad-paper-shadow-gate/1.0"})
+        with urlopen(req, timeout=2) as resp:
+            raw = resp.read()
+        obj = json.loads(raw.decode("utf-8"))
+        allow = bool(obj.get("allow_ibkr_paper", False))
+        return allow, "ok"
+    except Exception as e:
+        return False, f"live_gate_unreachable:{type(e).__name__}"
 
 MAX_HOLD_SECONDS = 10 * 60
 DEFAULT_CONTRACT_CACHE_TTL_SECONDS = 60 * 10  # 10 minutes
@@ -88,7 +180,10 @@ def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
             return default
-        return float(x)
+        f = float(x)
+        if f != f or f in (float("inf"), float("-inf")):
+            return default
+        return f
     except Exception:
         return default
 
@@ -100,6 +195,13 @@ def safe_int(x: Any, default: int = 0) -> int:
         return int(x)
     except Exception:
         return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def canonical_json(obj: Any) -> str:
@@ -150,6 +252,9 @@ class RunnerConfig:
     auto_cancel_seconds: float
     size_multiplier: float
 
+    canary_fallback: bool
+    canary_max_qty: float
+
     ib_host: str
     ib_port: int
     ib_client_id: int
@@ -172,9 +277,22 @@ class RunnerConfig:
             )
         ).resolve()
 
-        hold_s = int(max(1, min(int(safe_int(os.environ.get("CHAD_SHADOW_HOLD_SECONDS", args.hold_seconds), args.hold_seconds)), MAX_HOLD_SECONDS)))
+        hold_s = int(
+            max(
+                1,
+                min(
+                    int(safe_int(os.environ.get("CHAD_SHADOW_HOLD_SECONDS", args.hold_seconds), args.hold_seconds)),
+                    MAX_HOLD_SECONDS,
+                ),
+            )
+        )
         cancel_s = float(max(1.0, safe_float(os.environ.get("CHAD_SHADOW_AUTO_CANCEL_SECONDS", args.auto_cancel_seconds), args.auto_cancel_seconds)))
         mult = float(max(0.0, safe_float(os.environ.get("CHAD_SHADOW_SIZE_MULTIPLIER", args.size_multiplier), args.size_multiplier)))
+
+        canary_fallback = env_bool("CHAD_SHADOW_CANARY_FALLBACK", True)
+        canary_max_qty = float(max(0.0, safe_float(os.environ.get("CHAD_SHADOW_CANARY_MAX_QTY", "1.0"), 1.0)))
+        if canary_max_qty <= 0:
+            canary_max_qty = 1.0
 
         ib_host = os.environ.get("IBKR_HOST", "127.0.0.1").strip()
         ib_port = safe_int(os.environ.get("IBKR_PORT", "4002"), 4002)
@@ -195,6 +313,8 @@ class RunnerConfig:
             hold_seconds=hold_s,
             auto_cancel_seconds=cancel_s,
             size_multiplier=mult,
+            canary_fallback=bool(canary_fallback),
+            canary_max_qty=float(canary_max_qty),
             ib_host=ib_host,
             ib_port=ib_port,
             ib_client_id=ib_client_id,
@@ -218,7 +338,7 @@ class PlannedIntent:
     def from_dict(d: Dict[str, Any]) -> "PlannedIntent":
         return PlannedIntent(
             strategy=str(d.get("strategy") or "beta").strip().lower() or "beta",
-            symbol=str(d.get("symbol") or "UNKNOWN").strip().upper(),
+            symbol=str(d.get("symbol") or "").strip().upper(),
             side=str(d.get("side") or "BUY").strip().upper(),
             quantity=float(safe_float(d.get("quantity"), 0.0)),
             exchange=str(d.get("exchange") or "SMART").strip().upper(),
@@ -259,13 +379,14 @@ class TradeResult:
 
 
 # =============================================================================
-# Ledger (append-only + hash chain)
+# Ledger (append-only + hash chain + exactly-once gate)
 # =============================================================================
 
 class TradeLedger:
-    def __init__(self, trades_dir: Path) -> None:
+    def __init__(self, *, trades_dir: Path, repo_root: Path) -> None:
         self._dir = trades_dir
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._repo_root = repo_root
 
     def _path_for_day(self, now: datetime) -> Path:
         return self._dir / f"trade_history_{now.strftime('%Y%m%d')}.ndjson"
@@ -285,11 +406,18 @@ class TradeLedger:
             if not lines:
                 return "0" * 64
             last = json.loads(lines[-1])
-            return str(last.get("record_hash") or ("0" * 64))
+            rh = str(last.get("record_hash") or ("0" * 64))
+            return rh if len(rh) == 64 else ("0" * 64)
         except Exception:
             return "0" * 64
 
-    def append_trade_result(self, tr: TradeResult) -> Path:
+    def append_trade_result(self, tr: TradeResult) -> Tuple[Path, bool]:
+        """
+        Append a realized trade record to the ledger.
+
+        Returns: (ledger_path, wrote_bool)
+          - wrote_bool=False means duplicate trade_id was suppressed.
+        """
         now = utc_now()
         path = self._path_for_day(now)
         prev = self._prev_hash(path)
@@ -322,33 +450,20 @@ class TradeLedger:
         rec_hash = sha256_hex(canonical_json(rec))
         rec["record_hash"] = rec_hash
 
-        # Exactly-once gate (Phase 11): prevent duplicate trade_id ledger writes
-
-        # Skip ONLY on proven duplicate. If the store errors, fail-open and write.
-
+        # Exactly-once gate: skip ONLY on proven duplicate.
+        # If store errors, fail-open and write.
         try:
-
-            repo_root = Path(__file__).resolve().parents[2]
-
-            store = IdempotencyStore(default_paper_db_path(repo_root))
-
+            store = IdempotencyStore(default_paper_db_path(self._repo_root))
             payload_hash = sha256_hex(canonical_json(payload))
-
             trade_id = str(payload.get("trade_id") or "")
-
             m = store.mark_once(trade_id, payload_hash, meta={"source": "paper_shadow_runner", "ledger": str(path)})
-
             if getattr(m, "reason", "") == "duplicate":
-
-                return path
-
+                return path, False
         except Exception:
-
             pass
 
-
         fsync_append_line(path, canonical_json(rec) + "\n")
-        return path
+        return path, True
 
 
 # =============================================================================
@@ -377,7 +492,96 @@ def operator_mode(runtime_dir: Path) -> str:
 
 
 # =============================================================================
-# IBKR Facade (lazy imports, bounded retries, contract-hours cache)
+# Plan load + intent selection
+# =============================================================================
+
+def load_plan(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def iter_ibkr_intents(plan: Dict[str, Any]) -> Iterable[PlannedIntent]:
+    intents = plan.get("ibkr_intents")
+    if isinstance(intents, list):
+        for d in intents:
+            if isinstance(d, dict):
+                it = PlannedIntent.from_dict(d)
+                if it.symbol:
+                    yield it
+
+
+def choose_one_buy_intent(plan: Dict[str, Any]) -> Optional[PlannedIntent]:
+    """
+    Deterministic intent selection:
+    - Only BUY
+    - Only positive qty
+    - Prefer smallest notional estimate if present (safer), then alpha sort
+    """
+    candidates: List[Tuple[float, str, PlannedIntent]] = []
+    for it in iter_ibkr_intents(plan):
+        if it.side != "BUY":
+            continue
+        if it.quantity <= 0:
+            continue
+        # try to infer notional estimate from raw dict (if present)
+        notional = 0.0
+        try:
+            raw_list = plan.get("ibkr_intents") or []
+            for d in raw_list:
+                if isinstance(d, dict) and str(d.get("symbol", "")).upper() == it.symbol and str(d.get("side", "")).upper() == "BUY":
+                    notional = safe_float(d.get("notional_estimate"), 0.0)
+                    break
+        except Exception:
+            notional = 0.0
+        key_notional = notional if notional > 0 else 1e18
+        candidates.append((key_notional, it.symbol, it))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[0][2]
+
+
+def canary_fallback_intent(plan: Dict[str, Any], *, max_qty: float) -> Optional[PlannedIntent]:
+    """
+    Build a deterministic tiny BUY intent from summary.tick_symbols.
+    Deterministic selection: first symbol in sorted tick_symbols.
+    """
+    try:
+        summary = plan.get("summary")
+        if not isinstance(summary, dict):
+            return None
+        ts = summary.get("tick_symbols")
+        if not isinstance(ts, list):
+            return None
+        syms = [str(x).strip().upper() for x in ts if str(x).strip()]
+        if not syms:
+            return None
+        symbol = sorted(syms)[0]
+        qty = float(max(0.0, min(float(max_qty), 1.0e9)))
+        if qty <= 0:
+            qty = 1.0
+        return PlannedIntent(
+            strategy="paper_shadow_canary",
+            symbol=symbol,
+            side="BUY",
+            quantity=float(qty),
+            exchange="SMART",
+            currency="USD",
+            sec_type="STK",
+        )
+    except Exception:
+        return None
+
+
+# =============================================================================
+# IBKR facade (lazy imports, bounded retries, contract-hours cache)
 # =============================================================================
 
 class IBKRClient:
@@ -385,257 +589,279 @@ class IBKRClient:
         self._host = host
         self._port = port
         self._client_id = client_id
-        self._ib = None
+        self.ib = None
 
     def connect(self, *, retries: int) -> None:
-        last_exc: Optional[Exception] = None
-        for attempt in range(retries + 1):
-            try:
-                from ib_insync import IB  # type: ignore[import]
-                ib = IB()
-                ib.connect(self._host, self._port, clientId=self._client_id, timeout=10.0)
-                self._ib = ib
-                return
-            except Exception as exc:
-                last_exc = exc
-                jitter_sleep(0.5 * (attempt + 1))
-        raise RuntimeError(f"IBKR connect failed after {retries+1} attempts: {type(last_exc).__name__}: {last_exc}")
+        from ib_insync import IB  # type: ignore
 
-    @property
-    def ib(self):
-        if self._ib is None:
-            raise RuntimeError("IBKR not connected")
-        return self._ib
+        last: Optional[Exception] = None
+        for attempt in range(max(0, retries) + 1):
+            ib = IB()
+            try:
+                ib.connect(self._host, int(self._port), clientId=int(self._client_id), timeout=10)
+                if not ib.isConnected():
+                    raise RuntimeError("ibkr_connected_false")
+                self.ib = ib
+                return
+            except Exception as e:
+                last = e
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                if attempt >= retries:
+                    raise
+                jitter_sleep(0.6 * (2 ** attempt), jitter_frac=0.25)
+        if last:
+            raise last
 
     def disconnect(self) -> None:
-        if self._ib is not None:
-            try:
-                self._ib.disconnect()
-            except Exception:
-                pass
-        self._ib = None
+        try:
+            if self.ib is not None:
+                self.ib.disconnect()
+        except Exception:
+            pass
+        self.ib = None
 
 
-def _extract_day_hours(hours_str: str, day_yyyymmdd: str) -> str:
-    # format: "20260119:CLOSED;20260120:0930-1600;..."
-    for part in str(hours_str or "").split(";"):
-        part = part.strip()
-        if part.startswith(day_yyyymmdd + ":"):
-            return part.split(":", 1)[1].strip()
-    return ""
+def _cache_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "calendar_state.json"
 
 
-def _parse_hhmm_segments(day_spec: str) -> List[Tuple[int, int]]:
-    # Accept "CLOSED", "" or "0930-1600" or "0400-20260120:2000" or multi ","
-    segs: List[Tuple[int, int]] = []
-    if not day_spec or day_spec.upper() == "CLOSED":
-        return segs
-    for seg in day_spec.split(","):
-        seg = seg.strip()
-        if not seg or seg.upper() == "CLOSED":
-            continue
-        if "-" not in seg:
-            continue
-        a, b = seg.split("-", 1)
-        a = a[-4:]
-        b = b[-4:]
-        if len(a) == 4 and len(b) == 4 and a.isdigit() and b.isdigit():
-            segs.append((int(a), int(b)))
-    return segs
+def _load_contract_cache(runtime_dir: Path) -> Dict[str, Any]:
+    p = _cache_path(runtime_dir)
+    if not p.exists():
+        return {"ts_utc": "", "items": {}}
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {"ts_utc": "", "items": {}}
+    except Exception:
+        return {"ts_utc": "", "items": {}}
+
+
+def _save_contract_cache(runtime_dir: Path, obj: Dict[str, Any]) -> None:
+    atomic_write_json(_cache_path(runtime_dir), obj)
 
 
 def ibkr_is_liquid_open_now(
-    ib,
+    ib: Any,
     *,
+    runtime_dir: Path,
     symbol: str,
     exchange: str,
     currency: str,
     now: datetime,
     details_retries: int,
+    cache_ttl_s: int,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    IBKR-truth market gate using contractDetails liquidHours/tradingHours.
-
-    Returns (is_open, reason, debug_payload). Fail-closed on uncertainty.
+    Uses IBKR contractDetails to determine if liquidHours/tradingHours are open now.
+    Cached in runtime/calendar_state.json (TTL).
     """
-    try:
-        from zoneinfo import ZoneInfo
-        from ib_insync import Stock  # type: ignore[import]
-    except Exception:
-        return False, "deps_missing", {}
+    dbg: Dict[str, Any] = {"symbol": symbol, "exchange": exchange, "currency": currency}
+    key = f"{symbol}::{exchange}::{currency}"
 
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now_et = now.astimezone(ZoneInfo("America/New_York"))
-    day = now_et.strftime("%Y%m%d")
-    hhmm = now_et.hour * 100 + now_et.minute
+    cache = _load_contract_cache(runtime_dir)
+    items = cache.get("items") if isinstance(cache.get("items"), dict) else {}
+    dbg["cache_keys"] = len(items) if isinstance(items, dict) else 0
 
-    last_exc: Optional[Exception] = None
-    cd = None
-    for attempt in range(details_retries + 1):
+    # Cache freshness check (per-key)
+    if isinstance(items, dict) and key in items:
+        it = items.get(key)
+        if isinstance(it, dict):
+            ts = str(it.get("fetched_ts_utc") or "")
+            try:
+                fetched = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+                age = (now.astimezone(timezone.utc) - fetched).total_seconds()
+                if age <= float(cache_ttl_s):
+                    # Use cached liquidHours string
+                    lh = str(it.get("liquidHours") or "")
+                    dbg["cache_hit"] = True
+                    ok = _hours_open_now(liquid_hours=lh, now=now, dbg=dbg)
+                    return ok, ("OPEN" if ok else "CLOSED"), dbg
+            except Exception:
+                pass
+
+    dbg["cache_hit"] = False
+
+    # Fetch contractDetails
+    from ib_insync import Stock  # type: ignore
+
+    contract = Stock(symbol, exchange, currency)
+    last: Optional[Exception] = None
+    details = None
+    for attempt in range(max(0, details_retries) + 1):
         try:
-            cds = ib.reqContractDetails(Stock(symbol, exchange, currency))
-            if not cds:
-                return False, "no_contract_details", {}
-            cd = cds[0]
+            details_list = ib.reqContractDetails(contract)
+            if not details_list:
+                raise RuntimeError("contractDetails_empty")
+            details = details_list[0]
             break
-        except Exception as exc:
-            last_exc = exc
-            jitter_sleep(0.35 * (attempt + 1))
-    if cd is None:
-        return False, f"contract_details_error:{type(last_exc).__name__}", {}
+        except Exception as e:
+            last = e
+            if attempt >= details_retries:
+                raise
+            jitter_sleep(0.6 * (2 ** attempt), jitter_frac=0.25)
+    if details is None and last:
+        raise last
 
-    trading = str(getattr(cd, "tradingHours", "") or "")
-    liquid = str(getattr(cd, "liquidHours", "") or "")
-
-    th = _extract_day_hours(trading, day)
-    lh = _extract_day_hours(liquid, day)
-
-    dbg = {
-        "day_et": day,
-        "now_et": now_et.isoformat(),
-        "hhmm_et": hhmm,
-        "tradingHours_raw": trading,
-        "liquidHours_raw": liquid,
-        "today_tradingHours": th or "<missing>",
-        "today_liquidHours": lh or "<missing>",
-    }
-
-    # Fail-closed on CLOSED
-    if (th.upper() == "CLOSED") or (lh.upper() == "CLOSED"):
-        return False, f"ibkr_closed_day={day}", dbg
-
-    # Prefer liquidHours segments (regular session), fallback tradingHours
-    src = lh or th
-    segs = _parse_hhmm_segments(src)
-    if not segs:
-        return False, "no_time_segments", dbg
-
-    for a, b in segs:
-        if a <= hhmm < b:
-            return True, f"ibkr_open_day={day}_et={now_et.strftime('%H:%M')}", dbg
-
-    return False, f"outside_segments_day={day}_et={now_et.strftime('%H:%M')}", dbg
-
-
-# =============================================================================
-# Plan loading + selection (deterministic, safe)
-# =============================================================================
-
-def load_plan(path: Path) -> List[PlannedIntent]:
-    if not path.exists():
-        return []
+    # Extract hours
+    liquid = ""
+    trading = ""
     try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
+        liquid = str(getattr(details, "liquidHours", "") or "")
+        trading = str(getattr(details, "tradingHours", "") or "")
     except Exception:
-        return []
-    if not isinstance(obj, dict):
-        return []
+        liquid = ""
+        trading = ""
 
-    intents = obj.get("ibkr_intents")
-    orders = obj.get("orders")
+    dbg["liquidHours"] = liquid
+    dbg["tradingHours"] = trading
 
-    out: List[PlannedIntent] = []
-    if isinstance(intents, list):
-        for it in intents:
-            if isinstance(it, dict):
-                out.append(PlannedIntent.from_dict(it))
-    if out:
-        return out
-
-    # Fallback: map orders schema
-    if isinstance(orders, list):
-        for it in orders:
-            if isinstance(it, dict):
-                out.append(
-                    PlannedIntent.from_dict(
-                        {
-                            "strategy": it.get("primary_strategy") or it.get("strategy") or "beta",
-                            "symbol": it.get("symbol"),
-                            "side": it.get("side"),
-                            "quantity": it.get("size") or it.get("quantity"),
-                            "exchange": "SMART",
-                            "currency": "USD",
-                            "sec_type": "STK",
-                        }
-                    )
-                )
-    return out
-
-
-def choose_one_intent(planned: List[PlannedIntent]) -> Optional[PlannedIntent]:
-    # Deterministic: first BUY, qty>0, known symbol
-    for it in planned:
-        if it.side == "BUY" and it.quantity > 0.0 and it.symbol and it.symbol != "UNKNOWN":
-            return it
-    return None
-
-
-# =============================================================================
-# Order placement + fill wait
-# =============================================================================
-
-def place_mkt_order(ib, *, symbol: str, exchange: str, currency: str, side: str, qty: float):
-    from ib_insync import Contract, Order  # type: ignore[import]
-    c = Contract()
-    c.symbol = symbol
-    c.secType = "STK"
-    c.exchange = exchange
-    c.currency = currency
-
-    o = Order()
-    o.action = side.upper()
-    o.orderType = "MKT"
-    o.totalQuantity = float(qty)
-    return ib.placeOrder(c, o)
-
-
-def wait_fill_or_cancel(ib, trade, *, timeout_s: float) -> Tuple[bool, float, str, float]:
-    deadline = time.time() + float(timeout_s)
-    last_status = "UNKNOWN"
-    filled_qty = 0.0
-    avg_price = 0.0
-
-    while time.time() < deadline:
-        ib.sleep(0.25)
-        st = getattr(trade, "orderStatus", None)
-        if st is not None:
-            last_status = str(getattr(st, "status", last_status))
-            filled_qty = float(getattr(st, "filled", filled_qty) or filled_qty)
-            avg_price = float(getattr(st, "avgFillPrice", avg_price) or avg_price)
-        if last_status.upper() == "FILLED" and filled_qty > 0.0 and avg_price > 0.0:
-            return True, filled_qty, last_status, avg_price
-        if last_status.upper() in ("CANCELLED", "INACTIVE", "API_CANCELLED"):
-            return False, filled_qty, last_status, avg_price
-
-    # timeout -> cancel
+    # Update cache
     try:
-        ib.cancelOrder(trade.order)
-        ib.sleep(0.5)
+        if not isinstance(items, dict):
+            items = {}
+        items[key] = {
+            "fetched_ts_utc": iso_utc(now),
+            "liquidHours": liquid,
+            "tradingHours": trading,
+        }
+        cache["items"] = items
+        cache["ts_utc"] = iso_utc(now)
+        _save_contract_cache(runtime_dir, cache)
     except Exception:
         pass
 
-    st = getattr(trade, "orderStatus", None)
-    if st is not None:
-        last_status = str(getattr(st, "status", last_status))
-        filled_qty = float(getattr(st, "filled", filled_qty) or filled_qty)
-        avg_price = float(getattr(st, "avgFillPrice", avg_price) or avg_price)
+    ok = _hours_open_now(liquid_hours=liquid or trading, now=now, dbg=dbg)
+    return ok, ("OPEN" if ok else "CLOSED"), dbg
 
-    return False, filled_qty, last_status, avg_price
+
+def _hours_open_now(*, liquid_hours: str, now: datetime, dbg: Dict[str, Any]) -> bool:
+    """
+    IBKR hours format: "YYYYMMDD:HHMM-YYYYMMDD:HHMM;YYYYMMDD:CLOSED;..."
+    We treat any range that covers now as open.
+    """
+    s = str(liquid_hours or "").strip()
+    dbg["hours_len"] = len(s)
+
+    if not s or s.upper() == "CLOSED":
+        return False
+
+    now_utc = now.astimezone(timezone.utc)
+    ymd = now_utc.strftime("%Y%m%d")
+    # Find the segment for today
+    seg = None
+    for part in s.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith(ymd + ":"):
+            seg = part
+            break
+
+    if not seg:
+        # If no today segment, fail closed
+        dbg["hours_today_segment"] = None
+        return False
+
+    dbg["hours_today_segment"] = seg
+    rhs = seg.split(":", 1)[1].strip()
+    if rhs.upper() == "CLOSED":
+        return False
+
+    # Can have multiple windows separated by ","
+    for win in rhs.split(","):
+        win = win.strip()
+        if not win:
+            continue
+        if "-" not in win:
+            continue
+        a, b = win.split("-", 1)
+        a = a.strip()
+        b = b.strip()
+        # Sometimes IBKR returns HHMM-HHMM (same day). Sometimes full ymd:HHMM.
+        try:
+            start = _parse_hours_point(ymd, a)
+            end = _parse_hours_point(ymd, b)
+            if start <= now_utc <= end:
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _parse_hours_point(today_ymd: str, token: str) -> datetime:
+    t = token.strip()
+    if ":" in t:
+        ymd, hhmm = t.split(":", 1)
+        ymd = ymd.strip()
+        hhmm = hhmm.strip()
+    else:
+        ymd, hhmm = today_ymd, t
+    hhmm = hhmm.replace(" ", "")
+    hh = int(hhmm[:2])
+    mm = int(hhmm[2:4])
+    return datetime(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8]), hh, mm, tzinfo=timezone.utc)
+
+
+# =============================================================================
+# IBKR order helpers (paper only)
+# =============================================================================
+
+def place_mkt_order(ib: Any, *, symbol: str, exchange: str, currency: str, side: str, qty: float) -> Any:
+    from ib_insync import Stock, MarketOrder  # type: ignore
+
+    c = Stock(symbol, exchange, currency)
+    order = MarketOrder(side.upper(), float(qty))
+    trade = ib.placeOrder(c, order)
+    return trade
+
+
+def wait_fill_or_cancel(ib: Any, trade: Any, *, timeout_s: float) -> Tuple[bool, float, str, float]:
+    """
+    Wait for trade fill; cancel at timeout.
+    Returns: (filled?, filled_qty, status, avg_fill_price)
+    """
+    t0 = time.time()
+    filled_qty = 0.0
+    avg_price = 0.0
+    status = ""
+
+    while True:
+        status = str(getattr(trade, "orderStatus", None).status if getattr(trade, "orderStatus", None) else "")
+        filled_qty = safe_float(getattr(trade, "orderStatus", None).filled if getattr(trade, "orderStatus", None) else 0.0, 0.0)
+        avg_price = safe_float(getattr(trade, "orderStatus", None).avgFillPrice if getattr(trade, "orderStatus", None) else 0.0, 0.0)
+
+        if status.upper() == "FILLED" and filled_qty > 0.0:
+            return True, float(filled_qty), status, float(avg_price)
+
+        if time.time() - t0 >= float(timeout_s):
+            try:
+                ib.cancelOrder(trade.order)
+            except Exception:
+                pass
+            return False, float(filled_qty), status or "TIMEOUT", float(avg_price)
+
+        time.sleep(0.25)
+
+
+# =============================================================================
+# Report model
+# =============================================================================
+
+@dataclass
+class RunReport:
+    ts_utc: str
+    safety: Dict[str, Any]
+    actions: Dict[str, Any]
+    notes: List[Dict[str, Any]]
 
 
 # =============================================================================
 # Runner
 # =============================================================================
-
-@dataclass
-class RunReport:
-    generated_at_utc: str
-    config: Dict[str, Any]
-    safety: Dict[str, Any]
-    actions: Dict[str, Any]
-    notes: List[Dict[str, Any]]
-
 
 class PaperShadowRunner:
     def __init__(self, cfg: RunnerConfig, *, ledger: TradeLedger) -> None:
@@ -644,19 +870,9 @@ class PaperShadowRunner:
 
     def run_once(self) -> RunReport:
         now = utc_now()
+
         report = RunReport(
-            generated_at_utc=iso_utc(now),
-            config={
-                "preview": self._cfg.preview,
-                "execute": self._cfg.execute,
-                "planned_path": str(self._cfg.planned_path),
-                "hold_seconds": self._cfg.hold_seconds,
-                "auto_cancel_seconds": self._cfg.auto_cancel_seconds,
-                "size_multiplier": self._cfg.size_multiplier,
-                "ib_host": self._cfg.ib_host,
-                "ib_port": self._cfg.ib_port,
-                "ib_client_id": self._cfg.ib_client_id,
-            },
+            ts_utc=iso_utc(now),
             safety={},
             actions={
                 "orders_submitted": 0,
@@ -681,14 +897,20 @@ class PaperShadowRunner:
             report.notes.append({"event": "blocked", "reason": "operator_deny_all"})
             return report
         if op == "EXIT_ONLY":
-            # This runner places entries; exit-only means do not open new positions.
             report.safety.update({"blocked": True, "no_orders": True, "no_ledger": True})
             report.notes.append({"event": "blocked", "reason": "operator_exit_only_blocks_entries"})
             return report
 
-        # Plan
+        # Plan -> BUY intent selection
         planned = load_plan(self._cfg.planned_path)
-        it = choose_one_intent(planned)
+        it = choose_one_buy_intent(planned)
+
+        if it is None and self._cfg.canary_fallback:
+            it = canary_fallback_intent(planned, max_qty=self._cfg.canary_max_qty)
+            if it is not None:
+                report.safety["canary_fallback"] = True
+                report.notes.append({"event": "canary_fallback", "reason": "no_valid_buy_intent", "symbol": it.symbol})
+
         if it is None:
             report.safety.update({"no_plan": True, "no_orders": True, "no_ledger": True})
             report.notes.append({"event": "no_plan", "reason": "no_valid_buy_intent"})
@@ -708,35 +930,21 @@ class PaperShadowRunner:
 
             ok, why, dbg = ibkr_is_liquid_open_now(
                 ibc.ib,
+                runtime_dir=self._cfg.runtime_dir,
                 symbol=it.symbol,
                 exchange=it.exchange,
                 currency=it.currency,
                 now=now,
                 details_retries=self._cfg.details_retries,
+                cache_ttl_s=self._cfg.contract_cache_ttl_seconds,
             )
             report.safety["ibkr_market_open"] = bool(ok)
             report.safety["ibkr_market_reason"] = why
             report.safety["ibkr_market_debug"] = dbg
 
-            # Persist a small cache artifact (operators can inspect)
-            cal_path = self._cfg.runtime_dir / "calendar_state.json"
-            atomic_write_json(
-                cal_path,
-                {
-                    "ts_utc": iso_utc(now),
-                    "ttl_seconds": self._cfg.contract_cache_ttl_seconds,
-                    "symbol": it.symbol,
-                    "exchange": it.exchange,
-                    "currency": it.currency,
-                    "open": bool(ok),
-                    "reason": why,
-                    "debug": dbg,
-                },
-            )
-
             if not ok:
                 report.safety.update({"blocked": True, "no_orders": True, "no_ledger": True})
-                report.notes.append({"event": "blocked", "reason": f"ibkr_market_closed:{why}"})
+                report.notes.append({"event": "blocked", "reason": "market_closed"})
                 return report
 
             # ENTRY
@@ -747,22 +955,23 @@ class PaperShadowRunner:
                 exchange=it.exchange,
                 currency=it.currency,
                 side="BUY",
-                qty=qty,
+                qty=float(qty),
             )
             report.actions["orders_submitted"] += 1
-            report.notes.append({"event": "order_submitted", "side": "BUY", "symbol": it.symbol, "qty": qty})
+            report.notes.append({"event": "order_submitted", "side": "BUY", "symbol": it.symbol, "qty": float(qty)})
 
-            filled, filled_qty, status, entry_fp = wait_fill_or_cancel(
+            entry_filled, entry_filled_qty, entry_status, entry_fp = wait_fill_or_cancel(
                 ibc.ib, entry_trade, timeout_s=self._cfg.auto_cancel_seconds
             )
-            if not filled:
+            if not entry_filled:
                 report.actions["orders_cancelled"] += 1
                 report.safety["no_ledger"] = True
-                report.notes.append({"event": "entry_not_filled", "status": status, "filled_qty": float(filled_qty), "entry_fp": float(entry_fp)})
+                report.notes.append({"event": "entry_not_filled", "status": entry_status, "filled_qty": float(entry_filled_qty), "entry_fp": float(entry_fp)})
                 return report
-            if filled_qty <= 0.0 or entry_fp <= 0.0:
+
+            if entry_filled_qty <= 0.0 or entry_fp <= 0.0:
                 report.safety["no_ledger"] = True
-                report.notes.append({"event": "entry_bad_fill", "filled_qty": float(filled_qty), "entry_fp": float(entry_fp)})
+                report.notes.append({"event": "entry_bad_fill", "filled_qty": float(entry_filled_qty), "entry_fp": float(entry_fp)})
                 return report
 
             # HOLD
@@ -776,10 +985,10 @@ class PaperShadowRunner:
                 exchange=it.exchange,
                 currency=it.currency,
                 side="SELL",
-                qty=float(filled_qty),
+                qty=float(entry_filled_qty),
             )
             report.actions["orders_submitted"] += 1
-            report.notes.append({"event": "order_submitted", "side": "SELL", "symbol": it.symbol, "qty": float(filled_qty)})
+            report.notes.append({"event": "order_submitted", "side": "SELL", "symbol": it.symbol, "qty": float(entry_filled_qty)})
 
             exit_filled, exit_filled_qty, exit_status, exit_fp = wait_fill_or_cancel(
                 ibc.ib, exit_trade, timeout_s=self._cfg.auto_cancel_seconds
@@ -789,9 +998,10 @@ class PaperShadowRunner:
                 report.safety["no_ledger"] = True
                 report.notes.append({"event": "exit_not_filled", "status": exit_status, "filled_qty": float(exit_filled_qty), "exit_fp": float(exit_fp)})
                 return report
+
             if exit_filled_qty <= 0.0 or exit_fp <= 0.0:
                 report.safety["no_ledger"] = True
-                report.notes.append({"event": "exit_bad_fill", "exit_filled_qty": float(exit_filled_qty), "exit_fp": float(exit_fp)})
+                report.notes.append({"event": "exit_bad_fill", "filled_qty": float(exit_filled_qty), "exit_fp": float(exit_fp)})
                 return report
 
             realized = (float(exit_fp) - float(entry_fp)) * float(exit_filled_qty)
@@ -807,24 +1017,25 @@ class PaperShadowRunner:
                 ts_exit_utc=iso_utc(exit_ts),
                 broker="ibkr",
                 is_live=False,
-                order_id_entry=safe_int(getattr(entry_trade.order, "orderId", None), 0) or None,
-                order_id_exit=safe_int(getattr(exit_trade.order, "orderId", None), 0) or None,
-                perm_id_entry=safe_int(getattr(entry_trade.order, "permId", None), 0) or None,
-                perm_id_exit=safe_int(getattr(exit_trade.order, "permId", None), 0) or None,
+                order_id_entry=safe_int(getattr(getattr(entry_trade, "order", None), "orderId", None), 0) or None,
+                order_id_exit=safe_int(getattr(getattr(exit_trade, "order", None), "orderId", None), 0) or None,
+                perm_id_entry=safe_int(getattr(getattr(entry_trade, "order", None), "permId", None), 0) or None,
+                perm_id_exit=safe_int(getattr(getattr(exit_trade, "order", None), "permId", None), 0) or None,
                 extra={
                     "exchange": it.exchange,
                     "currency": it.currency,
                     "sec_type": it.sec_type,
-                    "source": "paper_shadow_runner_institutional",
+                    "source": "paper_shadow_runner",
                     "planned_path": str(self._cfg.planned_path),
                     "hold_seconds": int(self._cfg.hold_seconds),
+                    "canary_fallback": bool(report.safety.get("canary_fallback", False)),
                 },
             )
 
-            ledger_path = self._ledger.append_trade_result(tr)
-            report.actions["trade_results_logged"] += 1
+            ledger_path, wrote = self._ledger.append_trade_result(tr)
+            report.actions["trade_results_logged"] += 1 if wrote else 0
             report.actions["ledger_path"] = str(ledger_path)
-            report.notes.append({"event": "trade_result_logged", "trade_id": tr.trade_id(), "realized_pnl": float(realized), "ledger_path": str(ledger_path)})
+            report.notes.append({"event": "trade_result_logged", "trade_id": tr.trade_id(), "realized_pnl": float(realized), "ledger_path": str(ledger_path), "wrote": bool(wrote)})
 
             return report
 
@@ -837,7 +1048,7 @@ class PaperShadowRunner:
 # =============================================================================
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="CHAD Paper Shadow Runner (institutional-grade)")
+    ap = argparse.ArgumentParser(description="CHAD Paper Shadow Runner (production-grade)")
     ap.add_argument("--preview", action="store_true", help="Preview only: no connect, no orders, no ledger.")
     ap.add_argument("--execute", action="store_true", help="Execute one paper round-trip if fully allowed.")
     ap.add_argument("--hold-seconds", type=int, default=5, help="Hold time between entry and exit.")
@@ -853,9 +1064,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     args = build_parser().parse_args(argv)
-
     cfg = RunnerConfig.from_env_args(args)
-    ledger = TradeLedger(cfg.trades_dir)
+    ledger = TradeLedger(trades_dir=cfg.trades_dir, repo_root=cfg.repo_root)
     runner = PaperShadowRunner(cfg, ledger=ledger)
 
     report = runner.run_once()
@@ -864,7 +1074,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     rp = cfg.reports_dir / f"PAPER_SHADOW_RUN_{utc_now().strftime('%Y%m%dT%H%M%SZ')}.json"
     atomic_write_json(rp, dataclasses.asdict(report))
 
-    # Human-friendly minimal stdout (stable for systemd logs)
+    # Stable stdout for systemd/wrapper parsing
     print(json.dumps({"report_path": str(rp), "actions": report.actions, "safety": report.safety}, indent=2, sort_keys=True))
     return 0
 
