@@ -49,6 +49,7 @@ from chad.core.stop_state import load_stop_state
 from chad.execution.execution_config import get_execution_config
 from chad.intel.research_engine import run_research_scenario_from_request
 from chad.intel.schemas import ResearchRequestInput, ResearchScenario
+from backend.approval_surface import router as approval_router
 
 # Optional: dynamic caps file path used by orchestrator.
 DYNAMIC_CAPS_PATH = Path("runtime/dynamic_caps.json")
@@ -634,6 +635,7 @@ app = FastAPI(
 )
 
 app.include_router(portfolio_router)
+app.include_router(approval_router)
 
 
 from backend.operator_surface_v2 import build_operator_router
