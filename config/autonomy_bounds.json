@@ -1,0 +1,23 @@
+{
+  "schema_version": "autonomy_bounds.v1",
+  "ts_utc": "2026-02-05T00:00:00Z",
+  "rebalance_auto_execute": {
+    "enabled_default": false,
+    "min_seconds_between_executes": 21600,
+    "max_total_turnover_per_execute": 0.25,
+    "max_abs_delta_weight_per_symbol": 0.10,
+    "min_drift_to_execute": {
+      "max_position_weight_drift_gte": 0.08,
+      "total_turnover_needed_gte": 0.20
+    },
+    "block_if_event_risk_severity_in": [
+      "high",
+      "unknown"
+    ],
+    "notes": [
+      "This file defines bounded automation rules for Phase 12 Part 2.",
+      "No live trading. Paper receipts only.",
+      "Executor must fail-closed if this file is missing or invalid."
+    ]
+  }
+}
