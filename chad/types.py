@@ -2,45 +2,61 @@
 """
 chad/types.py
 
-Core type definitions for CHAD Phase 3 (Strategy Layer & Core Types).
+CHAD Core Types — Single Source of Truth (SSOT)
 
-This module is the strongly-typed foundation that all brains (Alpha, Beta,
-Gamma, Omega, AlphaCrypto, AlphaForex, Delta) and the orchestrator share.
+This module defines CHAD’s foundational domain types used across:
+- ContextBuilder / MarketContext (input plane)
+- Strategy signals and configurations
+- Portfolio snapshots
+- Risk policy references
+- Execution planning interfaces
 
-It is designed to satisfy the Phase-3 quality gates from the System Freeze:
-- mypy --strict chad/types.py chad/engine.py chad/policy.py
-- pytest -q chad/tests/test_types.py
-- ruff check chad/types.py
+Design Guarantees
+-----------------
+- Backward compatible defaults: adding new fields is non-breaking.
+- Strong typing with conservative, stable dataclasses.
+- JSON-serializable patterns where appropriate.
+- No external dependencies.
+- No runtime side effects.
+
+Key Upgrade (Phase 4 enablement)
+--------------------------------
+Adds optional `bars` to MarketContext:
+- Strategies like Alpha/Gamma/Delta/Omega can now access OHLCV bars when provided.
+- Defaults to None so existing callers remain valid.
+
+Bars format expectation (best-effort)
+-------------------------------------
+MarketContext.bars is an Optional mapping:
+  { "AAPL": [ {open,high,low,close,volume,ts_utc}, ... ], ... }
+
+Strategies should remain defensive if bars are missing or malformed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import math
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------
 # Enums
-# ---------------------------------------------------------------------------
-
+# -----------------------------
 
 class StrategyName(str, Enum):
-    """Canonical identifiers for all CHAD brains."""
-
-    ALPHA = "alpha"  # Intraday stocks/ETFs
-    BETA = "beta"  # Long-term legend/ETF
-    GAMMA = "gamma"  # Swing/momentum
-    OMEGA = "omega"  # Hedge / macro
-    ALPHA_CRYPTO = "alpha_crypto"  # Intraday crypto
-    ALPHA_FOREX = "alpha_forex"  # Intraday FX
-    DELTA = "delta"  # Micro-execution / optimization
+    ALPHA = "alpha"
+    BETA = "beta"
+    GAMMA = "gamma"
+    OMEGA = "omega"
+    DELTA = "delta"
+    ALPHA_CRYPTO = "alpha_crypto"
+    ALPHA_FOREX = "alpha_forex"
 
 
 class AssetClass(str, Enum):
-    """Supported asset classes for CHAD."""
-
     EQUITY = "equity"
     ETF = "etf"
     CRYPTO = "crypto"
@@ -49,229 +65,235 @@ class AssetClass(str, Enum):
 
 
 class SignalSide(str, Enum):
-    """Direction of a trading signal."""
-
-    BUY = "buy"
-    SELL = "sell"
+    BUY = "BUY"
+    SELL = "SELL"
 
 
-class TimeInForce(str, Enum):
-    """Simplified time-in-force flags for Phase 3."""
+# -----------------------------
+# Strategy config + signals
+# -----------------------------
 
-    DAY = "DAY"
-    GTC = "GTC"
-
-
-class SignalOrigin(str, Enum):
-    """Where a signal came from, for traceability and debugging."""
-
-    STRATEGY = "strategy"
-    MANUAL = "manual"
-    GOVERNOR = "governor"  # Shadow Confidence Router / governor overrides
-
-
-# ---------------------------------------------------------------------------
-# Market & reference data types
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class MarketTick:
-    """
-    Single trade/quote tick as seen by CHAD.
-    Phase 2 gives us Polygon last-trade data for SPY/QQQ; Phase 3 strategies
-    consume these in higher-level aggregates.
-    """
-
-    symbol: str
-    price: float
-    size: float
-    exchange: Optional[int]
-    timestamp: datetime
-    source: str = "polygon"
-
-
-@dataclass(frozen=True)
-class LegendConsensus:
-    """
-    Legend (13F-style) consensus weights.
-
-    Backed by data/legend_top_stocks.json produced by the Legend pipeline.
-    """
-
-    as_of: datetime
-    weights: Mapping[str, float]
-
-
-# ---------------------------------------------------------------------------
-# Portfolio & position views
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Position:
-    """Snapshot of a single position in a symbol."""
-
-    symbol: str
-    asset_class: AssetClass
-    quantity: float
-    avg_price: float
-
-
-@dataclass(frozen=True)
-class PortfolioSnapshot:
-    """
-    Minimal portfolio snapshot used in Phase 3.
-    Risk engine and full accounting are Phase 4; here we only need
-    enough structure for strategies to reason about exposure.
-    """
-
-    timestamp: datetime
-    cash: float
-    positions: Mapping[str, Position]
-
-    @property
-    def symbols(self) -> Sequence[str]:
-        return list(self.positions.keys())
-
-
-# ---------------------------------------------------------------------------
-# Strategy configuration & context
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StrategyConfig:
-    """Static configuration for a strategy brain."""
+    """
+    Strategy registration configuration for StrategyEngine.
 
+    target_universe may be None for strategies that derive symbols dynamically.
+    """
     name: StrategyName
     enabled: bool = True
     target_universe: Optional[Sequence[str]] = None
-    max_gross_exposure: Optional[float] = None  # e.g. notional cap
+    max_gross_exposure: Optional[float] = None
     notes: str = ""
 
 
-@dataclass(frozen=True)
-class MarketContext:
-    """
-    Inputs a strategy needs to decide on signals for a given cycle.
-
-    In Phase 3 this is intentionally lean: last trades + legend consensus
-    for Beta; later phases can extend this via additional fields.
-    """
-
-    now: datetime
-    ticks: Mapping[str, MarketTick]
-    legend: Optional[LegendConsensus]
-    portfolio: PortfolioSnapshot
-
-
-# ---------------------------------------------------------------------------
-# Trade signals & execution requests
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TradeSignal:
     """
-    A raw trade signal produced by a strategy.
+    Strategy output intent. Still subject to policy + risk + execution gates.
 
-    This is *not* yet a final broker order; the Execution/Risk Engine
-    in Phase 4/5 will further shape and approve these.
+    Notes:
+    - size is "units" (strategy-level), not notional dollars.
+    - confidence is a 0..1 hint, not a guarantee.
+    - meta is optional diagnostic payload.
+
+    Backward-compatibility contract:
+    - created_at defaults to datetime.utcnow so older callers remain valid
+    - meta defaults to {} so older callers do not break
     """
-
     strategy: StrategyName
     symbol: str
     side: SignalSide
-    size: float  # positive units (shares, contracts, etc.)
-    confidence: float  # 0.0–1.0; used by governor / allocator
+    size: float
+    confidence: float
     asset_class: AssetClass
-    time_in_force: TimeInForce = TimeInForce.DAY
-    origin: SignalOrigin = SignalOrigin.STRATEGY
-    created_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    tags: Tuple[str, ...] = field(default_factory=tuple)
-    meta: Mapping[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    meta: Dict[str, Any] = field(default_factory=dict)
+# -----------------------------
+# Routed output (Phase 3 contract)
+# -----------------------------
 
-    def with_tag(self, tag: str) -> "TradeSignal":
-        """Return a copy with an extra tag."""
-        new_tags = tuple((*self.tags, tag))
-        return TradeSignal(
-            strategy=self.strategy,
-            symbol=self.symbol,
-            side=self.side,
-            size=self.size,
-            confidence=self.confidence,
-            asset_class=self.asset_class,
-            time_in_force=self.time_in_force,
-            origin=self.origin,
-            created_at=self.created_at,
-            tags=new_tags,
-            meta=self.meta,
-        )
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RoutedSignal:
     """
-    Signal after passing through the SignalRouter.
+    Phase 3 routed signal (SSOT contract).
 
-    The router may:
-      - merge multiple signals on the same symbol,
-      - downgrade confidence,
-      - mark conflicts, etc.
+    This type is the canonical output of SignalRouter and the canonical input to:
+      - policy
+      - daily_throttle
+      - execution planning / adapters
+
+    Contract compatibility (locked by tests):
+      - net_size (float) is the routed quantity (units, not dollars)
+      - source_strategies is a tuple[StrategyName, ...]
+      - created_at may be None (tests use None in some cases)
     """
-
     symbol: str
     side: SignalSide
     net_size: float
     source_strategies: Tuple[StrategyName, ...]
     confidence: float
     asset_class: AssetClass
-    created_at: datetime
-    meta: Mapping[str, Any] = field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    meta: Optional[Dict[str, Any]] = None
+
+    # Best-effort market price for notional estimation (may be 0.0 if unknown)
+    price: float = 0.0
+
+    # Optional upstream idempotency + tags
+    idempotency_key: Optional[str] = None
+    tags: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        def _ff(x: Any, d: float = 0.0) -> float:
+            try:
+                v = float(x)
+                return v if math.isfinite(v) else float(d)
+            except Exception:
+                return float(d)
+
+        sym = (self.symbol or "").strip().upper()
+        object.__setattr__(self, "symbol", sym)
+
+        object.__setattr__(self, "net_size", _ff(self.net_size, 0.0))
+        object.__setattr__(self, "confidence", max(0.0, min(1.0, _ff(self.confidence, 0.0))))
+        object.__setattr__(self, "price", max(0.0, _ff(self.price, 0.0)))
+
+        object.__setattr__(self, "source_strategies", tuple(self.source_strategies or ()))
+        object.__setattr__(self, "tags", tuple(self.tags or ()))
+
+    @property
+    def size(self) -> float:
+        """
+        Backward-compatible alias: some newer code may refer to .size.
+        The SSOT contract uses net_size.
+        """
+        return float(self.net_size)
+
+        object.__setattr__(self, "size", _ff(self.size, 0.0))
+        object.__setattr__(self, "confidence", max(0.0, min(1.0, _ff(self.confidence, 0.0))))
+        object.__setattr__(self, "price", max(0.0, _ff(self.price, 0.0)))
+
+        # Normalize symbol
+        sym = (self.symbol or "").strip().upper()
+        object.__setattr__(self, "symbol", sym)
+
+        # Ensure tuple type for strategies/tags
+        object.__setattr__(self, "source_strategies", tuple(self.source_strategies or ()))
+        object.__setattr__(self, "tags", tuple(self.tags or ()))
 
 
-# ---------------------------------------------------------------------------
-# Brain health & registry
-# ---------------------------------------------------------------------------
+# -----------------------------
+# Market + portfolio types
+# -----------------------------
+
+@dataclass(frozen=True, slots=True)
+class MarketTick:
+    symbol: str
+    price: float
+    size: float
+    exchange: Optional[int]
+    timestamp: datetime
+    source: str = "unknown"
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class LegendConsensus:
+    as_of: datetime
+    weights: Mapping[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class Position:
+    symbol: str
+    asset_class: AssetClass
+    quantity: float
+    avg_price: float
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioSnapshot:
+    timestamp: datetime
+    cash: float
+    positions: Mapping[str, Position]
+    extra: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class MarketContext:
+    """
+    Canonical context passed to strategies.
+
+    New field:
+      bars: optional OHLCV series per symbol.
+
+    Backward compatibility:
+      bars defaults to None.
+    """
+    now: datetime
+    ticks: Mapping[str, MarketTick]
+    legend: Optional[LegendConsensus]
+    portfolio: PortfolioSnapshot
+    bars: Optional[Mapping[str, list]] = None
+
+
+# -----------------------------
+# Optional: policy/risk helper enums used elsewhere
+# -----------------------------
+
+class RiskLane(str, Enum):
+    PAPER = "paper"
+    LIVE = "live"
+    EXIT_ONLY = "exit_only"
+    DENY_ALL = "deny_all"
+
+
+class GovernorName(str, Enum):
+    GOVERNOR = "governor"
+# -----------------------------
+# Brain health registry (Phase 3 engine contract)
+# -----------------------------
+
+@dataclass(slots=True)
 class BrainStatus:
     """
-    Mutable status tracked by the orchestrator for each strategy.
+    Lightweight per-brain health tracker.
 
-    This is polled and updated each run cycle.
+    Used by StrategyEngine:
+      - record_error(reason)
+      - heartbeat(signal_count=...)
     """
-
     name: StrategyName
-    enabled: bool = True
-    last_heartbeat: Optional[datetime] = None
-    last_error: Optional[str] = None
-    last_signal_count: int = 0
-    extra: MutableMapping[str, Any] = field(default_factory=dict)
+    ok: bool = True
+    last_heartbeat_utc: Optional[datetime] = None
+    last_error_utc: Optional[datetime] = None
+    last_error_reason: str = ""
+    total_cycles: int = 0
+    total_signals: int = 0
+    total_errors: int = 0
 
-    def heartbeat(self, signal_count: int) -> None:
-        self.last_heartbeat = datetime.now(timezone.utc)
-        self.last_signal_count = signal_count
-        self.last_error = None
+    def heartbeat(self, *, signal_count: int = 0) -> None:
+        self.ok = True
+        self.last_heartbeat_utc = datetime.utcnow()
+        self.total_cycles += 1
+        if isinstance(signal_count, int) and signal_count > 0:
+            self.total_signals += int(signal_count)
 
-    def record_error(self, message: str) -> None:
-        self.last_heartbeat = datetime.now(timezone.utc)
-        self.last_error = message
+    def record_error(self, reason: str) -> None:
+        self.ok = False
+        self.total_errors += 1
+        self.last_error_utc = datetime.utcnow()
+        self.last_error_reason = str(reason or "unknown_error")
 
 
-@dataclass
+@dataclass(slots=True)
 class BrainRegistry:
     """
-    Registry for all strategy brains.
+    Registry mapping StrategyName -> BrainStatus.
 
-    The orchestrator uses this to track status and to implement features like
-    toggling strategies, reporting health, etc.
+    StrategyEngine expects:
+      - ensure(name) -> BrainStatus
     """
-
     brains: Dict[StrategyName, BrainStatus] = field(default_factory=dict)
 
     def ensure(self, name: StrategyName) -> BrainStatus:
@@ -279,5 +301,17 @@ class BrainRegistry:
             self.brains[name] = BrainStatus(name=name)
         return self.brains[name]
 
-    def all_status(self) -> List[BrainStatus]:
-        return list(self.brains.values())
+    def snapshot(self) -> Dict[str, Any]:
+        # Safe JSON-ish snapshot for status surfaces (optional).
+        out: Dict[str, Any] = {}
+        for k, v in self.brains.items():
+            out[str(k.value)] = {
+                "ok": bool(v.ok),
+                "last_heartbeat_utc": v.last_heartbeat_utc.isoformat() if v.last_heartbeat_utc else None,
+                "last_error_utc": v.last_error_utc.isoformat() if v.last_error_utc else None,
+                "last_error_reason": v.last_error_reason,
+                "total_cycles": int(v.total_cycles),
+                "total_signals": int(v.total_signals),
+                "total_errors": int(v.total_errors),
+            }
+        return out
