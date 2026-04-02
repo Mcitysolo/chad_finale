@@ -3,93 +3,102 @@ from __future__ import annotations
 """
 chad/execution/execution_pipeline.py
 
-Phase-4 Execution Pipeline (Broker-Agnostic Planning Layer)
+Professional-grade broker-agnostic execution planning layer for CHAD.
 
-This module bridges the *logical* decision layer and the concrete broker
-executors (IBKR, Kraken, etc.) by turning RoutedSignal objects + prices into
-a normalized set of "planned orders" (ExecutionPlan). It deliberately does
-NOT talk to brokers or enforce caps; that work is delegated to the existing
-IBKRExecutor / KrakenExecutor modules and the dynamic risk allocator.
+What this module does
+---------------------
+1. Nets routed signals by symbol.
+2. Validates prices and sizes.
+3. Produces a deterministic ExecutionPlan of PlannedOrder objects.
+4. Converts eligible PlannedOrder objects into IBKR StrategyTradeIntent objects.
+5. Supports multi-asset routing for:
+   - EQUITY
+   - ETF
+   - FUTURES
+   - FOREX
+6. Fails closed for unsupported / malformed instruments.
 
-Primary responsibilities
-------------------------
-* Take a batch of RoutedSignal objects (already:
-    - produced by DecisionPipeline,
-    - policy-filtered,
-    - per-symbol netted).
-* Look up prices and compute notional estimates.
-* Produce a list of PlannedOrder instances that contain:
-    - strategy label(s),
-    - symbol,
-    - side,
-    - size,
-    - asset_class,
-    - unit price,
-    - notional.
+Design goals
+------------
+- Pure transformation layer: no network I/O, no broker sockets.
+- Deterministic, testable, auditable behavior.
+- Strong validation and explicit rejection reasons.
+- Extensible instrument resolution via strategy/factory style registry.
+- Backwards-compatible public entry points:
+    * build_execution_plan(...)
+    * build_ibkr_intents_from_plan(...)
 
-This keeps execution planning:
-* deterministic,
-* easily testable,
-* decoupled from any specific broker API.
-
-Downstream mapping (Phase 4+)
------------------------------
-* IBKRExecutor consumes StrategyTradeIntent (see chad/execution/ibkr_executor.py).
-* KrakenExecutor consumes StrategyTradeIntent (see chad/execution/kraken_executor.py).
-
-This module also provides a helper to convert an ExecutionPlan into a set of
-IBKR StrategyTradeIntent objects for equity/ETF symbols. This is still pure
-transformation: no sockets, no network I/O.
+Notes
+-----
+- This module assumes:
+    * RoutedSignal objects expose:
+        symbol, side, net_size, asset_class, source_strategies
+    * IBKRStrategyTradeIntent supports:
+        strategy, symbol, sec_type, exchange, currency, side,
+        order_type, quantity, notional_estimate, limit_price
+- Futures support requires broker-side contract construction elsewhere
+  (expiry / localSymbol / multiplier). This module correctly routes FUT intents
+  but does not build ib_insync Contract objects itself.
 """
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from enum import Enum
+from functools import lru_cache
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
 
 
-# ---------------------------------------------------------------------------
-# Broker-agnostic planning models
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Constants / tuning
+# ============================================================================
+
+_EPSILON = Decimal("0.000000000001")
+_DEFAULT_ORDER_TYPE = "MKT"
+_DEFAULT_FOREX_CURRENCY = "USD"
+_DEFAULT_FUTURES_CURRENCY = "USD"
+
+# Whole-unit instrument types on standard IBKR paths.
+_WHOLE_UNIT_SEC_TYPES = frozenset({"STK", "FUT", "OPT"})
+
+# Reason codes are intentionally short and machine-friendly.
+_REASON_UNSUPPORTED_ASSET_CLASS = "unsupported_asset_class"
+_REASON_MISSING_PRICE = "missing_price"
+_REASON_NON_POSITIVE_PRICE = "non_positive_price"
+_REASON_NON_POSITIVE_SIZE = "non_positive_size"
+_REASON_MISSING_STRATEGY = "missing_strategy"
+_REASON_INVALID_SYMBOL = "invalid_symbol"
+_REASON_INVALID_FOREX_SYMBOL = "invalid_forex_symbol"
+_REASON_INVALID_FUTURES_SYMBOL = "invalid_futures_symbol"
+_REASON_INVALID_QUANTITY = "invalid_quantity"
+
+
+# ============================================================================
+# Data models
+# ============================================================================
+
+
+class PlanRejectionSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class PlanRejection:
+    symbol: str
+    reason: str
+    severity: PlanRejectionSeverity = PlanRejectionSeverity.WARNING
+    detail: str = ""
 
 
 @dataclass(frozen=True)
 class PlannedOrder:
     """
-    Normalized, broker-agnostic representation of a planned trade.
-
-    Fields
-    ------
-    symbol:
-        Ticker / instrument identifier, e.g. "SPY", "AAPL", "QQQ".
-
-    side:
-        BUY or SELL as a SignalSide enum.
-
-    size:
-        Net size in natural units (e.g. shares or contracts) as produced by
-        the SignalRouter. Positive size for BUY, positive size for SELL
-        (direction is carried by `side`).
-
-    asset_class:
-        AssetClass enum (e.g. EQUITY, ETF, CRYPTO, FOREX).
-
-    price:
-        Latest known unit price from the pricing layer (ContextBuilder), used
-        for notional estimation and risk comparisons.
-
-    notional:
-        size * price. Always >= 0.0. If price is missing or invalid, the
-        RoutedSignal is excluded from the plan.
-
-    primary_strategy:
-        The first StrategyName that contributed to this RoutedSignal. This
-        is useful for mapping into per-strategy caps (e.g. dynamic_caps.json).
-
-    contributing_strategies:
-        All StrategyName values that contributed to this RoutedSignal.
+    Broker-agnostic normalized order.
     """
 
     symbol: str
@@ -100,31 +109,276 @@ class PlannedOrder:
     notional: float
     primary_strategy: StrategyName
     contributing_strategies: Sequence[StrategyName]
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class ExecutionPlan:
     """
-    Container for a batch of planned orders.
+    Deterministic planning result.
 
-    Fields
-    ------
     orders:
-        List of PlannedOrder instances.
+        Accepted normalized planned orders.
 
-    Notes
-    -----
-    This object is deliberately simple; it can be enriched later with metadata
-    (e.g. snapshot timestamps, risk context) without affecting the basic
-    interface.
+    rejections:
+        Explicitly rejected routed signals / netted symbols, useful for audit.
+
+    Notes:
+        This preserves enough state to explain why something did not convert
+        into an executable broker intent.
     """
 
     orders: List[PlannedOrder]
+    rejections: List[PlanRejection] = field(default_factory=list)
 
     @property
     def total_notional(self) -> float:
-        """Total notional across all planned orders."""
         return float(sum(o.notional for o in self.orders))
+
+    @property
+    def futures_orders_count(self) -> int:
+        return sum(1 for o in self.orders if o.asset_class == AssetClass.FUTURES)
+
+    @property
+    def equity_like_orders_count(self) -> int:
+        return sum(1 for o in self.orders if o.asset_class in (AssetClass.EQUITY, AssetClass.ETF))
+
+    @property
+    def forex_orders_count(self) -> int:
+        return sum(1 for o in self.orders if o.asset_class == AssetClass.FOREX)
+
+    @property
+    def symbols(self) -> List[str]:
+        return [o.symbol for o in self.orders]
+
+
+@dataclass(frozen=True)
+class IBKRInstrumentSpec:
+    """
+    Canonical broker intent mapping for an instrument family.
+    """
+
+    sec_type: str
+    exchange: str
+    currency: str
+    quantity_step: Decimal = Decimal("1")
+    whole_units: bool = True
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+# ============================================================================
+# Helpers: numeric hygiene
+# ============================================================================
+
+
+def _to_decimal(value: object, *, default: Optional[Decimal] = None) -> Optional[Decimal]:
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _is_effectively_zero(value: Decimal) -> bool:
+    return abs(value) <= _EPSILON
+
+
+def _quantize_down(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        raise ValueError("step must be positive")
+    units = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    return units * step
+
+
+def _normalize_symbol(symbol: object) -> str:
+    return str(symbol or "").strip().upper()
+
+
+# ============================================================================
+# Instrument resolution
+# ============================================================================
+
+
+@lru_cache(maxsize=256)
+def _futures_spec_registry() -> Dict[str, IBKRInstrumentSpec]:
+    """
+    Minimal futures routing registry for currently observed CHAD futures symbols.
+
+    These are routing defaults only.
+    Contract expiry / localSymbol / multiplier handling must still be done in
+    the broker adapter / contract builder layer.
+    """
+    return {
+        "MES": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="CME",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "equity_index", "underlier": "ES", "micro": True},
+        ),
+        "MNQ": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="CME",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "equity_index", "underlier": "NQ", "micro": True},
+        ),
+        "MCL": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="NYMEX",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "energy", "underlier": "CL", "micro": True},
+        ),
+        "MGC": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="COMEX",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "metals", "underlier": "GC", "micro": True},
+        ),
+    }
+
+
+def _resolve_equity_like_spec(
+    asset_class: AssetClass,
+    *,
+    default_exchange: str,
+    default_currency: str,
+    default_sec_type: str,
+) -> IBKRInstrumentSpec:
+    sec_type = "STK" if asset_class in (AssetClass.EQUITY, AssetClass.ETF) else default_sec_type
+    return IBKRInstrumentSpec(
+        sec_type=sec_type,
+        exchange=default_exchange,
+        currency=default_currency,
+        quantity_step=Decimal("1"),
+        whole_units=True,
+        metadata={"asset_class": asset_class.value},
+    )
+
+
+def _resolve_forex_spec(symbol: str) -> IBKRInstrumentSpec:
+    # Accept either EURUSD or EUR-USD style.
+    compact = symbol.replace("-", "").replace("/", "")
+    if len(compact) != 6 or not compact.isalpha():
+        raise ValueError(_REASON_INVALID_FOREX_SYMBOL)
+
+    base = compact[:3]
+    quote = compact[3:]
+
+    return IBKRInstrumentSpec(
+        sec_type="CASH",
+        exchange="IDEALPRO",
+        currency=quote,
+        quantity_step=Decimal("0.0001"),
+        whole_units=False,
+        metadata={"base_currency": base, "quote_currency": quote},
+    )
+
+
+def _resolve_futures_spec(symbol: str) -> IBKRInstrumentSpec:
+    spec = _futures_spec_registry().get(symbol)
+    if spec is None:
+        raise ValueError(_REASON_INVALID_FUTURES_SYMBOL)
+    return spec
+
+
+def resolve_ibkr_instrument_spec(
+    *,
+    symbol: str,
+    asset_class: AssetClass,
+    default_sec_type: str,
+    default_exchange: str,
+    default_currency: str,
+) -> IBKRInstrumentSpec:
+    """
+    Factory-style resolver for IBKR instrument mapping.
+    """
+    if asset_class in (AssetClass.EQUITY, AssetClass.ETF):
+        return _resolve_equity_like_spec(
+            asset_class,
+            default_exchange=default_exchange,
+            default_currency=default_currency,
+            default_sec_type=default_sec_type,
+        )
+
+    if asset_class == AssetClass.FUTURES:
+        return _resolve_futures_spec(symbol)
+
+    if asset_class == AssetClass.FOREX:
+        return _resolve_forex_spec(symbol)
+
+    raise ValueError(_REASON_UNSUPPORTED_ASSET_CLASS)
+
+
+# ============================================================================
+# Plan building
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class _NettedBucket:
+    symbol: str
+    net_signed_size: Decimal
+    buy_rs: Optional[RoutedSignal]
+    sell_rs: Optional[RoutedSignal]
+
+
+def _net_routed_signals(routed_signals: Iterable[RoutedSignal]) -> Dict[str, _NettedBucket]:
+    buckets: Dict[str, Dict[str, object]] = {}
+
+    for rs in routed_signals:
+        symbol = _normalize_symbol(getattr(rs, "symbol", ""))
+        if not symbol:
+            continue
+
+        raw_size = _to_decimal(getattr(rs, "net_size", None), default=Decimal("0"))
+        if raw_size is None or raw_size <= 0:
+            continue
+
+        side = getattr(rs, "side", None)
+        if side not in (SignalSide.BUY, SignalSide.SELL):
+            continue
+
+        signed_size = raw_size if side is SignalSide.BUY else -raw_size
+
+        if symbol not in buckets:
+            buckets[symbol] = {
+                "net_signed_size": Decimal("0"),
+                "buy_rs": None,
+                "sell_rs": None,
+            }
+
+        bucket = buckets[symbol]
+        bucket["net_signed_size"] = Decimal(bucket["net_signed_size"]) + signed_size
+
+        if side is SignalSide.BUY:
+            prev = bucket["buy_rs"]
+            prev_size = _to_decimal(getattr(prev, "net_size", None), default=Decimal("0")) if prev else Decimal("0")
+            if prev is None or raw_size > prev_size:
+                bucket["buy_rs"] = rs
+        else:
+            prev = bucket["sell_rs"]
+            prev_size = _to_decimal(getattr(prev, "net_size", None), default=Decimal("0")) if prev else Decimal("0")
+            if prev is None or raw_size > prev_size:
+                bucket["sell_rs"] = rs
+
+    out: Dict[str, _NettedBucket] = {}
+    for symbol in sorted(buckets.keys()):
+        b = buckets[symbol]
+        out[symbol] = _NettedBucket(
+            symbol=symbol,
+            net_signed_size=Decimal(b["net_signed_size"]),
+            buy_rs=b["buy_rs"],
+            sell_rs=b["sell_rs"],
+        )
+    return out
 
 
 def build_execution_plan(
@@ -132,75 +386,113 @@ def build_execution_plan(
     prices: Mapping[str, float],
 ) -> ExecutionPlan:
     """
-    Build an ExecutionPlan from routed signals and current prices.
+    Pure planning function.
 
-    Behaviour
-    ---------
-    * For each RoutedSignal:
-        - Look up price in `prices` by symbol.
-        - If price is missing or <= 0, skip the signal (cannot compute notional).
-        - Compute notional = abs(net_size) * price.
-        - Use the first contributing strategy as `primary_strategy`.
-        - Preserve the full tuple of contributing strategies.
-
-    * Returns:
-        ExecutionPlan(orders=[...]) with one PlannedOrder per RoutedSignal
-        that has a valid price.
-
-    This function is *pure* and side-effect free. It does not:
-        - talk to brokers,
-        - mutate dynamic caps,
-        - enforce any caps,
-        - write logs or files.
+    - Nets opposing same-symbol orders.
+    - Drops symbols with missing or invalid prices.
+    - Preserves strategy provenance.
+    - Returns both accepted orders and explicit rejections.
     """
-
+    buckets = _net_routed_signals(routed_signals)
     orders: List[PlannedOrder] = []
+    rejections: List[PlanRejection] = []
 
-    for rs in routed_signals:
-        symbol = rs.symbol
+    for symbol in sorted(buckets.keys()):
+        bucket = buckets[symbol]
+
+        if _is_effectively_zero(bucket.net_signed_size):
+            continue
+
+        side = SignalSide.BUY if bucket.net_signed_size > 0 else SignalSide.SELL
+        size_dec = abs(bucket.net_signed_size)
+
+        survivor = bucket.buy_rs if side is SignalSide.BUY else bucket.sell_rs
+        if survivor is None:
+            rejections.append(
+                PlanRejection(symbol=symbol, reason=_REASON_NON_POSITIVE_SIZE, detail="missing_survivor_signal")
+            )
+            continue
+
+        asset_class = getattr(survivor, "asset_class", None)
+        if not isinstance(asset_class, AssetClass):
+            rejections.append(
+                PlanRejection(symbol=symbol, reason=_REASON_UNSUPPORTED_ASSET_CLASS, detail=f"asset_class={asset_class!r}")
+            )
+            continue
+
         price = prices.get(symbol)
-
-        if price is None or price <= 0.0:
-            # Skip symbols with missing/invalid prices; they should have been
-            # filtered earlier by policy, but we keep this guard as a final
-            # safety net.
+        if price is None:
+            rejections.append(
+                PlanRejection(symbol=symbol, reason=_REASON_MISSING_PRICE, detail="no_price_in_mapping")
+            )
             continue
 
-        # Net size is always positive; direction is encoded in `side`.
-        size = float(rs.net_size)
-        if size <= 0.0:
-            # Nothing to do; keep plan free of zero-sized orders.
+        price_dec = _to_decimal(price)
+        if price_dec is None or price_dec <= 0:
+            rejections.append(
+                PlanRejection(symbol=symbol, reason=_REASON_NON_POSITIVE_PRICE, detail=f"price={price!r}")
+            )
             continue
 
-        notional = abs(size) * float(price)
-
-        if not rs.source_strategies:
-            # This should not normally happen; RoutedSignal is expected to
-            # carry at least one contributing StrategyName. We simply skip
-            # such entries rather than guessing.
+        strategies = tuple(getattr(survivor, "source_strategies", ()) or ())
+        if not strategies:
+            rejections.append(
+                PlanRejection(symbol=symbol, reason=_REASON_MISSING_STRATEGY, detail="empty_source_strategies")
+            )
             continue
 
-        primary = rs.source_strategies[0]
-        contributing = tuple(rs.source_strategies)
+        primary_strategy = strategies[0]
+        if not isinstance(primary_strategy, StrategyName):
+            rejections.append(
+                PlanRejection(symbol=symbol, reason=_REASON_MISSING_STRATEGY, detail=f"primary_strategy={primary_strategy!r}")
+            )
+            continue
 
-        order = PlannedOrder(
-            symbol=symbol,
-            side=rs.side,
-            size=size,
-            asset_class=rs.asset_class,
-            price=float(price),
-            notional=float(notional),
-            primary_strategy=primary,
-            contributing_strategies=contributing,
+        notional_dec = size_dec * price_dec
+
+        metadata = {
+            "netted": True,
+            "survivor_side": side.value,
+            "raw_asset_class": asset_class.value,
+            "strategy_count": len(strategies),
+        }
+
+        orders.append(
+            PlannedOrder(
+                symbol=symbol,
+                side=side,
+                size=float(size_dec),
+                asset_class=asset_class,
+                price=float(price_dec),
+                notional=float(notional_dec),
+                primary_strategy=primary_strategy,
+                contributing_strategies=strategies,
+                metadata=metadata,
+            )
         )
-        orders.append(order)
 
-    return ExecutionPlan(orders=orders)
+    return ExecutionPlan(orders=orders, rejections=rejections)
 
 
-# ---------------------------------------------------------------------------
-# IBKR intent builder (Phase 4 mapping layer)
-# ---------------------------------------------------------------------------
+# ============================================================================
+# IBKR intent mapping
+# ============================================================================
+
+
+def _normalize_quantity_for_spec(quantity: float, spec: IBKRInstrumentSpec) -> float:
+    q = _to_decimal(quantity)
+    if q is None or q <= 0:
+        raise ValueError(_REASON_INVALID_QUANTITY)
+
+    if spec.whole_units or spec.sec_type in _WHOLE_UNIT_SEC_TYPES:
+        q = _quantize_down(q, Decimal("1"))
+    else:
+        q = _quantize_down(q, spec.quantity_step)
+
+    if q <= 0:
+        raise ValueError(_REASON_INVALID_QUANTITY)
+
+    return float(q)
 
 
 def build_ibkr_intents_from_plan(
@@ -211,61 +503,97 @@ def build_ibkr_intents_from_plan(
     default_currency: str = "USD",
 ) -> List[IBKRStrategyTradeIntent]:
     """
-    Map an ExecutionPlan into a list of IBKR StrategyTradeIntent objects.
+    Convert an ExecutionPlan into IBKR StrategyTradeIntent objects.
 
-    Rules
-    -----
-    * Only EQUITY and ETF asset classes are mapped; other classes are skipped.
-    * Strategy name passed to IBKR is the lowercase StrategyName value
-      (e.g. 'beta', 'alpha').
-    * Side is converted from SignalSide enum to 'BUY' / 'SELL'.
-    * Quantity comes from PlannedOrder.size.
-    * notional_estimate is copied from PlannedOrder.notional.
-    * Orders are MARKET by default (MKT) with no limit price.
+    Supported asset classes
+    -----------------------
+    - EQUITY -> STK / SMART / USD
+    - ETF    -> STK / SMART / USD
+    - FUTURES -> FUT / exchange per registry / USD
+    - FOREX  -> CASH / IDEALPRO / quote currency
 
-    Parameters
-    ----------
-    plan:
-        ExecutionPlan to convert.
-
-    default_sec_type:
-        Default IBKR secType for equity-like instruments, usually "STK".
-
-    default_exchange:
-        Default IBKR exchange/routing, usually "SMART".
-
-    default_currency:
-        Default trade currency, e.g. "USD". This should match your IBKR
-        account base currency for notional comparisons.
-
-    Returns
-    -------
-    List[IBKRStrategyTradeIntent]
-        One intent per PlannedOrder that is eligible for IBKR.
+    Important
+    ---------
+    This function routes futures correctly as FUT intents, but broker-side
+    contract construction still needs expiry/local-symbol logic elsewhere.
     """
-
     intents: List[IBKRStrategyTradeIntent] = []
 
     for order in plan.orders:
-        if order.asset_class not in (AssetClass.EQUITY, AssetClass.ETF):
-            # Let other executors (e.g. Kraken, Forex) handle non-equity assets.
+        try:
+            spec = resolve_ibkr_instrument_spec(
+                symbol=order.symbol,
+                asset_class=order.asset_class,
+                default_sec_type=default_sec_type,
+                default_exchange=default_exchange,
+                default_currency=default_currency,
+            )
+        except ValueError:
+            # Fail closed. Unsupported instruments stay out of broker intents.
             continue
 
-        strategy_name = order.primary_strategy.value  # e.g. "beta"
         side = "BUY" if order.side is SignalSide.BUY else "SELL"
+        strategy_name = order.primary_strategy.value
+        quantity = _normalize_quantity_for_spec(order.size, spec)
+
+        # Symbol normalization:
+        # - equities/etfs/futures pass through unchanged
+        # - forex becomes compact "EURUSD" for IBKR CASH path
+        broker_symbol = order.symbol
+        if order.asset_class == AssetClass.FOREX:
+            broker_symbol = order.symbol.replace("-", "").replace("/", "").upper()
 
         intent = IBKRStrategyTradeIntent(
             strategy=strategy_name,
-            symbol=order.symbol,
-            sec_type=default_sec_type,
-            exchange=default_exchange,
-            currency=default_currency,
+            symbol=broker_symbol,
+            sec_type=spec.sec_type,
+            exchange=spec.exchange,
+            currency=spec.currency,
             side=side,
-            order_type="MKT",
-            quantity=order.size,
+            order_type=_DEFAULT_ORDER_TYPE,
+            quantity=quantity,
             notional_estimate=order.notional,
             limit_price=None,
         )
         intents.append(intent)
 
     return intents
+
+
+# ============================================================================
+# Optional audit helpers
+# ============================================================================
+
+
+def summarize_execution_plan(plan: ExecutionPlan) -> Dict[str, object]:
+    """
+    Lightweight deterministic summary for logs/tests.
+    """
+    by_asset: Dict[str, int] = {}
+    for order in plan.orders:
+        key = order.asset_class.value
+        by_asset[key] = by_asset.get(key, 0) + 1
+
+    return {
+        "orders_count": len(plan.orders),
+        "total_notional": round(plan.total_notional, 8),
+        "futures_orders_count": plan.futures_orders_count,
+        "equity_like_orders_count": plan.equity_like_orders_count,
+        "forex_orders_count": plan.forex_orders_count,
+        "rejections_count": len(plan.rejections),
+        "orders_by_asset_class": dict(sorted(by_asset.items())),
+        "symbols": plan.symbols,
+    }
+
+
+__all__ = [
+    "PlannedOrder",
+    "ExecutionPlan",
+    "PlanRejection",
+    "PlanRejectionSeverity",
+    "IBKRInstrumentSpec",
+    "build_execution_plan",
+    "build_ibkr_intents_from_plan",
+    "resolve_ibkr_instrument_spec",
+    "summarize_execution_plan",
+]

@@ -54,7 +54,7 @@ class StrategyName(str, Enum):
     DELTA = "delta"
     ALPHA_CRYPTO = "alpha_crypto"
     ALPHA_FOREX = "alpha_forex"
-
+    ALPHA_FUTURES = "alpha_futures"
 
 class AssetClass(str, Enum):
     EQUITY = "equity"
@@ -62,7 +62,7 @@ class AssetClass(str, Enum):
     CRYPTO = "crypto"
     FOREX = "forex"
     CASH = "cash"
-
+    FUTURES = "futures"
 
 class SignalSide(str, Enum):
     BUY = "BUY"
@@ -224,17 +224,25 @@ class MarketContext:
     """
     Canonical context passed to strategies.
 
-    New field:
-      bars: optional OHLCV series per symbol.
+    Optional context surfaces:
+      - bars: optional OHLCV series per symbol
+      - spread_bps: optional per-symbol spread in basis points
+      - dollar_volume / volume_usd / liquidity_usd: optional per-symbol liquidity views
+      - volatility: optional per-symbol realized/estimated volatility
 
     Backward compatibility:
-      bars defaults to None.
+      all optional fields default to None so existing callers remain valid.
     """
     now: datetime
     ticks: Mapping[str, MarketTick]
     legend: Optional[LegendConsensus]
     portfolio: PortfolioSnapshot
     bars: Optional[Mapping[str, list]] = None
+    spread_bps: Optional[Mapping[str, float]] = None
+    dollar_volume: Optional[Mapping[str, float]] = None
+    volume_usd: Optional[Mapping[str, float]] = None
+    liquidity_usd: Optional[Mapping[str, float]] = None
+    volatility: Optional[Mapping[str, float]] = None
 
 
 # -----------------------------

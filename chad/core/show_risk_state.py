@@ -22,7 +22,7 @@ This tool prints a unified snapshot of CHAD's current risk state:
 
 Usage:
 
-    PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.show_risk_state
+    PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.show_risk_state
 
 This command is STRICTLY READ-ONLY – it does NOT execute trades,
 modify config, or change system mode.
@@ -88,7 +88,7 @@ def main() -> None:
 
     # --- Shadow Confidence State ---
     stats = load_and_compute(
-        max_trades=200,
+        max_trades=500,
         days_back=30,
         include_paper=True,
         include_live=True,

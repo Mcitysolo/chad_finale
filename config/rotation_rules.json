@@ -1,0 +1,51 @@
+{
+  "schema_version": "rotation_rules.v1",
+  "ts_utc": "2026-03-05T22:25:00Z",
+  "enabled": true,
+  "advisory_only": true,
+  "write_pointer": true,
+  "ttl_seconds": 3600,
+  "fail_closed_on_missing_inputs": true,
+  "fail_closed_event_risk_severities": [
+    "high",
+    "unknown"
+  ],
+  "max_abs_tilt": 0.05,
+  "inputs": {
+    "macro_state_path": "/home/ubuntu/chad_finale/runtime/macro_state.json",
+    "event_risk_path": "/home/ubuntu/chad_finale/runtime/event_risk.json",
+    "sector_rotation_path": "/home/ubuntu/chad_finale/runtime/sector_rotation.json"
+  },
+  "output": {
+    "reports_dir": "/home/ubuntu/chad_finale/reports/rotation",
+    "pointer_path": "/home/ubuntu/chad_finale/runtime/rotation_state.json"
+  },
+  "regime_rules": {
+    "event_risk_override": {
+      "growth_momo": -0.05,
+      "hedge": 0.05,
+      "reason": "event_risk_high_or_unknown"
+    },
+    "risk_off": {
+      "growth_momo": -0.05,
+      "hedge": 0.05,
+      "reason": "macro_risk_off"
+    },
+    "risk_on": {
+      "growth_momo": 0.05,
+      "hedge": -0.05,
+      "reason": "macro_risk_on"
+    },
+    "neutral": {
+      "growth_momo": 0.0,
+      "hedge": 0.0,
+      "reason": "macro_neutral"
+    }
+  },
+  "symbol_blocks": [],
+  "notes": [
+    "SSOT v4.2 rotation rules contract.",
+    "Preserves existing bootstrap advisory-only behavior.",
+    "No broker calls. No direct execution."
+  ]
+}

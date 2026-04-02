@@ -1,0 +1,13 @@
+[Unit]
+Description=CHAD Intel Cache Publisher (every 5 minutes)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+Persistent=true
+AccuracySec=10
+
+Unit=chad-intel-cache.service
+
+[Install]
+WantedBy=timers.target

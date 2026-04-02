@@ -22,8 +22,8 @@ def _run(env: dict, args: list[str]) -> dict:
 def test_execute_blocks_caps_not_met() -> None:
     env = {
         "PYTHONPATH": "/home/ubuntu/chad_finale",
-        "CHAD_RUNTIME_DIR": "/home/ubuntu/CHAD FINALE/runtime",
-        "CHAD_CONFIG_DIR": "/home/ubuntu/CHAD FINALE/config",
+        "CHAD_RUNTIME_DIR": "/home/ubuntu/chad_finale/runtime",
+        "CHAD_CONFIG_DIR": "/home/ubuntu/chad_finale/config",
         "CHAD_AUTO_EXECUTE_REBALANCE": "1",
         "CHAD_PORTFOLIO_PROFILE": "BALANCED",
     }
@@ -38,8 +38,8 @@ def test_execute_blocks_caps_not_met() -> None:
 def test_preview_includes_would_execute_flag() -> None:
     env = {
         "PYTHONPATH": "/home/ubuntu/chad_finale",
-        "CHAD_RUNTIME_DIR": "/home/ubuntu/CHAD FINALE/runtime",
-        "CHAD_CONFIG_DIR": "/home/ubuntu/CHAD FINALE/config",
+        "CHAD_RUNTIME_DIR": "/home/ubuntu/chad_finale/runtime",
+        "CHAD_CONFIG_DIR": "/home/ubuntu/chad_finale/config",
         "CHAD_PORTFOLIO_PROFILE": "BALANCED",
     }
     obj = _run(env, [])

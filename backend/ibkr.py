@@ -31,7 +31,9 @@ import threading
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException
-from ib_insync import IB
+def _lazy_ib() -> "type[object]":
+    from ib_insync import IB  # type: ignore
+    return IB
 
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
 IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))

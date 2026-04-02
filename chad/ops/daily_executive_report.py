@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-REPO_ROOT = Path("/home/ubuntu/CHAD FINALE")
+REPO_ROOT = Path("/home/ubuntu/chad_finale")
 REPORTS_DIR = REPO_ROOT / "reports" / "ops"
 
 
@@ -246,6 +246,118 @@ def render_md(exec_payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_telegram_summary(exec_payload: Dict[str, Any]) -> str:
+    ops = exec_payload.get("ops") or {}
+    perf = exec_payload.get("performance") or {}
+
+    lines = []
+    lines.append("ℹ️ CHAD Daily Update")
+    lines.append("")
+
+    if ops.get("ok") is True and isinstance(ops.get("payload"), dict):
+        op = ops["payload"]
+        scr_state = op.get("scr_state")
+        ib = op.get("ibkr_health") or {}
+        met = op.get("metrics") or {}
+
+        if scr_state is not None:
+            lines.append(f"System status: {scr_state}")
+
+        if isinstance(ib, dict):
+            ib_ok = ib.get("ok")
+            latency = ib.get("latency_ms")
+            if ib_ok is True:
+                if latency is not None:
+                    try:
+                        latency_f = float(latency)
+                        if latency_f >= 5000:
+                            lines.append("Broker connection: working, but a bit slow")
+                        else:
+                            lines.append("Broker connection: working normally")
+                    except Exception:
+                        lines.append("Broker connection: working")
+                else:
+                    lines.append("Broker connection: working")
+            elif ib_ok is False:
+                lines.append("Broker connection: issue detected")
+
+        if isinstance(met, dict):
+            pt = met.get("paper_trades_total")
+            wr = met.get("paper_win_rate")
+            pnl = met.get("paper_total_pnl")
+            lines.append("")
+            lines.append("Overall paper trading:")
+            lines.append(f"- Trades: {pt}")
+            if wr is not None:
+                try:
+                    lines.append(f"- Win rate: {round(float(wr) * 100, 1)}%")
+                except Exception:
+                    lines.append(f"- Win rate: {wr}")
+            if pnl is not None:
+                try:
+                    lines.append(f"- Total profit: ${round(float(pnl), 2)}")
+                except Exception:
+                    lines.append(f"- Total profit: {pnl}")
+
+    if perf.get("ok") is True and isinstance(perf.get("payload"), dict):
+        pp = perf["payload"]
+        overall = pp.get("overall") or {}
+
+        lines.append("")
+        lines.append("Today’s result:")
+
+        trades = overall.get("trades")
+        win_rate = overall.get("win_rate")
+        pnl_total = overall.get("pnl_total")
+
+        lines.append(f"- Trades: {trades}")
+        if win_rate is not None:
+            try:
+                lines.append(f"- Win rate: {round(float(win_rate) * 100, 1)}%")
+            except Exception:
+                lines.append(f"- Win rate: {win_rate}")
+        if pnl_total is not None:
+            try:
+                pnl_f = float(pnl_total)
+                sign = "+" if pnl_f > 0 else ""
+                lines.append(f"- Profit: {sign}${round(pnl_f, 2)}")
+            except Exception:
+                lines.append(f"- Profit: {pnl_total}")
+
+        bt = overall.get("best_trade") or {}
+        wt = overall.get("worst_trade") or {}
+
+        if isinstance(bt, dict) and bt:
+            lines.append(f"- Best trade: {bt.get('symbol')} {bt.get('side')} {bt.get('pnl')}")
+        if isinstance(wt, dict) and wt:
+            lines.append(f"- Worst trade: {wt.get('symbol')} {wt.get('side')} {wt.get('pnl')}")
+
+        bys = pp.get("by_strategy") or {}
+        if isinstance(bys, dict) and bys:
+            top_strategy = next(iter(sorted(bys.items())))
+            strat_name, strat_data = top_strategy
+            if isinstance(strat_data, dict):
+                lines.append("")
+                lines.append(f"Main strategy today: {strat_name}")
+
+        if pnl_total is not None:
+            try:
+                pnl_f = float(pnl_total)
+                lines.append("")
+                if pnl_f > 0:
+                    lines.append("Quick read: Positive day overall.")
+                elif pnl_f < 0:
+                    lines.append("Quick read: Negative day overall.")
+                else:
+                    lines.append("Quick read: Flat day overall.")
+            except Exception:
+                pass
+
+    lines.append("")
+    lines.append("Full reports were saved on the server.")
+    return "\n".join(lines)
+
+
 def run() -> Tuple[Path, Path]:
     safe_mkdir(REPORTS_DIR)
     ts = utc_now_compact()
@@ -285,10 +397,10 @@ def run() -> Tuple[Path, Path]:
     try:
         from chad.utils.telegram_notify import notify  # type: ignore
 
-        snippet = "\n".join(md_text.splitlines()[:35]).strip()
-        if snippet:
+        telegram_text = render_telegram_summary(payload).strip()
+        if telegram_text:
             notify(
-                snippet,
+                telegram_text,
                 severity="info",
                 dedupe_key="daily_exec_report",
                 raise_on_fail=False,

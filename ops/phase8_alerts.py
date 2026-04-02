@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.request import Request, urlopen
 
-RUNTIME = Path("/home/ubuntu/CHAD FINALE/runtime")
+RUNTIME = Path("/home/ubuntu/chad_finale/runtime")
 STATE_PATH = RUNTIME / "phase8_alert_state.json"
 LIVEGATE_URL = "http://127.0.0.1:9618/live-gate"
 

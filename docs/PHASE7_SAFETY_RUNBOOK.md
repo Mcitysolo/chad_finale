@@ -71,7 +71,7 @@ How to Check CHAD’s Current Mode
 
 ExecutionConfig (adapter-level truth):
 
-PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.show_execution_config
+PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.show_execution_config
 
 Expect:
 mode = DRY_RUN
@@ -79,14 +79,14 @@ ibkr_dry_run = Yes
 
 Live Gate (final yes/no):
 
-PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.show_live_gate
+PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.show_live_gate
 
 Expect:
 allow_ibkr_live = False
 
 Risk & Confidence:
 
-PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.show_risk_state
+PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.show_risk_state
 
 Shows CHAD_MODE, caps, SCR, reasons.
 

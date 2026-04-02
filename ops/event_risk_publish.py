@@ -5,7 +5,7 @@ CHAD Market Radar — event_risk publisher (Production)
 File: ops/event_risk_publish.py
 
 Outputs:
-  /home/ubuntu/CHAD FINALE/runtime/event_risk.json
+  /home/ubuntu/chad_finale/runtime/event_risk.json
 
 Purpose
 -------
@@ -46,7 +46,7 @@ from typing import Any, Dict, List, Protocol
 # Paths / Config
 # -----------------------------
 
-DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/CHAD FINALE/runtime")
+DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 OUT_PATH = Path(os.environ.get("CHAD_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR))) / "event_risk.json"
 
 TTL_SECONDS = int(os.environ.get("CHAD_EVENT_RISK_TTL_SECONDS", "1800"))  # 30 min

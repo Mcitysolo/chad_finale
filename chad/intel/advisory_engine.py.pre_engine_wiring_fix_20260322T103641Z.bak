@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""
+CHAD Advisory Engine
+====================
+
+Production-grade orchestration layer for CHAD's higher-level intelligence stack.
+
+Purpose
+-------
+Combine multiple "brains" into one coherent advisory answer:
+    1. Research engine
+    2. Lessons learned engine
+    3. Risk explainer
+    4. Macro interpreter
+    5. Model doctor
+
+Then synthesize the results into a user-facing explanation using OpenAI.
+
+Key guarantees
+--------------
+- Fail-soft: one engine failure never kills the whole advisory run
+- Deterministic structure: always returns the same top-level schema
+- Parallel execution for speed
+- Dynamic symbol resolution for engine function names
+- Safe normalization of arbitrary engine outputs
+- Runtime-state aware (positions/reconciliation/live gate/feed/SCR if available)
+- CLI + importable API
+"""
+
+import argparse
+import importlib
+import inspect
+import json
+import logging
+import os
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
+
+
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+
+LOG = logging.getLogger("chad.intel.advisory_engine")
+
+
+# ---------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def repo_root() -> Path:
+    env = str(os.environ.get("CHAD_ROOT", "")).strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        if (p / "chad").is_dir():
+            return p
+    return Path(__file__).resolve().parents[2]
+
+
+def runtime_dir() -> Path:
+    raw = str(os.environ.get("CHAD_RUNTIME_DIR", "")).strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (repo_root() / "runtime").resolve()
+
+
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, indent=2)
+
+
+def read_json_dict(path: Path) -> Dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)] + "..."
+
+
+def normalize_to_primitive(obj: Any, *, depth: int = 0, max_depth: int = 6) -> Any:
+    if depth > max_depth:
+        return "<max_depth_exceeded>"
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+
+    if is_dataclass(obj):
+        return normalize_to_primitive(asdict(obj), depth=depth + 1, max_depth=max_depth)
+
+    if isinstance(obj, Mapping):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            out[str(k)] = normalize_to_primitive(v, depth=depth + 1, max_depth=max_depth)
+        return out
+
+    if isinstance(obj, (list, tuple, set)):
+        return [normalize_to_primitive(v, depth=depth + 1, max_depth=max_depth) for v in obj]
+
+    if hasattr(obj, "__dict__"):
+        try:
+            return normalize_to_primitive(vars(obj), depth=depth + 1, max_depth=max_depth)
+        except Exception:
+            pass
+
+    return repr(obj)
+
+
+def make_error_payload(exc: BaseException) -> Dict[str, Any]:
+    return {
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(limit=8),
+        }
+    }
+
+
+# ---------------------------------------------------------------------
+# Data contracts
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AdvisoryRequest:
+    symbol: str
+    user_question: str
+    horizon: str = "unspecified"
+    risk_profile: str = "unspecified"
+    user_context: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    name: str
+    module_name: str
+    candidate_functions: Tuple[str, ...]
+    timeout_seconds: float = 10.0
+    required: bool = False
+
+
+@dataclass(frozen=True)
+class EngineResult:
+    name: str
+    ok: bool
+    module_name: str
+    function_name: Optional[str]
+    duration_ms: int
+    data: Dict[str, Any]
+    notes: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AdvisoryResult:
+    ts_utc: str
+    symbol: str
+    user_question: str
+    local_runtime_state: Dict[str, Any]
+    engine_results: Dict[str, EngineResult]
+    synthesis_model: Optional[str]
+    synthesis_ok: bool
+    analysis_text: str
+    raw_prompt_preview: str
+    diagnostics: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ts_utc": self.ts_utc,
+            "symbol": self.symbol,
+            "user_question": self.user_question,
+            "local_runtime_state": self.local_runtime_state,
+            "engine_results": {k: asdict(v) for k, v in self.engine_results.items()},
+            "synthesis_model": self.synthesis_model,
+            "synthesis_ok": self.synthesis_ok,
+            "analysis_text": self.analysis_text,
+            "raw_prompt_preview": self.raw_prompt_preview,
+            "diagnostics": self.diagnostics,
+        }
+
+
+# ---------------------------------------------------------------------
+# OpenAI abstraction
+# ---------------------------------------------------------------------
+
+class LLMClient(Protocol):
+    def synthesize(self, request: AdvisoryRequest, runtime_state: Dict[str, Any], engine_results: Dict[str, EngineResult]) -> Tuple[bool, str, Optional[str], str]:
+        ...
+
+
+class OpenAIAdvisoryClient:
+    def __init__(
+        self,
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        max_prompt_chars: int = 120_000,
+    ) -> None:
+        self._model = model or str(os.environ.get("CHAD_ADVISORY_OPENAI_MODEL", "gpt-5")).strip()
+        self._temperature = float(temperature)
+        self._max_prompt_chars = int(max_prompt_chars)
+
+        api_key = str(os.environ.get("OPENAI_API_KEY", "")).strip()
+        if OpenAI is None:
+            self._client = None
+        elif not api_key:
+            self._client = None
+        else:
+            try:
+                self._client = OpenAI(api_key=api_key)
+            except Exception:
+                self._client = None
+
+    def synthesize(
+        self,
+        request: AdvisoryRequest,
+        runtime_state: Dict[str, Any],
+        engine_results: Dict[str, EngineResult],
+    ) -> Tuple[bool, str, Optional[str], str]:
+        prompt = self._build_prompt(request, runtime_state, engine_results)
+        prompt_preview = truncate_text(prompt, 6000)
+
+        if self._client is None:
+            return False, self._fallback_text(request, runtime_state, engine_results, "openai_package_unavailable"), self._model, prompt_preview
+
+        try:
+            # Newer client path
+            if hasattr(self._client, "responses"):
+                resp = self._client.responses.create(
+                    model=self._model,
+                    input=prompt,
+                    temperature=self._temperature,
+                )
+                text = getattr(resp, "output_text", None)
+                if isinstance(text, str) and text.strip():
+                    return True, text.strip(), self._model, prompt_preview
+
+            # Compatibility fallback
+            if hasattr(self._client, "chat") and hasattr(self._client.chat, "completions"):
+                resp = self._client.chat.completions.create(
+                    model=self._model,
+                    temperature=self._temperature,
+                    messages=[
+                        {"role": "system", "content": "You are CHAD's market advisory explainer. Be clear, direct, balanced, and risk-aware."},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                text = resp.choices[0].message.content if resp.choices else None
+                if isinstance(text, str) and text.strip():
+                    return True, text.strip(), self._model, prompt_preview
+
+            return False, self._fallback_text(request, runtime_state, engine_results, "openai_empty_response"), self._model, prompt_preview
+        except Exception as exc:
+            return False, self._fallback_text(request, runtime_state, engine_results, f"openai_error:{type(exc).__name__}:{exc}"), self._model, prompt_preview
+
+    def _build_prompt(
+        self,
+        request: AdvisoryRequest,
+        runtime_state: Dict[str, Any],
+        engine_results: Dict[str, EngineResult],
+    ) -> str:
+        engine_payload = {
+            name: {
+                "ok": result.ok,
+                "function_name": result.function_name,
+                "duration_ms": result.duration_ms,
+                "notes": result.notes,
+                "data": result.data,
+            }
+            for name, result in engine_results.items()
+        }
+
+        return truncate_text(
+            f"""
+You are CHAD's advisory synthesis layer.
+
+Your job:
+- Answer the user's question like a sharp but grounded trading assistant
+- Be practical, not hype-driven
+- Distinguish clearly between long-term investing and short-term trading
+- Explain risks in simple English
+- Avoid pretending certainty exists when it doesn't
+- If the local brains disagree, say that plainly
+- If data is incomplete, say what is missing
+- Do not mention internal function names or code
+- Do not expose secrets, env vars, stack traces, or file-system details unless relevant to trading logic
+- Use a structure that feels like:
+  current setup -> bull case -> bear case -> what to do depending on timeframe -> bottom line
+
+User request:
+{safe_json_dumps(asdict(request))}
+
+Local CHAD runtime state:
+{safe_json_dumps(runtime_state)}
+
+Engine outputs:
+{safe_json_dumps(engine_payload)}
+
+Return a direct, polished answer in plain English.
+""".strip(),
+            self._max_prompt_chars,
+        )
+
+    def _fallback_text(
+        self,
+        request: AdvisoryRequest,
+        runtime_state: Dict[str, Any],
+        engine_results: Dict[str, EngineResult],
+        reason: str,
+    ) -> str:
+        lines: List[str] = []
+        lines.append(f"CHAD advisory fallback triggered: {reason}")
+        lines.append("")
+        lines.append(f"Question: {request.user_question}")
+        lines.append(f"Symbol: {request.symbol}")
+        lines.append("")
+
+        shadow = runtime_state.get("scr_state", {})
+        live_gate = runtime_state.get("live_gate", {})
+        recon = runtime_state.get("reconciliation_state", {})
+
+        lines.append("System state")
+        lines.append(f"- SCR state: {shadow.get('state', 'unknown')}")
+        lines.append(f"- Reconciliation: {recon.get('status', 'unknown')}")
+        lines.append(f"- Live gate allow_ibkr_live: {live_gate.get('allow_ibkr_live', False)}")
+        lines.append("")
+
+        lines.append("Brain status")
+        for name, result in engine_results.items():
+            status = "OK" if result.ok else "ERROR"
+            lines.append(f"- {name}: {status}")
+        lines.append("")
+        lines.append("OpenAI synthesis was unavailable, so this is a local fallback summary.")
+        return "\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------
+# Engine resolver / runner
+# ---------------------------------------------------------------------
+
+def _symbol_candidates(symbol: str) -> List[str]:
+    s = str(symbol or "").strip().upper()
+    return [s] if s else []
+
+
+@lru_cache(maxsize=128)
+def import_module_cached(module_name: str):
+    return importlib.import_module(module_name)
+
+
+def resolve_callable(module_name: str, candidate_functions: Sequence[str]) -> Tuple[Optional[Callable[..., Any]], Optional[str], List[str]]:
+    notes: List[str] = []
+    try:
+        module = import_module_cached(module_name)
+    except Exception as exc:
+        notes.append(f"module_import_failed:{type(exc).__name__}:{exc}")
+        return None, None, notes
+
+    for fn_name in candidate_functions:
+        fn = getattr(module, fn_name, None)
+        if callable(fn):
+            notes.append(f"resolved:{module_name}.{fn_name}")
+            return fn, fn_name, notes
+
+    exported = sorted(name for name in dir(module) if callable(getattr(module, name, None)) and not name.startswith("_"))
+    notes.append(f"callable_not_found:candidates={list(candidate_functions)} exports={exported[:40]}")
+    return None, None, notes
+
+
+def build_engine_call_kwargs(fn: Callable[..., Any], request: AdvisoryRequest) -> Dict[str, Any]:
+    sig = inspect.signature(fn)
+    kwargs: Dict[str, Any] = {}
+
+    candidate_values = {
+        "symbol": request.symbol,
+        "ticker": request.symbol,
+        "asset": request.symbol,
+        "question": request.user_question,
+        "prompt": request.user_question,
+        "query": request.user_question,
+        "user_question": request.user_question,
+        "request": request,
+        "horizon": request.horizon,
+        "risk_profile": request.risk_profile,
+        "user_context": request.user_context,
+        "context": request.user_context,
+    }
+
+    for name, param in sig.parameters.items():
+        if name in candidate_values:
+            kwargs[name] = candidate_values[name]
+        elif param.default is inspect.Parameter.empty:
+            # Do not guess arbitrary required params.
+            # Leave unresolved and let caller decide whether to invoke.
+            pass
+
+    return kwargs
+
+
+def can_call_with_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> bool:
+    try:
+        inspect.signature(fn).bind_partial(**kwargs)
+        # Still need all required args satisfied
+        sig = inspect.signature(fn)
+        for name, p in sig.parameters.items():
+            if p.default is inspect.Parameter.empty and p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                if name not in kwargs:
+                    return False
+        return True
+    except Exception:
+        return False
+
+
+class EngineRunner:
+    def __init__(self, specs: Sequence[EngineSpec], *, max_workers: int = 5) -> None:
+        self._specs = list(specs)
+        self._max_workers = max(1, int(max_workers))
+
+    def run_all(self, request: AdvisoryRequest) -> Dict[str, EngineResult]:
+        results: Dict[str, EngineResult] = {}
+        lock = threading.Lock()
+
+        def _run_one(spec: EngineSpec) -> None:
+            started = datetime.now(timezone.utc)
+
+            fn, fn_name, resolve_notes = resolve_callable(spec.module_name, spec.candidate_functions)
+            if fn is None:
+                result = EngineResult(
+                    name=spec.name,
+                    ok=False,
+                    module_name=spec.module_name,
+                    function_name=None,
+                    duration_ms=0,
+                    data={"error": {"message": "callable_resolution_failed"}},
+                    notes=resolve_notes,
+                )
+                with lock:
+                    results[spec.name] = result
+                return
+
+            kwargs = build_engine_call_kwargs(fn, request)
+            if not can_call_with_kwargs(fn, kwargs):
+                result = EngineResult(
+                    name=spec.name,
+                    ok=False,
+                    module_name=spec.module_name,
+                    function_name=fn_name,
+                    duration_ms=0,
+                    data={"error": {"message": "required_parameters_not_satisfied", "provided_kwargs": sorted(kwargs.keys())}},
+                    notes=resolve_notes,
+                )
+                with lock:
+                    results[spec.name] = result
+                return
+
+            data: Dict[str, Any]
+            ok = False
+            notes = list(resolve_notes)
+
+            try:
+                with ThreadPoolExecutor(max_workers=1) as inner_pool:
+                    fut = inner_pool.submit(fn, **kwargs)
+                    raw = fut.result(timeout=spec.timeout_seconds)
+                data = normalize_to_primitive(raw)
+                if not isinstance(data, dict):
+                    data = {"result": data}
+                ok = "error" not in data
+            except FuturesTimeoutError:
+                data = {"error": {"message": f"engine_timeout_after_{spec.timeout_seconds}s"}}
+                notes.append("timeout")
+                ok = False
+            except Exception as exc:
+                data = make_error_payload(exc)
+                ok = False
+
+            duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            result = EngineResult(
+                name=spec.name,
+                ok=ok,
+                module_name=spec.module_name,
+                function_name=fn_name,
+                duration_ms=duration_ms,
+                data=data,
+                notes=notes,
+            )
+            with lock:
+                results[spec.name] = result
+
+        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            futures = [pool.submit(_run_one, spec) for spec in self._specs]
+            for fut in futures:
+                fut.result()
+
+        return results
+
+
+# ---------------------------------------------------------------------
+# Runtime state collector
+# ---------------------------------------------------------------------
+
+class RuntimeStateProvider:
+    def __init__(self, root: Optional[Path] = None) -> None:
+        self._runtime_dir = (root or runtime_dir()).resolve()
+
+    def collect(self) -> Dict[str, Any]:
+        files = {
+            "positions_snapshot": self._runtime_dir / "positions_snapshot.json",
+            "reconciliation_state": self._runtime_dir / "reconciliation_state.json",
+            "scr_state": self._runtime_dir / "scr_state.json",
+            "dynamic_caps": self._runtime_dir / "dynamic_caps.json",
+            "live_readiness": self._runtime_dir / "live_readiness.json",
+            "positions_truth": self._runtime_dir / "positions_truth.json",
+            "trade_lifecycle_state": self._runtime_dir / "trade_lifecycle_state.json",
+            "feed_state": self._runtime_dir / "feed_state.json",
+        }
+
+        out = {
+            name: read_json_dict(path)
+            for name, path in files.items()
+        }
+
+        # Try local API-derived snapshot only if present in runtime or if a local mirror exists.
+        # This keeps the module file-safe and network-optional.
+        live_gate_path = self._runtime_dir / "live_gate_snapshot.json"
+        out["live_gate"] = read_json_dict(live_gate_path)
+
+        return normalize_to_primitive(out)
+
+
+# ---------------------------------------------------------------------
+# Engine registry
+# ---------------------------------------------------------------------
+
+DEFAULT_ENGINE_SPECS: Tuple[EngineSpec, ...] = (
+    EngineSpec(
+        name="research_engine",
+        module_name="chad.intel.research_engine",
+        candidate_functions=("run_research_engine", "run_research_job", "run_research", "build_research_report"),
+        timeout_seconds=12.0,
+    ),
+    EngineSpec(
+        name="lessons_engine",
+        module_name="chad.intel.lessons_engine",
+        candidate_functions=("run_lessons_engine", "run_lessons_job", "run_lessons", "build_lessons_report"),
+        timeout_seconds=8.0,
+    ),
+    EngineSpec(
+        name="risk_explainer",
+        module_name="chad.intel.risk_explainer",
+        candidate_functions=("run_risk_explainer", "explain_risk", "build_risk_explainer", "build_risk_report"),
+        timeout_seconds=8.0,
+    ),
+    EngineSpec(
+        name="macro_interpreter",
+        module_name="chad.intel.macro_interpreter",
+        candidate_functions=("run_macro_interpreter", "run_macro_job", "interpret_macro", "build_macro_report"),
+        timeout_seconds=8.0,
+    ),
+    EngineSpec(
+        name="model_doctor",
+        module_name="chad.intel.model_doctor",
+        candidate_functions=("run_model_doctor", "run_model_doctor_job", "check_model_health", "build_model_diagnostics"),
+        timeout_seconds=8.0,
+    ),
+)
+
+
+# ---------------------------------------------------------------------
+# Advisory service
+# ---------------------------------------------------------------------
+
+class AdvisoryService:
+    def __init__(
+        self,
+        *,
+        runtime_provider: Optional[RuntimeStateProvider] = None,
+        engine_runner: Optional[EngineRunner] = None,
+        llm_client: Optional[LLMClient] = None,
+    ) -> None:
+        self._runtime_provider = runtime_provider or RuntimeStateProvider()
+        self._engine_runner = engine_runner or EngineRunner(DEFAULT_ENGINE_SPECS)
+        self._llm_client = llm_client or OpenAIAdvisoryClient()
+
+    def run(self, request: AdvisoryRequest) -> AdvisoryResult:
+        ts = utc_now_iso()
+        runtime_state = self._runtime_provider.collect()
+        engine_results = self._engine_runner.run_all(request)
+        synthesis_ok, analysis_text, model_name, prompt_preview = self._llm_client.synthesize(request, runtime_state, engine_results)
+
+        diagnostics = {
+            "runtime_dir": str(runtime_dir()),
+            "engine_count": len(engine_results),
+            "engines_ok": sorted([name for name, r in engine_results.items() if r.ok]),
+            "engines_failed": sorted([name for name, r in engine_results.items() if not r.ok]),
+        }
+
+        return AdvisoryResult(
+            ts_utc=ts,
+            symbol=request.symbol,
+            user_question=request.user_question,
+            local_runtime_state=runtime_state,
+            engine_results=engine_results,
+            synthesis_model=model_name,
+            synthesis_ok=synthesis_ok,
+            analysis_text=analysis_text,
+            raw_prompt_preview=prompt_preview,
+            diagnostics=diagnostics,
+        )
+
+
+# ---------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------
+
+def run_full_advisory(
+    symbol: str,
+    user_question: str,
+    *,
+    horizon: str = "unspecified",
+    risk_profile: str = "unspecified",
+    user_context: Optional[Dict[str, Any]] = None,
+    as_dict: bool = True,
+) -> Dict[str, Any] | AdvisoryResult:
+    request = AdvisoryRequest(
+        symbol=str(symbol).strip().upper(),
+        user_question=str(user_question).strip(),
+        horizon=str(horizon).strip(),
+        risk_profile=str(risk_profile).strip(),
+        user_context=dict(user_context or {}),
+    )
+    service = AdvisoryService()
+    result = service.run(request)
+    return result.to_dict() if as_dict else result
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run CHAD full advisory synthesis.")
+    p.add_argument("symbol", help="Ticker/symbol, e.g. AAPL")
+    p.add_argument("question", help="User question, e.g. 'Should I buy this stock right now?'")
+    p.add_argument("--horizon", default="unspecified", help="Optional horizon label")
+    p.add_argument("--risk-profile", default="unspecified", help="Optional risk profile label")
+    p.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    p.add_argument("--analysis-only", action="store_true", help="Print only synthesized analysis text")
+    p.add_argument("--log-level", default=os.environ.get("CHAD_LOG_LEVEL", "INFO"))
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)sZ %(levelname)s %(name)s %(message)s",
+    )
+
+    result = run_full_advisory(
+        args.symbol,
+        args.question,
+        horizon=args.horizon,
+        risk_profile=args.risk_profile,
+        as_dict=True,
+    )
+
+    if args.analysis_only:
+        print(str(result["analysis_text"]))
+        return 0
+
+    if args.pretty:
+        print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

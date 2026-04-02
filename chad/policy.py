@@ -133,7 +133,7 @@ class EvaluatedSignal:
 # - Deny-by-default when caps enabled but evaluator fails (unknown == unsafe)
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]  # /home/ubuntu/CHAD FINALE
+_REPO_ROOT = Path(__file__).resolve().parents[1]  # /home/ubuntu/chad_finale
 _SYMBOL_CAPS_CONFIG = _REPO_ROOT / "config" / "symbol_caps.json"
 
 
@@ -499,7 +499,14 @@ def build_default_strategy_limits() -> Dict[StrategyName, StrategyRiskLimits]:
         max_trade_notional=7_500.0,
         allow_short=False,
     )
-
+    # Alpha Futures: micro futures momentum sleeve
+    limits[StrategyName.ALPHA_FUTURES] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=50_000.0,
+        allow_short=True,
+    )
     # Gamma / Omega / AlphaCrypto / AlphaForex / Delta are not yet wired on
     # this instance; keep them disabled at the policy layer until their
     # full strategies are restored.

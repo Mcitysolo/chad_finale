@@ -20,7 +20,7 @@ echo
 # --- Discover CHAD root (no assumptions) ---
 candidates=(
   "/home/ubuntu/chad_finale"
-  "/home/ubuntu/CHAD FINALE"
+  "/home/ubuntu/chad_finale"
   "$HOME/chad_finale"
   "$HOME/CHAD FINALE"
 )
@@ -34,7 +34,7 @@ done
 
 if [ -z "$CHAD_ROOT" ]; then
   echo "ERROR: Could not find CHAD root. Searched: ${candidates[*]}"
-  echo "Tip: put CHAD at /home/ubuntu/chad_finale or /home/ubuntu/CHAD FINALE per CSB."
+  echo "Tip: put CHAD at /home/ubuntu/chad_finale or /home/ubuntu/chad_finale per CSB."
   exit 2
 fi
 

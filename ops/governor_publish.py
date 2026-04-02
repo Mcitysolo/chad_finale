@@ -43,8 +43,8 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 from urllib.request import Request, urlopen
 
-RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime")).resolve()
-REPORTS_DIR = Path(os.environ.get("CHAD_REPORTS_DIR", "/home/ubuntu/CHAD FINALE/reports")).resolve()
+RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime")).resolve()
+REPORTS_DIR = Path(os.environ.get("CHAD_REPORTS_DIR", "/home/ubuntu/chad_finale/reports")).resolve()
 OUT_DIR = REPORTS_DIR / "governor"
 
 POINTER_PATH = RUNTIME_DIR / "governor_state.json"

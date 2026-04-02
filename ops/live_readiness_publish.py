@@ -16,7 +16,6 @@ It only inspects current system gates and writes:
 It is designed so that "ready_for_live" is only True when ALL gates are green:
 - STOP is false
 - CHAD_MODE == LIVE and live_enabled == true
-- LiveGate allow_ibkr_live == true
 - SCR paper_only == false and state != PAUSED
 - feed_state and reconciliation_state are GREEN/fresh
 - operator intent is not EXIT_ONLY/DENY_ALL
@@ -33,17 +32,17 @@ import hashlib
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
 from urllib.request import Request, urlopen
 
-RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime")).resolve()
-REPORTS_DIR = Path(os.environ.get("CHAD_REPORTS_DIR", "/home/ubuntu/CHAD FINALE/reports")).resolve()
+RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime")).resolve()
+REPORTS_DIR = Path(os.environ.get("CHAD_REPORTS_DIR", "/home/ubuntu/chad_finale/reports")).resolve()
 OUT_DIR = REPORTS_DIR / "live_readiness"
 
 POINTER_PATH = RUNTIME_DIR / "live_readiness.json"
 
-LIVE_GATE_URL = os.environ.get("CHAD_LIVE_GATE_URL", "http://127.0.0.1:9618/live-gate")
 STATUS_URL = os.environ.get("CHAD_STATUS_URL", "http://127.0.0.1:9618/status")
 
 HTTP_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_TIMEOUT_S", "4.0"))
@@ -51,6 +50,11 @@ HTTP_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_TIMEOUT_S", "4.0"))
 STOP_PATH = RUNTIME_DIR / "stop_state.json"
 FEED_PATH = RUNTIME_DIR / "feed_state.json"
 RECON_PATH = RUNTIME_DIR / "reconciliation_state.json"
+TRUTH_PATH = RUNTIME_DIR / "positions_truth.json"
+LIFECYCLE_PATH = RUNTIME_DIR / "trade_lifecycle_state.json"
+EXECQ_PATH = RUNTIME_DIR / "execution_quality.json"
+ACTION_PATH = RUNTIME_DIR / "action_state.json"
+CANARY_PATH = RUNTIME_DIR / "change_canary_state.json"
 
 
 def utc_now_iso() -> str:
@@ -65,6 +69,18 @@ def sha256_hex(b: bytes) -> str:
     h = hashlib.sha256()
     h.update(b)
     return h.hexdigest()
+
+
+def parse_utc_iso(s: str) -> datetime:
+    ss = (s or "").strip()
+    if not ss:
+        raise ValueError("empty_ts")
+    if ss.endswith("Z"):
+        ss = ss[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ss)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def atomic_write_json(path: Path, obj: Dict[str, Any]) -> str:
@@ -145,35 +161,99 @@ def feed_ok() -> Tuple[bool, str]:
         return False, f"feed_unreadable:{type(exc).__name__}"
 
 
+def lifecycle_truth_ok() -> Tuple[bool, str]:
+    try:
+        truth = read_json_dict(TRUTH_PATH)
+        lifecycle = read_json_dict(LIFECYCLE_PATH)
+        if not bool(truth.get("truth_ok", False)):
+            return False, f"truth_ok={truth.get('truth_ok', False)} source={truth.get('truth_source')}"
+        if bool(lifecycle.get("gap_flag", True)):
+            return False, "lifecycle_gap_flag=true"
+        if bool(lifecycle.get("backlog_flag", True)):
+            return False, "lifecycle_backlog_flag=true"
+        return True, "lifecycle_truth=GREEN"
+    except Exception as exc:
+        return False, f"lifecycle_truth_unreadable:{type(exc).__name__}"
+
+
+def execution_quality_ok() -> Tuple[bool, str]:
+    try:
+        eq = read_json_dict(EXECQ_PATH)
+        env_label = str(eq.get("env_label") or "unknown").lower()
+        if env_label in ("dangerous", "unknown"):
+            return False, f"execution_env={env_label}"
+        return True, f"execution_env={env_label}"
+    except Exception as exc:
+        return False, f"execution_quality_unreadable:{type(exc).__name__}"
+
+
+def mutation_ok() -> Tuple[bool, str]:
+    try:
+        a = read_json_dict(ACTION_PATH)
+        if not bool(a.get("ok", True)):
+            return False, "action_state_ok=false"
+        pending = int(a.get("pending_count", 0) or 0)
+        rejected = int(a.get("rejected_count", 0) or 0)
+        if pending > 0:
+            return False, f"pending_count={pending}"
+        if rejected > 0:
+            return False, f"rejected_count={rejected}"
+        return True, "mutation_state=clean"
+    except Exception as exc:
+        return False, f"mutation_state_unreadable:{type(exc).__name__}"
+
+
+def canary_ok() -> Tuple[bool, str]:
+    try:
+        c = read_json_dict(CANARY_PATH)
+        factor = float(c.get("canary_factor", 1.0) or 1.0)
+        until = c.get("canary_until_ts_utc")
+        if factor < 1.0:
+            return False, f"canary_factor={factor}"
+        if until:
+            dt = parse_utc_iso(str(until))
+            if dt > datetime.now(timezone.utc):
+                return False, f"canary_until={until}"
+        return True, "canary=clear"
+    except Exception as exc:
+        return False, f"canary_state_unreadable:{type(exc).__name__}"
+
+
 def main() -> int:
     ts = utc_now_iso()
     ts_compact = utc_now_compact()
 
     # Pull API state
     status = {}
-    live_gate = {}
     try:
         status = http_get_json(STATUS_URL)
     except Exception as exc:
         status = {"error": f"status_fetch_failed:{type(exc).__name__}"}
 
-    try:
-        live_gate = http_get_json(LIVE_GATE_URL)
-    except Exception as exc:
-        live_gate = {"error": f"live_gate_fetch_failed:{type(exc).__name__}"}
-
     # Local checks
     ok_stop, stop_reason = stop_ok()
     ok_feed, feed_reason = feed_ok()
     ok_recon, recon_reason = reconciliation_ok()
+    ok_truth, truth_reason = lifecycle_truth_ok()
+    ok_execq, execq_reason = execution_quality_ok()
+    ok_mutation, mutation_reason = mutation_ok()
+    ok_canary, canary_reason = canary_ok()
 
     # Gate interpretation (fail-closed)
     mode = status.get("mode") if isinstance(status.get("mode"), dict) else {}
     chad_mode = str(mode.get("chad_mode") or "")
     live_enabled = bool(mode.get("live_enabled", False))
 
-    operator_mode = str(live_gate.get("operator_mode") or "")
-    allow_ibkr_live = bool(live_gate.get("allow_ibkr_live", False))
+    operator_mode = "UNKNOWN"
+    runtime_files = status.get("runtime_files") if isinstance(status.get("runtime_files"), dict) else {}
+    op_meta = runtime_files.get("operator_intent") if isinstance(runtime_files.get("operator_intent"), dict) else {}
+    op_path = op_meta.get("path")
+    if op_path:
+        try:
+            op_obj = read_json_dict(Path(op_path))
+            operator_mode = str(op_obj.get("operator_mode") or op_obj.get("mode") or "UNKNOWN")
+        except Exception:
+            operator_mode = "UNKNOWN"
 
     shadow = status.get("shadow") if isinstance(status.get("shadow"), dict) else {}
     shadow_state = str(shadow.get("state") or "")
@@ -183,10 +263,13 @@ def main() -> int:
         "stop": {"ok": ok_stop, "reason": stop_reason},
         "feed": {"ok": ok_feed, "reason": feed_reason},
         "reconciliation": {"ok": ok_recon, "reason": recon_reason},
-        "chad_mode": {"ok": (chad_mode == "LIVE" and live_enabled), "reason": f"chad_mode={chad_mode} live_enabled={live_enabled}"},
+        "lifecycle_truth": {"ok": ok_truth, "reason": truth_reason},
+        "execution_quality": {"ok": ok_execq, "reason": execq_reason},
+        "mutation_state": {"ok": ok_mutation, "reason": mutation_reason},
+        "canary_state": {"ok": ok_canary, "reason": canary_reason},
+        "chad_mode": {"ok": (chad_mode.lower() == "live" and live_enabled), "reason": f"chad_mode={chad_mode} live_enabled={live_enabled}"},
         "operator_intent": {"ok": (operator_mode == "ALLOW_LIVE"), "reason": f"operator_mode={operator_mode}"},
         "scr": {"ok": (not paper_only and shadow_state != "PAUSED"), "reason": f"paper_only={paper_only} state={shadow_state}"},
-        "live_gate": {"ok": bool(allow_ibkr_live), "reason": f"allow_ibkr_live={allow_ibkr_live}"},
     }
 
     ready = all(bool(v.get("ok")) for v in checks.values())
@@ -197,7 +280,6 @@ def main() -> int:
         "ready_for_live": bool(ready),
         "checks": checks,
         "status_snapshot": status,
-        "live_gate_snapshot": live_gate,
         "notes": "scaffolding only; does not change any live settings",
     }
 

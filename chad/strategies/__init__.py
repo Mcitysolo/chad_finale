@@ -36,10 +36,11 @@ from .beta import build_beta_config, beta_handler
 from .gamma import build_gamma_config, gamma_handler
 from .omega import build_omega_config, omega_handler
 from .delta import build_delta_config, delta_handler
-from .alpha_crypto import build_alpha_crypto_config, alpha_crypto_handler
-from .alpha_forex import build_alpha_forex_config, alpha_forex_handler
-
-
+from .alpha_crypto import build_alpha_crypto_config, alpha_crypto_handler, AlphaCryptoParams
+from .alpha_forex import build_alpha_forex_config, alpha_forex_handler, AlphaForexParams
+from chad.strategies.alpha_futures import build_alpha_futures_signals
+from .alpha_futures import alpha_futures_handler
+from .alpha_futures_config import build_alpha_futures_config
 # ---------------------------------------------------------------------------
 # Protocols & Dataclasses
 # ---------------------------------------------------------------------------
@@ -121,12 +122,17 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
         StrategyName.ALPHA_CRYPTO: StrategyRegistration(
             name=StrategyName.ALPHA_CRYPTO,
             build_config=build_alpha_crypto_config,
-            handler=alpha_crypto_handler,
+            handler=(lambda ctx: alpha_crypto_handler(ctx, AlphaCryptoParams())),
         ),
         StrategyName.ALPHA_FOREX: StrategyRegistration(
             name=StrategyName.ALPHA_FOREX,
             build_config=build_alpha_forex_config,
-            handler=alpha_forex_handler,
+            handler=(lambda ctx: alpha_forex_handler(ctx, AlphaForexParams())),
+        ),
+        StrategyName.ALPHA_FUTURES: StrategyRegistration(
+            name=StrategyName.ALPHA_FUTURES,
+            build_config=build_alpha_futures_config,
+            handler=alpha_futures_handler,
         ),
     }
     return registrations

@@ -6,7 +6,7 @@ Purpose
 Create a single source-of-truth index pointing to the latest generated report artifacts.
 
 Scans:
-  /home/ubuntu/CHAD FINALE/reports/ops/
+  /home/ubuntu/chad_finale/reports/ops/
 
 Writes:
   reports/ops/REPORTS_INDEX_<ts>.json
@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-REPO_ROOT = Path("/home/ubuntu/CHAD FINALE")
+REPO_ROOT = Path("/home/ubuntu/chad_finale")
 OPS_DIR = REPO_ROOT / "reports" / "ops"
 
 

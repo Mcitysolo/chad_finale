@@ -253,6 +253,15 @@ def _send_alerts(st: IBKRStatus, *, max_age: float, max_failures: int) -> List[D
     """
     Returns list of alert events produced (whether sent or suppressed).
     """
+
+    def human_last_ok_age(v: float) -> str:
+        try:
+            import math
+            if not math.isfinite(float(v)) or float(v) >= 1e12:
+                return "no recent healthy check found"
+            return f"{float(v):.1f} seconds"
+        except Exception:
+            return "unknown"
     events: List[Dict[str, Any]] = []
     silent = _safe_bool(os.environ.get("IBKR_WATCHDOG_SILENT", "0"), False)
 
@@ -277,7 +286,15 @@ def _send_alerts(st: IBKRStatus, *, max_age: float, max_failures: int) -> List[D
     # Hard down
     if not st.ok:
         emit(
-            msg=f"IBKR WATCHDOG: ibkr_status.ok=false (failures={st.consecutive_failures}, last_ok_age_s={st.last_ok_age_seconds:.1f})",
+            msg=(
+                "🚨 Broker connection problem\n\n"
+                "CHAD cannot confirm Interactive Brokers is responding right now.\n\n"
+                "What this means:\n"
+                f"- broker health check failed\n"
+                f"- consecutive failures: {st.consecutive_failures}\n"
+                f"- seconds since last healthy check: {human_last_ok_age(st.last_ok_age_seconds)}\n\n"
+                "Trading should be treated as blocked until this clears."
+            ),
             severity="critical",
             dedupe_key="ibkr_down",
         )
@@ -285,7 +302,15 @@ def _send_alerts(st: IBKRStatus, *, max_age: float, max_failures: int) -> List[D
     # Stale
     if st.last_ok_age_seconds >= float(max_age):
         emit(
-            msg=f"IBKR WATCHDOG: stale heartbeat (last_ok_age_s={st.last_ok_age_seconds:.1f} >= {max_age:.1f}) failures={st.consecutive_failures}",
+            msg=(
+                "🚨 Broker heartbeat is stale\n\n"
+                "CHAD has not seen a fresh healthy broker update in time.\n\n"
+                "What this means:\n"
+                f"- seconds since last healthy check: {human_last_ok_age(st.last_ok_age_seconds)}\n"
+                f"- stale threshold: {max_age:.1f}\n"
+                f"- consecutive failures: {st.consecutive_failures}\n\n"
+                "Treat broker-linked trading as unsafe until the connection refreshes."
+            ),
             severity="critical",
             dedupe_key="ibkr_stale",
         )
@@ -293,7 +318,15 @@ def _send_alerts(st: IBKRStatus, *, max_age: float, max_failures: int) -> List[D
     # Failures threshold
     if st.consecutive_failures >= int(max_failures) and st.consecutive_failures > 0:
         emit(
-            msg=f"IBKR WATCHDOG: consecutive_failures={st.consecutive_failures} >= {max_failures} (last_ok_age_s={st.last_ok_age_seconds:.1f})",
+            msg=(
+                "⚠️ Broker checks keep failing\n\n"
+                "CHAD is seeing repeated broker health-check failures.\n\n"
+                "What this means:\n"
+                f"- consecutive failures: {st.consecutive_failures}\n"
+                f"- warning threshold: {max_failures}\n"
+                f"- seconds since last healthy check: {human_last_ok_age(st.last_ok_age_seconds)}\n\n"
+                "Watch this closely. If it continues, trading should stay blocked."
+            ),
             severity="warn",
             dedupe_key="ibkr_failures",
         )

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.request import Request, urlopen
 
-RUNTIME = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime"))
+RUNTIME = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime"))
 OUT = RUNTIME / "tier_state.json"
 RISK_URL = os.environ.get("CHAD_RISK_URL", "http://127.0.0.1:9618/risk-state")
 TTL_SECONDS = int(os.environ.get("CHAD_TIER_TTL_SECONDS", "300"))

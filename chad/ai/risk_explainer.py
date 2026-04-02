@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-REPO_ROOT = Path("/home/ubuntu/CHAD FINALE")
+REPO_ROOT = Path("/home/ubuntu/chad_finale")
 OPS_DIR = REPO_ROOT / "reports" / "ops"
 
 
@@ -165,7 +165,7 @@ def explain_scr(scr_state: str) -> Tuple[str, List[str]]:
 
 def recommended_commands() -> List[str]:
     return [
-        'cd "/home/ubuntu/CHAD FINALE"',
+        'cd "/home/ubuntu/chad_finale"',
         'cat reports/ops/REPORTS_INDEX_LATEST.json',
         'ls -la reports/ops | tail -n 50',
         'cat runtime/ibkr_status.json',

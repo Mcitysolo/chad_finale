@@ -1,48 +1,48 @@
 #!/usr/bin/env python3
 """
-chad/portfolio/kraken_roundtrip_runner.py
+CHAD Kraken Roundtrip Runner — SSOT-safe micro roundtrip harness (validate-only works with zero secrets).
 
-CHAD Kraken Roundtrip Runner (24/7 micro execution, production-safe)
+This script is designed to be *impossible* to use as a LiveGate bypass.
 
-Purpose
--------
-This runner performs a *small, controlled* Kraken crypto roundtrip to generate
-real, traceable TradeResult entries that count toward SCR "effective_trades"
-and can be enriched by the Kraken PnL Watcher.
+Key guarantees
+--------------
+1) SSOT / LiveGate authority:
+   - If --live is requested, LiveGate MUST explicitly return ALLOW_LIVE or we exit cleanly.
+   - If LiveGate cannot be imported/evaluated, we fail-closed for --live.
 
-It is designed for:
-- wiring verification (end-to-end execution + ledger + enrichment)
-- safe micro testing (tiny volume, strict balance floors)
-- unattended operation (systemd timer) with concurrency lock + state
+2) Validate-only (default) requires zero Kraken private env vars:
+   - Uses only Kraken public endpoints (Ticker, AssetPairs).
+   - Produces a deterministic "planned orders" report and writes it to runtime.
+   - Does not construct Kraken clients, does not touch secrets.
 
-Hard Safety Guarantees
-----------------------
-- Does nothing live unless --live is explicitly provided.
-- Enforces CAD_FLOOR and BTC_FLOOR before placing any LIVE order.
-- Enforces Kraken minimum volume (ordermin) for the configured pair.
-- Single-instance lock prevents overlapping executions.
-- Writes no secrets, prints no secrets.
+3) Operational safety:
+   - Single-instance lock file using fcntl (Linux) with clear LOCK_BUSY semantics.
+   - Atomic writes for state + last report (write tmp then rename).
+   - No secrets printed; errors are sanitized and concise.
 
-Notes
------
-- This runner uses KrakenExecutor, which logs a TradeResult entry per order.
-- The Kraken PnL Watcher should run separately (timer) to enrich those records
-  with cost/fee/price and compute realized PnL for sells (FIFO).
+Execution model
+---------------
+- validate-only:
+    - fetch ordermin + mid price
+    - build deterministic "roundtrip plan" (buy then sell OR sell then buy)
+    - write runtime/kraken_roundtrip_last_report.json
 
-Typical usage
--------------
-Validate-only (safe):
+- live:
+    - LiveGate ALLOW_LIVE required
+    - requires Kraken private env vars (KRAKEN_API_KEY / KRAKEN_API_SECRET) via CHAD Kraken modules
+    - runs a micro roundtrip using KrakenExecutor.execute_with_risk()
+    - writes runtime/kraken_roundtrip_last_report.json
+
+Recommended invocation (repo root + venv)
+-----------------------------------------
+cd "/home/ubuntu/chad_finale"
+source venv/bin/activate
+
+Validate-only:
   python3 -m chad.portfolio.kraken_roundtrip_runner --once
 
-Live canary (one roundtrip):
+Live (only when LiveGate is ALLOW_LIVE):
   python3 -m chad.portfolio.kraken_roundtrip_runner --once --live
-
-Daemon-like loop (N roundtrips, live):
-  python3 -m chad.portfolio.kraken_roundtrip_runner --roundtrips 5 --live
-
-Recommended systemd timer cadence:
-- Every 5–15 minutes (not every minute) to avoid fee churn.
-
 """
 
 from __future__ import annotations
@@ -54,46 +54,39 @@ import os
 import random
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-# CHAD internal modules (already in your build)
-from chad.execution.kraken_executor import KrakenExecutor, StrategyTradeIntent
-from chad.execution.kraken_trade_router import KrakenTradeRouter
-from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig, KrakenAPIError, KrakenConfigError
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
 
 
-ROOT = Path("/home/ubuntu/CHAD FINALE")
-RUNTIME = ROOT / "runtime"
-LOCK_PATH = RUNTIME / "kraken_roundtrip.lock"
-STATE_PATH = RUNTIME / "kraken_roundtrip_state.json"
+# ---------------------------
+# Defaults / constants
+# ---------------------------
 
 KRAKEN_API_BASE = "https://api.kraken.com"
 DEFAULT_PAIR = "XXBTZCAD"
 DEFAULT_STRATEGY = "crypto"
 
-# Conservative fee buffer (Kraken fees vary by tier; we use a conservative buffer for safety).
-FEE_BUFFER_PCT = 0.01  # 1% buffer on estimated notional
-# If Kraken ticker fails, we still allow validate-only, but live requires a price estimate.
-PRICE_FALLBACK_CAD = 100_000.0
+HTTP_TIMEOUT_S = 10.0
+HTTP_MAX_RETRIES = 3
 
+FEE_BUFFER_PCT = 0.01
+PRICE_FALLBACK_CAD = 100_000.0  # fallback is allowed for validate-only, blocked for live by default
+
+LOCK_FILENAME = "kraken_roundtrip.lock"
+STATE_FILENAME = "kraken_roundtrip_state.json"
+REPORT_FILENAME = "kraken_roundtrip_last_report.json"
+
+
+# ---------------------------
+# Small utilities
+# ---------------------------
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -106,57 +99,75 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _http_get_json(url: str, timeout_s: float = 10.0) -> Dict[str, Any]:
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        j = json.loads(raw)
+        return j if isinstance(j, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _backoff_s(attempt: int) -> float:
+    base = 0.4 * (2 ** max(0, attempt - 1))
+    jitter = random.random() * 0.25
+    return float(min(3.0, base + jitter))
+
+
+def _http_get_json(url: str, *, timeout_s: float = HTTP_TIMEOUT_S) -> Dict[str, Any]:
     req = urllib.request.Request(url, headers={"User-Agent": "CHAD/kraken_roundtrip_runner"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as r:  # noqa: S310 (we control URL)
-        raw = r.read().decode("utf-8", errors="replace").strip()
-    if not raw.startswith("{"):
-        raise ValueError(f"NOT_JSON_BODY: {raw[:200]!r}")
-    j = json.loads(raw)
-    errs = j.get("error") or []
-    if errs:
-        raise ValueError(f"KRAKEN_API_ERROR: {errs}")
-    return j
+    last_err: Optional[str] = None
+
+    for i in range(1, HTTP_MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as r:  # noqa: S310
+                raw = r.read().decode("utf-8", errors="replace").strip()
+
+            if not raw.startswith("{"):
+                raise ValueError(f"NOT_JSON_BODY: {raw[:200]!r}")
+
+            j = json.loads(raw)
+            if not isinstance(j, dict):
+                raise ValueError("NON_OBJECT_JSON")
+
+            errs = j.get("error") or []
+            if errs:
+                raise ValueError(f"KRAKEN_API_ERROR: {errs}")
+
+            return j
+
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+            if i < HTTP_MAX_RETRIES:
+                time.sleep(_backoff_s(i))
+                continue
+            raise RuntimeError(f"HTTP_GET_FAILED url={url!r} err={last_err}") from exc
+
+    raise RuntimeError(f"HTTP_GET_FAILED url={url!r} err={last_err}")
 
 
-def _kraken_assetpairs(pair: str) -> Dict[str, Any]:
-    url = f"{KRAKEN_API_BASE}/0/public/AssetPairs?pair={pair}"
-    return _http_get_json(url)
+# ---------------------------
+# Domain objects
+# ---------------------------
 
-
-def _kraken_ticker(pair: str) -> Dict[str, Any]:
-    url = f"{KRAKEN_API_BASE}/0/public/Ticker?pair={pair}"
-    return _http_get_json(url)
-
-
-def _pair_min_volume(pair: str) -> float:
-    j = _kraken_assetpairs(pair)
-    info = (j.get("result") or {}).get(pair) or {}
-    v = _safe_float(info.get("ordermin"), default=0.0)
-    if v <= 0.0:
-        raise ValueError(f"Could not read ordermin for pair={pair}: {info}")
-    return v
-
-
-def _pair_mid_price_cad(pair: str) -> float:
-    """
-    Return a mid-price estimate in CAD for the given pair using Kraken public ticker.
-
-    This is used ONLY to estimate notional for risk gating and balance floors.
-    """
-    j = _kraken_ticker(pair)
-    result = j.get("result") or {}
-    # Kraken may return the requested key or an altname key; take first entry.
-    if not result:
-        raise ValueError(f"No ticker result for pair={pair}")
-    info = next(iter(result.values()))
-    ask = _safe_float((info.get("a") or [None])[0], default=0.0)
-    bid = _safe_float((info.get("b") or [None])[0], default=0.0)
-    if ask <= 0.0 and bid <= 0.0:
-        raise ValueError(f"Ticker returned invalid bid/ask for pair={pair}: {info}")
-    if ask > 0.0 and bid > 0.0:
-        return (ask + bid) / 2.0
-    return ask if ask > 0.0 else bid
+@dataclass(frozen=True)
+class Event:
+    ts_utc: str
+    event: str
+    data: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -170,84 +181,224 @@ class RunConfig:
     pair: str
     strategy: str
     volume: float
+    roundtrips: int
     live: bool
-    max_roundtrips: int
-    sleep_between_legs_s: float
-    floors: Floors
+    sleep_s: float
+    cad_floor: float
+    btc_floor: float
+    allow_live_with_fallback_price: bool
+    runtime_dir: Path
 
 
-@dataclass
-class Event:
-    ts_utc: str
-    event: str
-    data: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
+@dataclass(frozen=True)
 class RunReport:
-    ok: bool
     ts_utc: str
-    config: Dict[str, Any]
+    live_requested: bool
+    live_allowed: bool
+    pair: str
+    strategy: str
+    volume: float
+    roundtrips: int
     events: List[Event]
-    error_type: Optional[str] = None
-    error: Optional[str] = None
+    orders: List[Dict[str, Any]]
+    summary: Dict[str, Any]
 
 
-def _load_state() -> Dict[str, Any]:
-    if not STATE_PATH.is_file():
-        return {"last_first_leg": None, "updated_at_utc": None}
+# ---------------------------
+# Single-instance lock
+# ---------------------------
+
+class _FileLock:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fh = None
+
+    def acquire(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self._path, "a+", encoding="utf-8")  # noqa: PTH123
+        try:
+            import fcntl  # Linux only
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception as exc:
+            fh.close()
+            raise RuntimeError(f"LOCK_BUSY: {type(exc).__name__}: {exc}") from exc
+
+        fh.seek(0)
+        fh.truncate(0)
+        fh.write(f"pid={os.getpid()} ts_utc={_utc_now()}\n")
+        fh.flush()
+        self._fh = fh
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
+# ---------------------------
+# LiveGate (SSOT authority)
+# ---------------------------
+
+@dataclass(frozen=True)
+class LiveGateSnapshot:
+    mode: str
+    reasons: List[str]
+
+
+def _livegate_snapshot_failclosed() -> LiveGateSnapshot:
     try:
-        return json.loads(_read_text(STATE_PATH))
-    except Exception:
-        return {"last_first_leg": None, "updated_at_utc": None}
-
-
-def _save_state(state: Dict[str, Any]) -> None:
-    state["updated_at_utc"] = _utc_now()
-    _write_text_atomic(STATE_PATH, json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-
-def _acquire_lock() -> Any:
-    """
-    Best-effort single-instance lock.
-    Uses a simple lock file with OS-level advisory lock where available.
-    """
-    RUNTIME.mkdir(parents=True, exist_ok=True)
-    f = open(LOCK_PATH, "a+", encoding="utf-8")  # noqa: PTH123
-    try:
-        import fcntl  # Linux only
-
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        from chad.core.live_gate import evaluate_live_gate  # type: ignore
     except Exception as exc:
-        f.close()
-        raise RuntimeError(f"LOCK_BUSY: {exc}")
-    f.seek(0)
-    f.truncate(0)
-    f.write(f"pid={os.getpid()} ts_utc={_utc_now()}\n")
-    f.flush()
-    return f
+        return LiveGateSnapshot(mode="DENY_ALL", reasons=[f"livegate_import_failed: {type(exc).__name__}"])
+
+    try:
+        d = evaluate_live_gate()
+        mode = str(getattr(d, "mode", "DENY_ALL")).upper().strip()
+        rr = getattr(d, "reasons", None)
+        reasons: List[str] = []
+        if isinstance(rr, list):
+            reasons = [str(x) for x in rr[:50]]
+        return LiveGateSnapshot(mode=mode, reasons=reasons)
+    except Exception as exc:
+        return LiveGateSnapshot(mode="DENY_ALL", reasons=[f"livegate_eval_failed: {type(exc).__name__}: {exc}"])
 
 
-def _balances(client: KrakenClient) -> Tuple[float, float]:
+def _require_allow_live(*, live_requested: bool) -> Tuple[bool, List[str]]:
+    if not live_requested:
+        return True, ["validate_only: live not requested"]
+
+    snap = _livegate_snapshot_failclosed()
+    if snap.mode != "ALLOW_LIVE":
+        return False, ["LiveGate denied live execution", f"mode={snap.mode}", *snap.reasons]
+    return True, ["LiveGate allow_live", *snap.reasons]
+
+
+# ---------------------------
+# Kraken public market data
+# ---------------------------
+
+def _pair_min_volume(pair: str) -> float:
+    url = f"{KRAKEN_API_BASE}/0/public/AssetPairs?pair={pair}"
+    j = _http_get_json(url)
+    res = j.get("result") or {}
+    if not isinstance(res, dict) or not res:
+        raise RuntimeError("assetpairs_result_empty")
+    first = next(iter(res.values()))
+    if not isinstance(first, dict):
+        raise RuntimeError("assetpairs_bad_shape")
+    ordermin = _safe_float(first.get("ordermin"), default=0.0)
+    if ordermin <= 0:
+        raise RuntimeError("ordermin_missing")
+    return float(ordermin)
+
+
+def _pair_mid_price_cad(pair: str) -> Tuple[float, bool]:
     """
-    Return (btc, cad) balances as floats.
+    Returns (mid_price, is_fallback).
     """
-    b = client.balance()
-    btc = _safe_float(b.get("XXBT"), default=0.0)  # Kraken uses XXBT for BTC
-    cad = _safe_float(b.get("ZCAD"), default=0.0)
-    return btc, cad
+    url = f"{KRAKEN_API_BASE}/0/public/Ticker?pair={pair}"
+    try:
+        j = _http_get_json(url)
+        res = j.get("result") or {}
+        if not isinstance(res, dict) or not res:
+            raise RuntimeError("ticker_result_empty")
+        first = next(iter(res.values()))
+        if not isinstance(first, dict):
+            raise RuntimeError("ticker_bad_shape")
+        ask = _safe_float((first.get("a") or [None])[0], default=0.0)
+        bid = _safe_float((first.get("b") or [None])[0], default=0.0)
+        if ask <= 0 or bid <= 0:
+            raise RuntimeError("ticker_missing_bid_ask")
+        return float((ask + bid) / 2.0), False
+    except Exception:
+        return float(PRICE_FALLBACK_CAD), True
 
 
-def _build_executor() -> KrakenExecutor:
+# ---------------------------
+# Execution DI boundary (live only)
+# ---------------------------
+
+@dataclass(frozen=True)
+class StrategyTradeIntent:
+    strategy: str
+    pair: str
+    side: str          # "buy" | "sell"
+    ordertype: str     # "market"
+    volume: float
+    notional_estimate: float
+    price: Optional[float] = None
+
+
+class KrakenExecutorPort(Protocol):
+    def execute_with_risk(self, *, intent: StrategyTradeIntent, live: bool) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+        ...
+
+
+class KrakenExecutionError(RuntimeError):
+    pass
+
+
+def _build_executor() -> KrakenExecutorPort:
+    """
+    Live-only: requires CHAD Kraken modules + private env vars.
+    We deliberately do NOT call this on validate-only runs.
+    """
+    try:
+        from chad.execution.kraken_executor import KrakenExecutor as RealExec  # type: ignore
+        from chad.execution.kraken_executor import StrategyTradeIntent as RealIntent  # type: ignore
+        from chad.execution.kraken_trade_router import KrakenTradeRouter  # type: ignore
+        from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig  # type: ignore
+    except Exception as exc:
+        raise KrakenExecutionError(f"Kraken modules unavailable: {type(exc).__name__}: {exc}") from exc
+
     cfg = KrakenClientConfig.from_env()
     client = KrakenClient(cfg)
     router = KrakenTradeRouter(client)
-    return KrakenExecutor(router=router)
+    real = RealExec(router=router)
+
+    class _Adapter:
+        def execute_with_risk(self, *, intent: StrategyTradeIntent, live: bool) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+            ri = RealIntent(
+                strategy=intent.strategy,
+                pair=intent.pair,
+                side=intent.side,
+                ordertype=intent.ordertype,
+                volume=float(intent.volume),
+                notional_estimate=float(intent.notional_estimate),
+                price=intent.price,
+            )
+            risk, resp = real.execute_with_risk(intent=ri, live=live)
+
+            risk_m = (
+                asdict(risk)
+                if hasattr(risk, "__dataclass_fields__")
+                else dict(risk.__dict__) if hasattr(risk, "__dict__")
+                else {"allowed": getattr(risk, "allowed", False), "reason": getattr(risk, "reason", "")}
+            )
+            resp_m = (
+                asdict(resp)
+                if (resp is not None and hasattr(resp, "__dataclass_fields__"))
+                else dict(resp.__dict__) if (resp is not None and hasattr(resp, "__dict__"))
+                else {"txids": getattr(resp, "txids", [])} if resp is not None
+                else {}
+            )
+            return risk_m, resp_m
+
+    return _Adapter()
 
 
 def _place_order(
     *,
-    executor: KrakenExecutor,
+    executor: KrakenExecutorPort,
     pair: str,
     strategy: str,
     side: str,
@@ -255,10 +406,6 @@ def _place_order(
     notional_estimate: float,
     live: bool,
 ) -> Dict[str, Any]:
-    """
-    Place/validate a market order via KrakenExecutor.
-    Returns a compact dict with risk + response.
-    """
     intent = StrategyTradeIntent(
         strategy=strategy,
         pair=pair,
@@ -270,287 +417,314 @@ def _place_order(
     )
     risk, resp = executor.execute_with_risk(intent=intent, live=live)
 
-    out: Dict[str, Any] = {
+    allowed = bool(risk.get("allowed", False))
+    reason = str(risk.get("reason", ""))
+
+    txids: List[str] = []
+    raw = resp.get("txids") if isinstance(resp, Mapping) else None
+    if isinstance(raw, list):
+        txids = [str(x) for x in raw[:20]]
+
+    return {
+        "ts_utc": _utc_now(),
+        "pair": pair,
+        "strategy": strategy,
         "side": side,
         "volume": float(volume),
         "notional_estimate": float(notional_estimate),
-        "risk_allowed": bool(risk.allowed),
-        "risk_reason": str(risk.reason),
         "validate_only": (not live),
-        "txids": [],
+        "risk_allowed": allowed,
+        "risk_reason": reason,
+        "txids": txids,
     }
-    if resp is not None:
-        out["txids"] = list(resp.txids)
-    return out
 
 
-def _estimated_notional_cad(mid_price: float, volume: float) -> float:
+# ---------------------------
+# Business rules
+# ---------------------------
+
+def _estimated_notional(mid_price: float, volume: float) -> float:
     return float(mid_price * float(volume))
 
 
 def _can_live_buy(*, cad: float, est_notional: float, floors: Floors) -> bool:
-    # Require cad >= floor + est_notional + buffer
     need = floors.cad_floor + est_notional * (1.0 + FEE_BUFFER_PCT)
     return cad >= need
 
 
 def _can_live_sell(*, btc: float, volume: float, floors: Floors) -> bool:
-    # Require btc - volume >= btc_floor
     return (btc - volume) >= floors.btc_floor
 
 
-def _decide_first_leg(
-    *,
-    btc: float,
-    cad: float,
-    volume: float,
-    est_notional: float,
-    floors: Floors,
-    state: Dict[str, Any],
-) -> str:
+def _decide_first_leg(*, state: Dict[str, Any], floors: Floors, est_notional: float, volume: float) -> str:
     """
-    Decide first leg direction: "buy" or "sell".
-    Preference:
-      - If can't buy safely but can sell -> sell first
-      - If can't sell safely but can buy -> buy first
-      - Else alternate with state to avoid bias
+    Deterministic leg selection for validate-only (no balance probe):
+      - Alternate buy/sell using persisted state, else default to buy.
+    Live mode will still respect risk checks inside KrakenExecutor.
     """
-    can_buy = _can_live_buy(cad=cad, est_notional=est_notional, floors=floors)
-    can_sell = _can_live_sell(btc=btc, volume=volume, floors=floors)
-
-    if not can_buy and can_sell:
-        return "sell"
-    if not can_sell and can_buy:
-        return "buy"
-
-    last = (state.get("last_first_leg") or "").lower()
+    last = str(state.get("last_first_leg", "")).lower().strip()
     if last == "buy":
         return "sell"
     if last == "sell":
         return "buy"
+    return "buy"
 
-    # Default (deterministic-ish): pick sell if btc is relatively "high", else buy
-    return "sell" if btc >= (floors.btc_floor + 2.0 * volume) else "buy"
 
+# ---------------------------
+# Core runner
+# ---------------------------
 
 def run_roundtrip(cfg: RunConfig) -> RunReport:
-    ts = _utc_now()
+    ts0 = _utc_now()
     events: List[Event] = []
+    orders: List[Dict[str, Any]] = []
+
+    cfg.runtime_dir.mkdir(parents=True, exist_ok=True)
+    lock = _FileLock(cfg.runtime_dir / LOCK_FILENAME)
+
+    state_path = cfg.runtime_dir / STATE_FILENAME
+    state = _read_json(state_path)
+
+    floors = Floors(cad_floor=float(cfg.cad_floor), btc_floor=float(cfg.btc_floor))
+    events.append(Event(ts_utc=_utc_now(), event="config_loaded", data={
+        "pair": cfg.pair,
+        "strategy": cfg.strategy,
+        "volume": cfg.volume,
+        "roundtrips": cfg.roundtrips,
+        "live": cfg.live,
+        "runtime_dir": str(cfg.runtime_dir),
+        "floors": asdict(floors),
+    }))
+
+    live_allowed, live_reasons = _require_allow_live(live_requested=cfg.live)
+    events.append(Event(ts_utc=_utc_now(), event="livegate_evaluated", data={
+        "live_requested": cfg.live,
+        "live_allowed": live_allowed,
+        "reasons": live_reasons,
+    }))
+
+    if cfg.live and not live_allowed:
+        report = RunReport(
+            ts_utc=ts0,
+            live_requested=True,
+            live_allowed=False,
+            pair=cfg.pair,
+            strategy=cfg.strategy,
+            volume=cfg.volume,
+            roundtrips=cfg.roundtrips,
+            events=events,
+            orders=[],
+            summary={"status": "blocked", "blocked_by": "LiveGate", "reasons": live_reasons},
+        )
+        _write_text_atomic(cfg.runtime_dir / REPORT_FILENAME, _json_dumps(asdict(report)) + "\n")
+        return report
+
+    # Acquire lock only after LiveGate decision so we never lock-block someone just checking status.
+    lock.acquire()
+    events.append(Event(ts_utc=_utc_now(), event="lock_acquired", data={"path": str(cfg.runtime_dir / LOCK_FILENAME)}))
+
     try:
-        _lock = _acquire_lock()
-        events.append(Event(ts_utc=_utc_now(), event="lock_acquired", data={"lock_path": str(LOCK_PATH)}))
-
-        # Build executor (private client inside)
-        executor = _build_executor()
-        client = executor._router._client  # noqa: SLF001 (internal reference, stable in this build)
-
-        # Determine Kraken minimum volume and ensure cfg.volume respects it
+        # Public checks
         min_vol = _pair_min_volume(cfg.pair)
         events.append(Event(ts_utc=_utc_now(), event="pair_min_volume", data={"pair": cfg.pair, "ordermin": min_vol}))
 
         if cfg.volume + 1e-12 < min_vol:
-            raise ValueError(f"volume {cfg.volume} is below Kraken ordermin {min_vol} for pair {cfg.pair}")
+            raise SystemExit(f"volume {cfg.volume} below Kraken ordermin {min_vol} for {cfg.pair}")
 
-        # Price estimate (needed for floors & risk gating)
-        try:
-            mid = _pair_mid_price_cad(cfg.pair)
-        except Exception as exc:
-            mid = PRICE_FALLBACK_CAD
-            events.append(
-                Event(
-                    ts_utc=_utc_now(),
-                    event="ticker_failed_using_fallback",
-                    data={"pair": cfg.pair, "fallback_price_cad": mid, "error": f"{type(exc).__name__}: {exc}"},
-                )
+        mid, is_fallback = _pair_mid_price_cad(cfg.pair)
+        events.append(Event(ts_utc=_utc_now(), event="ticker_mid_price", data={
+            "pair": cfg.pair,
+            "mid_price_cad": mid,
+            "is_fallback": is_fallback,
+        }))
+
+        if cfg.live and (not cfg.allow_live_with_fallback_price) and is_fallback:
+            raise SystemExit("LIVE_REQUIRES_REAL_PRICE: ticker failed and fallback is disallowed for live")
+
+        est_notional = _estimated_notional(mid, cfg.volume)
+        events.append(Event(ts_utc=_utc_now(), event="notional_estimated", data={"mid_price_cad": mid, "est_notional_cad": est_notional}))
+
+        first_leg = _decide_first_leg(state=state, floors=floors, est_notional=est_notional, volume=cfg.volume)
+        second_leg = "sell" if first_leg == "buy" else "buy"
+        events.append(Event(ts_utc=_utc_now(), event="legs_decided", data={"first": first_leg, "second": second_leg}))
+
+        # Validate-only: no secrets required, just emit a deterministic plan + report.
+        if not cfg.live:
+            planned = [
+                {"side": first_leg, "volume": float(cfg.volume), "notional_estimate": float(est_notional), "validate_only": True},
+                {"side": second_leg, "volume": float(cfg.volume), "notional_estimate": float(est_notional), "validate_only": True},
+            ]
+            events.append(Event(ts_utc=_utc_now(), event="validate_only_plan", data={"planned_orders": planned}))
+
+            state["last_first_leg"] = first_leg
+            state["last_run_ts_utc"] = _utc_now()
+            _write_text_atomic(state_path, _json_dumps(state) + "\n")
+
+            report = RunReport(
+                ts_utc=ts0,
+                live_requested=False,
+                live_allowed=True,
+                pair=cfg.pair,
+                strategy=cfg.strategy,
+                volume=cfg.volume,
+                roundtrips=cfg.roundtrips,
+                events=events,
+                orders=planned,
+                summary={
+                    "status": "ok",
+                    "mode": "validate_only",
+                    "orders_planned": len(planned),
+                    "price_used_cad": mid,
+                    "price_is_fallback": is_fallback,
+                },
             )
-        else:
-            events.append(Event(ts_utc=_utc_now(), event="ticker_mid_price", data={"pair": cfg.pair, "mid_price_cad": mid}))
+            _write_text_atomic(cfg.runtime_dir / REPORT_FILENAME, _json_dumps(asdict(report)) + "\n")
+            return report
 
-        est_notional = _estimated_notional_cad(mid, cfg.volume)
-        events.append(Event(ts_utc=_utc_now(), event="notional_estimate", data={"est_notional_cad": est_notional}))
+        # LIVE path: build executor (requires private env vars) and run the roundtrip(s)
+        executor = _build_executor()
+        events.append(Event(ts_utc=_utc_now(), event="executor_built", data={"live": True}))
 
-        # Balances
-        btc, cad = _balances(client)
-        events.append(Event(ts_utc=_utc_now(), event="balances_before", data={"XXBT": btc, "ZCAD": cad}))
+        for i in range(int(cfg.roundtrips)):
+            events.append(Event(ts_utc=_utc_now(), event="roundtrip_start", data={"i": i + 1, "n": cfg.roundtrips}))
 
-        # Decide first leg
-        state = _load_state()
-        first = _decide_first_leg(btc=btc, cad=cad, volume=cfg.volume, est_notional=est_notional, floors=cfg.floors, state=state)
-        second = "buy" if first == "sell" else "sell"
-        events.append(Event(ts_utc=_utc_now(), event="roundtrip_plan", data={"first_leg": first, "second_leg": second, "live": cfg.live}))
+            o1 = _place_order(
+                executor=executor,
+                pair=cfg.pair,
+                strategy=cfg.strategy,
+                side=first_leg,
+                volume=cfg.volume,
+                notional_estimate=est_notional,
+                live=True,
+            )
+            orders.append(o1)
+            events.append(Event(ts_utc=_utc_now(), event="order_1", data={"risk_allowed": o1["risk_allowed"], "risk_reason": o1["risk_reason"], "txids": o1["txids"]}))
 
-        # Safety checks for LIVE
-        if cfg.live:
-            if first == "buy" and not _can_live_buy(cad=cad, est_notional=est_notional, floors=cfg.floors):
-                raise RuntimeError(
-                    f"LIVE_BLOCKED: insufficient CAD. cad={cad:.4f} need>={cfg.floors.cad_floor + est_notional*(1.0+FEE_BUFFER_PCT):.4f}"
-                )
-            if first == "sell" and not _can_live_sell(btc=btc, volume=cfg.volume, floors=cfg.floors):
-                raise RuntimeError(
-                    f"LIVE_BLOCKED: insufficient BTC. btc={btc:.8f} need>={cfg.floors.btc_floor + cfg.volume:.8f}"
-                )
+            o2 = _place_order(
+                executor=executor,
+                pair=cfg.pair,
+                strategy=cfg.strategy,
+                side=second_leg,
+                volume=cfg.volume,
+                notional_estimate=est_notional,
+                live=True,
+            )
+            orders.append(o2)
+            events.append(Event(ts_utc=_utc_now(), event="order_2", data={"risk_allowed": o2["risk_allowed"], "risk_reason": o2["risk_reason"], "txids": o2["txids"]}))
 
-        # Place first leg
-        r1 = _place_order(
-            executor=executor,
+            state["last_first_leg"] = first_leg
+            state["last_run_ts_utc"] = _utc_now()
+            _write_text_atomic(state_path, _json_dumps(state) + "\n")
+
+            if i + 1 < int(cfg.roundtrips):
+                time.sleep(float(cfg.sleep_s))
+
+        report = RunReport(
+            ts_utc=ts0,
+            live_requested=True,
+            live_allowed=True,
             pair=cfg.pair,
             strategy=cfg.strategy,
-            side=first,
             volume=cfg.volume,
-            notional_estimate=est_notional,
-            live=cfg.live,
-        )
-        events.append(Event(ts_utc=_utc_now(), event="leg1_result", data=r1))
-        if not r1.get("risk_allowed", False):
-            raise RuntimeError(f"RISK_GATE_BLOCKED leg1: {r1.get('risk_reason')}")
-
-        # Wait between legs (let balances/positions settle)
-        if cfg.sleep_between_legs_s > 0:
-            time.sleep(cfg.sleep_between_legs_s)
-
-        # Refresh balances after first leg (especially important for LIVE)
-        btc2, cad2 = _balances(client)
-        events.append(Event(ts_utc=_utc_now(), event="balances_after_leg1", data={"XXBT": btc2, "ZCAD": cad2}))
-
-        # Safety checks for second leg LIVE
-        if cfg.live:
-            # recompute notional with latest mid for realism (best-effort)
-            try:
-                mid2 = _pair_mid_price_cad(cfg.pair)
-            except Exception:
-                mid2 = mid
-            est2 = _estimated_notional_cad(mid2, cfg.volume)
-
-            if second == "buy" and not _can_live_buy(cad=cad2, est_notional=est2, floors=cfg.floors):
-                raise RuntimeError(
-                    f"LIVE_BLOCKED leg2 buy: insufficient CAD. cad={cad2:.4f} need>={cfg.floors.cad_floor + est2*(1.0+FEE_BUFFER_PCT):.4f}"
-                )
-            if second == "sell" and not _can_live_sell(btc=btc2, volume=cfg.volume, floors=cfg.floors):
-                raise RuntimeError(
-                    f"LIVE_BLOCKED leg2 sell: insufficient BTC. btc={btc2:.8f} need>={cfg.floors.btc_floor + cfg.volume:.8f}"
-                )
-
-        # Place second leg
-        # refresh mid estimate lightly to avoid stale notional estimate
-        try:
-            mid_final = _pair_mid_price_cad(cfg.pair)
-        except Exception:
-            mid_final = mid
-        est_final = _estimated_notional_cad(mid_final, cfg.volume)
-
-        r2 = _place_order(
-            executor=executor,
-            pair=cfg.pair,
-            strategy=cfg.strategy,
-            side=second,
-            volume=cfg.volume,
-            notional_estimate=est_final,
-            live=cfg.live,
-        )
-        events.append(Event(ts_utc=_utc_now(), event="leg2_result", data=r2))
-        if not r2.get("risk_allowed", False):
-            raise RuntimeError(f"RISK_GATE_BLOCKED leg2: {r2.get('risk_reason')}")
-
-        # Persist alternation state
-        state["last_first_leg"] = first
-        _save_state(state)
-        events.append(Event(ts_utc=_utc_now(), event="state_saved", data={"state_path": str(STATE_PATH), "last_first_leg": first}))
-
-        # Final balances (best-effort)
-        btc3, cad3 = _balances(client)
-        events.append(Event(ts_utc=_utc_now(), event="balances_after_leg2", data={"XXBT": btc3, "ZCAD": cad3}))
-
-        # Release lock by closing file
-        try:
-            _lock.close()
-        except Exception:
-            pass
-
-        return RunReport(
-            ok=True,
-            ts_utc=ts,
-            config=asdict(cfg),
+            roundtrips=cfg.roundtrips,
             events=events,
+            orders=orders,
+            summary={
+                "status": "ok",
+                "mode": "live",
+                "orders": len(orders),
+                "price_used_cad": mid,
+                "price_is_fallback": is_fallback,
+            },
         )
+        _write_text_atomic(cfg.runtime_dir / REPORT_FILENAME, _json_dumps(asdict(report)) + "\n")
+        return report
 
-    except (KrakenAPIError, KrakenConfigError) as exc:
-        return RunReport(
-            ok=False,
-            ts_utc=ts,
-            config=asdict(cfg),
-            events=events + [Event(ts_utc=_utc_now(), event="kraken_error", data={"error": str(exc)})],
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return RunReport(
-            ok=False,
-            ts_utc=ts,
-            config=asdict(cfg),
-            events=events + [Event(ts_utc=_utc_now(), event="error", data={"error": f"{type(exc).__name__}: {exc}"})],
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
+    finally:
+        lock.release()
 
 
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="CHAD Kraken micro roundtrip runner (safe by default).")
-    p.add_argument("--pair", default=DEFAULT_PAIR, help="Kraken pair, e.g. XXBTZCAD.")
-    p.add_argument("--strategy", default=DEFAULT_STRATEGY, help="Strategy key used for caps + TradeResult logging (must be in dynamic_caps.json).")
-    p.add_argument("--volume", type=float, default=0.00005, help="Base volume per order. Must be >= Kraken ordermin.")
-    p.add_argument("--live", action="store_true", help="Actually place live orders. If omitted, validate-only.")
-    p.add_argument("--once", action="store_true", help="Run exactly 1 roundtrip.")
-    p.add_argument("--roundtrips", type=int, default=1, help="Number of roundtrips to run (ignored if --once is set).")
-    p.add_argument("--sleep-between-legs", type=float, default=2.0, help="Sleep seconds between leg1 and leg2.")
-    p.add_argument("--cad-floor", type=float, default=20.0, help="Hard CAD floor. Runner refuses LIVE if it would dip below this.")
-    p.add_argument("--btc-floor", type=float, default=0.0, help="Hard BTC floor. Runner refuses LIVE if it would dip below this.")
-    return p.parse_args(argv)
+# ---------------------------
+# CLI
+# ---------------------------
+
+def _default_runtime_dir() -> Path:
+    env = os.getenv("CHAD_RUNTIME_DIR", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+
+    # derive repo root from this file location: .../chad/portfolio/kraken_roundtrip_runner.py
+    here = Path(__file__).resolve()
+    repo_root = here.parents[2]
+    return (repo_root / "runtime").resolve()
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> RunConfig:
+    ap = argparse.ArgumentParser(description="CHAD Kraken Roundtrip Runner (SSOT-safe, validate-only works without secrets).")
+    ap.add_argument("--pair", default=DEFAULT_PAIR)
+    ap.add_argument("--strategy", default=DEFAULT_STRATEGY)
+    ap.add_argument("--volume", type=float, default=0.0002)
+    ap.add_argument("--roundtrips", type=int, default=1)
+    ap.add_argument("--once", action="store_true", help="Alias for --roundtrips 1")
+    ap.add_argument("--live", action="store_true", help="LIVE orders (requires LiveGate ALLOW_LIVE)")
+    ap.add_argument("--sleep-s", type=float, default=2.5)
+    ap.add_argument("--cad-floor", type=float, default=25.0)
+    ap.add_argument("--btc-floor", type=float, default=0.0005)
+    ap.add_argument("--allow-live-with-fallback-price", action="store_true", help="Not recommended")
+    ap.add_argument("--runtime-dir", default="", help="Override runtime dir (or use CHAD_RUNTIME_DIR)")
+
+    a = ap.parse_args(argv)
+
+    rt = Path(a.runtime_dir).expanduser().resolve() if str(a.runtime_dir).strip() else _default_runtime_dir()
+    roundtrips = 1 if bool(a.once) else int(a.roundtrips)
+
+    vol = float(a.volume)
+    if roundtrips <= 0:
+        raise SystemExit("roundtrips must be >= 1")
+    if not math.isfinite(vol) or vol <= 0:
+        raise SystemExit("volume must be finite and > 0")
+
+    sleep_s = float(a.sleep_s)
+    if not math.isfinite(sleep_s) or sleep_s < 0:
+        raise SystemExit("sleep-s must be finite and >= 0")
+
+    cad_floor = float(a.cad_floor)
+    btc_floor = float(a.btc_floor)
+    if not math.isfinite(cad_floor) or cad_floor < 0:
+        raise SystemExit("cad-floor must be finite and >= 0")
+    if not math.isfinite(btc_floor) or btc_floor < 0:
+        raise SystemExit("btc-floor must be finite and >= 0")
+
+    return RunConfig(
+        pair=str(a.pair).strip(),
+        strategy=str(a.strategy).strip(),
+        volume=vol,
+        roundtrips=roundtrips,
+        live=bool(a.live),
+        sleep_s=sleep_s,
+        cad_floor=cad_floor,
+        btc_floor=btc_floor,
+        allow_live_with_fallback_price=bool(a.allow_live_with_fallback_price),
+        runtime_dir=rt,
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = _parse_args(argv)
-
-    cfg = RunConfig(
-        pair=str(args.pair).strip(),
-        strategy=str(args.strategy).strip(),
-        volume=float(args.volume),
-        live=bool(args.live),
-        max_roundtrips=1 if bool(args.once) else int(args.roundtrips),
-        sleep_between_legs_s=float(args.sleep_between_legs),
-        floors=Floors(cad_floor=float(args.cad_floor), btc_floor=float(args.btc_floor)),
-    )
-
-    # Small jitter to reduce herd collisions if this is timer-driven.
-    time.sleep(random.uniform(0.0, 0.5))
-
-    all_reports: List[Dict[str, Any]] = []
-    ok_all = True
-
-    for i in range(cfg.max_roundtrips):
-        rep = run_roundtrip(cfg)
-        all_reports.append(
-            {
-                "ok": rep.ok,
-                "ts_utc": rep.ts_utc,
-                "config": rep.config,
-                "error_type": rep.error_type,
-                "error": rep.error,
-                "events": [dict(ts_utc=e.ts_utc, event=e.event, data=e.data) for e in rep.events],
-            }
-        )
-
-        print(json.dumps(all_reports[-1], indent=2, sort_keys=True))
-
-        if not rep.ok:
-            ok_all = False
-            break
-
-        # Small pause between roundtrips (avoid fee-churn burst)
-        if i + 1 < cfg.max_roundtrips:
-            time.sleep(2.0)
-
-    return 0 if ok_all else 2
+    try:
+        cfg = _parse_args(argv)
+        report = run_roundtrip(cfg)
+        print(_json_dumps({"ts_utc": report.ts_utc, "summary": report.summary}))
+        return 0 if report.summary.get("status") in ("ok", "blocked") else 2
+    except SystemExit as exc:
+        msg = str(exc)
+        if msg:
+            print(msg, file=sys.stderr)
+        return 2
+    except Exception as exc:
+        # sanitized error (never prints env vars)
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())

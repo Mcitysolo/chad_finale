@@ -1,0 +1,58 @@
+{
+  "artifact": {
+    "out_path": "/home/ubuntu/chad_finale/runtime/universe.json",
+    "symbols_sha256": "06c159a685fd58ce38f03f0b296cd6fc8d67b11733089d604a4fdfdc8f64f394"
+  },
+  "counts": {
+    "symbols": 25
+  },
+  "max_symbols": 25,
+  "ok": true,
+  "schema_version": "universe.v1",
+  "sources": {
+    "config_universe": {
+      "count": 11,
+      "error": null,
+      "path": "/home/ubuntu/chad_finale/config/universe.json"
+    },
+    "plan_tick_symbols": {
+      "count": 2198,
+      "error": null,
+      "path": "/home/ubuntu/chad_finale/runtime/full_execution_cycle_last.json"
+    },
+    "polygon_universe_txt": {
+      "count": 11,
+      "error": null,
+      "path": "/home/ubuntu/chad_finale/control/polygon_universe.txt"
+    }
+  },
+  "symbols": [
+    "AAPL",
+    "SPY",
+    "MSFT",
+    "GOOGL",
+    "BAC",
+    "IEMG",
+    "QQQ",
+    "VWO",
+    "NVDA",
+    "GLD",
+    "SH",
+    "AA",
+    "AAAU",
+    "AAL",
+    "AAOI",
+    "AAP",
+    "AAPU",
+    "AAPW",
+    "AAUC",
+    "AB",
+    "ABAT",
+    "ABBV",
+    "ABCL",
+    "ABEV",
+    "ABLV"
+  ],
+  "ts_utc": "2026-02-24T22:30:04Z",
+  "warnings": []
+}

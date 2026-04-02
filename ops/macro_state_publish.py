@@ -5,7 +5,7 @@ CHAD Market Radar — macro_state publisher (Production)
 File: ops/macro_state_publish.py
 
 Outputs:
-  /home/ubuntu/CHAD FINALE/runtime/macro_state.json
+  /home/ubuntu/chad_finale/runtime/macro_state.json
 
 SSOT contract (v4.2):
   runtime/macro_state.json must exist, be valid JSON, include ts_utc + ttl_seconds,
@@ -43,7 +43,7 @@ import urllib.request
 # Constants / Paths
 # -----------------------------
 
-DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/CHAD FINALE/runtime")
+DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 OUT_PATH = Path(os.environ.get("CHAD_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR))) / "macro_state.json"
 
 # TTL (seconds). SSOT suggests 1800 as a sane baseline for macro. :contentReference[oaicite:2]{index=2}

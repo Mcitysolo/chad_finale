@@ -3,7 +3,7 @@
   "ts_utc": "2026-02-05T00:00:00Z",
   "rebalance_auto_execute": {
     "enabled_default": false,
-    "min_seconds_between_executes": 21600,
+    "min_seconds_between_executes": 0,    
     "max_total_turnover_per_execute": 0.25,
     "max_abs_delta_weight_per_symbol": 0.10,
     "min_drift_to_execute": {

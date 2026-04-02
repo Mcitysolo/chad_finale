@@ -181,6 +181,50 @@ class DynamicRiskAllocator:
 
         norm = self.strategy_allocation.normalized()
         portfolio_risk_cap = total_equity * self.daily_risk_fraction
+        # Keep payload summary consistent with compute_caps()
+        try:
+            import json
+            from pathlib import Path
+
+            profit_lock_path = Path(__file__).resolve().parents[2] / "runtime" / "profit_lock_state.json"
+
+            if profit_lock_path.is_file():
+                with profit_lock_path.open("r", encoding="utf-8") as f:
+                    pl = json.load(f)
+
+                sizing_factor = float(pl.get("sizing_factor", 1.0))
+                stop_new_entries = bool(pl.get("stop_new_entries", False))
+
+                portfolio_risk_cap *= max(0.0, min(1.0, sizing_factor))
+
+                if stop_new_entries:
+                    portfolio_risk_cap = 0.0
+
+        except Exception:
+            pass        # --- PROFIT LOCK INTEGRATION (SYSTEM-LEVEL CONTROL) ---
+        try:
+            import json
+            from pathlib import Path
+
+            profit_lock_path = Path(__file__).resolve().parents[2] / "runtime" / "profit_lock_state.json"
+
+            if profit_lock_path.is_file():
+                with profit_lock_path.open("r", encoding="utf-8") as f:
+                    pl = json.load(f)
+
+                sizing_factor = float(pl.get("sizing_factor", 1.0))
+                stop_new_entries = bool(pl.get("stop_new_entries", False))
+
+                # Apply scaling
+                portfolio_risk_cap *= max(0.0, min(1.0, sizing_factor))
+
+                # Hard stop overrides everything
+                if stop_new_entries:
+                    portfolio_risk_cap = 0.0
+
+        except Exception:
+            # Fail-safe: never break allocator
+            pass
 
         caps: Dict[str, float] = {}
         for name, frac in norm.items():

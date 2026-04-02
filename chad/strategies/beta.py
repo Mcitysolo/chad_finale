@@ -2,16 +2,36 @@
 """
 chad/strategies/beta.py
 
-BetaBrain (Phase 3) — legend / long-term allocator.
+BetaBrain — Legend-driven long-term allocator (WEALTH MODE, low-churn, once-per-day)
 
-Uses the Legend consensus file (generated from data/legend_top_stocks.json)
-to propose small, incremental entries into high-conviction symbols.
+Why this replacement (measured)
+-------------------------------
+Metrics proved Beta is generating ~760 "trades" in the paper window.
+That is unacceptable for a long-term allocator and will destroy SCR win_rate.
+
+Root cause:
+- beta_handler emits BUYs whenever qty==0.
+- In paper / ledger pipelines, qty may remain 0 for long periods or signals are logged as trades
+  even if later rejected/throttled. Result: repeated BUY proposals every cycle.
+
+Fix:
+- Enforce "once per UTC day per symbol" proposals (hard gate).
+- Enforce "max signals per UTC day" (hard cap).
+- Preserve test contract: must emit at least some signals in minimal contexts.
+
+Guarantees
+----------
+- Deterministic, no I/O, no disk writes.
+- Uses in-memory state only.
+- Works with only ctx.legend + ctx.portfolio + ctx.now.
+- Still allows conservative add-ons, but also once-per-day gated.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Sequence, Tuple
 
 from chad.types import (
     AssetClass,
@@ -26,90 +46,269 @@ from chad.types import (
 )
 
 
+# -------------------------
+# Params
+# -------------------------
+
 @dataclass(frozen=True)
 class BetaParams:
-    """
-    Tunable parameters for Beta.
-
-    Very conservative profile for Phase 3; real sizing and cash controls are
-    handled by the execution/risk layer in later phases.
-    """
-
+    # Safety / cash gating
     min_cash: float = 10_000.0
-    min_weight: float = 0.05  # minimum legend weight to consider
-    max_symbols: int = 10     # focus on top N legend names
-    base_size: float = 3.0    # nominal units per entry
+
+    # Legend selection
+    min_weight: float = 0.05
+    max_symbols: int = 10
+
+    # WEALTH MODE throttles (critical)
+    max_signals_per_day: int = 5          # hard cap: total Beta signals/day
+    once_per_day_per_symbol: bool = True  # hard gate
+
+    # Churn controls
+    min_hold_days: int = 21
+    cooldown_days_after_exit: int = 14
+
+    # Smoothing
+    smoothing_alpha: float = 0.35
+
+    # Sizing
+    base_size: float = 3.0
+    max_size: float = 8.0
+    size_scale: float = 10.0
 
 
 DEFAULT_PARAMS = BetaParams()
 
 
-def _sorted_legend_weights(legend: LegendConsensus, params: BetaParams) -> List[tuple[str, float]]:
-    """
-    Return top N legend weights above min_weight, sorted descending.
-    """
-    items = [
-        (sym, w)
-        for sym, w in legend.weights.items()
-        if w >= params.min_weight
-    ]
-    items.sort(key=lambda kv: kv[1], reverse=True)
-    return items[: params.max_symbols]
+# -------------------------
+# In-memory state (no disk)
+# -------------------------
 
+# -------------------------
+# Symbol classification helper
+# -------------------------
+
+def _asset_class_for_symbol(sym: str) -> AssetClass:
+    if sym in {"SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "LQD", "VWO", "IEMG"}:
+        return AssetClass.ETF
+    return AssetClass.EQUITY
+
+class _BetaState:
+    def __init__(self) -> None:
+        self.ewma: Dict[str, float] = {}
+        self.last_entered_iso: Dict[str, str] = {}
+        self.last_exited_iso: Dict[str, str] = {}
+
+        # Throttle state (UTC day keys)
+        self.last_proposed_day: Dict[str, str] = {}  # sym -> YYYY-MM-DD
+        self.day_counts: Dict[str, int] = {}         # YYYY-MM-DD -> count
+
+    def _parse_iso(self, s: str) -> datetime | None:
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+
+    def _day_key(self, now: datetime) -> str:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+        return now.date().isoformat()  # YYYY-MM-DD
+
+    def days_since(self, *, now: datetime, iso: str | None) -> int:
+        if not iso:
+            return 999999
+        dt = self._parse_iso(iso)
+        if dt is None:
+            return 999999
+        delta = now - dt
+        return max(0, int(delta.total_seconds() // 86400))
+
+    def mark_enter(self, sym: str, now: datetime) -> None:
+        self.last_entered_iso[sym] = now.isoformat()
+
+    def mark_exit(self, sym: str, now: datetime) -> None:
+        self.last_exited_iso[sym] = now.isoformat()
+
+    # Throttle
+    def can_propose(self, *, sym: str, now: datetime, max_signals_per_day: int, once_per_day_per_symbol: bool) -> bool:
+        day = self._day_key(now)
+
+        # daily total cap
+        c = int(self.day_counts.get(day, 0))
+        if c >= int(max(1, max_signals_per_day)):
+            return False
+
+        if once_per_day_per_symbol:
+            last_day = self.last_proposed_day.get(sym)
+            if last_day == day:
+                return False
+
+        return True
+
+    def mark_proposed(self, *, sym: str, now: datetime) -> None:
+        day = self._day_key(now)
+        self.last_proposed_day[sym] = day
+        self.day_counts[day] = int(self.day_counts.get(day, 0)) + 1
+
+
+_STATE = _BetaState()
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def _norm_sym(x: Any) -> str:
+    return str(x or "").strip().upper()
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    if x != x:
+        return lo
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _sorted_legend_weights(legend: LegendConsensus, p: BetaParams) -> List[Tuple[str, float]]:
+    items = [(_norm_sym(sym), float(w)) for sym, w in legend.weights.items() if float(w) >= p.min_weight]
+    items = [(s, w) for s, w in items if s]
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    return items[: p.max_symbols]
+
+
+def _ewma_update(sym: str, weight: float, alpha: float) -> float:
+    prev = _STATE.ewma.get(sym)
+    if prev is None:
+        _STATE.ewma[sym] = weight
+        return weight
+    new = alpha * weight + (1.0 - alpha) * prev
+    _STATE.ewma[sym] = new
+    return new
+
+
+def _size_for_weight(p: BetaParams, w: float) -> float:
+    return _clamp(p.base_size + (w * p.size_scale), p.base_size, p.max_size)
+
+
+# -------------------------
+# Config
+# -------------------------
 
 def build_beta_config() -> StrategyConfig:
-    """
-    StrategyConfig for BetaBrain.
-    """
     return StrategyConfig(
         name=StrategyName.BETA,
         enabled=True,
-        target_universe=None,  # derived dynamically from legend
+        target_universe=None,
         max_gross_exposure=None,
-        notes="Phase-3 BetaBrain (Legend-driven long-term entries).",
+        notes="BetaBrain (wealth-mode low-churn; once-per-day throttle).",
     )
 
 
+# -------------------------
+# Handler
+# -------------------------
+
 def beta_handler(ctx: MarketContext, params: BetaParams | None = None) -> Sequence[TradeSignal]:
-    """
-    Public handler for Beta, suitable for registration with StrategyEngine.
-    """
     p = params or DEFAULT_PARAMS
+
     legend = ctx.legend
     if legend is None:
         return []
 
-    if ctx.portfolio.cash < p.min_cash:
+    portfolio: PortfolioSnapshot = ctx.portfolio
+    if portfolio.cash < p.min_cash:
         return []
 
-    portfolio: PortfolioSnapshot = ctx.portfolio
-    positions: dict[str, Position] = dict(portfolio.positions)
+    now = ctx.now if isinstance(ctx.now, datetime) else datetime.now(timezone.utc)
+    positions: Dict[str, Position] = dict(portfolio.positions)
+
+    ranked = _sorted_legend_weights(legend, p)
+    if not ranked:
+        return []
+
+    alpha = _clamp(p.smoothing_alpha, 0.01, 0.95)
+
+    scored: List[Tuple[str, float]] = []
+    for sym, w in ranked:
+        sm = _ewma_update(sym, w, alpha=alpha)
+        scored.append((sym, _clamp(sm, 0.0, 1.0)))
+
+    scored.sort(key=lambda kv: kv[1], reverse=True)
 
     signals: List[TradeSignal] = []
 
-    for symbol, weight in _sorted_legend_weights(legend, p):
-        pos = positions.get(symbol)
-        qty = pos.quantity if pos is not None else 0.0
+    for sym, w in scored:
+        pos = positions.get(sym)
+        qty = float(pos.quantity) if pos is not None else 0.0
 
-        # For Phase 3, Beta only proposes entries when we have zero exposure.
-        if qty > 0:
+        # cooldown after exit (only matters if flat)
+        if qty <= 0:
+            if _STATE.days_since(now=now, iso=_STATE.last_exited_iso.get(sym)) < p.cooldown_days_after_exit:
+                continue
+
+        # Throttle gate: once/day per symbol + max/day
+        if not _STATE.can_propose(
+            sym=sym,
+            now=now,
+            max_signals_per_day=p.max_signals_per_day,
+            once_per_day_per_symbol=p.once_per_day_per_symbol,
+        ):
             continue
 
-        signals.append(
-            TradeSignal(
-                strategy=StrategyName.BETA,
-                symbol=symbol,
-                side=SignalSide.BUY,
-                size=p.base_size,
-                confidence=min(1.0, max(0.5, weight * 2.0)),  # simple mapping of legend weight → confidence
-                asset_class=AssetClass.EQUITY,
-                created_at=ctx.now,
-                meta={
-                    "reason": "legend_weight_entry",
-                    "legend_weight": weight,
-                    "legend_as_of": legend.as_of.isoformat(),
-                },
+        # Entry if flat, conservative add-on if holding and hold period satisfied
+        size = _size_for_weight(p, w)
+        confidence = _clamp(0.50 + (w * 2.0), 0.50, 0.95)
+
+        if qty <= 0:
+            signals.append(
+                TradeSignal(
+                    strategy=StrategyName.BETA,
+                    symbol=sym,
+                    side=SignalSide.BUY,
+                    size=float(size),
+                    confidence=float(confidence),
+                    asset_class=_asset_class_for_symbol(sym),
+                    created_at=now,
+                    meta={
+                        "reason": "legend_entry_once_per_day",
+                        "legend_weight_raw": float(legend.weights.get(sym, w)),
+                        "legend_weight_ewma": float(w),
+                        "legend_as_of": legend.as_of.isoformat(),
+                    },
+                )
             )
-        )
+            _STATE.mark_enter(sym, now)
+            _STATE.mark_proposed(sym=sym, now=now)
+
+        else:
+            # Add-ons: only after min_hold_days, and also once-per-day gated
+            if _STATE.days_since(now=now, iso=_STATE.last_entered_iso.get(sym)) < p.min_hold_days:
+                continue
+
+            signals.append(
+                TradeSignal(
+                    strategy=StrategyName.BETA,
+                    symbol=sym,
+                    side=SignalSide.BUY,
+                    size=float(_clamp(size * 0.5, 0.0, p.max_size)),
+                    confidence=float(_clamp(confidence * 0.95, 0.50, 0.90)),
+                    asset_class=_asset_class_for_symbol(sym),
+                    created_at=now,
+                    meta={
+                        "reason": "legend_topup_once_per_day",
+                        "legend_weight_ewma": float(w),
+                    },
+                )
+            )
+            _STATE.mark_proposed(sym=sym, now=now)
+
+        if len(signals) >= int(max(1, p.max_signals_per_day)):
+            break
 
     return signals

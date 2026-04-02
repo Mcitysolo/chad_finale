@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from chad.core.regime_tag import resolve_regime_label
+from datetime import datetime, timezone
 
 from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig, KrakenAPIError
 
@@ -232,7 +234,7 @@ def _append_enrichment_record(
             "is_live": True,
             "entry_time_utc": str(payload.get("entry_time_utc") or _utc_now_iso()),
             "exit_time_utc": str(payload.get("exit_time_utc") or _utc_now_iso()),
-            "regime": None,
+            "regime": resolve_regime_label(now_utc=datetime.now(timezone.utc)),
             "tags": list(payload.get("tags") or []) + ["kraken_enriched"],
             "extra": {
                 "source": "kraken_pnl_watcher",

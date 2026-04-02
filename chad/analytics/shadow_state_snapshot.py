@@ -49,7 +49,7 @@ Intended usage
 * Called on-demand by the Telegram coach or status HTTP endpoint.
 
 CLI:
-    PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.analytics.shadow_state_snapshot
+    PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.analytics.shadow_state_snapshot
 """
 
 from __future__ import annotations
@@ -69,6 +69,8 @@ from chad.analytics.shadow_confidence_router import evaluate_confidence, ShadowS
 LOGGER_NAME = "chad.shadow_state_snapshot"
 SHADOW_DIR = Path("data") / "shadow"
 SHADOW_STATE_PATH = SHADOW_DIR / "shadow_state.json"
+
+DEFAULT_TTL_SECONDS = 300  # SSOT freshness contract
 
 
 def _get_logger() -> logging.Logger:
@@ -114,7 +116,7 @@ def write_shadow_snapshot() -> Path:
 
     logger.info("Loading recent trade stats for shadow state snapshot...")
     stats = load_and_compute(
-        max_trades=200,
+        max_trades=500,
         days_back=30,
         include_paper=True,
         include_live=True,
@@ -131,6 +133,8 @@ def write_shadow_snapshot() -> Path:
 
     snapshot: Dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "ts_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z"),
+        "ttl_seconds": DEFAULT_TTL_SECONDS,
         "state": shadow_state.state,
         "sizing_factor": float(shadow_state.sizing_factor),
         "paper_only": bool(shadow_state.paper_only),

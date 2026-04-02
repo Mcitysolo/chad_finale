@@ -1,761 +1,1315 @@
+
+from __future__ import annotations
+
 """
 chad/execution/ibkr_adapter.py
 
-Phase 12 upgrade: broker execution hardening with durable exactly-once semantics.
+Professional-grade IBKR execution adapter for CHAD.
 
-What this module now guarantees (Phase 12 core requirements):
-- Exactly-once *broker submission* for a given idempotency_key (durable across restarts)
-- Safe retries with bounded backoff + jitter
-- Durable broker_order_id writeback to exec_state.sqlite3
-- Deterministic idempotency_key derivation (prefers upstream-provided keys, else hashes a canonical intent payload)
+Why this module exists
+----------------------
+This adapter is the boundary between CHAD's internal signal/intent world and
+Interactive Brokers' contract + order API surface.
 
-Design notes:
-- This adapter is intentionally minimal and focused: it converts RoutedSignal -> IBKR order submission.
-- LiveGate / SCR gating happens upstream. This adapter enforces *execution integrity* once called.
-- DRY_RUN remains side-effect-free (no broker calls); it still returns SubmittedOrder objects.
+Key properties
+--------------
+* Supports both legacy RoutedSignal submission and higher-level IBKR-style
+  trade intents.
+* Adds first-class futures + forex handling instead of treating everything as a
+  stock.
+* Uses dependency injection for the IB client factory and time source.
+* Supports safe DRY_RUN mode, optional WHAT-IF simulation, idempotency, retry,
+  connection reuse, and explicit contract resolution.
+* Fails closed on malformed inputs.
+* Keeps the original public shape familiar:
+    - IbkrConfig
+    - SubmittedOrder
+    - IbkrAdapter.ensure_connected()
+    - IbkrAdapter.shutdown()
+    - IbkrAdapter.submit_routed_signals(...)
 """
-
-from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import os
-import random
+import math
 import sqlite3
+import threading
 import time
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple, TypeVar, TYPE_CHECKING
 
-# Type-only imports (avoid importing ib_insync unless execution paths run)
-from typing import TYPE_CHECKING
+from chad.types import AssetClass, RoutedSignal, SignalSide
 
-from chad.types import AssetClass, SignalSide
+LOGGER = logging.getLogger("chad.execution.ibkr")
 
 if TYPE_CHECKING:
-    from ib_insync import IB, Contract, Order  # type: ignore
-    from chad.analytics.shadow_router import RoutedSignal  # type: ignore
-
-LOGGER = logging.getLogger("chad.execution.ibkr_adapter")
+    from chad.execution.ibkr_executor import StrategyTradeIntent
 
 
-# ----------------------------
-# Configuration + Output Types
-# ----------------------------
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class IbkrAdapterError(RuntimeError):
+    """Base class for adapter-level failures."""
+
+
+class ConnectionError(IbkrAdapterError):
+    """Raised when the adapter cannot establish an IBKR connection."""
+
+
+class ValidationError(IbkrAdapterError):
+    """Raised when input data is malformed or unsupported."""
+
+
+class ContractResolutionError(IbkrAdapterError):
+    """Raised when a broker contract cannot be resolved safely."""
+
+
+class SubmissionError(IbkrAdapterError):
+    """Raised when order submission fails after retries."""
+
+
+# ---------------------------------------------------------------------------
+# Public data models
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FuturesContractSpec:
+    """
+    Static routing metadata for a futures root symbol.
+
+    The contract month itself is resolved dynamically from IBKR contract details
+    when possible.
+    """
+
+    symbol: str
+    exchange: str
+    currency: str = "USD"
+    multiplier: Optional[str] = None
+    include_expired: bool = False
+    local_symbol_prefix: Optional[str] = None
+    notes: str = ""
+
 
 @dataclass(frozen=True)
 class IbkrConfig:
     """
-    Configuration for IBKR adapter.
+    Configuration for the IBKR adapter.
 
-    dry_run:
-      - True: never connect or submit orders; only logs + returns SubmittedOrder(dry_run=True)
-      - False: connects and submits orders (requires upstream LiveGate/SCR gating)
+    Safe defaults:
+    - dry_run=True
+    - simulate_what_if_in_dry_run=False
+    - idempotency enabled
+    - conservative retry strategy
     """
-    dry_run: bool = True
 
     host: str = "127.0.0.1"
     port: int = 4002
-    client_id: int = 19
+    client_id: int = 99
 
-    # Execution hardening
-    submit_max_attempts: int = 3
-    submit_base_backoff_s: float = 0.5
-    submit_backoff_cap_s: float = 5.0
-    submit_jitter_frac: float = 0.25
+    dry_run: bool = True
+    simulate_what_if_in_dry_run: bool = False
+    validate_contracts_in_dry_run: bool = False
 
-    # Exec-state DB path (durable exactly-once store)
-    exec_state_db_path: Optional[str] = None
+    connect_timeout_s: float = 10.0
+    initial_status_wait_s: float = 1.0
+    max_connect_retries: int = 3
+    max_submit_retries: int = 2
+    retry_backoff_s: float = 1.25
+
+    default_stock_exchange: str = "SMART"
+    default_stock_currency: str = "USD"
+    default_forex_exchange: str = "IDEALPRO"
+    default_forex_quantity_step: str = "0.0001"
+    default_whole_unit_sec_types: Tuple[str, ...] = ("STK", "FUT", "OPT")
+
+    primary_exchange_by_symbol: Mapping[str, str] = field(
+        default_factory=lambda: {
+            "SPY": "ARCA",
+            "QQQ": "NASDAQ",
+            "IVV": "ARCA",
+            "VOO": "ARCA",
+        }
+    )
+
+    futures_contracts: Mapping[str, FuturesContractSpec] = field(
+        default_factory=lambda: {
+            "MES": FuturesContractSpec(symbol="MES", exchange="CME", currency="USD", multiplier="5", notes="Micro E-mini S&P 500"),
+            "MNQ": FuturesContractSpec(symbol="MNQ", exchange="CME", currency="USD", multiplier="2", notes="Micro E-mini Nasdaq-100"),
+            "MCL": FuturesContractSpec(symbol="MCL", exchange="NYMEX", currency="USD", multiplier="100", notes="Micro WTI Crude Oil"),
+            "MGC": FuturesContractSpec(symbol="MGC", exchange="COMEX", currency="USD", multiplier="10", notes="Micro Gold"),
+        }
+    )
+
+    enable_idempotency: bool = True
+    state_db_path: Optional[Path] = None
+
+    account: Optional[str] = None
+    outside_rth: bool = False
+    tif: str = "DAY"
+    allow_market_orders: bool = True
+
+    def resolved_state_db_path(self) -> Path:
+        if self.state_db_path is not None:
+            return self.state_db_path
+        repo_root = Path(__file__).resolve().parents[2]
+        runtime_dir = repo_root / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        return runtime_dir / "ibkr_adapter_state.sqlite3"
 
 
 @dataclass(frozen=True)
 class SubmittedOrder:
+    """
+    Representation of an order that was sent, simulated, skipped, or blocked.
+
+    Fields kept for compatibility with the original adapter:
+    - symbol
+    - side
+    - quantity
+    - strategy
+    - dry_run
+    - submitted_at
+    - ib_order_id
+    """
+
     symbol: str
     side: str
     quantity: float
     strategy: List[str]
     dry_run: bool
     submitted_at: datetime
-    ib_order_id: Optional[int]
+    ib_order_id: Optional[int] = None
+
+    status: str = "unknown"
+    asset_class: str = "unknown"
+    sec_type: str = ""
+    exchange: str = ""
+    currency: str = ""
+    order_type: str = "MKT"
+    limit_price: Optional[float] = None
+    what_if: bool = False
+    perm_id: Optional[int] = None
+    idempotency_key: Optional[str] = None
+    contract_summary: Mapping[str, Any] = field(default_factory=dict)
+    raw: Mapping[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
 
 
-# ----------------------------
-# Exec-State Durable Store
-# ----------------------------
+# ---------------------------------------------------------------------------
+# Internal models
+# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
-class ExecStateClaim:
-    inserted: bool
-    status: str
-    broker_order_id: Optional[str]
-    submit_attempts: int
-    claim_attempts: int
-
-
-class ExecStateStore:
+class NormalizedIntent:
     """
-    Durable, restart-safe execution state store.
+    Adapter-internal normalized submission intent.
 
-    Backed by: data/exec_state/exec_state.sqlite3
-
-    Contract:
-    - idempotency_key is PRIMARY KEY
-    - claim() is INSERT OR IGNORE (exactly-once)
-    - mark_submitted() persists broker_order_id and status transition
-    - mark_error() persists failure and bumps attempts
+    This lets the adapter accept both legacy RoutedSignal objects and higher-
+    level StrategyTradeIntent-like objects while sharing one submission path.
     """
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = db_path
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+    strategy: str
+    symbol: str
+    sec_type: str
+    exchange: str
+    currency: str
+    side: str
+    order_type: str
+    quantity: float
+    notional_estimate: float
+    asset_class: str
+    source_strategies: Tuple[str, ...]
+    created_at: datetime
+    limit_price: Optional[float] = None
+    meta: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ResolvedContract:
+    contract: Any
+    summary: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _PreparedOrder:
+    order: Any
+    quantity: float
+    what_if: bool
+
+
+# ---------------------------------------------------------------------------
+# Protocols / dependency injection
+# ---------------------------------------------------------------------------
+
+
+class IBLike(Protocol):
+    def isConnected(self) -> bool: ...
+    def connect(self, host: str, port: int, clientId: int, timeout: float) -> Any: ...
+    def disconnect(self) -> Any: ...
+    def managedAccounts(self) -> Sequence[str]: ...
+    def qualifyContracts(self, *contracts: Any) -> Sequence[Any]: ...
+    def reqContractDetails(self, contract: Any) -> Sequence[Any]: ...
+    def whatIfOrder(self, contract: Any, order: Any) -> Any: ...
+    def placeOrder(self, contract: Any, order: Any) -> Any: ...
+    def sleep(self, seconds: float) -> Any: ...
+
+
+IBFactory = Callable[[], IBLike]
+NowFn = Callable[[], datetime]
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+T = TypeVar("T")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _safe_upper(value: Any, default: str = "") -> str:
+    return _safe_str(value, default).upper()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(out) or math.isinf(out):
+        return default
+    return out
+
+
+def _to_decimal(value: Any, default: Optional[Decimal] = None) -> Optional[Decimal]:
+    if value is None:
+        return default
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def _quantize_down(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        raise ValueError("step must be > 0")
+    units = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    return units * step
+
+
+def _enum_value(value: Any) -> str:
+    if hasattr(value, "value"):
+        return str(getattr(value, "value")).strip().lower()
+    return str(value).strip().lower()
+
+
+def _side_to_ib(side: Any) -> str:
+    side_value = _enum_value(side)
+    if side_value == "buy":
+        return "BUY"
+    if side_value == "sell":
+        return "SELL"
+    raise ValidationError(f"Unsupported side: {side!r}")
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    out = _safe_upper(symbol)
+    if not out:
+        raise ValidationError("symbol is required")
+    return out
+
+
+def _stable_json(data: Mapping[str, Any]) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _hash_payload(data: Mapping[str, Any]) -> str:
+    raw = _stable_json(data).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _asset_class_key(asset_class: Any) -> str:
+    return _enum_value(asset_class)
+
+
+def _strategy_name(value: Any) -> str:
+    if hasattr(value, "value"):
+        return str(getattr(value, "value")).strip()
+    return str(value).strip()
+
+
+def _jsonable(value: Any) -> Any:
+    """
+    Best-effort JSON serializer for ib_insync / dataclass / enum objects.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if hasattr(value, "__dict__"):
+        return {str(k): _jsonable(v) for k, v in vars(value).items() if not k.startswith("_")}
+    return str(value)
+
+
+def _parse_fx_pair(raw_symbol: str) -> Tuple[str, str, str]:
+    compact = "".join(ch for ch in raw_symbol.upper() if ch.isalpha())
+    if len(compact) != 6:
+        raise ValidationError(f"Invalid FX pair symbol: {raw_symbol!r}")
+    base = compact[:3]
+    quote = compact[3:]
+    return compact, base, quote
+
+
+def _should_connect(config: IbkrConfig, *, force: bool = False) -> bool:
+    if force:
+        return True
+    if config.dry_run and not config.simulate_what_if_in_dry_run and not config.validate_contracts_in_dry_run:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# SQLite idempotency store
+# ---------------------------------------------------------------------------
+
+
+class _SQLiteIdempotencyStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(
-            str(self._db_path),
-            timeout=5.0,
-            isolation_level=None,  # autocommit; we manage transactions explicitly
-        )
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.execute("PRAGMA synchronous=NORMAL;")
-        con.execute("PRAGMA foreign_keys=ON;")
-        return con
+        conn = sqlite3.connect(str(self._path), timeout=30, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
 
-    def claim(
-        self,
-        *,
-        idempotency_key: str,
-        broker: str,
-        strategy: str,
-        symbol: str,
-        side: str,
-        quantity: float,
-        asset_class: str,
-        intent_canonical_json: str,
-        extra_json: str,
-    ) -> ExecStateClaim:
-        now = _utc_now_iso()
-        qty = float(quantity)
-
-        with self._connect() as con:
-            con.execute("BEGIN IMMEDIATE;")
-
-            # Try insert (exactly-once)
-            con.execute(
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
                 """
-                INSERT OR IGNORE INTO exec_state (
-                    idempotency_key, status,
-                    created_at_utc, updated_at_utc,
-                    broker, strategy, symbol, side, quantity, asset_class,
-                    broker_order_id,
-                    intent_canonical_json, extra_json,
-                    claim_attempts, submit_attempts, last_error
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                CREATE TABLE IF NOT EXISTS ibkr_exec_state (
+                    idempotency_key TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    broker_order_id INTEGER,
+                    payload_json TEXT NOT NULL,
+                    result_json TEXT
+                )
+                """
+            )
+
+    def claim(self, key: str, payload: Mapping[str, Any], now: datetime) -> bool:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO ibkr_exec_state (
+                    idempotency_key, status, created_at_utc, updated_at_utc,
+                    broker_order_id, payload_json, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    idempotency_key,
-                    "CLAIMED",
-                    now,
-                    now,
-                    broker,
-                    strategy,
-                    symbol,
-                    side,
-                    qty,
-                    asset_class,
+                    key,
+                    "claimed",
+                    now.isoformat(),
+                    now.isoformat(),
                     None,
-                    intent_canonical_json,
-                    extra_json,
-                    1,
-                    0,
+                    _stable_json(payload),
                     None,
                 ),
             )
+            return cur.rowcount == 1
 
-            # Read row
-            row = con.execute(
+    def mark(self, key: str, *, status: str, broker_order_id: Optional[int], result: Mapping[str, Any], now: datetime) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
                 """
-                SELECT status, broker_order_id, submit_attempts, claim_attempts
-                FROM exec_state
-                WHERE idempotency_key=?
+                UPDATE ibkr_exec_state
+                   SET status = ?, updated_at_utc = ?, broker_order_id = ?, result_json = ?
+                 WHERE idempotency_key = ?
                 """,
-                (idempotency_key,),
-            ).fetchone()
-
-            if row is None:
-                con.execute("COMMIT;")
-                # Should not happen given insert+select, but fail closed
-                return ExecStateClaim(inserted=False, status="ERROR", broker_order_id=None, submit_attempts=0, claim_attempts=0)
-
-            status, broker_order_id, submit_attempts, claim_attempts = row
-
-            # If this was NOT newly inserted, bump claim_attempts for audit
-            inserted = (claim_attempts == 1) and (submit_attempts == 0) and (broker_order_id is None) and (status == "CLAIMED")
-            if not inserted:
-                con.execute(
-                    """
-                    UPDATE exec_state
-                    SET claim_attempts = claim_attempts + 1,
-                        updated_at_utc = ?
-                    WHERE idempotency_key=?
-                    """,
-                    (now, idempotency_key),
-                )
-                # Refresh claim_attempts
-                row2 = con.execute(
-                    "SELECT status, broker_order_id, submit_attempts, claim_attempts FROM exec_state WHERE idempotency_key=?",
-                    (idempotency_key,),
-                ).fetchone()
-                if row2:
-                    status, broker_order_id, submit_attempts, claim_attempts = row2
-
-            con.execute("COMMIT;")
-
-        return ExecStateClaim(
-            inserted=inserted,
-            status=str(status),
-            broker_order_id=str(broker_order_id) if broker_order_id is not None else None,
-            submit_attempts=int(submit_attempts or 0),
-            claim_attempts=int(claim_attempts or 0),
-        )
-
-    def bump_submit_attempt(self, *, idempotency_key: str) -> int:
-        now = _utc_now_iso()
-        with self._connect() as con:
-            con.execute("BEGIN IMMEDIATE;")
-            con.execute(
-                """
-                UPDATE exec_state
-                SET submit_attempts = submit_attempts + 1,
-                    updated_at_utc = ?
-                WHERE idempotency_key=?
-                """,
-                (now, idempotency_key),
+                (
+                    status,
+                    now.isoformat(),
+                    broker_order_id,
+                    _stable_json(result),
+                    key,
+                ),
             )
-            row = con.execute(
-                "SELECT submit_attempts FROM exec_state WHERE idempotency_key=?",
-                (idempotency_key,),
+
+    def get(self, key: str) -> Optional[Mapping[str, Any]]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT idempotency_key, status, created_at_utc, updated_at_utc,
+                       broker_order_id, payload_json, result_json
+                  FROM ibkr_exec_state
+                 WHERE idempotency_key = ?
+                """,
+                (key,),
             ).fetchone()
-            con.execute("COMMIT;")
-        return int(row[0]) if row and row[0] is not None else 0
-
-    def mark_submitted(self, *, idempotency_key: str, broker_order_id: str) -> None:
-        now = _utc_now_iso()
-        with self._connect() as con:
-            con.execute("BEGIN IMMEDIATE;")
-            con.execute(
-                """
-                UPDATE exec_state
-                SET status = ?,
-                    broker_order_id = ?,
-                    updated_at_utc = ?,
-                    last_error = NULL
-                WHERE idempotency_key=?
-                """,
-                ("SUBMITTED", str(broker_order_id), now, idempotency_key),
-            )
-            con.execute("COMMIT;")
-
-    def mark_error(self, *, idempotency_key: str, err: str) -> None:
-        now = _utc_now_iso()
-        with self._connect() as con:
-            con.execute("BEGIN IMMEDIATE;")
-            con.execute(
-                """
-                UPDATE exec_state
-                SET status = ?,
-                    last_error = ?,
-                    updated_at_utc = ?
-                WHERE idempotency_key=?
-                """,
-                ("ERROR", str(err)[:800], now, idempotency_key),
-            )
-            con.execute("COMMIT;")
-
-    def get(self, *, idempotency_key: str) -> Optional[Dict[str, Any]]:
-        with self._connect() as con:
-            row = con.execute(
-                """
-                SELECT
-                    idempotency_key, status, created_at_utc, updated_at_utc,
-                    broker, strategy, symbol, side, quantity, asset_class,
-                    broker_order_id, intent_canonical_json, extra_json,
-                    claim_attempts, submit_attempts, last_error
-                FROM exec_state
-                WHERE idempotency_key=?
-                """,
-                (idempotency_key,),
-            ).fetchone()
-        if not row:
+        if row is None:
             return None
-        keys = [
-            "idempotency_key", "status", "created_at_utc", "updated_at_utc",
-            "broker", "strategy", "symbol", "side", "quantity", "asset_class",
-            "broker_order_id", "intent_canonical_json", "extra_json",
-            "claim_attempts", "submit_attempts", "last_error",
-        ]
-        return {k: row[i] for i, k in enumerate(keys)}
+        return {
+            "idempotency_key": row[0],
+            "status": row[1],
+            "created_at_utc": row[2],
+            "updated_at_utc": row[3],
+            "broker_order_id": row[4],
+            "payload_json": row[5],
+            "result_json": row[6],
+        }
 
 
-# ----------------------------
+# ---------------------------------------------------------------------------
+# Lazy ib_insync imports
+# ---------------------------------------------------------------------------
+
+
+def _lazy_import_ib_factory() -> IBFactory:
+    def factory() -> IBLike:
+        try:
+            from ib_insync import IB  # type: ignore[import]
+        except ImportError as exc:  # pragma: no cover
+            raise ConnectionError(
+                "ib_insync is not installed. Install it inside the CHAD venv."
+            ) from exc
+        return IB()
+
+    return factory
+
+
+def _lazy_import_contract_classes() -> Tuple[Any, Any, Any, Any, Any]:
+    try:
+        from ib_insync import Contract, Future, Forex, Order, Stock  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover
+        raise ConnectionError(
+            "ib_insync is not installed. Install it inside the CHAD venv."
+        ) from exc
+    return Contract, Future, Forex, Order, Stock
+
+
+# ---------------------------------------------------------------------------
+# Contract resolution
+# ---------------------------------------------------------------------------
+
+
+class _ContractResolver:
+    def __init__(self, config: IbkrConfig, now_fn: NowFn) -> None:
+        self._config = config
+        self._now_fn = now_fn
+        self._cache: MutableMapping[str, _ResolvedContract] = {}
+
+    def resolve(self, ib: Optional[IBLike], intent: NormalizedIntent) -> _ResolvedContract:
+        cache_key = _hash_payload(
+            {
+                "symbol": intent.symbol,
+                "sec_type": intent.sec_type,
+                "exchange": intent.exchange,
+                "currency": intent.currency,
+                "meta": dict(intent.meta),
+            }
+        )
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        sec_type = _safe_upper(intent.sec_type)
+        if sec_type == "STK":
+            resolved = self._resolve_stock(intent)
+        elif sec_type == "CASH":
+            resolved = self._resolve_forex(intent)
+        elif sec_type == "FUT":
+            resolved = self._resolve_future(ib, intent)
+        else:
+            raise ContractResolutionError(f"Unsupported sec_type: {intent.sec_type!r}")
+
+        self._cache[cache_key] = resolved
+        return resolved
+
+    def _resolve_stock(self, intent: NormalizedIntent) -> _ResolvedContract:
+        _Contract, _Future, _Forex, _Order, Stock = _lazy_import_contract_classes()
+        primary_exchange = self._config.primary_exchange_by_symbol.get(intent.symbol)
+        kwargs: Dict[str, Any] = {}
+        if primary_exchange:
+            kwargs["primaryExchange"] = primary_exchange
+        contract = Stock(intent.symbol, intent.exchange, intent.currency, **kwargs)
+        summary = {
+            "symbol": intent.symbol,
+            "sec_type": "STK",
+            "exchange": intent.exchange,
+            "currency": intent.currency,
+            "primary_exchange": primary_exchange,
+        }
+        return _ResolvedContract(contract=contract, summary=summary)
+
+    def _resolve_forex(self, intent: NormalizedIntent) -> _ResolvedContract:
+        _Contract, _Future, Forex, _Order, _Stock = _lazy_import_contract_classes()
+        pair, base, quote = _parse_fx_pair(intent.symbol)
+        contract = Forex(pair, exchange=intent.exchange)
+        summary = {
+            "symbol": pair,
+            "sec_type": "CASH",
+            "exchange": intent.exchange,
+            "currency": quote,
+            "base_currency": base,
+            "quote_currency": quote,
+        }
+        return _ResolvedContract(contract=contract, summary=summary)
+
+    def _resolve_future(self, ib: Optional[IBLike], intent: NormalizedIntent) -> _ResolvedContract:
+        _Contract, Future, _Forex, _Order, _Stock = _lazy_import_contract_classes()
+        spec = self._config.futures_contracts.get(intent.symbol)
+        if spec is None:
+            raise ContractResolutionError(f"Unsupported futures symbol: {intent.symbol!r}")
+
+        explicit_month = _safe_str(intent.meta.get("lastTradeDateOrContractMonth") or intent.meta.get("contract_month"))
+        multiplier = _safe_str(intent.meta.get("multiplier") or spec.multiplier or "")
+
+        if explicit_month:
+            contract = Future(
+                symbol=spec.symbol,
+                lastTradeDateOrContractMonth=explicit_month,
+                exchange=spec.exchange,
+                currency=spec.currency,
+                multiplier=multiplier or None,
+            )
+            summary = {
+                "symbol": spec.symbol,
+                "sec_type": "FUT",
+                "exchange": spec.exchange,
+                "currency": spec.currency,
+                "contract_month": explicit_month,
+                "multiplier": multiplier or None,
+                "resolution": "explicit",
+            }
+            return _ResolvedContract(contract=contract, summary=summary)
+
+        if ib is None:
+            # In pure dry-run mode we may intentionally avoid network access.
+            # We still return a broad futures contract for logging, but this is
+            # not sufficient for live submission.
+            contract = Future(
+                symbol=spec.symbol,
+                exchange=spec.exchange,
+                currency=spec.currency,
+                multiplier=multiplier or None,
+            )
+            summary = {
+                "symbol": spec.symbol,
+                "sec_type": "FUT",
+                "exchange": spec.exchange,
+                "currency": spec.currency,
+                "contract_month": None,
+                "multiplier": multiplier or None,
+                "resolution": "broad_unqualified",
+            }
+            return _ResolvedContract(contract=contract, summary=summary)
+
+        query = Future(
+            symbol=spec.symbol,
+            exchange=spec.exchange,
+            currency=spec.currency,
+            multiplier=multiplier or None,
+        )
+        details = list(ib.reqContractDetails(query) or [])
+        if not details:
+            raise ContractResolutionError(
+                f"No IBKR contract details returned for futures root {spec.symbol} on {spec.exchange}"
+            )
+
+        chosen = self._choose_front_month(details)
+        contract = chosen.contract
+        summary = {
+            "symbol": getattr(contract, "symbol", spec.symbol),
+            "sec_type": getattr(contract, "secType", "FUT"),
+            "exchange": getattr(contract, "exchange", spec.exchange),
+            "currency": getattr(contract, "currency", spec.currency),
+            "contract_month": getattr(contract, "lastTradeDateOrContractMonth", None),
+            "local_symbol": getattr(contract, "localSymbol", None),
+            "multiplier": getattr(contract, "multiplier", multiplier or None),
+            "con_id": getattr(contract, "conId", None),
+            "resolution": "front_month",
+        }
+        return _ResolvedContract(contract=contract, summary=summary)
+
+    def _choose_front_month(self, details: Sequence[Any]) -> Any:
+        today = self._now_fn().date()
+
+        def score(detail: Any) -> Tuple[int, str]:
+            contract = getattr(detail, "contract", None)
+            month = _safe_str(getattr(contract, "lastTradeDateOrContractMonth", ""))
+            parsed = self._parse_contract_month(month)
+            if parsed is None:
+                return (1, month)
+            if parsed < today:
+                return (2, month)
+            return (0, month)
+
+        sorted_details = sorted(details, key=score)
+        return sorted_details[0]
+
+    @staticmethod
+    def _parse_contract_month(raw: str) -> Optional[date]:
+        if len(raw) >= 8 and raw[:8].isdigit():
+            try:
+                return datetime.strptime(raw[:8], "%Y%m%d").date()
+            except ValueError:
+                return None
+        if len(raw) >= 6 and raw[:6].isdigit():
+            try:
+                return datetime.strptime(raw[:6], "%Y%m").date()
+            except ValueError:
+                return None
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Order factory
+# ---------------------------------------------------------------------------
+
+
+class _OrderFactory:
+    def __init__(self, config: IbkrConfig) -> None:
+        self._config = config
+        self._whole_units = frozenset(_safe_upper(x) for x in config.default_whole_unit_sec_types)
+        self._fx_step = _to_decimal(config.default_forex_quantity_step, Decimal("0.0001")) or Decimal("0.0001")
+
+    def build(self, intent: NormalizedIntent, *, what_if: bool) -> _PreparedOrder:
+        _Contract, _Future, _Forex, Order, _Stock = _lazy_import_contract_classes()
+
+        side = _side_to_ib(intent.side)
+        order_type = _safe_upper(intent.order_type)
+        if order_type not in {"MKT", "LMT"}:
+            raise ValidationError(f"Unsupported order_type: {intent.order_type!r}")
+        if order_type == "MKT" and not self._config.allow_market_orders:
+            raise ValidationError("Market orders are disabled by configuration")
+
+        quantity = self._normalize_quantity(intent.quantity, sec_type=intent.sec_type)
+        if quantity <= 0:
+            raise ValidationError("Quantity rounds down to zero or is non-positive")
+
+        limit_price = _safe_float(intent.limit_price, default=float("nan"))
+        if order_type == "LMT" and (math.isnan(limit_price) or limit_price <= 0.0):
+            raise ValidationError("Limit order requires positive limit_price")
+
+        order = Order()
+        order.action = side
+        order.orderType = order_type
+        order.totalQuantity = quantity
+        order.tif = _safe_upper(self._config.tif, "DAY")
+        order.outsideRth = bool(self._config.outside_rth)
+        order.whatIf = bool(what_if)
+        if self._config.account:
+            order.account = self._config.account
+        if order_type == "LMT":
+            order.lmtPrice = float(limit_price)
+
+        return _PreparedOrder(order=order, quantity=quantity, what_if=what_if)
+
+    def _normalize_quantity(self, raw_quantity: float, *, sec_type: str) -> float:
+        q = _to_decimal(raw_quantity)
+        if q is None or q <= 0:
+            raise ValidationError("quantity must be > 0")
+
+        normalized_sec_type = _safe_upper(sec_type)
+        if normalized_sec_type in self._whole_units:
+            q = _quantize_down(q, Decimal("1"))
+        else:
+            q = _quantize_down(q, self._fx_step)
+
+        out = float(q)
+        if out <= 0 or math.isnan(out) or math.isinf(out):
+            raise ValidationError("quantity normalization produced invalid result")
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Adapter
-# ----------------------------
+# ---------------------------------------------------------------------------
+
 
 class IbkrAdapter:
     """
-    IBKR execution adapter using ib_insync.
+    Production-grade IBKR execution adapter using ib_insync.
 
-    Phase 12 behavior:
-    - Before any live broker submission, claim idempotency_key in exec_state.sqlite3.
-    - If the key already exists and broker_order_id is present, do NOT re-submit.
-    - On submit, write back broker_order_id and mark status SUBMITTED.
-    - Retries are bounded and recorded (submit_attempts + last_error).
+    Supported submission styles
+    ---------------------------
+    * submit_routed_signals(signals)
+      Legacy CHAD path that accepts RoutedSignal objects directly.
+
+    * submit_strategy_trade_intents(intents)
+      Higher-level path for StrategyTradeIntent-like objects created by the
+      planning layer.
+
+    Design notes
+    ------------
+    * DRY_RUN mode never places a live order.
+    * Optional WHAT-IF in DRY_RUN mode can still connect to IBKR and request
+      contract + commission/margin simulation.
+    * Idempotency protects against duplicate live submissions.
     """
 
-    def __init__(self, config: IbkrConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: Optional[IbkrConfig] = None,
+        *,
+        ib_factory: Optional[IBFactory] = None,
+        now_fn: Optional[NowFn] = None,
+    ) -> None:
         self._config = config or IbkrConfig()
-        self._ib: Optional["IB"] = None
-        self._store = ExecStateStore(_resolve_exec_state_db_path(self._config.exec_state_db_path))
-
-    # -------------------------
-    # Connection management
-    # -------------------------
-
-    def ensure_connected(self) -> None:
-        """
-        Ensure there is an active connection to IBKR.
-
-        In DRY_RUN mode this is a no-op.
-        """
-        if self._config.dry_run:
-            return
-
-        if self._ib is not None and getattr(self._ib, "isConnected", lambda: False)():
-            return
-
-        IB = _lazy_import_ib_insync_ib()
-        ib = IB()
-        ib.connect(
-            self._config.host,
-            int(self._config.port),
-            clientId=int(self._config.client_id),
-            timeout=10.0,
+        self._ib_factory = ib_factory or _lazy_import_ib_factory()
+        self._now_fn = now_fn or _utc_now
+        self._ib: Optional[IBLike] = None
+        self._lock = threading.RLock()
+        self._resolver = _ContractResolver(self._config, self._now_fn)
+        self._order_factory = _OrderFactory(self._config)
+        self._idempotency = (
+            _SQLiteIdempotencyStore(self._config.resolved_state_db_path())
+            if self._config.enable_idempotency
+            else None
         )
-        self._ib = ib
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def ensure_connected(self, *, force: bool = False) -> None:
+        """
+        Ensure the adapter has an active IB connection.
+
+        In pure DRY_RUN mode, this is a no-op unless `force=True` or the config
+        explicitly opts into contract validation / WHAT-IF simulation.
+        """
+        if not _should_connect(self._config, force=force):
+            LOGGER.info(
+                "ibkr.dry_run_connection_skipped",
+                extra={"host": self._config.host, "port": self._config.port},
+            )
+            return
+
+        with self._lock:
+            if self._ib is None:
+                self._ib = self._ib_factory()
+
+            if self._ib.isConnected():
+                return
+
+            last_error: Optional[BaseException] = None
+            for attempt in range(1, self._config.max_connect_retries + 1):
+                try:
+                    LOGGER.info(
+                        "ibkr.connecting",
+                        extra={
+                            "host": self._config.host,
+                            "port": self._config.port,
+                            "client_id": self._config.client_id,
+                            "attempt": attempt,
+                        },
+                    )
+                    self._ib.connect(
+                        self._config.host,
+                        self._config.port,
+                        clientId=self._config.client_id,
+                        timeout=float(self._config.connect_timeout_s),
+                    )
+                    if self._ib.isConnected():
+                        LOGGER.info(
+                            "ibkr.connected",
+                            extra={"accounts": list(self._ib.managedAccounts() or [])},
+                        )
+                        return
+                except BaseException as exc:  # noqa: BLE001
+                    last_error = exc
+                    LOGGER.warning(
+                        "ibkr.connection_attempt_failed",
+                        extra={"attempt": attempt, "error": str(exc)},
+                    )
+                    if attempt < self._config.max_connect_retries:
+                        time.sleep(self._config.retry_backoff_s * attempt)
+
+            raise ConnectionError(
+                f"Failed to connect to IBKR at {self._config.host}:{self._config.port}"
+            ) from last_error
 
     def shutdown(self) -> None:
-        try:
-            if self._ib is not None:
-                self._ib.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
-        self._ib = None
+        """Disconnect cleanly; safe to call multiple times."""
+        with self._lock:
+            if self._ib is not None and self._ib.isConnected():
+                try:
+                    self._ib.disconnect()
+                except BaseException as exc:  # noqa: BLE001
+                    LOGGER.warning("ibkr.disconnect_error", extra={"error": str(exc)})
+            self._ib = None
 
-    # -------------------------
-    # Order submission
-    # -------------------------
+    # ------------------------------------------------------------------
+    # Public submission APIs
+    # ------------------------------------------------------------------
 
-    def submit_routed_signals(self, signals: Iterable["RoutedSignal"]) -> List[SubmittedOrder]:
-        """
-        Submit (or log) orders corresponding to routed signals.
-
-        DRY_RUN:
-          - no external side effects beyond logging.
-
-        LIVE:
-          - exactly-once submission enforced by exec_state store.
-        """
+    def submit_routed_signals(self, signals: Iterable[RoutedSignal]) -> List[SubmittedOrder]:
         submitted: List[SubmittedOrder] = []
-
-        for r in signals:
+        for routed in signals:
             try:
-                so = self._submit_single_routed(r)
-                if so is not None:
-                    submitted.append(so)
-            except Exception as exc:  # noqa: BLE001
+                intent = self._intent_from_routed_signal(routed)
+                result = self._submit_intent(intent)
+                if result is not None:
+                    submitted.append(result)
+            except BaseException as exc:  # noqa: BLE001
                 LOGGER.exception(
                     "ibkr.submit_routed_signal_failed",
                     extra={
-                        "symbol": getattr(r, "symbol", ""),
-                        "side": getattr(getattr(r, "side", None), "value", ""),
-                        "net_size": getattr(r, "net_size", None),
+                        "symbol": getattr(routed, "symbol", ""),
+                        "side": _enum_value(getattr(routed, "side", "")),
+                        "net_size": _safe_float(getattr(routed, "net_size", 0.0)),
                         "error": str(exc),
                     },
                 )
-
+                submitted.append(
+                    self._build_error_result_from_routed_signal(routed, exc)
+                )
         return submitted
 
-    def _submit_single_routed(self, routed: "RoutedSignal") -> Optional[SubmittedOrder]:
-        """
-        Handle one RoutedSignal.
+    def submit_strategy_trade_intents(self, intents: Iterable["StrategyTradeIntent"]) -> List[SubmittedOrder]:
+        submitted: List[SubmittedOrder] = []
+        for raw_intent in intents:
+            try:
+                intent = self._intent_from_trade_intent(raw_intent)
+                result = self._submit_intent(intent)
+                if result is not None:
+                    submitted.append(result)
+            except BaseException as exc:  # noqa: BLE001
+                LOGGER.exception(
+                    "ibkr.submit_trade_intent_failed",
+                    extra={"symbol": getattr(raw_intent, "symbol", ""), "error": str(exc)},
+                )
+                submitted.append(self._build_error_result_from_trade_intent(raw_intent, exc))
+        return submitted
 
-        Supported:
-          - AssetClass.EQUITY
-          - AssetClass.ETF
-        """
-        if float(getattr(routed, "net_size", 0.0) or 0.0) <= 0.0:
+    # ------------------------------------------------------------------
+    # Intent normalization
+    # ------------------------------------------------------------------
+
+    def _intent_from_routed_signal(self, routed: RoutedSignal) -> NormalizedIntent:
+        symbol = _normalize_symbol(getattr(routed, "symbol", ""))
+        side = _side_to_ib(getattr(routed, "side", ""))
+        quantity = _safe_float(getattr(routed, "net_size", 0.0))
+        if quantity <= 0.0:
+            raise ValidationError("net_size must be > 0")
+
+        asset_class = _asset_class_key(getattr(routed, "asset_class", "unknown"))
+        strategies = tuple(_strategy_name(s) for s in (getattr(routed, "source_strategies", ()) or ()))
+        if not strategies:
+            strategies = ("unknown",)
+
+        created_at = getattr(routed, "created_at", None)
+        if not isinstance(created_at, datetime):
+            created_at = self._now_fn()
+
+        meta = dict(getattr(routed, "meta", {}) or {})
+
+        if asset_class in {"equity", "etf"}:
+            sec_type = "STK"
+            exchange = _safe_upper(meta.get("exchange"), self._config.default_stock_exchange)
+            currency = _safe_upper(meta.get("currency"), self._config.default_stock_currency)
+        elif asset_class == "futures":
+            spec = self._config.futures_contracts.get(symbol)
+            if spec is None:
+                raise ValidationError(f"Unsupported futures symbol: {symbol!r}")
+            sec_type = "FUT"
+            exchange = spec.exchange
+            currency = spec.currency
+            meta = {**meta, "multiplier": meta.get("multiplier") or spec.multiplier}
+        elif asset_class in {"forex", "cash"}:
+            pair, base, quote = _parse_fx_pair(symbol)
+            symbol = pair
+            sec_type = "CASH"
+            exchange = _safe_upper(meta.get("exchange"), self._config.default_forex_exchange)
+            currency = quote
+            meta = {**meta, "base_currency": base, "quote_currency": quote}
+        else:
+            raise ValidationError(f"Unsupported asset_class for IBKR adapter: {asset_class!r}")
+
+        return NormalizedIntent(
+            strategy=strategies[0],
+            symbol=symbol,
+            sec_type=sec_type,
+            exchange=exchange,
+            currency=currency,
+            side=side,
+            order_type=_safe_upper(meta.get("order_type"), "MKT"),
+            quantity=quantity,
+            notional_estimate=_safe_float(meta.get("notional_estimate"), 0.0),
+            asset_class=asset_class,
+            source_strategies=strategies,
+            created_at=created_at,
+            limit_price=_safe_float(meta.get("limit_price"), float("nan")),
+            meta=meta,
+        )
+
+    def _intent_from_trade_intent(self, raw_intent: "StrategyTradeIntent") -> NormalizedIntent:
+        symbol = _normalize_symbol(getattr(raw_intent, "symbol", ""))
+        sec_type = _safe_upper(getattr(raw_intent, "sec_type", ""))
+        side = _side_to_ib(getattr(raw_intent, "side", ""))
+        order_type = _safe_upper(getattr(raw_intent, "order_type", "MKT"))
+        quantity = _safe_float(getattr(raw_intent, "quantity", 0.0))
+        if quantity <= 0.0:
+            raise ValidationError("quantity must be > 0")
+
+        exchange = _safe_upper(getattr(raw_intent, "exchange", ""))
+        currency = _safe_upper(getattr(raw_intent, "currency", ""))
+        strategy = _safe_str(getattr(raw_intent, "strategy", "unknown")) or "unknown"
+
+        if sec_type == "STK":
+            asset_class = "equity"
+        elif sec_type == "FUT":
+            asset_class = "futures"
+        elif sec_type == "CASH":
+            asset_class = "forex"
+        else:
+            asset_class = "unknown"
+
+        limit_price_raw = getattr(raw_intent, "limit_price", None)
+        limit_price = None if limit_price_raw is None else _safe_float(limit_price_raw, float("nan"))
+
+        return NormalizedIntent(
+            strategy=strategy,
+            symbol=symbol,
+            sec_type=sec_type,
+            exchange=exchange,
+            currency=currency,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            notional_estimate=_safe_float(getattr(raw_intent, "notional_estimate", 0.0)),
+            asset_class=asset_class,
+            source_strategies=(strategy,),
+            created_at=self._now_fn(),
+            limit_price=limit_price,
+            meta={},
+        )
+
+    # ------------------------------------------------------------------
+    # Submission
+    # ------------------------------------------------------------------
+
+    def _submit_intent(self, intent: NormalizedIntent) -> Optional[SubmittedOrder]:
+        if intent.quantity <= 0.0:
             LOGGER.info(
                 "ibkr.skip_non_positive_size",
-                extra={"symbol": routed.symbol, "net_size": routed.net_size},
+                extra={"symbol": intent.symbol, "quantity": intent.quantity},
             )
             return None
 
-        asset_class = routed.asset_class
-        if asset_class not in (AssetClass.EQUITY, AssetClass.ETF):
-            LOGGER.info(
-                "ibkr.skip_unsupported_asset_class",
-                extra={"symbol": routed.symbol, "asset_class": asset_class.value},
+        now = self._now_fn()
+        idempotency_key = self._compute_idempotency_key(intent)
+        if self._idempotency and not self._config.dry_run:
+            claimed = self._idempotency.claim(idempotency_key, self._intent_payload(intent), now)
+            if not claimed:
+                existing = self._idempotency.get(idempotency_key) or {}
+                LOGGER.warning(
+                    "ibkr.duplicate_submission_blocked",
+                    extra={"symbol": intent.symbol, "idempotency_key": idempotency_key},
+                )
+                return SubmittedOrder(
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    quantity=intent.quantity,
+                    strategy=list(intent.source_strategies),
+                    dry_run=self._config.dry_run,
+                    submitted_at=now,
+                    ib_order_id=existing.get("broker_order_id"),
+                    status="duplicate_blocked",
+                    asset_class=intent.asset_class,
+                    sec_type=intent.sec_type,
+                    exchange=intent.exchange,
+                    currency=intent.currency,
+                    order_type=intent.order_type,
+                    what_if=False,
+                    idempotency_key=idempotency_key,
+                    raw=existing,
+                )
+
+        needs_live_connection = not self._config.dry_run or self._config.simulate_what_if_in_dry_run
+        needs_contract_validation = self._config.validate_contracts_in_dry_run or needs_live_connection
+        ib: Optional[IBLike] = None
+        if needs_live_connection or needs_contract_validation:
+            self.ensure_connected(force=True)
+            ib = self._ib
+
+        resolved_contract = self._resolver.resolve(ib, intent)
+        what_if = bool(self._config.dry_run and self._config.simulate_what_if_in_dry_run)
+        prepared = self._order_factory.build(intent, what_if=what_if)
+
+        if self._config.dry_run and not self._config.simulate_what_if_in_dry_run:
+            result = SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=prepared.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=True,
+                submitted_at=now,
+                ib_order_id=None,
+                status="dry_run",
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                limit_price=intent.limit_price,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                contract_summary=resolved_contract.summary,
+                raw={"intent": _jsonable(self._intent_payload(intent))},
             )
-            return None
-
-        side = routed.side
-        qty = float(routed.net_size)
-        symbol = str(routed.symbol)
-        strategies = [s.value for s in routed.source_strategies]
-
-        submitted_at = datetime.now(timezone.utc)
-
-        # DRY_RUN: log only, do not touch exec_state (no broker side effects occur).
-        if self._config.dry_run:
             LOGGER.info(
                 "ibkr.dry_run_order",
                 extra={
-                    "symbol": symbol,
-                    "side": side.value,
-                    "quantity": qty,
-                    "strategies": strategies,
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "quantity": prepared.quantity,
+                    "strategies": list(intent.source_strategies),
+                    "sec_type": intent.sec_type,
+                    "exchange": intent.exchange,
                 },
             )
-            return SubmittedOrder(
-                symbol=symbol,
-                side=side.value.lower(),
-                quantity=qty,
-                strategy=strategies,
-                dry_run=True,
-                submitted_at=submitted_at,
-                ib_order_id=None,
-            )
+            return result
 
-        # Build canonical intent + idempotency key
-        idem_key, intent_json, extra_json = _build_idempotency_and_payload(
-            broker="ibkr",
-            routed=routed,
-            strategies=strategies,
+        if ib is None:
+            raise SubmissionError("Internal error: connected IB client is required for submission")
+
+        result = self._submit_via_ib(
+            ib=ib,
+            intent=intent,
+            resolved_contract=resolved_contract,
+            prepared=prepared,
+            submitted_at=now,
+            idempotency_key=idempotency_key,
         )
-
-        # Claim exactly-once
-        claim = self._store.claim(
-            idempotency_key=idem_key,
-            broker="ibkr",
-            strategy=",".join(strategies) if strategies else "unknown",
-            symbol=symbol,
-            side=str(side.value).lower(),
-            quantity=qty,
-            asset_class=str(asset_class.value),
-            intent_canonical_json=intent_json,
-            extra_json=extra_json,
-        )
-
-        # If already submitted and broker_order_id exists -> DO NOT re-submit
-        if claim.status.upper() == "SUBMITTED" and claim.broker_order_id:
-            LOGGER.warning(
-                "ibkr.duplicate_suppressed_already_submitted",
-                extra={
-                    "idempotency_key": idem_key,
-                    "symbol": symbol,
-                    "side": side.value,
-                    "quantity": qty,
-                    "broker_order_id": claim.broker_order_id,
-                    "claim_attempts": claim.claim_attempts,
-                    "submit_attempts": claim.submit_attempts,
-                },
+        if self._idempotency and not self._config.dry_run:
+            self._idempotency.mark(
+                idempotency_key,
+                status=result.status,
+                broker_order_id=result.ib_order_id,
+                result=_jsonable(asdict(result)),
+                now=self._now_fn(),
             )
-            return SubmittedOrder(
-                symbol=symbol,
-                side=side.value.lower(),
-                quantity=qty,
-                strategy=strategies,
-                dry_run=False,
-                submitted_at=submitted_at,
-                ib_order_id=_safe_int(claim.broker_order_id),
-            )
+        return result
 
-        # Live mode: ensure connection and place order with bounded retries
-        self.ensure_connected()
-        assert self._ib is not None  # for type-checkers
+    def _submit_via_ib(
+        self,
+        *,
+        ib: IBLike,
+        intent: NormalizedIntent,
+        resolved_contract: _ResolvedContract,
+        prepared: _PreparedOrder,
+        submitted_at: datetime,
+        idempotency_key: str,
+    ) -> SubmittedOrder:
+        last_exc: Optional[BaseException] = None
 
-        contract = self._build_stock_contract(symbol)
-        order = self._build_market_order(side, qty)
-
-        last_err: Optional[str] = None
-        for attempt in range(1, max(1, int(self._config.submit_max_attempts)) + 1):
-            # record submit attempt before trying
-            cur_attempts = self._store.bump_submit_attempt(idempotency_key=idem_key)
-
+        for attempt in range(1, self._config.max_submit_retries + 1):
             try:
+                qualified_contract = self._qualify_if_possible(ib, resolved_contract.contract)
+                if prepared.what_if:
+                    what_if_order = ib.whatIfOrder(qualified_contract, prepared.order)
+                    raw = {"what_if_order": _jsonable(what_if_order)}
+                    return SubmittedOrder(
+                        symbol=intent.symbol,
+                        side=intent.side,
+                        quantity=prepared.quantity,
+                        strategy=list(intent.source_strategies),
+                        dry_run=True,
+                        submitted_at=submitted_at,
+                        ib_order_id=int(getattr(what_if_order, "orderId", 0) or 0),
+                        status="what-if",
+                        asset_class=intent.asset_class,
+                        sec_type=intent.sec_type,
+                        exchange=intent.exchange,
+                        currency=intent.currency,
+                        order_type=intent.order_type,
+                        limit_price=intent.limit_price,
+                        what_if=True,
+                        idempotency_key=idempotency_key,
+                        contract_summary=resolved_contract.summary,
+                        raw=raw,
+                    )
+
                 LOGGER.info(
-                    "ibkr.place_order_attempt",
+                    "ibkr.place_order",
                     extra={
-                        "idempotency_key": idem_key,
-                        "attempt": attempt,
-                        "submit_attempts": cur_attempts,
-                        "symbol": symbol,
-                        "side": side.value,
-                        "quantity": qty,
-                        "strategies": strategies,
+                        "symbol": intent.symbol,
+                        "side": intent.side,
+                        "quantity": prepared.quantity,
+                        "strategies": list(intent.source_strategies),
+                        "sec_type": intent.sec_type,
+                        "exchange": intent.exchange,
                     },
                 )
+                trade = ib.placeOrder(qualified_contract, prepared.order)
+                ib.sleep(float(self._config.initial_status_wait_s))
 
-                trade = self._ib.placeOrder(contract, order)
+                order = getattr(trade, "order", None)
+                order_status = getattr(trade, "orderStatus", None)
+                fills = getattr(trade, "fills", []) or []
+                commissions = getattr(trade, "commissionReport", []) or []
 
-                ib_order_id = getattr(getattr(trade, "order", None), "orderId", None)
-                if ib_order_id is None:
-                    ib_order_id = getattr(trade, "orderId", None)
-
-                if ib_order_id is None:
-                    raise RuntimeError("ibkr_placeOrder_missing_orderId")
-
-                self._store.mark_submitted(idempotency_key=idem_key, broker_order_id=str(int(ib_order_id)))
-
-                LOGGER.info(
-                    "ibkr.place_order_submitted",
-                    extra={
-                        "idempotency_key": idem_key,
-                        "symbol": symbol,
-                        "side": side.value,
-                        "quantity": qty,
-                        "broker_order_id": int(ib_order_id),
-                    },
-                )
+                raw = {
+                    "order": _jsonable(order),
+                    "order_status": _jsonable(order_status),
+                    "fills": _jsonable(fills),
+                    "commissions": _jsonable(commissions),
+                    "trade": _jsonable(trade),
+                }
 
                 return SubmittedOrder(
-                    symbol=symbol,
-                    side=side.value.lower(),
-                    quantity=qty,
-                    strategy=strategies,
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    quantity=prepared.quantity,
+                    strategy=list(intent.source_strategies),
                     dry_run=False,
                     submitted_at=submitted_at,
-                    ib_order_id=int(ib_order_id),
+                    ib_order_id=int(getattr(order, "orderId", 0) or 0),
+                    status=_safe_str(getattr(order_status, "status", ""), "submitted"),
+                    asset_class=intent.asset_class,
+                    sec_type=intent.sec_type,
+                    exchange=intent.exchange,
+                    currency=intent.currency,
+                    order_type=intent.order_type,
+                    limit_price=intent.limit_price,
+                    what_if=False,
+                    perm_id=(int(getattr(order, "permId", 0)) if getattr(order, "permId", None) else None),
+                    idempotency_key=idempotency_key,
+                    contract_summary=resolved_contract.summary,
+                    raw=raw,
                 )
-
-            except Exception as exc:  # noqa: BLE001
-                last_err = f"{type(exc).__name__}: {exc}"
-                self._store.mark_error(idempotency_key=idem_key, err=last_err)
-
+            except BaseException as exc:  # noqa: BLE001
+                last_exc = exc
                 LOGGER.warning(
-                    "ibkr.place_order_failed",
+                    "ibkr.submit_attempt_failed",
                     extra={
-                        "idempotency_key": idem_key,
                         "attempt": attempt,
-                        "submit_attempts": cur_attempts,
-                        "symbol": symbol,
-                        "side": side.value,
-                        "quantity": qty,
-                        "error": last_err,
+                        "symbol": intent.symbol,
+                        "error": str(exc),
                     },
                 )
+                if attempt < self._config.max_submit_retries:
+                    time.sleep(self._config.retry_backoff_s * attempt)
 
-                if attempt >= int(self._config.submit_max_attempts):
-                    break
+        raise SubmissionError(f"Failed to submit order for {intent.symbol}: {last_exc}") from last_exc
 
-                time.sleep(_backoff_s(
-                    attempt=attempt,
-                    base=float(self._config.submit_base_backoff_s),
-                    cap=float(self._config.submit_backoff_cap_s),
-                    jitter_frac=float(self._config.submit_jitter_frac),
-                ))
+    def _qualify_if_possible(self, ib: IBLike, contract: Any) -> Any:
+        try:
+            qualified = list(ib.qualifyContracts(contract) or [])
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning("ibkr.qualify_contract_failed", extra={"error": str(exc)})
+            return contract
+        return qualified[0] if qualified else contract
 
-        # Final failure: fail closed (no SubmittedOrder returned means upstream can decide)
-        raise RuntimeError(f"ibkr_place_order_exhausted_retries: {last_err or 'unknown'}")
+    # ------------------------------------------------------------------
+    # Result helpers
+    # ------------------------------------------------------------------
 
-    # -------------------------
-    # Contract & order helpers
-    # -------------------------
-
-    @staticmethod
-    def _build_stock_contract(symbol: str) -> "Contract":
-        # Using Stock shortcut from ib_insync
-        Stock = _lazy_import_ib_insync_stock()
-        return Stock(symbol, "SMART", "USD")
+    def _compute_idempotency_key(self, intent: NormalizedIntent) -> str:
+        payload = self._intent_payload(intent)
+        return _hash_payload(payload)
 
     @staticmethod
-    def _build_market_order(side: SignalSide, quantity: float) -> "Order":
-        Order = _lazy_import_ib_insync_order()
-        action = "BUY" if side == SignalSide.BUY else "SELL"
-        order = Order()
-        order.action = action
-        order.orderType = "MKT"
-        order.totalQuantity = float(quantity)
-        return order
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def _resolve_exec_state_db_path(override: Optional[str]) -> Path:
-    """
-    Canonical location for live exec_state DB:
-      <repo_root>/data/exec_state/exec_state.sqlite3
-
-    Resolution order:
-    1) explicit override (config/env)
-    2) walk upwards from this file until we find a repo root marker
-    3) fail-closed to /home/ubuntu/chad_finale (SSOT deployment root)
-    """
-    if override and str(override).strip():
-        return Path(str(override)).expanduser().resolve()
-
-    here = Path(__file__).resolve()
-    for parent in [here.parent, *here.parents]:
-        if (parent / "chad").is_dir() and (parent / "data").is_dir():
-            return (parent / "data" / "exec_state" / "exec_state.sqlite3").resolve()
-
-    # SSOT fallback (production layout)
-    return Path("/home/ubuntu/chad_finale/data/exec_state/exec_state.sqlite3").resolve()
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_int(v: Optional[str]) -> Optional[int]:
-    if v is None:
-        return None
-    try:
-        return int(str(v).strip())
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _backoff_s(*, attempt: int, base: float, cap: float, jitter_frac: float) -> float:
-    a = max(1, int(attempt))
-    b = max(0.01, float(base))
-    c = max(b, float(cap))
-    j = max(0.0, float(jitter_frac))
-
-    raw = min(c, b * (2 ** (a - 1)))
-    jitter = raw * j * (random.random() * 2.0 - 1.0)
-    out = raw + jitter
-    return float(max(0.05, min(c, out)))
-
-
-def _canonical_json(obj: Any) -> str:
-    """
-    Deterministic JSON encoding for hashing/idempotency.
-    """
-    def _default(x: Any) -> str:
-        return str(x)
-
-    return json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        default=_default,
-    )
-
-
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="strict")).hexdigest()
-
-
-def _build_idempotency_and_payload(
-    *,
-    broker: str,
-    routed: "RoutedSignal",
-    strategies: Sequence[str],
-) -> tuple[str, str, str]:
-    """
-    Prefer an upstream deterministic idempotency key if present.
-    Otherwise derive a stable key from a canonical intent payload.
-
-    IMPORTANT:
-    - This key must be stable across restarts for the *same* intended action.
-    - Upstream should ideally pass a plan_hash / trace_id; we consume if present.
-    """
-
-    # Best-effort harvest of upstream identifiers if present
-    upstream_key = getattr(routed, "idempotency_key", None)
-    if upstream_key and str(upstream_key).strip():
-        idem = str(upstream_key).strip()
-        payload = {
-            "broker": broker,
-            "idempotency_key": idem,
-            "symbol": str(routed.symbol),
-            "side": str(routed.side.value),
-            "quantity": float(routed.net_size),
-            "asset_class": str(routed.asset_class.value),
-            "strategies": sorted([str(s) for s in strategies]),
+    def _intent_payload(intent: NormalizedIntent) -> Mapping[str, Any]:
+        return {
+            "strategy": intent.strategy,
+            "symbol": intent.symbol,
+            "sec_type": intent.sec_type,
+            "exchange": intent.exchange,
+            "currency": intent.currency,
+            "side": intent.side,
+            "order_type": intent.order_type,
+            "quantity": intent.quantity,
+            "notional_estimate": intent.notional_estimate,
+            "asset_class": intent.asset_class,
+            "source_strategies": list(intent.source_strategies),
+            "created_at": intent.created_at.isoformat(),
+            "limit_price": intent.limit_price,
+            "meta": dict(intent.meta),
         }
-        intent_json = _canonical_json(payload)
-        return idem, intent_json, _canonical_json({"source": "upstream"})
 
-    meta: Dict[str, Any] = {}
-    for k in ("trace_id", "cycle_id", "plan_hash", "execution_plan_hash", "source_hash"):
-        v = getattr(routed, k, None)
-        if v is not None and str(v).strip():
-            meta[k] = str(v).strip()
+    def _build_error_result_from_routed_signal(self, routed: RoutedSignal, exc: BaseException) -> SubmittedOrder:
+        now = self._now_fn()
+        symbol = _safe_upper(getattr(routed, "symbol", ""))
+        side = _side_to_ib(getattr(routed, "side", "BUY")) if getattr(routed, "side", None) else "BUY"
+        qty = _safe_float(getattr(routed, "net_size", 0.0))
+        strategies = [_strategy_name(s) for s in (getattr(routed, "source_strategies", ()) or ())]
+        return SubmittedOrder(
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            strategy=strategies,
+            dry_run=self._config.dry_run,
+            submitted_at=now,
+            status="error",
+            asset_class=_asset_class_key(getattr(routed, "asset_class", "unknown")),
+            error=str(exc),
+            raw={"exception": str(exc)},
+        )
 
-    base_payload = {
-        "broker": broker,
-        "symbol": str(routed.symbol),
-        "side": str(routed.side.value),
-        "quantity": _fmt_qty(float(routed.net_size)),
-        "asset_class": str(routed.asset_class.value),
-        "strategies": sorted([str(s) for s in strategies]),
-        "meta": meta,  # empty dict is ok (still deterministic)
-    }
-    intent_json = _canonical_json(base_payload)
-    idem = f"{broker}:{_sha256_hex(intent_json)}"
-    extra = {"meta": meta, "derived_from": "canonical_intent_hash"}
-    return idem, intent_json, _canonical_json(extra)
-
-
-def _fmt_qty(q: float) -> str:
-    # stable string formatting to reduce float drift in hashing
-    try:
-        return f"{float(q):.8f}"
-    except Exception:  # noqa: BLE001
-        return "0.00000000"
-
-
-# ----------------------------
-# Lazy imports (execution-only)
-# ----------------------------
-
-def _lazy_import_ib_insync_ib():
-    try:
-        from ib_insync import IB  # type: ignore
-        return IB
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "ib_insync import failed. Ensure ib-insync is installed in the active venv."
-        ) from exc
+    def _build_error_result_from_trade_intent(self, raw_intent: "StrategyTradeIntent", exc: BaseException) -> SubmittedOrder:
+        now = self._now_fn()
+        return SubmittedOrder(
+            symbol=_safe_upper(getattr(raw_intent, "symbol", "")),
+            side=_safe_upper(getattr(raw_intent, "side", "")),
+            quantity=_safe_float(getattr(raw_intent, "quantity", 0.0)),
+            strategy=[_safe_str(getattr(raw_intent, "strategy", "unknown"))],
+            dry_run=self._config.dry_run,
+            submitted_at=now,
+            status="error",
+            asset_class="unknown",
+            sec_type=_safe_upper(getattr(raw_intent, "sec_type", "")),
+            exchange=_safe_upper(getattr(raw_intent, "exchange", "")),
+            currency=_safe_upper(getattr(raw_intent, "currency", "")),
+            order_type=_safe_upper(getattr(raw_intent, "order_type", "MKT")),
+            error=str(exc),
+            raw={"exception": str(exc)},
+        )
 
 
-def _lazy_import_ib_insync_stock():
-    try:
-        from ib_insync import Stock  # type: ignore
-        return Stock
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "ib_insync import failed (Stock). Ensure ib-insync is installed in the active venv."
-        ) from exc
-
-
-def _lazy_import_ib_insync_order():
-    try:
-        from ib_insync import Order  # type: ignore
-        return Order
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "ib_insync import failed (Order). Ensure ib-insync is installed in the active venv."
-        ) from exc
-
-
-# ----------------------------
-# NOTE: RoutedSignal import
-# ----------------------------
-# Imported at bottom to avoid import cycles in some layouts.
+__all__ = [
+    "FuturesContractSpec",
+    "IbkrConfig",
+    "SubmittedOrder",
+    "IbkrAdapter",
+    "IbkrAdapterError",
+    "ConnectionError",
+    "ValidationError",
+    "ContractResolutionError",
+    "SubmissionError",
+]

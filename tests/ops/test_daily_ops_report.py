@@ -11,7 +11,7 @@ import pytest
 def ops_module(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """
     Import chad.ops.daily_ops_report and sandbox all filesystem roots into tmp_path
-    so tests never touch /home/ubuntu/CHAD FINALE.
+    so tests never touch /home/ubuntu/chad_finale.
     """
     import chad.ops.daily_ops_report as m
 

@@ -65,16 +65,16 @@ PROFILE = os.environ.get("CHAD_PORTFOLIO_PROFILE", "BALANCED").strip().upper()
 
 AUTO_EXECUTE = os.environ.get("CHAD_AUTO_EXECUTE_REBALANCE", "0").strip().lower() in ("1", "true", "yes", "on")
 
-RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime")).resolve()
-CONFIG_DIR = Path(os.environ.get("CHAD_CONFIG_DIR", "/home/ubuntu/CHAD FINALE/config")).resolve()
+RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime")).resolve()
+CONFIG_DIR = Path(os.environ.get("CHAD_CONFIG_DIR", "/home/ubuntu/chad_finale/config")).resolve()
 
 STOP_PATH = Path(os.environ.get("CHAD_STOP_STATE_PATH", str(RUNTIME_DIR / "stop_state.json")))
 PORTFOLIO_STATE_PATH = Path(os.environ.get("CHAD_PORTFOLIO_STATE_PATH", str(RUNTIME_DIR / "portfolio_state.json")))
 EVENT_RISK_PATH = Path(os.environ.get("CHAD_EVENT_RISK_PATH", str(RUNTIME_DIR / "event_risk.json")))
 BOUNDS_PATH = Path(os.environ.get("CHAD_AUTONOMY_BOUNDS_PATH", str(CONFIG_DIR / "autonomy_bounds.json")))
 
-REBALANCE_DIR = Path(os.environ.get("CHAD_REBALANCE_DIR", "/home/ubuntu/CHAD FINALE/reports/rebalance")).resolve()
-RECEIPTS_DIR = Path(os.environ.get("CHAD_REBALANCE_RECEIPTS_DIR", "/home/ubuntu/CHAD FINALE/reports/rebalance_receipts")).resolve()
+REBALANCE_DIR = Path(os.environ.get("CHAD_REBALANCE_DIR", "/home/ubuntu/chad_finale/reports/rebalance")).resolve()
+RECEIPTS_DIR = Path(os.environ.get("CHAD_REBALANCE_RECEIPTS_DIR", "/home/ubuntu/chad_finale/reports/rebalance_receipts")).resolve()
 
 AUTONOMY_STATE_PATH = Path(
     os.environ.get("CHAD_REBALANCE_AUTONOMY_STATE_PATH", str(RUNTIME_DIR / "rebalance_autonomy_state.json"))
@@ -292,6 +292,36 @@ def load_autonomy_state() -> Dict[str, Any]:
         return {}
 
 
+
+
+def _preserve_last_success_fields(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Preserve last success pointers from existing autonomy state.
+    If last_receipts_path is missing/None, recover deterministically by
+    finding the newest receipts file for PROFILE in RECEIPTS_DIR.
+    """
+    last_exec = None
+    last_receipts = None
+    try:
+        last_exec = state.get("last_execute_ts_utc")
+        last_receipts = state.get("last_receipts_path")
+    except Exception:
+        last_exec = None
+        last_receipts = None
+
+    # Deterministic recovery: newest receipts file for PROFILE
+    if not last_receipts:
+        try:
+            pattern = f"REBALANCE_RECEIPTS_{PROFILE}_*.json"
+            files = sorted(RECEIPTS_DIR.glob(pattern), key=lambda x: x.stat().st_mtime, reverse=True)
+            if files:
+                last_receipts = str(files[0].resolve())
+        except Exception:
+            pass
+
+    return {"last_execute_ts_utc": last_exec, "last_receipts_path": last_receipts}
+
+
 # =============================================================================
 # Policy evaluation
 # =============================================================================
@@ -390,6 +420,18 @@ def approval_ok(approval_id: str) -> Tuple[bool, str, Dict[str, Any]]:
     return True, "APPROVED", item
 
 
+
+def _write_autonomy_state(payload: Dict[str, Any]) -> None:
+    """
+    Always write autonomy state for operator visibility.
+    PREVIEW + blocked EXECUTE should write a state snapshot.
+    """
+    try:
+        AUTONOMY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(AUTONOMY_STATE_PATH, payload)
+    except Exception:
+        return
+
 # =============================================================================
 # Runner
 # =============================================================================
@@ -472,20 +514,110 @@ def run(*, execute: bool, approval_id: str) -> int:
             "auto_execute_env": AUTO_EXECUTE,
             "receipts_preview": receipts[:5],
         }
+        _write_autonomy_state({
+            "ts_utc": ts,
+            "ttl_seconds": 86400,
+            "schema_version": "rebalance_autonomy_state.v2",
+            "profile": PROFILE,
+              "last_execute_ts_utc": _preserve_last_success_fields(state).get("last_execute_ts_utc"),
+            "last_rebalance_plan_hash": f"sha256:{plan_hash}",
+              "last_receipts_path": _preserve_last_success_fields(state).get("last_receipts_path"),
+            "approval_id": approval_id.strip() or None,
+            "mode": "PREVIEW",
+            "would_execute": bool(out.get("would_execute", False)),
+            "blocked": False,
+            "reason": "PREVIEW",
+            "checks": out.get("checks") or {},
+            "cooldown": out.get("cooldown") or {},
+            "event_risk_severity": sev,
+            "notes": "preview_state_written",
+        })
         print(json.dumps(out, indent=2, sort_keys=True))
         return 0
 
     # EXECUTE gates
     if not AUTO_EXECUTE:
+        _write_autonomy_state({
+            "ts_utc": ts,
+            "ttl_seconds": 86400,
+            "schema_version": "rebalance_autonomy_state.v2",
+            "profile": PROFILE,
+              "last_execute_ts_utc": _preserve_last_success_fields(state).get("last_execute_ts_utc"),
+            "last_rebalance_plan_hash": f"sha256:{plan_hash}",
+              "last_receipts_path": _preserve_last_success_fields(state).get("last_receipts_path"),
+            "approval_id": approval_id.strip() or None,
+            "mode": "EXECUTE",
+            "would_execute": False,
+            "blocked": True,
+            "reason": "AUTO_EXECUTE_DISABLED",
+            "checks": decision.checks,
+            "cooldown": decision.cooldown,
+            "event_risk_severity": sev,
+            "notes": "blocked_state_written",
+        })
         print(json.dumps({**decision.__dict__, "ok": False, "blocked": True, "reason": "AUTO_EXECUTE_DISABLED"}, sort_keys=True))
         return 0
     if not d_ok:
+        _write_autonomy_state({
+            "ts_utc": ts,
+            "ttl_seconds": 86400,
+            "schema_version": "rebalance_autonomy_state.v2",
+            "profile": PROFILE,
+              "last_execute_ts_utc": _preserve_last_success_fields(state).get("last_execute_ts_utc"),
+            "last_rebalance_plan_hash": f"sha256:{plan_hash}",
+              "last_receipts_path": _preserve_last_success_fields(state).get("last_receipts_path"),
+            "approval_id": approval_id.strip() or None,
+            "mode": "EXECUTE",
+            "would_execute": False,
+            "blocked": True,
+            "reason": "DRIFT_NOT_MET",
+            "checks": decision.checks,
+            "cooldown": decision.cooldown,
+            "event_risk_severity": sev,
+            "notes": "blocked_state_written",
+        })
         print(json.dumps({**decision.__dict__, "ok": False, "blocked": True, "reason": "DRIFT_NOT_MET"}, sort_keys=True))
         return 0
     if not c_ok:
+        _write_autonomy_state({
+            "ts_utc": ts,
+            "ttl_seconds": 86400,
+            "schema_version": "rebalance_autonomy_state.v2",
+            "profile": PROFILE,
+              "last_execute_ts_utc": _preserve_last_success_fields(state).get("last_execute_ts_utc"),
+            "last_rebalance_plan_hash": f"sha256:{plan_hash}",
+              "last_receipts_path": _preserve_last_success_fields(state).get("last_receipts_path"),
+            "approval_id": approval_id.strip() or None,
+            "mode": "EXECUTE",
+            "would_execute": False,
+            "blocked": True,
+            "reason": "CAPS_NOT_MET",
+            "checks": decision.checks,
+            "cooldown": decision.cooldown,
+            "event_risk_severity": sev,
+            "notes": "blocked_state_written",
+        })
         print(json.dumps({**decision.__dict__, "ok": False, "blocked": True, "reason": "CAPS_NOT_MET"}, sort_keys=True))
         return 0
     if not cd_ok:
+        _write_autonomy_state({
+            "ts_utc": ts,
+            "ttl_seconds": 86400,
+            "schema_version": "rebalance_autonomy_state.v2",
+            "profile": PROFILE,
+              "last_execute_ts_utc": _preserve_last_success_fields(state).get("last_execute_ts_utc"),
+            "last_rebalance_plan_hash": f"sha256:{plan_hash}",
+              "last_receipts_path": _preserve_last_success_fields(state).get("last_receipts_path"),
+            "approval_id": approval_id.strip() or None,
+            "mode": "EXECUTE",
+            "would_execute": False,
+            "blocked": True,
+            "reason": "COOLDOWN_NOT_MET",
+            "checks": decision.checks,
+            "cooldown": decision.cooldown,
+            "event_risk_severity": sev,
+            "notes": "blocked_state_written",
+        })
         print(json.dumps({**decision.__dict__, "ok": False, "blocked": True, "reason": "COOLDOWN_NOT_MET"}, sort_keys=True))
         return 0
 
@@ -541,10 +673,24 @@ def run(*, execute: bool, approval_id: str) -> int:
             "ttl_seconds": 86400,
             "schema_version": "rebalance_autonomy_state.v2",
             "profile": PROFILE,
+
+            # Normalized outcome fields (SSOT operator clarity)
+            "mode": "EXECUTE",
+            "blocked": False,
+            "reason": "EXECUTED_PAPER_RECEIPTS",
+            "would_execute": True,
+
+            # Pointers + audit
+            "approval_id": approval_id.strip(),
             "last_execute_ts_utc": ts,
             "last_rebalance_plan_hash": f"sha256:{plan_hash}",
             "last_receipts_path": str(out_path),
-            "approval_id": approval_id.strip(),
+
+            # Extra operator context (safe, no secrets)
+            "checks": decision.checks,
+            "cooldown": decision.cooldown,
+            "event_risk_severity": sev,
+
             "notes": "assisted_autonomy_paper_only",
         },
     )

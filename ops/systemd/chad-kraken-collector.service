@@ -10,7 +10,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/chad_finale
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/chad/kraken.env
-ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && source "/home/ubuntu/CHAD FINALE/venv/bin/activate" && exec python -m chad.portfolio.kraken_portfolio_collector collect'
+ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && source "/home/ubuntu/chad_finale/venv/bin/activate" && exec python -m chad.portfolio.kraken_portfolio_collector collect'
 
 [Install]
 WantedBy=multi-user.target

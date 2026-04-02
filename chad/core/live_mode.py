@@ -159,7 +159,7 @@ def main() -> int:
     -----
     From the CHAD runtime root:
 
-        PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.live_mode
+        PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.live_mode
 
     This prints the current contents of runtime/live_mode.json (or the
     safe default if it does not exist). It does NOT modify any state.

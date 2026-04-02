@@ -5,7 +5,7 @@ CHAD Market Radar — earnings_state publisher (Production, bootstrap)
 File: ops/earnings_state_publish.py
 
 Outputs:
-  /home/ubuntu/CHAD FINALE/runtime/earnings_state.json
+  /home/ubuntu/chad_finale/runtime/earnings_state.json
 
 SSOT contract (v4.2):
 - runtime/earnings_state.json exists, includes ts_utc + ttl_seconds, is safe to read while running (atomic write).
@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Paths / Config
 # -----------------------------
 
-DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/CHAD FINALE/runtime")
+DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
 
 OUT_PATH = RUNTIME_DIR / "earnings_state.json"

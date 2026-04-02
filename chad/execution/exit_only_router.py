@@ -16,7 +16,7 @@ Hard guarantees:
 - Crash-safe atomic write: tmp -> fsync -> replace -> best-effort dir fsync.
 
 Runtime artifact (default):
-- /home/ubuntu/CHAD FINALE/runtime/exit_only_plan.json
+- /home/ubuntu/chad_finale/runtime/exit_only_plan.json
 
 Input sources (recommended):
 - LiveGate: http://127.0.0.1:9618/live-gate
@@ -46,7 +46,7 @@ from chad.execution.exit_only_executor import (
     Side,
 )
 
-DEFAULT_RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime"))
+DEFAULT_RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime"))
 DEFAULT_OUT_PATH = DEFAULT_RUNTIME_DIR / "exit_only_plan.json"
 
 

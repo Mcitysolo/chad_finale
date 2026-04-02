@@ -8,7 +8,7 @@ This small CLI reads the latest Shadow Confidence snapshot from:
 and prints a human-readable summary to stdout.
 
 Usage:
-    PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.show_shadow_state
+    PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.show_shadow_state
 """
 
 from __future__ import annotations

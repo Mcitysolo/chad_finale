@@ -35,8 +35,8 @@ from chad.intel.schemas import LessonsLearned, LessonItem
 # Paths & constants
 # --------------------------------------------------------------------------- #
 
-TRADES_DIR = Path("/home/ubuntu/CHAD FINALE/data/trades")
-REPORTS_DIR = Path("/home/ubuntu/CHAD FINALE/reports/lessons")
+TRADES_DIR = Path("/home/ubuntu/chad_finale/data/trades")
+REPORTS_DIR = Path("/home/ubuntu/chad_finale/reports/lessons")
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 

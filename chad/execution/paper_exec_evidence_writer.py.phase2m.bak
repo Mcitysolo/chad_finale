@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import math
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_ymd() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sha256_hex(data: str) -> str:
+    return hashlib.sha256(data.encode("utf-8", errors="strict")).hexdigest()
+
+
+def _safe_str(x: Any, default: str = "") -> str:
+    try:
+        s = str(x).strip()
+        return s if s else default
+    except Exception:
+        return default
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _repo_root() -> Path:
+    env = _safe_str(os.environ.get("CHAD_ROOT"), "")
+    if env:
+        p = Path(env).expanduser().resolve()
+        if (p / "chad").is_dir():
+            return p
+    return Path(__file__).resolve().parents[2]
+
+
+def _ledger_dir(kind: str) -> Path:
+    root = _repo_root()
+    if kind == "fills":
+        p = root / "data" / "fills"
+    elif kind == "fees":
+        p = root / "data" / "fees"
+    elif kind == "execution_metrics":
+        p = root / "data" / "execution_metrics"
+    else:
+        raise ValueError(f"unsupported kind: {kind}")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _ledger_path_today(kind: str) -> Path:
+    ymd = _utc_ymd()
+    if kind == "fills":
+        return _ledger_dir(kind) / f"FILLS_{ymd}.ndjson"
+    if kind == "fees":
+        return _ledger_dir(kind) / f"FEES_{ymd}.ndjson"
+    return _ledger_dir(kind) / f"EXECUTION_METRICS_{ymd}.ndjson"
+
+
+def _read_last_record_metadata(fp) -> Tuple[int, str]:
+    genesis = "0" * 64
+    try:
+        fp.seek(0, os.SEEK_END)
+        size = fp.tell()
+        if size <= 0:
+            return 0, genesis
+
+        chunk_size = 8192
+        pos = size
+        buf = b""
+        while pos > 0:
+            step = min(chunk_size, pos)
+            pos -= step
+            fp.seek(pos, os.SEEK_SET)
+            buf = fp.read(step) + buf
+            if b"\n" in buf:
+                break
+
+        lines = [ln for ln in buf.splitlines() if ln.strip()]
+        if not lines:
+            return 0, genesis
+
+        last = lines[-1].decode("utf-8", errors="strict")
+        rec = json.loads(last)
+        seq = _safe_int(rec.get("sequence_id"), 0)
+        rh = _safe_str(rec.get("record_hash"), genesis) or genesis
+        if len(rh) != 64 or any(ch not in "0123456789abcdef" for ch in rh):
+            rh = genesis
+        return seq, rh
+    except Exception:
+        return 0, genesis
+
+
+def _append_hash_chained_record(path: Path, payload: Dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o640)
+    try:
+        with os.fdopen(fd, "r+", encoding="utf-8", newline="\n") as fp:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+            try:
+                last_seq, last_hash = _read_last_record_metadata(fp)
+                next_seq = int(last_seq) + 1
+                ts = _utc_now_iso()
+                core = {
+                    "timestamp_utc": ts,
+                    "sequence_id": next_seq,
+                    "prev_hash": last_hash,
+                    "payload": payload,
+                }
+                record_hash = _sha256_hex(last_hash + _canonical_json(core))
+                record = dict(core)
+                record["record_hash"] = record_hash
+
+                fp.seek(0, os.SEEK_END)
+                fp.write(_canonical_json(record) + "\n")
+                fp.flush()
+                os.fsync(fp.fileno())
+            finally:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+    finally:
+        pass
+    return path
+
+
+@dataclass(frozen=True)
+class PaperExecEvidence:
+    strategy: str
+    symbol: str
+    side: str
+    quantity: float
+    fill_price: float
+    notional: float
+    broker: str = "paper_exec"
+    venue: str = "paper_exec"
+    account_id: str = "PAPER_EXEC"
+    order_type: str = "SIM"
+    asset_class: str = "unknown"
+    is_live: bool = False
+    fill_time_utc: Optional[str] = None
+    entry_time_utc: Optional[str] = None
+    exit_time_utc: Optional[str] = None
+    plan_path: Optional[str] = None
+    plan_now_iso: Optional[str] = None
+    source: str = "paper_trade_executor"
+    fee_amount: float = 0.0
+    fee_currency: str = "USD"
+    slippage_bps: float = 0.0
+    latency_ms: Optional[float] = None
+    partial_fill: bool = False
+    reject: bool = False
+    tags: Optional[list[str]] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
+def write_paper_exec_evidence(ev: PaperExecEvidence) -> Dict[str, str]:
+    now = _utc_now_iso()
+    fill_ts = _safe_str(ev.fill_time_utc, now)
+    entry_ts = _safe_str(ev.entry_time_utc, fill_ts)
+    exit_ts = _safe_str(ev.exit_time_utc, fill_ts)
+
+    strategy = _safe_str(ev.strategy, "paper_exec").lower()
+    symbol = _safe_str(ev.symbol, "UNKNOWN").upper()
+    side = _safe_str(ev.side, "BUY").upper()
+    broker = _safe_str(ev.broker, "paper_exec")
+    venue = _safe_str(ev.venue, broker)
+    account_id = _safe_str(ev.account_id, "PAPER_EXEC")
+    order_type = _safe_str(ev.order_type, "SIM").upper()
+    asset_class = _safe_str(ev.asset_class, "unknown").lower()
+
+    qty = _safe_float(ev.quantity, 0.0)
+    fill_price = _safe_float(ev.fill_price, 0.0)
+    notional = _safe_float(ev.notional, 0.0)
+    fee_amount = _safe_float(ev.fee_amount, 0.0)
+    slippage_bps = _safe_float(ev.slippage_bps, 0.0)
+    latency_ms = None if ev.latency_ms is None else _safe_float(ev.latency_ms, 0.0)
+    partial_fill = bool(ev.partial_fill)
+    reject = bool(ev.reject)
+
+    tags = list(ev.tags) if isinstance(ev.tags, list) else []
+    extra = dict(ev.extra) if isinstance(ev.extra, dict) else {}
+
+    common = {
+        "broker": broker,
+        "venue": venue,
+        "account_id": account_id,
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "order_type": order_type,
+        "asset_class": asset_class,
+        "quantity": qty,
+        "fill_price": fill_price,
+        "notional": notional,
+        "is_live": bool(ev.is_live),
+        "fill_time_utc": fill_ts,
+        "entry_time_utc": entry_ts,
+        "exit_time_utc": exit_ts,
+        "source": _safe_str(ev.source, "paper_trade_executor"),
+        "plan_path": _safe_str(ev.plan_path, ""),
+        "plan_now_iso": _safe_str(ev.plan_now_iso, ""),
+        "tags": tags,
+        "extra": extra,
+    }
+
+    fills_payload = dict(common)
+    fills_payload.update(
+        {
+            "schema_version": "paper_exec_fill.v1",
+            "fill_id": _sha256_hex(f"{fill_ts}|{symbol}|{side}|{qty:.12f}|{fill_price:.12f}|{strategy}|{broker}"),
+            "status": "FILLED" if not reject else "REJECTED",
+            "partial_fill": partial_fill,
+            "reject": reject,
+        }
+    )
+
+    fees_payload = {
+        "schema_version": "paper_exec_fee.v1",
+        "fee_id": _sha256_hex(f"fee|{fill_ts}|{symbol}|{side}|{qty:.12f}|{fee_amount:.12f}|{strategy}|{broker}"),
+        "broker": broker,
+        "venue": venue,
+        "account_id": account_id,
+        "symbol": symbol,
+        "strategy": strategy,
+        "side": side,
+        "fee_amount": fee_amount,
+        "fee_currency": _safe_str(ev.fee_currency, "USD").upper(),
+        "is_live": bool(ev.is_live),
+        "fill_time_utc": fill_ts,
+        "source": _safe_str(ev.source, "paper_trade_executor"),
+        "plan_path": _safe_str(ev.plan_path, ""),
+        "tags": tags,
+        "extra": extra,
+    }
+
+    execq_payload = {
+        "schema_version": "paper_exec_execution_metric.v1",
+        "metric_id": _sha256_hex(f"execq|{fill_ts}|{symbol}|{side}|{qty:.12f}|{fill_price:.12f}|{strategy}|{broker}"),
+        "broker": broker,
+        "venue": venue,
+        "account_id": account_id,
+        "symbol": symbol,
+        "strategy": strategy,
+        "side": side,
+        "order_type": order_type,
+        "quantity": qty,
+        "fill_price": fill_price,
+        "notional": notional,
+        "slippage_bps": slippage_bps,
+        "latency_ms": latency_ms,
+        "partial_fill": partial_fill,
+        "reject": reject,
+        "status": "FILLED" if not reject else "REJECTED",
+        "is_live": bool(ev.is_live),
+        "fill_time_utc": fill_ts,
+        "source": _safe_str(ev.source, "paper_trade_executor"),
+        "plan_path": _safe_str(ev.plan_path, ""),
+        "tags": tags,
+        "extra": extra,
+    }
+
+    fills_path = _append_hash_chained_record(_ledger_path_today("fills"), fills_payload)
+    fees_path = _append_hash_chained_record(_ledger_path_today("fees"), fees_payload)
+    execq_path = _append_hash_chained_record(_ledger_path_today("execution_metrics"), execq_payload)
+
+    return {
+        "fills_path": str(fills_path),
+        "fees_path": str(fees_path),
+        "execution_metrics_path": str(execq_path),
+    }

@@ -267,20 +267,41 @@ def run_wrapper(mode: str, cfg: RunConfig, runner: Runner, journal: Journal) -> 
             "mode": mode,
         },
     )
+    # Always refresh calendar_state.json first (market hours cache)
+    cal_cmd = [sys.executable, "-m", "chad.core.paper_shadow_runner"]
 
-    cmd = [sys.executable, "-m", "chad.core.paper_shadow_runner"]
-    if mode == "EXECUTE":
-        cmd.append("--execute")
-    else:
-        cmd.append("--preview")
-
+    # In EXECUTE mode: run the safe rehearsal executor (WHAT-IF only)
+    exec_cmd = [sys.executable, "-m", "chad.core.ibkr_execution_runner", "--dry-run"]
     rc = 0
     stdout = ""
     stderr = ""
     err_hint = ""
 
     try:
-        rc, stdout, stderr = runner.run(cmd, cwd=cfg.repo_root, timeout_seconds=cfg.timeout_seconds)
+        cal_rc, cal_out, cal_err = runner.run(
+            cal_cmd,
+            cwd=cfg.repo_root,
+            timeout_seconds=min(60, int(cfg.timeout_seconds)),
+        )
+
+        if mode != "EXECUTE":
+            rc, stdout, stderr = cal_rc, cal_out, cal_err
+        else:
+            exec_rc, exec_out, exec_err = runner.run(
+                exec_cmd,
+                cwd=cfg.repo_root,
+                timeout_seconds=int(cfg.timeout_seconds),
+            )
+            # Treat calendar failure as a failure of the whole run.
+            rc = int(max(int(cal_rc), int(exec_rc)))
+            stdout = (
+                f"[calendar_state] rc={cal_rc}\n{cal_out}\n\n"
+                f"[ibkr_execution_runner] rc={exec_rc}\n{exec_out}"
+            )
+            stderr = (
+                f"[calendar_state] rc={cal_rc}\n{cal_err}\n\n"
+                f"[ibkr_execution_runner] rc={exec_rc}\n{exec_err}"
+            )
     except Exception as exc:
         rc = 1
         err_hint = "wrapper_exec_error:" + type(exc).__name__ + ":" + str(exc)

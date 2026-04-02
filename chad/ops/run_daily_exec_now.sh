@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "/home/ubuntu/CHAD FINALE"
+cd "/home/ubuntu/chad_finale"
 
 # Generate executive report now (also pushes to Telegram via notify()).
 OUT="$(./venv/bin/python -m chad.ops.daily_executive_report)"

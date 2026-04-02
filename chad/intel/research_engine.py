@@ -30,7 +30,7 @@ from chad.intel.schemas import (
 # Constants & paths
 # ------------------------------------------------------------------------------
 
-REPORTS_DIR = Path("/home/ubuntu/CHAD FINALE/reports/research")
+REPORTS_DIR = Path("/home/ubuntu/chad_finale/reports/research")
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 SYSTEM_PROMPT = """

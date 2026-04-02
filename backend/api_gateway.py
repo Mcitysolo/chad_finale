@@ -1,31 +1,21 @@
+#!/usr/bin/env python3
 """
-CHAD API Gateway (Phase 7/10 — Read-Only, Risk-Aware, DRY_RUN Only)
+CHAD API Gateway — SSOT v4.2 Operator Surface (Production)
 
-This FastAPI application exposes a strictly observational API surface for CHAD.
-It is designed so that **no HTTP request can ever trigger live trading**.
+Read-only operator visibility endpoints:
+- /             (root: must mention /health and /risk-state per tests)
+- /health
+- /status
+- /live-gate
+- /risk-state
+- /shadow
+- /orders       (disabled in Phase 7: must return 403)
 
-Key guarantees:
-
-* No endpoint sends orders to any broker (IBKR, crypto, forex).
-* All broker behaviour remains DRY_RUN-only at the adapter level.
-* Live trading is disabled by:
-    - ExecutionConfig (ibkr_dry_run=True),
-    - Global mode (CHAD_MODE),
-    - Shadow Confidence Router (SCR) + paper_only flag,
-    - Shadow risk gating logic implemented here,
-    - STOP (DENY_ALL) emergency freeze,
-    - Operator intent mode (Phase 10 control plane).
-* Endpoints only read CHAD’s internal state:
-    - Execution configuration,
-    - CHAD_MODE,
-    - Shadow confidence & trade stats,
-    - Dynamic risk caps (if present on disk),
-    - STOP state,
-    - Operator intent state.
-* Phase-10 AI endpoints are strictly advisory-only: they never touch
-  execution, risk limits, or DRY_RUN flags.
-
-This file is safe to be used as the main FastAPI app for the CHAD backend.
+SSOT alignment
+--------------
+- Observational only: no broker orders, no config mutations. :contentReference[oaicite:1]{index=1}
+- Fail-closed for LIVE; safe paper "what-if" lane remains available when IBKR adapter is enabled. 
+- Stable response shapes (tests + operator UX).
 """
 
 from __future__ import annotations
@@ -33,238 +23,147 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from backend.portfolio_surface import router as portfolio_router
 from pydantic import BaseModel, Field
 
 from chad.analytics.shadow_confidence_router import ShadowState, evaluate_confidence
 from chad.analytics.trade_stats_engine import load_and_compute
-from chad.core.mode import get_chad_mode, is_live_mode_enabled
-from chad.core.stop_state import load_stop_state
-from chad.execution.execution_config import get_execution_config
-from chad.intel.research_engine import run_research_scenario_from_request
-from chad.intel.schemas import ResearchRequestInput, ResearchScenario
-from backend.approval_surface import router as approval_router
-
-# Optional: dynamic caps file path used by orchestrator.
-DYNAMIC_CAPS_PATH = Path("runtime/dynamic_caps.json")
-
-# Phase 10 operator intent control plane runtime file
-OPERATOR_INTENT_PATH = Path("runtime/operator_intent.json")
-
-# Reconciliation runtime file (advisory now; can be gating later)
-RECONCILIATION_STATE_PATH = Path("runtime/reconciliation_state.json")
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None:
-        return int(default)
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return int(default)
-
-# Phase 8 feed freshness TTL (seconds)
-CHAD_FEED_TTL_SECONDS = _env_int("CHAD_FEED_TTL_SECONDS", 180)
-
-def _parse_utc(ts: str) -> float:
-    # Returns epoch seconds, or 0.0 on failure
-    try:
-        ts = str(ts).strip()
-        if ts.endswith("Z"):
-            ts = ts[:-1] + "+00:00"
-        return datetime.fromisoformat(ts).timestamp()
-    except Exception:
-        return 0.0
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-def _load_reconciliation_status() -> tuple[str, int]:
-    # returns (status, mismatches)
-    try:
-        if not RECONCILIATION_STATE_PATH.is_file():
-            return ("UNKNOWN", 0)
-        rec = json.loads(RECONCILIATION_STATE_PATH.read_text(encoding="utf-8"))
-        status = str(rec.get("status") or "UNKNOWN").upper()
-        mism = int((rec.get("counts") or {}).get("mismatches") or 0)
-        return (status, mism)
-    except Exception:
-        return ("ERROR", 0)
-
-def _load_feed_status() -> str:
-    # Phase 8 feed gate: file must exist, parse, and be fresh within TTL.
-    p = Path("runtime/feed_state.json")
-    try:
-        if not p.is_file():
-            return "UNKNOWN"
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return "ERROR"
-        ts_utc = str(data.get("ts_utc") or "")
-        t = _parse_utc(ts_utc)
-        if t <= 0.0:
-            return "ERROR"
-        age = float(datetime.now(timezone.utc).timestamp() - t)
-        if age > float(CHAD_FEED_TTL_SECONDS):
-            return "STALE"
-        return "OK"
-    except Exception:
-        return "ERROR"
-        # If present, treat as OK (TTL enforcement can be added later)
-        return "OK"
-    except Exception:
-        return "ERROR"
-
-
+from backend.operator_intent_store import OperatorIntentStore, OperatorMode as StoreOperatorMode
+from backend.approval_surface import router as approvals_router
+from backend.ai_surface import router as ai_router
+from backend.portfolio_surface import router as portfolio_router
+from chad.core.live_gate import evaluate_live_gate as evaluate_live_gate_core
 
 LOGGER = logging.getLogger("chad.api_gateway")
 
 
-# ---------------------------------------------------------------------------
-# Operator intent (Phase 10)
-# ---------------------------------------------------------------------------
-
-class OperatorMode(str):
-    ALLOW_LIVE = "ALLOW_LIVE"
-    EXIT_ONLY = "EXIT_ONLY"
-    DENY_ALL = "DENY_ALL"
-
-
-@dataclass(frozen=True)
-class OperatorIntentState:
-    mode: str
-    reason: str
-    updated_at_utc: str
+# =============================================================================
+# Paths + runtime helpers
+# =============================================================================
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _repo_root() -> Path:
+    env = os.environ.get("CHAD_REPO_ROOT", "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if p.is_dir():
+            return p.resolve()
+    return Path(__file__).resolve().parents[1]
 
-def _load_operator_intent() -> OperatorIntentState:
-    """
-    Load operator intent from runtime/operator_intent.json.
 
-    Supported schemas:
-      - Canonical (API-managed): {mode, reason, updated_at_utc}
-      - Legacy/runtime (older tooling): {operator_mode, operator_reason, ts_utc}
+REPO_DIR = _repo_root()
+RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", str(REPO_DIR / "runtime"))).expanduser().resolve()
 
-    Safe default is ALLOW_LIVE (meaning: do not add extra blocking beyond other gates).
-    Note: In Phase 7/8, ExecutionConfig + SCR still block real live trading.
-    """
-    if not OPERATOR_INTENT_PATH.is_file():
-        return OperatorIntentState(
-               mode=OperatorMode.EXIT_ONLY,
-               reason="default_exit_only",
-            updated_at_utc="",
-        )
+FEED_STATE_PATH = RUNTIME_DIR / "feed_state.json"
+POSITIONS_PATH = RUNTIME_DIR / "positions_snapshot.json"
+RECONCILIATION_STATE_PATH = RUNTIME_DIR / "reconciliation_state.json"
+DYNAMIC_CAPS_PATH = RUNTIME_DIR / "dynamic_caps.json"
+OPERATOR_INTENT_PATH = RUNTIME_DIR / "operator_intent.json"
+PORTFOLIO_SNAPSHOT_PATH = RUNTIME_DIR / "portfolio_snapshot.json"
+SCR_STATE_PATH = RUNTIME_DIR / "scr_state.json"
+TIER_STATE_PATH = RUNTIME_DIR / "tier_state.json"
+STOP_STATE_PATH = RUNTIME_DIR / "stop_state.json"
 
+
+def _read_runtime_json(path: Path) -> dict:
     try:
-        data = json.loads(OPERATOR_INTENT_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return OperatorIntentState(
-                   mode=OperatorMode.EXIT_ONLY,
-                   reason="parse_error_exit_only",
-                updated_at_utc="",
-            )
-
-        # Accept both schemas (canonical + legacy)
-        mode_raw = data.get("mode")
-        if mode_raw is None:
-            mode_raw = data.get("operator_mode")
-
-        reason_raw = data.get("reason")
-        if reason_raw is None:
-            reason_raw = data.get("operator_reason")
-
-        updated_raw = str(data.get("updated_at_utc") or data.get("ts_utc") or "")
-
-        mode = str(mode_raw or OperatorMode.ALLOW_LIVE).upper().strip()
-        reason = str(reason_raw or "unknown")
-        # Normalize legacy "ALLOW" to canonical "ALLOW_LIVE"
-        if mode == "ALLOW":
-            mode = OperatorMode.ALLOW_LIVE
-
-        if mode not in (OperatorMode.ALLOW_LIVE, OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
-            return OperatorIntentState(
-                   mode=OperatorMode.EXIT_ONLY,
-                   reason="invalid_mode_exit_only",
-                updated_at_utc=updated_raw,
-            )
-
-        return OperatorIntentState(
-            mode=mode,
-            reason=reason,
-            updated_at_utc=updated_raw,
-        )
-
+        if not path.is_file():
+            return {}
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
     except Exception:
-        return OperatorIntentState(
-               mode=OperatorMode.EXIT_ONLY,
-               reason="parse_error_exit_only",
-            updated_at_utc="",
-        )
+        return {}
 
 
-def _save_operator_intent(state: OperatorIntentState) -> None:
-    """
-    Atomic write: tmp -> replace.
-    """
-    OPERATOR_INTENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = asdict(state)
-    tmp = OPERATOR_INTENT_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, OPERATOR_INTENT_PATH)
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
-class OperatorIntentResponse(BaseModel):
-    mode: str
+# =============================================================================
+# Snapshots + LiveGate
+# =============================================================================
+
+
+class ChadMode(str, Enum):
+    DRY_RUN = "dry_run"
+    PAPER = "paper"
+    LIVE = "live"
+
+
+class OperatorMode(str, Enum):
+    DENY_ALL = "DENY_ALL"
+    EXIT_ONLY = "EXIT_ONLY"
+    ALLOW_LIVE = "ALLOW_LIVE"
+
+
+@dataclass(frozen=True)
+class OperatorIntent:
+    mode: OperatorMode
     reason: str
     updated_at_utc: str
 
 
-class OperatorIntentRequest(BaseModel):
-    mode: str = Field(..., description="One of: ALLOW_LIVE, EXIT_ONLY, DENY_ALL")
-    reason: str = Field(default="operator_update", description="Audit reason for change")
+def _get_chad_mode() -> ChadMode:
+    raw = str(os.environ.get("CHAD_EXECUTION_MODE", "dry_run")).strip().lower()
+    if raw == "live":
+        return ChadMode.LIVE
+    if raw == "paper":
+        return ChadMode.PAPER
+    return ChadMode.DRY_RUN
 
 
-# ---------------------------------------------------------------------------
-# Pydantic response models
-# ---------------------------------------------------------------------------
+def _is_live_mode_enabled() -> bool:
+    return _get_chad_mode() == ChadMode.LIVE
 
-class PriceSnapshotResponse(BaseModel):
+
+def _load_operator_intent() -> OperatorIntent:
     """
-    Response schema for the /ai/price endpoint.
+    Load OperatorIntent with strict TTL freshness enforcement (FAIL-CLOSED).
 
-    Mirrors chad.market_data.service.PriceSnapshot so that frontends
-    (Telegram, web, voice) have a stable, typed representation of
-    current price and simple daily moves.
+    Preserves production behavior:
+      operator_intent_stale_or_missing:expired age_s=... ttl_s=...
     """
-    symbol: str
-    asset_class: str
-    price: float
-    change: Optional[float] = None
-    percent_change: Optional[float] = None
-    as_of: Optional[str] = None
-    source: str
+    store = OperatorIntentStore(path=OPERATOR_INTENT_PATH)
+    st = store.load_fail_closed()
+
+    mode_raw = str(st.mode or "").strip().upper()
+    if mode_raw == StoreOperatorMode.DENY_ALL:
+        mode = OperatorMode.DENY_ALL
+    elif mode_raw == StoreOperatorMode.EXIT_ONLY:
+        mode = OperatorMode.EXIT_ONLY
+    elif mode_raw == StoreOperatorMode.ALLOW_LIVE:
+        mode = OperatorMode.ALLOW_LIVE
+    else:
+        mode = OperatorMode.DENY_ALL  # fail-closed
+
+    updated = str(st.ts_utc or _utc_now_iso())
+    reason = str(st.reason or "operator_intent_missing").strip()
+    return OperatorIntent(mode=mode, reason=reason, updated_at_utc=updated)
+
+    # Phase 7 safe default: do not block paper lane; live remains blocked elsewhere unless truly enabled.
+    return OperatorIntent(OperatorMode.ALLOW_LIVE, reason, updated)
 
 
-class HealthResponse(BaseModel):
-    service: str = Field(default="CHAD API Gateway")
-    healthy: bool
-    message: str
-    details: Dict[str, Any]
+def _load_stop_state() -> tuple[bool, str]:
+    obj = _read_runtime_json(STOP_STATE_PATH)
+    stop = bool(obj.get("stop", False))
+    reason = str(obj.get("reason") or "unknown").strip()
+    return stop, reason
 
 
 class ExecutionConfigSnapshot(BaseModel):
@@ -281,18 +180,13 @@ class ModeSnapshot(BaseModel):
 
 
 class ShadowStats(BaseModel):
-    # Raw counts (everything parsed)
     total_trades: int
     live_trades: int
     paper_trades: int
-
-    # Effective sample (what SCR actually trusts)
     effective_trades: int
     excluded_manual: int
     excluded_untrusted: int
     excluded_nonfinite: int
-
-    # Performance metrics over effective sample
     win_rate: float
     total_pnl: float
     max_drawdown: float
@@ -307,41 +201,31 @@ class ShadowSnapshot(BaseModel):
     stats: ShadowStats
 
 
-class DynamicCapsStrategyCaps(BaseModel):
-    alpha: float
-    beta: float
-    gamma: float
-    omega: float
-    delta: float
-    crypto: float
-    forex: float
-
-
-class DynamicCapsSnapshot(BaseModel):
-    total_equity: float
-    daily_risk_fraction: float
-    portfolio_risk_cap: float
-    strategy_caps: DynamicCapsStrategyCaps
-
-
 class LiveGateSnapshot(BaseModel):
     execution: ExecutionConfigSnapshot
     mode: ModeSnapshot
     shadow: ShadowSnapshot
 
-    # Phase 10 additions (operator control plane)
-    operator_mode: str
+    operator_mode: OperatorMode
     operator_reason: str
-    allow_exits_only: bool
 
+    allow_exits_only: bool
     allow_ibkr_live: bool
     allow_ibkr_paper: bool
+
     reasons: List[str]
+
+
+class HealthResponse(BaseModel):
+    healthy: bool
+    message: str
+    service: str
+    details: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RiskStateResponse(BaseModel):
     mode: ModeSnapshot
-    dynamic_caps: Optional[DynamicCapsSnapshot]
+    dynamic_caps: Optional[dict] = None
     shadow: ShadowSnapshot
 
 
@@ -349,64 +233,33 @@ class ShadowOnlyResponse(BaseModel):
     shadow: ShadowSnapshot
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+def _build_execution_snapshot() -> ExecutionConfigSnapshot:
+    mode = _get_chad_mode()
 
-def _load_dynamic_caps() -> Optional[DynamicCapsSnapshot]:
-    """
-    Load dynamic risk caps from runtime/dynamic_caps.json, if present.
+    # Phase 7 baseline: IBKR adapter exists.
+    ibkr_enabled = True
 
-    This file is written by the orchestrator. If it does not exist or is
-    malformed, we return None and the API simply omits the caps.
-    """
-    if not DYNAMIC_CAPS_PATH.is_file():
-        return None
+    kraken_enabled = _env_bool("CHAD_KRAKEN_ENABLED", False)
 
-    try:
-        data = json.loads(DYNAMIC_CAPS_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Failed to read dynamic caps from %s: %s", DYNAMIC_CAPS_PATH, exc)
-        return None
+    # DRY_RUN/PAPER => never live
+    ibkr_dry_run = mode != ChadMode.LIVE
 
-    try:
-        caps = DynamicCapsSnapshot(
-            total_equity=float(data["total_equity"]),
-            daily_risk_fraction=float(data["daily_risk_fraction"]),
-            portfolio_risk_cap=float(data["portfolio_risk_cap"]),
-            strategy_caps=DynamicCapsStrategyCaps(
-                alpha=float(data["strategy_caps"]["alpha"]),
-                beta=float(data["strategy_caps"]["beta"]),
-                gamma=float(data["strategy_caps"]["gamma"]),
-                omega=float(data["strategy_caps"]["omega"]),
-                delta=float(data["strategy_caps"]["delta"]),
-                crypto=float(data["strategy_caps"]["crypto"]),
-                forex=float(data["strategy_caps"]["forex"]),
-            ),
-        )
-    except KeyError as exc:
-        LOGGER.exception("Dynamic caps JSON missing expected key: %s", exc)
-        return None
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Failed to parse dynamic caps JSON: %s", exc)
-        return None
+    return ExecutionConfigSnapshot(
+        exec_mode=str(mode.value),
+        ibkr_enabled=bool(ibkr_enabled),
+        ibkr_dry_run=bool(ibkr_dry_run),
+        kraken_enabled=bool(kraken_enabled),
+        raw_mode_enum=str(mode.value),
+    )
 
-    return caps
+
+def _build_mode_snapshot() -> ModeSnapshot:
+    mode = _get_chad_mode()
+    return ModeSnapshot(chad_mode=str(mode.value), live_enabled=bool(_is_live_mode_enabled()))
 
 
 def _build_shadow_snapshot() -> ShadowSnapshot:
-    """
-    Compute ShadowState (SCR) and wrap it as a ShadowSnapshot.
-
-    This recomputes stats from trade history instead of reading a snapshot
-    file, so it always reflects the latest trade ledger.
-    """
-    stats_raw = load_and_compute(
-        max_trades=500,
-        days_back=30,
-        include_paper=True,
-        include_live=True,
-    )
+    stats_raw = load_and_compute(max_trades=500, days_back=30, include_paper=True, include_live=True)
     shadow_state: ShadowState = evaluate_confidence(stats_raw)
 
     stats_model = ShadowStats(
@@ -432,486 +285,180 @@ def _build_shadow_snapshot() -> ShadowSnapshot:
     )
 
 
-def _build_execution_snapshot() -> ExecutionConfigSnapshot:
-    """
-    Build a snapshot of the adapter-level execution configuration.
-    """
-    cfg = get_execution_config()
-    return ExecutionConfigSnapshot(
-        exec_mode=str(cfg.mode.value),
-        ibkr_enabled=bool(cfg.ibkr_enabled),
-        ibkr_dry_run=bool(cfg.ibkr_dry_run),
-        kraken_enabled=bool(getattr(cfg, "kraken_enabled", False)),
-        raw_mode_enum=str(cfg.mode),
-    )
+def _operator_mode_from_core(raw: str) -> OperatorMode:
+    s = str(raw or "").strip().upper()
+    try:
+        return OperatorMode(s)
+    except Exception:
+        pass
 
+    if s == "ALLOW":
+        try:
+            return OperatorMode.ALLOW_LIVE
+        except Exception:
+            pass
 
-def _build_mode_snapshot() -> ModeSnapshot:
-    """
-    Build a snapshot of the global CHAD_MODE.
-    """
-    mode = get_chad_mode()
-    live_enabled = is_live_mode_enabled()
-    return ModeSnapshot(
-        chad_mode=str(mode.value),
-        live_enabled=bool(live_enabled),
-    )
+    try:
+        return OperatorMode.DENY_ALL
+    except Exception:
+        # Final fallback for enum implementations that behave differently.
+        return list(OperatorMode)[0]
 
 
 def _evaluate_live_gate() -> LiveGateSnapshot:
     """
-    Evaluate whether IBKR live trading is allowed, based on:
-
-        1) ExecutionConfig (adapter-level DRY_RUN vs live),
-        2) Global CHAD_MODE,
-        3) ShadowState (SCR — paper_only, state, sizing_factor),
-        4) STOP (DENY_ALL),
-        5) Operator intent (Phase 10): DENY_ALL / EXIT_ONLY / ALLOW_LIVE.
+    Canonical API adapter:
+    - Delegates ALL gate logic to chad.core.live_gate.evaluate_live_gate()
+    - Converts the canonical decision into the legacy API response model
+    - Eliminates drift between CLI/core execution path and HTTP /live-gate
     """
-    execution_snapshot = _build_execution_snapshot()
-    mode_snapshot = _build_mode_snapshot()
-    shadow_snapshot = _build_shadow_snapshot()
-    operator = _load_operator_intent()
+    core = evaluate_live_gate_core().to_dict()
 
-    reasons: List[str] = []
-    # Reconciliation status (positions_snapshot vs ibkr_paper_ledger_state)
-    # Advisory for Phase 7, but surfaced so operators can see mismatches.
-    try:
-        if RECONCILIATION_STATE_PATH.is_file():
-            rec = json.loads(RECONCILIATION_STATE_PATH.read_text(encoding="utf-8"))
-            status = str(rec.get("status") or "UNKNOWN").upper()
-            mism = int((rec.get("counts") or {}).get("mismatches") or 0)
-            if status != "GREEN":
-                reasons.append(f"RECONCILIATION_{status}: mismatches={mism}.")
-        else:
-            reasons.append("RECONCILIATION_UNKNOWN: runtime/reconciliation_state.json missing.")
-    except Exception as exc:
-        reasons.append(f"RECONCILIATION_ERROR: failed to load reconciliation_state.json ({type(exc).__name__}).")
+    exec_raw = core.get("execution") if isinstance(core.get("execution"), dict) else {}
+    mode_raw = core.get("mode") if isinstance(core.get("mode"), dict) else {}
+    shadow_raw = core.get("shadow") if isinstance(core.get("shadow"), dict) else {}
+    stats_raw = shadow_raw.get("stats") if isinstance(shadow_raw.get("stats"), dict) else {}
 
-
-    # Adapter-level lock: if ibkr_dry_run is True, we categorically forbid live.
-    if execution_snapshot.ibkr_dry_run:
-        reasons.append(
-            "ExecutionConfig is hard-locked to DRY_RUN for IBKR "
-            "(ibkr_dry_run=True). LIVE execution is disabled at adapter level."
-        )
-
-    # Global mode intent: CHAD_MODE must be LIVE to even consider live trades.
-    if not mode_snapshot.live_enabled:
-        reasons.append(
-            "CHAD_MODE is not LIVE (or live_enabled=False). Global mode does "
-            "not permit live trading."
-        )
-
-    # SCR / Shadow router: paper_only or PAUSED states block live trading.
-    if shadow_snapshot.paper_only:
-        reasons.append(
-            "ShadowState.paper_only is True. SCR currently requires "
-            "paper-only operation; live trading is blocked."
-        )
-    if shadow_snapshot.state.upper() == "PAUSED":
-        reasons.append("ShadowState.state=PAUSED. Live execution is fully halted.")
-
-    allow_ibkr_live = (
-        execution_snapshot.ibkr_enabled
-        and not execution_snapshot.ibkr_dry_run
-        and mode_snapshot.live_enabled
-        and not shadow_snapshot.paper_only
-        and shadow_snapshot.state.upper() != "PAUSED"
+    execution_snapshot = ExecutionConfigSnapshot(
+        exec_mode=str(exec_raw.get("exec_mode") or "dry_run"),
+        ibkr_enabled=bool(exec_raw.get("ibkr_enabled", True)),
+        ibkr_dry_run=bool(exec_raw.get("ibkr_dry_run", True)),
+        kraken_enabled=bool(exec_raw.get("kraken_enabled", False)),
+        raw_mode_enum=str(exec_raw.get("raw_mode_enum") or exec_raw.get("exec_mode") or "dry_run"),
     )
 
-    # --- STOP enforcement (authoritative DENY_ALL) ---
-    stop_state = load_stop_state()
-    if bool(getattr(stop_state, "stop", False)):
-        reasons.append(
-            f"STOP is ENABLED (DENY_ALL). reason={getattr(stop_state, 'reason', 'unknown')!r}. "
-            "All trading actions are blocked (no live, no paper)."
-        )
-        # ##DEDUP_REASONS_PHASE8_V2##
-        reasons = list(dict.fromkeys(reasons))
-        return LiveGateSnapshot(
-            execution=execution_snapshot,
-            mode=mode_snapshot,
-            shadow=shadow_snapshot,
-            operator_mode=operator.mode,
-            operator_reason=operator.reason,
-            allow_exits_only=False,
-            allow_ibkr_live=False,
-            allow_ibkr_paper=False,
-            reasons=reasons,
-        )
+    mode_snapshot = ModeSnapshot(
+        chad_mode=str(mode_raw.get("chad_mode") or execution_snapshot.exec_mode),
+        live_enabled=bool(mode_raw.get("live_enabled", False)),
+    )
 
-    # --- Operator intent enforcement (Phase 10) ---
-    # DENY_ALL => block paper and live
-    # EXIT_ONLY => block new entries (paper/live), but signal exit-only mode to downstream
-    # ALLOW_LIVE => no extra operator restriction beyond other gates
-    allow_exits_only = False
-    if operator.mode == OperatorMode.DENY_ALL:
-        reasons.append(f"OperatorIntent=DENY_ALL. reason={operator.reason!r}. Blocking all trading actions.")
-        # ##DEDUP_REASONS_PHASE8_V2##
-        reasons = list(dict.fromkeys(reasons))
-        return LiveGateSnapshot(
-            execution=execution_snapshot,
-            mode=mode_snapshot,
-            shadow=shadow_snapshot,
-            operator_mode=operator.mode,
-            operator_reason=operator.reason,
-            allow_exits_only=False,
-            allow_ibkr_live=False,
-            allow_ibkr_paper=False,
-            reasons=reasons,
-        )
-    if operator.mode == OperatorMode.EXIT_ONLY:
-        allow_exits_only = True
-        reasons.append(f"OperatorIntent=EXIT_ONLY. reason={operator.reason!r}. No new entries; exits-only permitted.")
-        # In Phase 7, we model exits-only by denying new entries (paper/live),
-        # and exposing allow_exits_only=true. Execution layers must implement
-        # exit routing explicitly in a later phase.
-        # ##DEDUP_REASONS_PHASE8_V2##
-        reasons = list(dict.fromkeys(reasons))
-        return LiveGateSnapshot(
-            execution=execution_snapshot,
-            mode=mode_snapshot,
-            shadow=shadow_snapshot,
-            operator_mode=operator.mode,
-            operator_reason=operator.reason,
-            allow_exits_only=True,
-            allow_ibkr_live=False,
-            allow_ibkr_paper=False,
-            reasons=reasons,
-        )
+    shadow_snapshot = ShadowSnapshot(
+        state=str(shadow_raw.get("state") or "PAUSED"),
+        sizing_factor=float(shadow_raw.get("sizing_factor", 0.0)),
+        paper_only=bool(shadow_raw.get("paper_only", True)),
+        reasons=[str(x) for x in (shadow_raw.get("reasons") if isinstance(shadow_raw.get("reasons"), list) else [])],
+        stats=ShadowStats(
+            total_trades=int(stats_raw.get("total_trades", 0)),
+            live_trades=int(stats_raw.get("live_trades", 0)),
+            paper_trades=int(stats_raw.get("paper_trades", 0)),
+            effective_trades=int(stats_raw.get("effective_trades", 0)),
+            excluded_manual=int(stats_raw.get("excluded_manual", 0)),
+            excluded_untrusted=int(stats_raw.get("excluded_untrusted", 0)),
+            excluded_nonfinite=int(stats_raw.get("excluded_nonfinite", 0)),
+            win_rate=float(stats_raw.get("win_rate", 0.0)),
+            total_pnl=float(stats_raw.get("total_pnl", 0.0)),
+            max_drawdown=float(stats_raw.get("max_drawdown", 0.0)),
+            sharpe_like=float(stats_raw.get("sharpe_like", 0.0)),
+        ),
+    )
 
-    # Paper / what-if execution is allowed whenever IBKR is logically enabled.
-    allow_ibkr_paper = execution_snapshot.ibkr_enabled
-    # Phase 8 enforcement (default OFF): fail-closed on reconciliation/feed issues.
-    if _env_bool("CHAD_PHASE8_ENFORCEMENT", False):
-        rec_status, rec_mism = _load_reconciliation_status()
-        if rec_status != "GREEN":
-            reasons.append(f"RECONCILIATION_{rec_status}: mismatches={rec_mism}.")
-            allow_ibkr_paper = False
-            allow_exits_only = True
-
-        feed_status = _load_feed_status()
-        if feed_status != "OK":
-            reasons.append(f"FEED_{feed_status}")
-            allow_ibkr_paper = False
-            allow_exits_only = True
-
-
-    if not reasons:
-        reasons.append(
-            "All gating conditions currently satisfied; IBKR live trading "
-            "would be permitted if the adapter were not hard-locked to DRY_RUN."
-        )
-
-    # ##DEDUP_REASONS_PHASE8_V2##
-    reasons = list(dict.fromkeys(reasons))
     return LiveGateSnapshot(
         execution=execution_snapshot,
         mode=mode_snapshot,
         shadow=shadow_snapshot,
-        operator_mode=operator.mode,
-        operator_reason=operator.reason,
-        allow_exits_only=allow_exits_only,
-        allow_ibkr_live=bool(allow_ibkr_live),
-        allow_ibkr_paper=bool(allow_ibkr_paper),
-        reasons=reasons,
+        operator_mode=_operator_mode_from_core(str(core.get("operator_mode") or "DENY_ALL")),
+        operator_reason=str(core.get("operator_reason") or ""),
+        allow_exits_only=bool(core.get("allow_exits_only", False)),
+        allow_ibkr_live=bool(core.get("allow_ibkr_live", False)),
+        allow_ibkr_paper=bool(core.get("allow_ibkr_paper", False)),
+        reasons=[str(x) for x in (core.get("reasons") if isinstance(core.get("reasons"), list) else [])],
     )
 
 
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FastAPI app + endpoints
+# =============================================================================
+
 
 app = FastAPI(
     title="CHAD API Gateway",
     version="0.2.0-phase7-10",
-    description=(
-        "Read-only, risk-aware API gateway for CHAD. "
-        "All endpoints are strictly observational. No live trading is "
-        "possible through this API in Phase 7. Phase-10 AI endpoints "
-        "provide advisory-only intelligence."
-    ),
+    description="Read-only, risk-aware API gateway for CHAD (SSOT v4.2).",
 )
 
+# Phase 6: Read-only portfolio endpoints (SSOT v4.2)
 app.include_router(portfolio_router)
-app.include_router(approval_router)
+app.include_router(approvals_router)
+app.include_router(ai_router)
 
 
-from backend.operator_surface_v2 import build_operator_router
-app.include_router(build_operator_router())
+@app.get("/", tags=["system"])
+def root() -> dict:
+    # Must include /health and /risk-state in message string (test contract).
+    return {
+        "service": "CHAD API Gateway",
+        "message": "OK — see /health, /risk-state, /shadow, /status, /live-gate",
+        "ts_utc": _utc_now_iso(),
+    }
 
 
-@app.on_event("startup")
-async def _on_startup() -> None:
-    """
-    Configure logging on startup if not already configured.
-    """
-    if not LOGGER.handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        )
-    LOGGER.info("CHAD API Gateway startup complete.")
+@app.api_route("/orders", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], tags=["disabled"])
+def orders_disabled() -> None:
+    # Must return 403 and detail must include "disabled in Phase 7" (test contract).
+    raise HTTPException(status_code=403, detail="orders endpoint disabled in Phase 7")
 
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])
-async def health() -> HealthResponse:
-    """
-    Simple health endpoint for liveness checks (load balancers, uptime monitors).
-
-    This does *not* touch any broker connections or trading subsystems.
-    """
+def health() -> HealthResponse:
     exec_snapshot = _build_execution_snapshot()
     mode_snapshot = _build_mode_snapshot()
     shadow_snapshot = _build_shadow_snapshot()
 
-    healthy = True
-    message = "CHAD API Gateway is up. Trading is DRY_RUN-only in Phase 7."
-
-    details: Dict[str, Any] = {
-        "execution": exec_snapshot.dict(),
-        "mode": mode_snapshot.dict(),
-        "shadow": {
-            "state": shadow_snapshot.state,
-            "paper_only": shadow_snapshot.paper_only,
-            "sizing_factor": shadow_snapshot.sizing_factor,
-        },
-    }
-
     return HealthResponse(
-        healthy=healthy,
-        message=message,
+        healthy=True,
+        message="CHAD API Gateway is up. Trading is DRY_RUN-only in Phase 7 unless explicitly enabled.",
         service="CHAD API Gateway",
-        details=details,
+        details={
+            "execution": exec_snapshot.model_dump(),
+            "mode": mode_snapshot.model_dump(),
+            "shadow": shadow_snapshot.model_dump(),
+        },
     )
 
 
+@app.get("/live-gate", response_model=LiveGateSnapshot, tags=["risk"])
+def live_gate() -> LiveGateSnapshot:
+    return _evaluate_live_gate()
 
-# ##CHAD_STATUS_ENDPOINT_V1##
-# ---------------------------------------------------------------------------
-# Operator status (SSOT audit snapshot)
-# ---------------------------------------------------------------------------
 
-def _runtime_file_meta(path: Path) -> Dict[str, Any]:
-    """
-    Lightweight runtime file metadata + embedded ts_utc/ttl_seconds if present.
-    Never raises; fails closed with exists=False.
-    """
-    try:
-        st = path.stat()
-    except FileNotFoundError:
-        return {"path": str(path), "exists": False}
-    except Exception as exc:
-        return {"path": str(path), "exists": False, "error": f"stat_error:{type(exc).__name__}"}  # type: ignore[dict-item]
+@app.get("/risk-state", response_model=RiskStateResponse, tags=["risk"])
+def risk_state() -> RiskStateResponse:
+    mode_snapshot = _build_mode_snapshot()
+    shadow_snapshot = _build_shadow_snapshot()
+    dynamic_caps = _read_runtime_json(DYNAMIC_CAPS_PATH) if DYNAMIC_CAPS_PATH.is_file() else None
+    return RiskStateResponse(mode=mode_snapshot, dynamic_caps=dynamic_caps, shadow=shadow_snapshot)
 
-    meta: Dict[str, Any] = {
-        "path": str(path),
-        "exists": True,
-        "size_bytes": int(st.st_size),
-        "mtime_epoch": float(st.st_mtime),
-    }
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            if "ts_utc" in data:
-                meta["ts_utc"] = data.get("ts_utc")
-            if "ttl_seconds" in data:
-                meta["ttl_seconds"] = data.get("ttl_seconds")
-    except Exception:
-        meta["json_parse"] = "failed"
-    return meta
+
+@app.get("/shadow", response_model=ShadowOnlyResponse, tags=["risk"])
+def shadow() -> ShadowOnlyResponse:
+    return ShadowOnlyResponse(shadow=_build_shadow_snapshot())
 
 
 @app.get("/status", tags=["system"])
-async def status() -> Dict[str, Any]:
-    """
-    Read-only operator status snapshot (audit-focused).
-    No broker calls. No mutations.
-    """
+def status() -> dict:
     exec_snapshot = _build_execution_snapshot()
     mode_snapshot = _build_mode_snapshot()
+    live_gate_snapshot = _evaluate_live_gate()
     shadow_snapshot = _build_shadow_snapshot()
-    lg = _evaluate_live_gate()
 
-    runtime_paths = {
-        "feed_state": Path("runtime/feed_state.json"),
-        "positions_snapshot": Path("runtime/positions_snapshot.json"),
-        "reconciliation_state": RECONCILIATION_STATE_PATH,
-        "dynamic_caps": Path("runtime/dynamic_caps.json"),
-        "operator_intent": Path("runtime/operator_intent.json"),
-        "portfolio_snapshot": Path("runtime/portfolio_snapshot.json"),
-        "scr_state": Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json"),
-        "tier_state": Path("/home/ubuntu/CHAD FINALE/runtime/tier_state.json"),
+    runtime_files = {
+        "feed_state": {"path": str(FEED_STATE_PATH), "exists": FEED_STATE_PATH.is_file()},
+        "positions_snapshot": {"path": str(POSITIONS_PATH), "exists": POSITIONS_PATH.is_file()},
+        "reconciliation_state": {"path": str(RECONCILIATION_STATE_PATH), "exists": RECONCILIATION_STATE_PATH.is_file()},
+        "dynamic_caps": {"path": str(DYNAMIC_CAPS_PATH), "exists": DYNAMIC_CAPS_PATH.is_file()},
+        "operator_intent": {"path": str(OPERATOR_INTENT_PATH), "exists": OPERATOR_INTENT_PATH.is_file()},
+        "portfolio_snapshot": {"path": str(PORTFOLIO_SNAPSHOT_PATH), "exists": PORTFOLIO_SNAPSHOT_PATH.is_file()},
+        "scr_state": {"path": str(SCR_STATE_PATH), "exists": SCR_STATE_PATH.is_file()},
+        "tier_state": {"path": str(TIER_STATE_PATH), "exists": TIER_STATE_PATH.is_file()},
     }
-
-    files = {k: _runtime_file_meta(v) for k, v in runtime_paths.items()}
 
     return {
         "service": "CHAD API Gateway",
         "ts_utc": _utc_now_iso(),
-        "execution": exec_snapshot.dict(),
-        "mode": mode_snapshot.dict(),
-        "live_gate": {
-            "operator_mode": lg.operator_mode,
-            "operator_reason": lg.operator_reason,
-            "allow_exits_only": lg.allow_exits_only,
-            "allow_ibkr_paper": lg.allow_ibkr_paper,
-            "allow_ibkr_live": lg.allow_ibkr_live,
-            "reasons": list(lg.reasons),
-        },
-        "shadow": {
-            "state": shadow_snapshot.state,
-            "paper_only": shadow_snapshot.paper_only,
-            "sizing_factor": shadow_snapshot.sizing_factor,
-            "reasons": list(shadow_snapshot.reasons),
-        },
-        "runtime_files": files,
+        "execution": exec_snapshot.model_dump(),
+        "mode": mode_snapshot.model_dump(),
+        "live_gate": live_gate_snapshot.model_dump(),
+        "shadow": shadow_snapshot.model_dump(),
+        "runtime_files": runtime_files,
     }
 
-
-@app.get("/live-gate", response_model=LiveGateSnapshot, tags=["risk"])
-async def live_gate() -> LiveGateSnapshot:
-    """
-    Return the full LiveGate decision snapshot.
-
-    This is the **single source of truth** for whether IBKR live trading would
-    ever be allowed, even in future phases.
-    """
-    return _evaluate_live_gate()
-
-
-@app.get("/operator-intent", response_model=OperatorIntentResponse, tags=["operator"])
-async def get_operator_intent() -> OperatorIntentResponse:
-    st = _load_operator_intent()
-    return OperatorIntentResponse(mode=st.mode, reason=st.reason, updated_at_utc=st.updated_at_utc)
-
-
-@app.post("/operator-intent", response_model=OperatorIntentResponse, tags=["operator"])
-async def set_operator_intent(req: OperatorIntentRequest) -> OperatorIntentResponse:
-    mode = str(req.mode).upper().strip()
-    if mode not in (OperatorMode.ALLOW_LIVE, OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
-        raise HTTPException(status_code=400, detail=f"invalid_operator_mode: {mode!r}")
-
-    st = OperatorIntentState(
-        mode=mode,
-        reason=str(req.reason),
-        updated_at_utc=_utc_now_iso(),
-    )
-    _save_operator_intent(st)
-    return OperatorIntentResponse(mode=st.mode, reason=st.reason, updated_at_utc=st.updated_at_utc)
-
-
-@app.get("/risk-state", response_model=RiskStateResponse, tags=["risk"])
-async def risk_state() -> RiskStateResponse:
-    mode_snapshot = _build_mode_snapshot()
-    dynamic_caps = _load_dynamic_caps()
-    shadow_snapshot = _build_shadow_snapshot()
-
-    return RiskStateResponse(
-        mode=mode_snapshot,
-        dynamic_caps=dynamic_caps,
-        shadow=shadow_snapshot,
-    )
-
-
-@app.get("/shadow", response_model=ShadowOnlyResponse, tags=["shadow"])
-async def shadow() -> ShadowOnlyResponse:
-    snapshot = _build_shadow_snapshot()
-    return ShadowOnlyResponse(shadow=snapshot)
-
-
-
-
-# ---------------------------------------------------------------------------
-# Operator read-only runtime endpoints (Phase 7 safe)
-# ---------------------------------------------------------------------------
-
-def _read_runtime_json(path: Path) -> dict:
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"missing_runtime_file: {path}")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"runtime_json_parse_error: {path.name}") from exc
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail=f"runtime_json_invalid_shape: {path.name}")
-    return data
-
-
-@app.get("/reconciliation-state", tags=["risk"])
-async def reconciliation_state() -> dict:
-    return _read_runtime_json(RECONCILIATION_STATE_PATH)
-
-
-@app.get("/positions-snapshot", tags=["risk"])
-async def positions_snapshot() -> dict:
-    return _read_runtime_json(Path("runtime/positions_snapshot.json"))
-
-
-@app.get("/feed-state", tags=["system"])
-async def feed_state() -> dict:
-    return _read_runtime_json(Path("runtime/feed_state.json"))
-
-
-@app.get("/portfolio-snapshot", tags=["system"])
-async def portfolio_snapshot() -> dict:
-    return _read_runtime_json(Path("runtime/portfolio_snapshot.json"))
-@app.get("/", include_in_schema=False)
-async def root() -> Dict[str, str]:
-    return {
-        "service": "CHAD API Gateway",
-        "message": "See /health, /risk-state, /live-gate, /shadow, and /ai/research.",
-    }
-
-
-@app.get("/ai/price", response_model=PriceSnapshotResponse, tags=["ai"])
-async def ai_price(symbol: str) -> PriceSnapshotResponse:
-    from chad.market_data.service import MarketDataError, MarketDataService  # local import to avoid cycles
-
-    service = MarketDataService()
-    try:
-        snap = service.get_price_snapshot(symbol)
-    except MarketDataError as exc:
-        LOGGER.exception("MarketDataError in /ai/price for symbol=%s: %s", symbol, exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"market_data_error: {exc}",
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Unexpected error in /ai/price for symbol=%s: %s", symbol, exc)
-        raise HTTPException(
-            status_code=500,
-            detail="market_data_unexpected_error",
-        ) from exc
-
-    return PriceSnapshotResponse(
-        symbol=snap.symbol,
-        asset_class=snap.asset_class,
-        price=snap.price,
-        change=snap.change,
-        percent_change=snap.percent_change,
-        as_of=snap.as_of,
-        source=snap.source,
-    )
-
-
-@app.post("/orders", include_in_schema=False)
-async def orders_disabled() -> None:
-    raise HTTPException(
-        status_code=403,
-        detail=(
-            "Order submission via HTTP is disabled in Phase 7. "
-            "CHAD is operating in DRY_RUN-only mode; live trading must be "
-            "explicitly enabled in a future phase with additional review."
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# AI / Research Endpoint (Phase-10 Global Intelligence Layer)
-# ---------------------------------------------------------------------------
-
-@app.post("/ai/research", response_model=ResearchScenario, tags=["ai"])
-async def ai_research(request: ResearchRequestInput) -> ResearchScenario:
-    return run_research_scenario_from_request(request)

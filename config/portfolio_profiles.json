@@ -1,11 +1,51 @@
 {
-  "schema_version": "portfolio_profiles.v1",
   "profiles": {
     "BALANCED": {
-      "description": "Default balanced profile. If explicit targets are empty, targets are derived deterministically from config/universe.json tickers (or plan tick_symbols fallback) with equal weights.",
+      "description": "Balanced profile with income sleeve contract enforced by engine.",
       "max_symbols": 25,
       "min_weight": 0.0,
       "targets": []
+    },
+    "BALANCED_TIGHT": {
+      "description": "Phase 12 drill profile (may still fail caps if active holdings are too concentrated).",
+      "max_symbols": 25,
+      "min_weight": 0.0,
+      "targets": []
+    },
+    "CAPS_PASS_DRILL": {
+      "description": "Phase 12 EXECUTE_SUCCESS drill: targets are intentionally close to current weights so caps can pass. NO income sleeve here (drill only).",
+      "income_meta": {
+        "enforced": false,
+        "income_min_weight": 0.0,
+        "income_symbols": [],
+        "rule": "disabled_for_phase12_drill",
+        "yield_status": "N/A"
+      },
+      "max_symbols": 10,
+      "min_weight": 0.0,
+      "targets": [
+        {
+          "symbol": "AAPL",
+          "weight": 0.609
+        },
+        {
+          "symbol": "MSFT",
+          "weight": 0.27
+        },
+        {
+          "symbol": "SPY",
+          "weight": 0.01
+        },
+        {
+          "symbol": "GLD",
+          "weight": 0.05
+        },
+        {
+          "symbol": "BIL",
+          "weight": 0.061
+        }
+      ]
     }
-  }
+  },
+  "schema_version": "portfolio_profiles.v1"
 }

@@ -1,0 +1,4 @@
+{
+  "schema_version": "data_sources.v1",
+  "notes": "Bootstrap config created for SSOT parity audit. Replace with production values after dedicated data sources contract audit."
+}

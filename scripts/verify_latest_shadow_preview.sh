@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "/home/ubuntu/CHAD FINALE"
+cd "/home/ubuntu/chad_finale"
 
 # Production-grade: avoid massive 'ls' expansions + handle race where JSON is mid-write.
 # We use find + sort, then retry JSON parse a few times.

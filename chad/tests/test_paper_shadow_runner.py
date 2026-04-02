@@ -40,10 +40,17 @@ def test_should_place_paper_orders_requires_arm(monkeypatch) -> None:
 
 def test_module_does_not_import_ib_insync_on_safe_paths(monkeypatch) -> None:
     """
-    Import safety: calling the gating functions should not import ib_insync.
-    (We import ib_insync lazily only inside preview pipeline builder, and
-    even that should not run during these gating tests.)
+    Import safety contract:
+    Calling the gating functions must not *cause* ib_insync to be imported.
+
+    Note: other tests may legitimately import ib_insync earlier in the same pytest process.
+    So we assert on the delta: the call must not introduce a new import.
     """
     monkeypatch.delenv(ARM_ENV_NAME, raising=False)
+
+    before = set(sys.modules.keys())
     _ = should_place_paper_orders(PaperShadowConfig(enabled=False))
-    assert "ib_insync" not in sys.modules
+    after = set(sys.modules.keys())
+
+    # The gating call must not be the reason ib_insync appears.
+    assert "ib_insync" not in (after - before)

@@ -35,12 +35,13 @@ from chad.portfolio.portfolio_engine import EnginePaths, PortfolioEngine
 # -----------------------------
 
 REPO_DIR = Path(os.environ.get("CHAD_REPO_DIR", "/home/ubuntu/chad_finale")).resolve()
-RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime")).resolve()
-CONFIG_DIR = Path(os.environ.get("CHAD_CONFIG_DIR", "/home/ubuntu/CHAD FINALE/config")).resolve()
+RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime")).resolve()
+CONFIG_DIR = Path(os.environ.get("CHAD_CONFIG_DIR", "/home/ubuntu/chad_finale/config")).resolve()
 
-REPORTS_DIR = Path(os.environ.get("CHAD_REPORTS_DIR", "/home/ubuntu/CHAD FINALE/reports")).resolve()
+REPORTS_DIR = Path(os.environ.get("CHAD_REPORTS_DIR", "/home/ubuntu/chad_finale/reports")).resolve()
 PORTFOLIOS_DIR = REPORTS_DIR / "portfolios"
 REBALANCE_DIR = REPORTS_DIR / "rebalance"
+PORTFOLIO_MEMOS_DIR = REPORTS_DIR / "portfolio_memos"
 
 PORTFOLIO_STATE_PATH = RUNTIME_DIR / "portfolio_state.json"
 
@@ -58,6 +59,21 @@ def utc_now_iso() -> str:
 
 def utc_now_compact() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+def _next_rebalance_ts_utc(now_epoch: float, cadence: str) -> str:
+    # Deterministic scheduler for next check; no external deps.
+    c = (cadence or "weekly").strip().lower()
+    if c in ("hourly", "1h"):
+        delta = 3600
+    elif c in ("daily", "1d"):
+        delta = 86400
+    elif c in ("monthly", "30d"):
+        delta = 30 * 86400
+    else:
+        # default weekly
+        delta = 7 * 86400
+    t = now_epoch + float(delta)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
 def sha256_hex(b: bytes) -> str:
@@ -100,7 +116,7 @@ def fail_closed_portfolio_state(ts: str, reason: str) -> Dict[str, Any]:
         "portfolio_target_id": None,
         "portfolio_target_hash": None,
         "drift": {"max_position_weight_drift": None, "total_turnover_needed": None},
-        "next_rebalance_check_ts_utc": None,
+        "next_rebalance_check_ts_utc": _next_rebalance_ts_utc(time.time(), os.environ.get("CHAD_PORTFOLIO_REBALANCE_CADENCE", "weekly")),
         "notes": reason,
     }
 
@@ -120,6 +136,7 @@ def main() -> int:
 
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
     REBALANCE_DIR.mkdir(parents=True, exist_ok=True)
+    PORTFOLIO_MEMOS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Force engine paths deterministically
     os.environ["CHAD_REPO_DIR"] = str(REPO_DIR)
@@ -156,6 +173,29 @@ def main() -> int:
         reb_path = REBALANCE_DIR / f"REBALANCE_{PROFILE}_{ts_compact}.json"
         atomic_write_json(reb_path, reb_payload)
 
+        # 2b) portfolio memo artifact (deterministic, no GPT required)
+        memo_path = PORTFOLIO_MEMOS_DIR / f"MEMO_{PROFILE}_{ts_compact}.md"
+        memo = []
+        memo.append(f"# CHAD Portfolio Memo — {PROFILE}\n")
+        memo.append(f"Generated (UTC): {ts}\n")
+        memo.append(f"PortfolioTarget: {target_id}\n")
+        memo.append(f"Target hash: sha256:{target_hash}\n")
+        memo.append("\n## Summary\n")
+        memo.append(f"This is a PROPOSE_ONLY portfolio + rebalance snapshot. No broker calls.\n")
+        memo.append(f"Targets symbols: {len(targets_payload.get('targets') or [])}\n")
+        memo.append(f"Rebalance diffs: {len(reb_payload.get('diffs') or [])}\n")
+        memo.append("\n## Notes\n")
+        memo.append("- This memo is deterministic and safe to generate without GPT.\n")
+        memo.append("- Income constraint enforcement is handled by the Portfolio Profile + Engine logic.\n")
+        memo_data = "".join(memo)
+        tmp = memo_path.with_suffix(memo_path.suffix + f".tmp.{os.getpid()}")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(memo_data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, memo_path)
+
+
         # Drift summary
         diffs = reb_payload.get("diffs") or []
         max_abs = 0.0
@@ -184,10 +224,11 @@ def main() -> int:
                 "max_position_weight_drift": round(max_abs, 6),
                 "total_turnover_needed": round(total_turnover, 6),
             },
-            "next_rebalance_check_ts_utc": None,
+            "next_rebalance_check_ts_utc": _next_rebalance_ts_utc(time.time(), os.environ.get("CHAD_PORTFOLIO_REBALANCE_CADENCE", "weekly")),
             "artifacts": {
                 "portfolio_target_path": str(target_path),
                 "rebalance_plan_path": str(reb_path),
+                "portfolio_memo_path": str(memo_path),
             },
             "notes": "propose_only_artifacts_written; no broker calls",
         }
@@ -198,6 +239,7 @@ def main() -> int:
             "profile": PROFILE,
             "portfolio_target_path": str(target_path),
             "rebalance_plan_path": str(reb_path),
+                "portfolio_memo_path": str(memo_path),
             "portfolio_state_path": str(PORTFOLIO_STATE_PATH),
             "ts_utc": ts,
         }, sort_keys=True))

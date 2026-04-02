@@ -16,7 +16,7 @@ from chad.execution.exit_only_executor import (
 )
 
 LIVEGATE_URL = os.getenv("CHAD_LIVEGATE_URL", "http://127.0.0.1:9618/live-gate").strip()
-RUNTIME = Path("/home/ubuntu/CHAD FINALE/runtime")
+RUNTIME = Path("/home/ubuntu/chad_finale/runtime")
 POS_SNAPSHOT_PATH = Path(os.getenv("CHAD_POSITIONS_SNAPSHOT", str(RUNTIME / "positions_snapshot.json")))
 
 

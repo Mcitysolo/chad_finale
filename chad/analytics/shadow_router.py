@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from chad.analytics.shadow_confidence_router import ShadowState, ConfidenceState
+from chad.analytics.shadow_confidence_router import ShadowState
 
 
 @dataclass(frozen=True)
@@ -97,7 +97,7 @@ class RoutingSummary:
     total: int
     live_allowed: int
     live_blocked: int
-    state: ConfidenceState
+    state: str
     sizing_factor: float
     paper_only: bool
     reasons: List[str] = field(default_factory=list)

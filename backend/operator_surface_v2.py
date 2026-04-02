@@ -200,7 +200,7 @@ class OperatorConfig:
 
 def default_config() -> OperatorConfig:
     repo_dir = Path(os.environ.get("CHAD_REPO_DIR", "/home/ubuntu/chad_finale"))
-    ssot_runtime_dir = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime"))
+    ssot_runtime_dir = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime"))
     return OperatorConfig(
         repo_dir=repo_dir,
         ssot_runtime_dir=ssot_runtime_dir,

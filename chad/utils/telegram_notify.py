@@ -197,9 +197,16 @@ def notify(
         "error": "🚨",
     }.get(sev, "ℹ️")
 
-    text = f"{prefix} CHAD {sev.upper()}: {str(message).strip()}"
-    if not text.strip():
+    raw_message = str(message).strip()
+    if not raw_message:
         return False
+
+    # Preserve already-formatted operator-facing messages as-is.
+    # Example: "ℹ️ CHAD Daily Update"
+    if raw_message.startswith(("ℹ️", "⚠️", "🚨")):
+        text = raw_message
+    else:
+        text = f"{prefix} CHAD {sev.upper()}: {raw_message}"
 
     if dedupe_key:
         if not _dedupe_allows(cfg, dedupe_key):

@@ -2,36 +2,32 @@
 """
 chad/ops/metrics_server.py
 
-CHAD Prometheus Metrics Server (Phase 9A)
+CHAD Metrics Server — Production-Grade Prometheus Exporter (Phase 6/7/11)
 
-Production goals (non-negotiable)
-- Serve Prometheus metrics on /metrics (default :9620).
-- Serve a fast health endpoint on /healthz (200 OK) for uptime probes.
-- Read-only observability: NEVER places orders, NEVER modifies trading config/state.
-- Fail-safe: /metrics must keep working even if runtime JSON is missing/corrupt,
-  ledgers contain bad rows (NaN/Inf), or optional imports fail.
-- Deterministic output: stable metric names + labels + HELP/TYPE lines.
+Serves:
+  - /metrics (Prometheus text format 0.0.4)
+  - /health
 
-Endpoints
-- /metrics   Prometheus text format (version=0.0.4)
-- /healthz   200 OK "ok\n" (liveness)
-- /health    alias of /healthz
-- /-/ready   200 if metrics can be generated now, else 503 (best-effort readiness)
+Computes paper performance rollups from append-only ledgers:
+  - data/trades/trade_history_YYYYMMDD.ndjson
 
-Config (env)
-- CHAD_METRICS_HOST (default 0.0.0.0)
-- CHAD_METRICS_PORT (default 9620)
-- CHAD_METRICS_CACHE_TTL_SECONDS (default 5.0)
-- CHAD_ROLLUP_DAYS_BACK (default 30)
-- CHAD_ROLLUP_MAX_TRADES (default 5000)
+LEAN set (SCR-aligned):
+  - excludes paper_sim artifacts
+  - excludes live trades (is_live=True)
+  - excludes non-finite pnl
+  - excludes untrusted pnl rows ("pnl_untrusted" tags/flags)
+  - excludes legacy alpha_crypto rows with pnl==0.0 (treated as unknown realized outcome)
 
-Data sources (best-effort)
-- data/trades/trade_history_YYYYMMDD.ndjson  (paper trade outcomes)
-- runtime/ibkr_status.json                   (IBKR watchdog)
-- runtime/ibkr_paper_ledger.json             (paper ledger enabled flag)
-- runtime/scr_stats.json                     (SCR trade stats and exclusions)
+Why exclude alpha_crypto pnl==0.0?
+  Historically, Kraken/crypto logging produced many rows with pnl=0.0 without
+  realized outcome calculation. Treating these as trusted destroys win_rate.
+  Until real PnL enrichment exists, we mark them untrusted for metrics.
 
-This file is intentionally stdlib-only.
+Test/compat requirements:
+  - MetricLine
+  - _escape_label
+  - _normalize_trade_record
+  - _paper_rollup_metrics returns List[MetricLine]
 """
 
 from __future__ import annotations
@@ -39,67 +35,33 @@ from __future__ import annotations
 import json
 import math
 import os
-import signal
-import sys
-import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-# -----------------------------
-# Constants / Paths
-# -----------------------------
-
-ROOT: Path = Path(__file__).resolve().parents[2]
-DATA_TRADES: Path = ROOT / "data" / "trades"
-RUNTIME_DIR: Path = ROOT / "runtime"
-
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 9620
-
-ROLLUP_DAYS_BACK_DEFAULT = 30
-ROLLUP_MAX_TRADES_DEFAULT = 5000
-CACHE_TTL_SECONDS_DEFAULT = 5.0
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 # -----------------------------
-# Env helpers
+# Paths / Defaults
 # -----------------------------
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_TRADES = REPO_ROOT / "data" / "trades"
+RUNTIME_DIR = REPO_ROOT / "runtime"
+RUNTIME_SCR_PATH = RUNTIME_DIR / "scr_state.json"
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        v = int(str(raw).strip())
-        return v if v > 0 else default
-    except Exception:
-        return default
+DEFAULT_HOST = os.environ.get("CHAD_METRICS_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.environ.get("CHAD_METRICS_PORT", "9620"))
+DEFAULT_DAYS_BACK = int(os.environ.get("CHAD_METRICS_DAYS_BACK", "7"))
+DEFAULT_MAX_TRADES = int(os.environ.get("CHAD_METRICS_MAX_TRADES", "5000"))
 
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        v = float(str(raw).strip())
-        return v if math.isfinite(v) and v > 0 else default
-    except Exception:
-        return default
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+TRADE_FILE_GLOB = "trade_history_*.ndjson"
 
 
 # -----------------------------
-# Metric formatting
+# Prometheus primitives
 # -----------------------------
-
 
 @dataclass(frozen=True)
 class MetricLine:
@@ -123,16 +85,15 @@ def _finite_or_zero(x: float) -> float:
 
 
 # -----------------------------
-# JSON / parsing helpers
+# JSON helpers
 # -----------------------------
 
-
 def _safe_json_loads(line: str) -> Optional[Dict[str, Any]]:
-    line = line.strip()
-    if not line:
+    s = line.strip()
+    if not s:
         return None
     try:
-        obj = json.loads(line)
+        obj = json.loads(s)
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
@@ -150,73 +111,154 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
 
 def _coerce_float(v: Any, default: float = 0.0) -> float:
     try:
-        x = float(v)
-        return x
+        return float(v)
     except Exception:
         return default
 
 
 # -----------------------------
-# Trade rollups (paper)
+# Trade normalization (compat)
 # -----------------------------
+
+def _normalize_trade_record(rec: dict) -> dict | None:
+    """
+    Normalize a trade ledger envelope into a metrics-friendly payload record.
+
+    Contract:
+      - Return None for paper_sim-tagged records.
+      - Return None if payload missing/invalid.
+      - Otherwise return payload dict.
+    """
+    try:
+        payload = rec.get("payload") if isinstance(rec, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        tags = payload.get("tags", [])
+        if isinstance(tags, list) and any(str(x).lower() == "paper_sim" for x in tags):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _is_live_trade(payload: Dict[str, Any]) -> bool:
+    return payload.get("is_live") is True
+
+
+def _is_untrusted_pnl(payload: Dict[str, Any]) -> bool:
+    """
+    True if payload should be excluded from LEAN performance stats.
+    """
+    try:
+        # Tag/flag-based untrusted
+        tags = payload.get("tags") or []
+        tagged = isinstance(tags, list) and any(str(x).lower() == "pnl_untrusted" for x in tags)
+        flagged = bool(payload.get("pnl_untrusted", False))
+        extra = payload.get("extra") or {}
+        extra_flag = isinstance(extra, dict) and extra.get("pnl_untrusted") is True
+        if tagged or flagged or extra_flag:
+            return True
+
+        # Backward-compat safety: legacy alpha_crypto rows logged with pnl=0.0 represent unknown realized outcomes.
+        strat = str(payload.get("strategy", "")).strip().lower()
+        if strat == "alpha_crypto":
+            try:
+                pnl = float(payload.get("pnl", 0.0))
+            except Exception:
+                pnl = 0.0
+            if pnl == 0.0:
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
+def _extract_strategy(payload: Dict[str, Any]) -> str:
+    s = payload.get("strategy")
+    if isinstance(s, str) and s.strip():
+        return s.strip().lower()
+    return "unknown"
+
+
+def _extract_pnl(payload: Dict[str, Any]) -> Optional[float]:
+    try:
+        return float(payload.get("pnl", 0.0))
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Paper trade loading
+# -----------------------------
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _iter_trade_files(days_back: int) -> List[Path]:
-    """
-    Return newest-first list of trade_history_YYYYMMDD.ndjson files within days_back window.
-    """
     if not DATA_TRADES.exists():
         return []
-    files = sorted(DATA_TRADES.glob("trade_history_*.ndjson"), reverse=True)
+    files = sorted(DATA_TRADES.glob(TRADE_FILE_GLOB), reverse=True)
     if not files:
         return []
     cutoff = _utc_now().date()
     keep: List[Path] = []
     for f in files:
-        name = f.name
         try:
-            ymd = name.split("_", 2)[2].split(".", 1)[0]
+            ymd = f.name.split("_", 2)[2].split(".", 1)[0]
             dt = datetime.strptime(ymd, "%Y%m%d").date()
             delta = (cutoff - dt).days
             if 0 <= delta <= max(days_back, 0):
                 keep.append(f)
         except Exception:
-            # Defensive: if filename doesn't parse, keep it.
             keep.append(f)
     return keep
 
 
-def _load_recent_paper_trades(*, days_back: int, max_trades: int) -> List[Dict[str, Any]]:
-    """
-    Load paper trade payloads from newest files first. Returns list of payload dicts.
-    This intentionally accepts imperfect records and filters later.
-    """
+def load_recent_paper_trades(
+    *,
+    days_back: int,
+    max_trades: int,
+    trades_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    for f in _iter_trade_files(days_back):
+    root = trades_dir if trades_dir is not None else DATA_TRADES
+    if not root.exists():
+        return out
+
+    files = sorted(root.glob(TRADE_FILE_GLOB), reverse=True) if trades_dir is not None else _iter_trade_files(days_back)
+
+    for f in files:
         try:
             lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             continue
-        # We read from top to bottom; order doesn't matter for rollup totals.
+
         for line in lines:
             rec = _safe_json_loads(line)
             if not rec:
                 continue
-            payload = rec.get("payload") or {}
-            if not isinstance(payload, dict):
+
+            payload = _normalize_trade_record(rec)
+            if payload is None:
                 continue
-            # Paper-only: best-effort check. Many CHAD logs use is_live or live flags.
-            is_live = payload.get("is_live")
-            if is_live is True:
+
+            if _is_live_trade(payload):
                 continue
+
             out.append(payload)
             if len(out) >= max_trades:
                 return out
+
     return out
 
 
+# -----------------------------
+# Performance math
+# -----------------------------
+
 def _compute_sharpe_like(pnls: List[float]) -> float:
-    # Simple, stable: mean / stddev (population). No annualization; this is "sharpe-like".
     if not pnls:
         return 0.0
     mu = sum(pnls) / float(len(pnls))
@@ -228,7 +270,6 @@ def _compute_sharpe_like(pnls: List[float]) -> float:
 
 
 def _compute_max_drawdown(pnls: List[float]) -> float:
-    # Max peak-to-trough on cumulative pnl.
     if not pnls:
         return 0.0
     peak = 0.0
@@ -244,354 +285,214 @@ def _compute_max_drawdown(pnls: List[float]) -> float:
     return float(max_dd)
 
 
-def _paper_rollup_metrics(*, days_back: int, max_trades: int) -> List[MetricLine]:
-    now_dt = _utc_now()
-    trades_raw = _load_recent_paper_trades(days_back=days_back, max_trades=max_trades)
+# -----------------------------
+# Rollups (tests rely on this)
+# -----------------------------
 
-    # RAW: all parsed records (may include NaN/Inf pnl rows).
+def _paper_rollup_metrics(
+    trades_dir: Path | None = None,
+    *,
+    days_back: int = DEFAULT_DAYS_BACK,
+    max_trades: int = DEFAULT_MAX_TRADES,
+) -> List[MetricLine]:
+    """
+    Return MetricLine list for paper rollups (tests rely on this).
+
+    LEAN set == finite pnl AND trusted pnl.
+    """
+    trades_raw = load_recent_paper_trades(days_back=days_back, max_trades=max_trades, trades_dir=trades_dir)
+
     total_trades_raw = float(len(trades_raw))
+    untrusted_count = float(sum(1.0 for t in trades_raw if _is_untrusted_pnl(t)))
 
-    # Extract PnL list (best-effort); keep parallel indexing with trades_raw.
-    raw_pnls: List[float] = []
+    pnls: List[float] = []
+    pnl_nonfinite_count = 0.0
+
     for t in trades_raw:
-        try:
-            raw_pnls.append(float(t.get("pnl", 0.0)))
-        except Exception:
-            raw_pnls.append(float("nan"))
+        if _is_untrusted_pnl(t):
+            continue
+        pnl = _extract_pnl(t)
+        if pnl is None or not math.isfinite(pnl):
+            pnl_nonfinite_count += 1.0
+            continue
+        pnls.append(float(pnl))
 
-    pnl_series: List[float] = [p for p in raw_pnls if math.isfinite(p)]
-    pnl_nonfinite_count = float(len(raw_pnls) - len(pnl_series))
-
-    finite_trades: List[Dict[str, Any]] = [t for (t, p) in zip(trades_raw, raw_pnls) if math.isfinite(p)]
-
-    # LEAN: finite-PnL only (align with SCR).
-    total_trades = float(len(pnl_series))
-    winners = float(sum(1 for p in pnl_series if p > 0.0))
-    losers = float(sum(1 for p in pnl_series if p < 0.0))
+    total_trades = float(len(pnls))
+    winners = float(sum(1 for p in pnls if p > 0.0))
+    losers = float(sum(1 for p in pnls if p < 0.0))
     win_rate = float(winners / total_trades) if total_trades > 0 else 0.0
-
-    total_pnl = float(sum(pnl_series)) if pnl_series else 0.0
-    sharpe_like = _compute_sharpe_like(pnl_series)
-    max_dd = _compute_max_drawdown(pnl_series)
-
-    # Notional and untrusted counts computed on the LEAN set.
-    total_notional = 0.0
-    untrusted_count = 0.0
-    for t in finite_trades:
-        try:
-            n = float(t.get("notional", 0.0))
-        except Exception:
-            n = 0.0
-        if math.isfinite(n):
-            total_notional += n
-
-        # "pnl_untrusted" can be in tags or boolean flag.
-        tags = t.get("tags") or []
-        tagged = isinstance(tags, list) and any(str(x).lower() == "pnl_untrusted" for x in tags)
-        flagged = bool(t.get("pnl_untrusted", False))
-        if tagged or flagged:
-            untrusted_count += 1.0
+    total_pnl = float(sum(pnls)) if pnls else 0.0
+    avg_pnl = float(total_pnl / total_trades) if total_trades > 0 else 0.0
 
     lines: List[MetricLine] = []
     lines.append(MetricLine("chad_paper_trades_total_raw", {}, _finite_or_zero(total_trades_raw)))
     lines.append(MetricLine("chad_paper_trades_total", {}, _finite_or_zero(total_trades)))
     lines.append(MetricLine("chad_paper_pnl_nonfinite_count", {}, _finite_or_zero(pnl_nonfinite_count)))
-
+    lines.append(MetricLine("chad_paper_pnl_untrusted_count", {}, _finite_or_zero(untrusted_count)))
     lines.append(MetricLine("chad_paper_win_rate", {}, _finite_or_zero(win_rate)))
     lines.append(MetricLine("chad_paper_total_pnl", {}, _finite_or_zero(total_pnl)))
-    lines.append(MetricLine("chad_paper_sharpe_like", {}, _finite_or_zero(sharpe_like)))
-    lines.append(MetricLine("chad_paper_max_drawdown", {}, _finite_or_zero(max_dd)))
-    lines.append(MetricLine("chad_paper_total_notional", {}, _finite_or_zero(total_notional)))
-    lines.append(MetricLine("chad_paper_pnl_untrusted_count", {}, _finite_or_zero(untrusted_count)))
+    lines.append(MetricLine("chad_paper_avg_pnl", {}, _finite_or_zero(avg_pnl)))
+    lines.append(MetricLine("chad_paper_sharpe_like", {}, _finite_or_zero(_compute_sharpe_like(pnls))))
+    lines.append(MetricLine("chad_paper_max_drawdown", {}, _finite_or_zero(_compute_max_drawdown(pnls))))
     lines.append(MetricLine("chad_paper_winners", {}, _finite_or_zero(winners)))
     lines.append(MetricLine("chad_paper_losers", {}, _finite_or_zero(losers)))
+    return lines
 
-    # Per-strategy rollups (LEAN set)
-    by_strategy_total: Dict[str, int] = {}
-    by_strategy_pnls: Dict[str, List[float]] = {}
-    for t, p in zip(trades_raw, raw_pnls):
-        if not math.isfinite(p):
+
+def _paper_strategy_lines(trades: List[Dict[str, Any]]) -> List[MetricLine]:
+    buckets: Dict[str, List[float]] = {}
+    for t in trades:
+        if _is_untrusted_pnl(t):
             continue
-        strat = str(t.get("strategy", "")).strip().lower() or "unknown"
-        by_strategy_total[strat] = by_strategy_total.get(strat, 0) + 1
-        by_strategy_pnls.setdefault(strat, []).append(float(p))
+        pnl = _extract_pnl(t)
+        if pnl is None or not math.isfinite(pnl):
+            continue
+        strat = _extract_strategy(t)
+        buckets.setdefault(strat, []).append(float(pnl))
 
-    for strat in sorted(by_strategy_total.keys()):
-        pnls = by_strategy_pnls.get(strat, [])
-        st_total = float(by_strategy_total[strat])
-        st_total_pnl = float(sum(pnls)) if pnls else 0.0
-        st_winners = float(sum(1 for x in pnls if x > 0.0))
-        st_win_rate = float(st_winners / st_total) if st_total > 0 else 0.0
-        lines.append(MetricLine("chad_paper_strategy_trades_total", {"strategy": strat}, _finite_or_zero(st_total)))
-        lines.append(MetricLine("chad_paper_strategy_total_pnl", {"strategy": strat}, _finite_or_zero(st_total_pnl)))
-        lines.append(MetricLine("chad_paper_strategy_win_rate", {"strategy": strat}, _finite_or_zero(st_win_rate)))
-
-    return lines
-
-
-# -----------------------------
-# IBKR runtime helpers
-# -----------------------------
-
-
-def _ibkr_status_metrics(now: datetime) -> List[MetricLine]:
-    """
-    Reads runtime/ibkr_status.json if present.
-    Expected shape (best-effort):
-      ok: bool
-      consecutive_failures: int
-      last_ok_at: unix ts (float)
-    """
     lines: List[MetricLine] = []
-    st = _read_json_file(RUNTIME_DIR / "ibkr_status.json") or {}
+    for strat, pnls in sorted(buckets.items()):
+        total = float(len(pnls))
+        wins = float(sum(1 for p in pnls if p > 0.0))
+        win_rate = float(wins / total) if total > 0 else 0.0
+        total_pnl = float(sum(pnls)) if pnls else 0.0
 
-    ok = 1.0 if bool(st.get("ok", False)) else 0.0
-    failures = float(_coerce_float(st.get("consecutive_failures", 0), 0.0))
+        lines.append(MetricLine("chad_paper_strategy_trades_total", {"strategy": strat}, _finite_or_zero(total)))
+        lines.append(MetricLine("chad_paper_strategy_total_pnl", {"strategy": strat}, _finite_or_zero(total_pnl)))
+        lines.append(MetricLine("chad_paper_strategy_win_rate", {"strategy": strat}, _finite_or_zero(win_rate)))
 
-    last_ok_at = st.get("last_ok_at")
-    age = -1.0
-    try:
-        if last_ok_at is not None:
-            ts = float(last_ok_at)
-            if math.isfinite(ts) and ts > 0:
-                age = max(0.0, now.timestamp() - ts)
-    except Exception:
-        age = -1.0
-
-    lines.append(MetricLine("chad_ibkr_ok", {}, _finite_or_zero(ok)))
-    lines.append(MetricLine("chad_ibkr_consecutive_failures", {}, _finite_or_zero(failures)))
-    lines.append(MetricLine("chad_ibkr_last_ok_age_seconds", {}, _finite_or_zero(age)))
     return lines
 
 
-def _ibkr_paper_ledger_enabled() -> float:
-    cfg = _read_json_file(RUNTIME_DIR / "ibkr_paper_ledger.json") or {}
-    return 1.0 if bool(cfg.get("enabled", False)) else 0.0
+# -----------------------------
+# SCR snapshot (best-effort)
+# -----------------------------
+
+def _load_scr_snapshot() -> Dict[str, Any]:
+    obj = _read_json_file(RUNTIME_SCR_PATH)
+    return obj if isinstance(obj, dict) else {}
+
+
+def _scr_lines() -> List[MetricLine]:
+    scr = _load_scr_snapshot()
+    stats = scr.get("stats") if isinstance(scr.get("stats"), dict) else {}
+    if not isinstance(stats, dict):
+        stats = {}
+
+    effective = float(_coerce_float(stats.get("effective_trades", 0), 0.0))
+    excluded_manual = float(_coerce_float(stats.get("excluded_manual", 0), 0.0))
+    excluded_untrusted = float(_coerce_float(stats.get("excluded_untrusted", 0), 0.0))
+    excluded_nonfinite = float(_coerce_float(stats.get("excluded_nonfinite", 0), 0.0))
+
+    state = str(scr.get("state", "UNKNOWN")).upper()
+    paper_only = bool(scr.get("paper_only", True))
+    sizing_factor = float(_coerce_float(scr.get("sizing_factor", 0.0), 0.0))
+
+    out: List[MetricLine] = []
+    out.append(MetricLine("chad_scr_effective_trades", {}, _finite_or_zero(effective)))
+    out.append(MetricLine("chad_scr_excluded_manual", {}, _finite_or_zero(excluded_manual)))
+    out.append(MetricLine("chad_scr_excluded_untrusted", {}, _finite_or_zero(excluded_untrusted)))
+    out.append(MetricLine("chad_scr_excluded_nonfinite", {}, _finite_or_zero(excluded_nonfinite)))
+    out.append(MetricLine("chad_scr_sizing_factor", {}, _finite_or_zero(sizing_factor)))
+    out.append(MetricLine("chad_scr_paper_only", {}, 1.0 if paper_only else 0.0))
+
+    for st in ("WARMUP", "CAUTIOUS", "CONFIDENT", "PAUSED", "UNKNOWN"):
+        out.append(MetricLine("chad_scr_state", {"state": st}, 1.0 if state == st else 0.0))
+
+    return out
 
 
 # -----------------------------
-# SCR helpers (best-effort)
+# Rendering
 # -----------------------------
-
-
-def _load_scr_stats() -> Dict[str, Any]:
-    # Prefer runtime/scr_stats.json if available, else fall back to empty dict.
-    return _read_json_file(RUNTIME_DIR / "scr_stats.json") or {}
-
-
-def _load_scr_state(scr_stats: Dict[str, Any]) -> Tuple[str, float, bool]:
-    """
-    Evaluate SCR band from stats using shadow_confidence_router (if available).
-    Returns (state, sizing_factor, paper_only). Best-effort; never raises.
-    """
-    try:
-        from chad.analytics.shadow_confidence_router import evaluate_confidence  # local import
-
-        shadow = evaluate_confidence(scr_stats)
-        return str(shadow.state), float(shadow.sizing_factor), bool(shadow.paper_only)
-    except Exception:
-        return "UNKNOWN", 0.0, True
-
-
-# -----------------------------
-# Metrics snapshot + caching
-# -----------------------------
-
-
-@dataclass(frozen=True)
-class MetricsSnapshot:
-    generated_at_utc: str
-    body: str
-
-
-class MetricsCache:
-    def __init__(self, ttl_seconds: float) -> None:
-        self._ttl = float(ttl_seconds)
-        self._lock = threading.Lock()
-        self._last_ts = 0.0
-        self._last: Optional[MetricsSnapshot] = None
-
-    def get_or_compute(self) -> MetricsSnapshot:
-        now = time.time()
-        with self._lock:
-            if self._last is not None and (now - self._last_ts) <= self._ttl:
-                return self._last
-
-        snap = _compute_metrics_snapshot()
-
-        with self._lock:
-            self._last_ts = time.time()
-            self._last = snap
-            return snap
-
-
-_CACHE = MetricsCache(ttl_seconds=_env_float("CHAD_METRICS_CACHE_TTL_SECONDS", CACHE_TTL_SECONDS_DEFAULT))
-
 
 def _render_prometheus(metrics: Iterable[MetricLine]) -> str:
-    # Minimal stable HELP/TYPE lines for core metrics, plus dynamic per-strategy.
     lines: List[str] = []
 
-    def ht(help_line: str, typ: str) -> None:
+    def ht(help_line: str, type_line: str) -> None:
         lines.append(help_line)
-        lines.append(typ)
+        lines.append(type_line)
 
     ht("# HELP chad_metrics_server_up Metrics server is running (1).", "# TYPE chad_metrics_server_up gauge")
-    ht("# HELP chad_metrics_generated_at_unix UNIX timestamp when metrics were generated.", "# TYPE chad_metrics_generated_at_unix gauge")
+    ht("# HELP chad_metrics_generated_at_unix Generation timestamp (unix).", "# TYPE chad_metrics_generated_at_unix gauge")
 
-    ht("# HELP chad_ibkr_paper_ledger_enabled 1 if ibkr_paper_ledger.json enabled is true.", "# TYPE chad_ibkr_paper_ledger_enabled gauge")
-    ht("# HELP chad_ibkr_ok 1 if IBKR watchdog ok==true.", "# TYPE chad_ibkr_ok gauge")
-    ht("# HELP chad_ibkr_consecutive_failures Consecutive IBKR failures.", "# TYPE chad_ibkr_consecutive_failures gauge")
-    ht("# HELP chad_ibkr_last_ok_age_seconds Seconds since last_ok_at (or -1 if unknown).", "# TYPE chad_ibkr_last_ok_age_seconds gauge")
+    ht("# HELP chad_paper_trades_total Paper trades in LEAN set (finite + trusted).", "# TYPE chad_paper_trades_total gauge")
+    ht("# HELP chad_paper_win_rate Win rate in LEAN set.", "# TYPE chad_paper_win_rate gauge")
+    ht("# HELP chad_paper_sharpe_like Mean/Std on LEAN pnl series.", "# TYPE chad_paper_sharpe_like gauge")
+    ht("# HELP chad_paper_pnl_untrusted_count Trades flagged pnl_untrusted (excluded from LEAN).", "# TYPE chad_paper_pnl_untrusted_count gauge")
 
-    ht("# HELP chad_paper_trades_total_raw Paper trades parsed in rollup window (RAW).", "# TYPE chad_paper_trades_total_raw gauge")
-    ht("# HELP chad_paper_trades_total Paper trades with finite PnL only (LEAN, aligns with SCR).", "# TYPE chad_paper_trades_total gauge")
-    ht("# HELP chad_paper_pnl_nonfinite_count Count of paper trades excluded due to non-finite PnL.", "# TYPE chad_paper_pnl_nonfinite_count gauge")
-
-    ht("# HELP chad_scr_effective_trades Count of trades included for SCR performance metrics.", "# TYPE chad_scr_effective_trades gauge")
-    ht("# HELP chad_scr_excluded_manual Count of trades excluded manually by operator.", "# TYPE chad_scr_excluded_manual gauge")
-    ht("# HELP chad_scr_excluded_untrusted Count of trades excluded due to untrusted PnL tags.", "# TYPE chad_scr_excluded_untrusted gauge")
-    ht("# HELP chad_scr_excluded_nonfinite Count of trades excluded due to non-finite PnL.", "# TYPE chad_scr_excluded_nonfinite gauge")
-    ht("# HELP chad_scr_sizing_factor SCR sizing factor (0..1).", "# TYPE chad_scr_sizing_factor gauge")
-    ht("# HELP chad_scr_paper_only 1 if SCR is paper-only.", "# TYPE chad_scr_paper_only gauge")
+    ht("# HELP chad_scr_effective_trades Trades included for SCR performance metrics.", "# TYPE chad_scr_effective_trades gauge")
     ht("# HELP chad_scr_state One-hot SCR state label.", "# TYPE chad_scr_state gauge")
 
-    # Strategy rollups are dynamic; HELP/TYPE lines once.
-    ht("# HELP chad_paper_strategy_trades_total Per-strategy paper trades (LEAN).", "# TYPE chad_paper_strategy_trades_total gauge")
-    ht("# HELP chad_paper_strategy_total_pnl Per-strategy total PnL (LEAN).", "# TYPE chad_paper_strategy_total_pnl gauge")
-    ht("# HELP chad_paper_strategy_win_rate Per-strategy win rate (LEAN).", "# TYPE chad_paper_strategy_win_rate gauge")
+    now_dt = _utc_now()
+    base = [
+        MetricLine("chad_metrics_server_up", {}, 1.0),
+        MetricLine("chad_metrics_generated_at_unix", {}, float(now_dt.timestamp())),
+    ]
 
-    # Render metric lines
+    rendered: List[str] = []
+    for m in base:
+        rendered.append(m.render())
     for m in metrics:
-        v = _finite_or_zero(float(m.value))
-        lines.append(MetricLine(m.name, m.labels, v).render())
+        rendered.append(m.render())
 
+    rendered = sorted(rendered)
+    lines.extend(rendered)
     return "\n".join(lines) + "\n"
 
 
-def _compute_metrics_snapshot() -> MetricsSnapshot:
-    now_dt = _utc_now()
-
-    days_back = _env_int("CHAD_ROLLUP_DAYS_BACK", ROLLUP_DAYS_BACK_DEFAULT)
-    max_trades = _env_int("CHAD_ROLLUP_MAX_TRADES", ROLLUP_MAX_TRADES_DEFAULT)
-
+def collect_metrics(*, days_back: int, max_trades: int) -> List[MetricLine]:
     out: List[MetricLine] = []
-    out.append(MetricLine("chad_metrics_server_up", {}, 1.0))
-    out.append(MetricLine("chad_metrics_generated_at_unix", {}, float(now_dt.timestamp())))
-
-    out.append(MetricLine("chad_ibkr_paper_ledger_enabled", {}, float(_ibkr_paper_ledger_enabled())))
-    out.extend(_ibkr_status_metrics(now_dt))
-
-    out.extend(_paper_rollup_metrics(days_back=days_back, max_trades=max_trades))
-
-    # SCR trade counters + state (best-effort)
-    scr = _load_scr_stats()
-    out.append(MetricLine("chad_scr_effective_trades", {}, float(_coerce_float(scr.get("effective_trades", 0), 0.0))))
-    out.append(MetricLine("chad_scr_excluded_manual", {}, float(_coerce_float(scr.get("excluded_manual", 0), 0.0))))
-    out.append(MetricLine("chad_scr_excluded_untrusted", {}, float(_coerce_float(scr.get("excluded_untrusted", 0), 0.0))))
-    out.append(MetricLine("chad_scr_excluded_nonfinite", {}, float(_coerce_float(scr.get("excluded_nonfinite", 0), 0.0))))
-
-    scr_state, scr_sizing, scr_paper_only = _load_scr_state(scr)
-    out.append(MetricLine("chad_scr_sizing_factor", {}, _finite_or_zero(float(scr_sizing))))
-    out.append(MetricLine("chad_scr_paper_only", {}, 1.0 if bool(scr_paper_only) else 0.0))
-    for st in ("WARMUP", "CAUTIOUS", "CONFIDENT", "PAUSED", "UNKNOWN"):
-        out.append(MetricLine("chad_scr_state", {"state": st}, 1.0 if scr_state.upper() == st else 0.0))
-
-    body = _render_prometheus(out)
-    return MetricsSnapshot(generated_at_utc=now_dt.isoformat(), body=body)
+    out.extend(_paper_rollup_metrics(None, days_back=days_back, max_trades=max_trades))
+    trades_raw = load_recent_paper_trades(days_back=days_back, max_trades=max_trades, trades_dir=None)
+    out.extend(_paper_strategy_lines(trades_raw))
+    out.extend(_scr_lines())
+    return out
 
 
 # -----------------------------
 # HTTP server
 # -----------------------------
 
+class MetricsHandler(BaseHTTPRequestHandler):
+    server_version = "CHADMetrics/1.0"
 
-class _Handler(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: str, content_type: str = "text/plain; version=0.0.4") -> None:
+        b = body.encode("utf-8", errors="replace")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
     def do_GET(self) -> None:  # noqa: N802
         try:
-            # Liveness
-            if self.path == "/healthz" or self.path.startswith("/healthz?") or self.path == "/health" or self.path.startswith("/health?") or self.path == "/":
-                self._send(200, b"ok\n", content_type="text/plain; charset=utf-8")
+            if self.path == "/health":
+                self._send(200, "ok\n", "text/plain")
                 return
-
-            # Readiness (best-effort): can we compute metrics right now?
-            if self.path == "/-/ready" or self.path.startswith("/-/ready?"):
-                try:
-                    _ = _CACHE.get_or_compute()
-                    self._send(200, b"ready\n", content_type="text/plain; charset=utf-8")
-                except Exception:
-                    self._send(503, b"not ready\n", content_type="text/plain; charset=utf-8")
-                return
-
-            # Metrics
             if self.path.startswith("/metrics"):
-                snap = _CACHE.get_or_compute()
-                self._send(
-                    200,
-                    snap.body.encode("utf-8"),
-                    content_type="text/plain; version=0.0.4; charset=utf-8",
-                )
+                metrics = collect_metrics(days_back=DEFAULT_DAYS_BACK, max_trades=DEFAULT_MAX_TRADES)
+                self._send(200, _render_prometheus(metrics), "text/plain; version=0.0.4")
                 return
-
-            self._send(404, b"not found\n", content_type="text/plain; charset=utf-8")
+            self._send(404, "not_found\n", "text/plain")
         except Exception:
-            # Never crash the server on handler errors.
-            try:
-                self._send(500, b"internal error\n", content_type="text/plain; charset=utf-8")
-            except Exception:
-                pass
+            self._send(500, "error\n", "text/plain")
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # quiet: systemd/journald already logs service lifecycle; keep handler silent
         return
 
-    def _send(self, code: int, payload: bytes, *, content_type: str) -> None:
-        self.send_response(int(code))
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
 
-
-def serve_forever(host: str, port: int) -> None:
-    srv = ThreadingHTTPServer((host, int(port)), _Handler)
-
-    stop = threading.Event()
-
-    def _sig_handler(signum: int, frame: Any) -> None:  # noqa: ARG001
-        stop.set()
-        try:
-            srv.shutdown()
-        except Exception:
-            pass
-
-    signal.signal(signal.SIGTERM, _sig_handler)
-    signal.signal(signal.SIGINT, _sig_handler)
-
+def main() -> int:
+    srv = ThreadingHTTPServer((DEFAULT_HOST, DEFAULT_PORT), MetricsHandler)
     try:
-        srv.serve_forever(poll_interval=0.25)
+        srv.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
     finally:
         try:
             srv.server_close()
         except Exception:
             pass
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    host = os.environ.get("CHAD_METRICS_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
-    port = _env_int("CHAD_METRICS_PORT", DEFAULT_PORT)
-
-    # Allow simple CLI override without adding argparse dependency here.
-    if argv is None:
-        argv = sys.argv[1:]
-    if len(argv) == 2:
-        host = str(argv[0])
-        try:
-            port = int(argv[1])
-        except Exception:
-            port = DEFAULT_PORT
-
-    serve_forever(host=host, port=port)
     return 0
 
 

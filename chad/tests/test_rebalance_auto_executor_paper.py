@@ -12,7 +12,7 @@ PYTHON = "/home/ubuntu/chad_finale/venv/bin/python3"
 def test_execute_blocks_when_disabled() -> None:
     env = {
         "PYTHONPATH": "/home/ubuntu/chad_finale",
-        "CHAD_RUNTIME_DIR": "/home/ubuntu/CHAD FINALE/runtime",
+        "CHAD_RUNTIME_DIR": "/home/ubuntu/chad_finale/runtime",
         # critical: AUTO_EXECUTE disabled
         "CHAD_AUTO_EXECUTE_REBALANCE": "0",
     }
@@ -32,7 +32,7 @@ def test_execute_blocks_when_disabled() -> None:
 def test_preview_smoke() -> None:
     env = {
         "PYTHONPATH": "/home/ubuntu/chad_finale",
-        "CHAD_RUNTIME_DIR": "/home/ubuntu/CHAD FINALE/runtime",
+        "CHAD_RUNTIME_DIR": "/home/ubuntu/chad_finale/runtime",
         "CHAD_PORTFOLIO_PROFILE": "BALANCED",
     }
     p = subprocess.run(

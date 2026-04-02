@@ -53,7 +53,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # Paths / constants
 # ----------------------------
 
-ROOT = Path("/home/ubuntu/CHAD FINALE")
+ROOT = Path("/home/ubuntu/chad_finale")
 RUNTIME = ROOT / "runtime"
 DATA = ROOT / "data"
 TRADES_DIR = DATA / "trades"

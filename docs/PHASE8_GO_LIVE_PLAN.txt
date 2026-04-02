@@ -1,7 +1,7 @@
 CHAD — Phase 8 GO-LIVE Plan (Design & Checklist)
 Host: Ubuntu 24.04 EC2 — user: ubuntu
 Repo: /home/ubuntu/chad_finale
-Runtime root: /home/ubuntu/CHAD FINALE
+Runtime root: /home/ubuntu/chad_finale
 Backend port: 9618 (backend.app -> backend.api_gateway)
 Shadow status: 9619 (chad.web.status_server)
 
@@ -57,7 +57,7 @@ Execution mode & safety layers:
        - chad/core/set_live_mode.py (CLI)
    - Example CLI usage (already tested):
        - Show state:
-           PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.set_live_mode show
+           PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.set_live_mode show
        - Mark LIVE intent:
            python -m chad.core.set_live_mode live --reason "operator_go_live_test"
        - Mark STOP intent:

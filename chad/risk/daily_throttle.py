@@ -380,6 +380,106 @@ def evaluate_throttle(
     )
 
 
+# --------------------------------------------------------------------------- #
+# dynamic_caps.json integration (Phase 3 contract hardening for Phase 11)
+# --------------------------------------------------------------------------- #
+
+def load_dynamic_caps_json(path: Path) -> Dict[str, object]:
+    """
+    Load runtime/dynamic_caps.json.
+
+    Contract:
+    - Read-only.
+    - Raises FileNotFoundError if missing (caller decides fail-closed vs fallback).
+    - Raises ValueError on malformed JSON/shape (caller decides fail-closed vs fallback).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"dynamic_caps.json not found at {path}")
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"dynamic_caps.json invalid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError("dynamic_caps.json must be a JSON object")
+    return obj
+
+
+def config_from_dynamic_caps(dyn: Mapping[str, object]) -> DailyThrottleConfig:
+    """
+    Convert dynamic_caps payload into a DailyThrottleConfig.
+
+    Expected minimal shape (from orchestrator/runtime):
+      {
+        "portfolio_risk_cap": float,
+        "strategy_caps": { "alpha": float, "beta": float, ... }
+      }
+
+    Notes:
+    - Per-symbol caps are not part of dynamic_caps by default; keep empty.
+    - Fail-closed: missing/invalid required fields raises ValueError.
+    """
+    prc = dyn.get("portfolio_risk_cap")
+    if not isinstance(prc, (int, float)):
+        raise ValueError("dynamic_caps missing/invalid portfolio_risk_cap")
+
+    sc = dyn.get("strategy_caps")
+    if not isinstance(sc, dict):
+        raise ValueError("dynamic_caps missing/invalid strategy_caps")
+
+    per_strategy: Dict[str, float] = {}
+    for k, v in sc.items():
+        if not isinstance(k, str):
+            continue
+        if not isinstance(v, (int, float)):
+            continue
+        per_strategy[k] = float(v)
+
+    return DailyThrottleConfig(per_symbol={}, per_strategy=per_strategy, global_cap=float(prc))
+
+
+def throttle_signals_from_dynamic_caps(
+    signals: Sequence[RoutedSignal],
+    price_map: Mapping[str, float],
+    *,
+    dynamic_caps_path: Path,
+    today: Optional[date] = None,
+    log_path: Optional[Path] = None,
+    fail_closed: bool = True,
+) -> ThrottleDecision:
+    """
+    Phase-3/11 contract wrapper:
+
+    - Loads runtime/dynamic_caps.json
+    - Derives DailyThrottleConfig
+    - Applies evaluate_throttle()
+
+    If fail_closed=True (default):
+      any missing/malformed dynamic_caps causes all signals to be rejected with a clear reason.
+
+    This keeps the underlying throttle pure while enforcing that production uses
+    the authoritative dynamic caps artifact.
+    """
+    try:
+        dyn = load_dynamic_caps_json(dynamic_caps_path)
+        cfg = config_from_dynamic_caps(dyn)
+    except Exception as exc:
+        if not fail_closed:
+            # fallback to a permissive config if explicitly allowed
+            cfg = DailyThrottleConfig(per_symbol={}, per_strategy={}, global_cap=float("inf"))
+            return evaluate_throttle(signals, cfg, price_map, today=today, log_path=log_path)
+        # fail-closed: reject everything
+        msg = f"dynamic_caps_unavailable:{exc}"
+        return ThrottleDecision(
+            accepted=[],
+            rejected=[msg for _ in signals],
+            symbol_notional={},
+            strategy_notional={},
+            total_notional=0.0,
+        )
+
+    return evaluate_throttle(signals, cfg, price_map, today=today, log_path=log_path)
+
+
 def throttle_signals(
     signals: Sequence[RoutedSignal],
     config: DailyThrottleConfig,

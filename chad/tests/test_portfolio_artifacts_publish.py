@@ -13,8 +13,8 @@ def test_portfolio_engine_targets_and_rebalance_smoke(tmp_path: Path) -> None:
     # This repo’s engine reads from paths.config_dir/runtime_dir; we just validate function presence.
     paths = EnginePaths(
         repo_dir=Path("/home/ubuntu/chad_finale"),
-        runtime_dir=Path("/home/ubuntu/CHAD FINALE/runtime"),
-        config_dir=Path("/home/ubuntu/CHAD FINALE/config"),
+        runtime_dir=Path("/home/ubuntu/chad_finale/runtime"),
+        config_dir=Path("/home/ubuntu/chad_finale/config"),
     )
     eng = PortfolioEngine(paths=paths)
 

@@ -40,7 +40,7 @@ router = APIRouter(tags=["operator"])
 # Constants / Paths (SSOT)
 # ----------------------------
 
-RUNTIME_DIR: Path = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime"))
+RUNTIME_DIR: Path = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/chad_finale/runtime"))
 REPO_DIR: Path = Path(os.environ.get("CHAD_REPO_DIR", "/home/ubuntu/chad_finale"))
 
 # Core runtime artifacts expected for operator clarity
@@ -52,8 +52,8 @@ RUNTIME_FILES: Dict[str, Path] = {
     "operator_intent": Path("runtime/operator_intent.json"),
     "portfolio_snapshot": Path("runtime/portfolio_snapshot.json"),
     # SSOT-alignment artifacts (absolute paths in your environment)
-    "scr_state": Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json"),
-    "tier_state": Path("/home/ubuntu/CHAD FINALE/runtime/tier_state.json"),
+    "scr_state": Path("/home/ubuntu/chad_finale/runtime/scr_state.json"),
+    "tier_state": Path("/home/ubuntu/chad_finale/runtime/tier_state.json"),
 }
 
 # Timers we care about (minimal list; avoids guessing)
@@ -303,7 +303,7 @@ def risk_explain() -> Dict[str, Any]:
     Output is stable and bounded for dashboards/Telegram.
     """
     caps_path = (REPO_DIR / "runtime" / "dynamic_caps.json")
-    scr_path = Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json")
+    scr_path = Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
 
     caps, caps_err = _safe_json_load(caps_path)
     scr, scr_err = _safe_json_load(scr_path)
@@ -343,7 +343,7 @@ def perf_snapshot() -> Dict[str, Any]:
 
     Output is stable + bounded for dashboards/Telegram.
     """
-    scr_path = Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json")
+    scr_path = Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
     portfolio_path = REPO_DIR / "runtime" / "portfolio_snapshot.json"
     heartbeat_path = REPO_DIR / "runtime" / "decision_trace_heartbeat.json"
 
@@ -596,7 +596,7 @@ def why_blocked() -> WhyBlockedResponse:
     # We do not call broker APIs; we only read files.
     lg_path = REPO_DIR / "runtime" / "live_gate.json"
     op_path = REPO_DIR / "runtime" / "operator_intent.json"
-    scr_path = Path("/home/ubuntu/CHAD FINALE/runtime/scr_state.json")
+    scr_path = Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
 
     lg, lg_err = _safe_json_load(lg_path)
     op, op_err = _safe_json_load(op_path)

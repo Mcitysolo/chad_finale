@@ -59,7 +59,7 @@ from requests import Response, Session
 # Constants
 # ---------------------------------------------------------------------------
 
-LOG_DIR_DEFAULT = "/home/ubuntu/CHAD FINALE/logs/gpt"
+LOG_DIR_DEFAULT = "/home/ubuntu/chad_finale/logs/gpt"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_ENV_PATH = "/etc/chad/openai.env"
 

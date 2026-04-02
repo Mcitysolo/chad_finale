@@ -1,57 +1,68 @@
 #!/usr/bin/env python3
-"""
-CHAD — Telegram Coach Bot (Read-Only, Production)
+from __future__ import annotations
 
-What this bot is
-----------------
-A read-only “coach” interface for CHAD that:
-- Explains system posture (why blocked / risk posture / readiness)
-- Shows operator-safe observability snapshots (op/* endpoints)
-- Shows portfolio proposal endpoints (portfolio/* endpoints)
-- Provides price + AI research (ai/price, ai/research) when available
-- Supports simple natural-language queries (best-effort, no execution)
+"""
+CHAD Telegram Bot — Production-Grade Read-Only Coach + CHADGPT Layer
+
+What this bot does
+------------------
+- Provides read-only operational access to CHAD over Telegram
+- Routes natural-language market questions into CHAD's advisory engine
+- Explains status, posture, readiness, risk, portfolio previews, and prices
+- Persists short-term chat memory for more natural follow-up questions
+- Deduplicates repeated inbound messages to prevent duplicate GPT runs/replies
+- Enforces strict chat authorization
+- Enforces single-instance runtime lock to prevent Telegram getUpdates conflicts
+- Uses hardened structured logging for forensic debugging
 
 Hard safety guarantees
 ----------------------
-- NEVER places orders
-- NEVER flips CHAD_MODE or operator intent
-- NEVER writes runtime/config
-- Only reads:
-  - HTTP endpoints on CHAD backend (default http://127.0.0.1:9618)
-  - Optional local runtime files for extra operator context (read-only)
+- Never places trades
+- Never flips runtime/operator intent
+- Never mutates trading config
+- Never writes anything except bot-local state:
+    - runtime/telegram_bot_state.json
+    - runtime/telegram_bot_dedupe.json
+    - runtime/telegram_bot_memory.json
+    - runtime/telegram_bot.lock
+    - logs/telegram_bot.log
 
-Operational requirements
-------------------------
-Environment variables (required):
+Environment
+-----------
+Required:
 - TELEGRAM_BOT_TOKEN
-- TELEGRAM_ALLOWED_CHAT_ID   (single chat id allowed; integer)
+- TELEGRAM_ALLOWED_CHAT_ID
 
 Optional:
-- CHAD_BACKEND_BASE_URL      (default http://127.0.0.1:9618)
-- TELEGRAM_DISABLE_OPENAI    (1/true to disable)
-- OPENAI_API_KEY             (optional; if absent, the bot still works)
+- CHAD_BACKEND_BASE_URL      default: http://127.0.0.1:9618
+- TELEGRAM_DISABLE_OPENAI    default: false
+- OPENAI_API_KEY             used indirectly by advisory_engine
+- CHAD_ROOT                  default inferred from this file location
 
-The service in your system runs:
-  python3 -m chad.utils.telegram_bot
-
-So keep the module importable and side-effect free on import.
+Compatible with:
+- python-telegram-bot v13.x
 """
 
-from __future__ import annotations
-
+import atexit
+import fcntl
 import json
 import logging
+import logging.handlers
 import os
 import re
+import signal
 import sys
 import textwrap
 import time
-from dataclasses import dataclass
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from threading import RLock
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple
 
 import requests
 from telegram import ParseMode, Update
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
     CallbackContext,
     CommandHandler,
@@ -60,129 +71,423 @@ from telegram.ext import (
     Updater,
 )
 
-# Optional OpenAI (bot is fully functional without it)
-try:
-    from openai import OpenAI  # type: ignore
-except Exception:  # noqa: BLE001
-    OpenAI = None  # type: ignore
+from chad.intel.advisory_engine import run_full_advisory
 
 
-LOGGER_NAME = "chad.telegram_bot"
-LOGGER = logging.getLogger(LOGGER_NAME)
+# =============================================================================
+# Paths / constants
+# =============================================================================
 
-TELEGRAM_MAX_CHARS = 3900  # keep margin under Telegram 4096
-HTTP_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_TIMEOUT_S", "12"))
-HTTP_CONNECT_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_CONNECT_TIMEOUT_S", "4"))
+REPO_ROOT = Path(os.environ.get("CHAD_ROOT", Path(__file__).resolve().parents[2])).resolve()
+RUNTIME_DIR = (REPO_ROOT / "runtime").resolve()
+LOG_DIR = (REPO_ROOT / "logs").resolve()
+BOT_LOG_PATH = LOG_DIR / "telegram_bot.log"
+
+STATE_PATH = RUNTIME_DIR / "telegram_bot_state.json"
+DEDUPE_PATH = RUNTIME_DIR / "telegram_bot_dedupe.json"
+MEMORY_PATH = RUNTIME_DIR / "telegram_bot_memory.json"
+LOCK_PATH = RUNTIME_DIR / "telegram_bot.lock"
+
+ENV_FILES = [
+    Path("/etc/chad/telegram.env"),
+    Path("/etc/chad/openai.env"),
+]
+
 DEFAULT_BASE_URL = "http://127.0.0.1:9618"
+HTTP_CONNECT_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_CONNECT_TIMEOUT_S", "5"))
+HTTP_READ_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_TIMEOUT_S", "20"))
+
+TELEGRAM_MESSAGE_LIMIT = 3900
+DEDUPE_WINDOW_SECONDS = int(os.environ.get("TELEGRAM_DEDUPE_WINDOW_SECONDS", "25"))
+MEMORY_MAX_MESSAGES = int(os.environ.get("TELEGRAM_MEMORY_MAX_MESSAGES", "8"))
+MEMORY_MAX_CHARS_PER_MESSAGE = int(os.environ.get("TELEGRAM_MEMORY_MAX_CHARS_PER_MESSAGE", "500"))
+ADVISORY_MAX_QUESTION_CHARS = int(os.environ.get("TELEGRAM_ADVISORY_MAX_QUESTION_CHARS", "1000"))
+
+LOGGER = logging.getLogger("chad.telegram_bot")
 
 
 # =============================================================================
-# Logging + env utilities
+# Utilities
 # =============================================================================
 
-def _init_logger() -> None:
-    if not LOGGER.handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        )
-
-
-def _load_env_file(path: str) -> None:
-    """
-    Best-effort KEY=VALUE loader without overwriting existing env vars.
-    """
-    p = Path(path)
-    if not p.is_file():
-        return
-    try:
-        for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            s = raw.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k and v and k not in os.environ:
-                os.environ[k] = v
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("env_file_load_failed path=%s err=%s", path, exc)
-
-
-def _env(name: str, required: bool = True) -> Optional[str]:
-    v = os.environ.get(name)
-    if required and not v:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return v
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.environ.get(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _get_backend_base_url() -> str:
-    base = (os.environ.get("CHAD_BACKEND_BASE_URL") or "").strip()
-    if not base:
-        return DEFAULT_BASE_URL
-    return base.rstrip("/")
-
-
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-# =============================================================================
-# Text helpers (safe for Telegram)
-# =============================================================================
-
-def _clip(s: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
-    s = s or ""
-    if len(s) <= limit:
-        return s
-    return s[: max(0, limit - 20)] + "\n…(truncated)…"
+def ensure_dirs() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _chunks(s: str, limit: int = TELEGRAM_MAX_CHARS) -> List[str]:
-    s = s or ""
-    if len(s) <= limit:
-        return [s]
-    out: List[str] = []
-    buf = s
-    while buf:
-        out.append(buf[:limit])
-        buf = buf[limit:]
-    return out
-
-
-def _codeblock(s: str) -> str:
-    # Telegram MarkdownV2 escaping is painful; use HTML <pre> for stability.
-    # We keep ParseMode.HTML and wrap with <pre>.
-    return f"<pre>{_escape_html(s)}</pre>"
-
-
-def _escape_html(s: str) -> str:
+def escape_html(text: str) -> str:
     return (
-        (s or "")
+        (text or "")
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
 
 
-def _bullets(items: List[str], max_items: int = 10) -> str:
-    out = []
-    for x in items[:max_items]:
-        out.append(f"• {x}")
-    if len(items) > max_items:
-        out.append(f"• …(+{len(items) - max_items} more)")
-    return "\n".join(out)
+def clip_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 20)] + "\n…(truncated)…"
+
+
+def chunk_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> List[str]:
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+    chunks: List[str] = []
+    remaining = text
+    while remaining:
+        chunks.append(remaining[:limit])
+        remaining = remaining[limit:]
+    return chunks
+
+
+def safe_json_dumps(obj: Any, *, pretty: bool = False) -> str:
+    if pretty:
+        return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def load_env_file(path: Path) -> None:
+    if not path.is_file():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
+    except Exception as exc:
+        LOGGER.warning("env_file_load_failed path=%s err=%s", path, exc)
+
+
+def load_all_env_files() -> None:
+    for path in ENV_FILES:
+        load_env_file(path)
+
+
+def require_env(name: str) -> str:
+    value = str(os.environ.get(name, "")).strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_backend_base_url() -> str:
+    return str(os.environ.get("CHAD_BACKEND_BASE_URL", DEFAULT_BASE_URL)).strip().rstrip("/") or DEFAULT_BASE_URL
 
 
 # =============================================================================
-# Backend HTTP client (read-only)
+# Logging
+# =============================================================================
+
+def init_logging() -> None:
+    ensure_dirs()
+
+    if LOGGER.handlers:
+        return
+
+    LOGGER.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        BOT_LOG_PATH,
+        maxBytes=10_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    LOGGER.addHandler(file_handler)
+    LOGGER.propagate = False
+
+
+# =============================================================================
+# JSON store
+# =============================================================================
+
+class JsonStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = RLock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def read(self) -> Dict[str, Any]:
+        with self._lock:
+            try:
+                if not self._path.exists():
+                    return {}
+                obj = json.loads(self._path.read_text(encoding="utf-8"))
+                return obj if isinstance(obj, dict) else {}
+            except Exception as exc:
+                LOGGER.warning("json_store_read_failed path=%s err=%s", self._path, exc)
+                return {}
+
+    def write(self, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(safe_json_dumps(payload, pretty=True) + "\n", encoding="utf-8")
+            os.replace(tmp, self._path)
+
+    def update(self, mutator: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
+        with self._lock:
+            current = self.read()
+            updated = mutator(current)
+            self.write(updated)
+            return updated
+
+
+STATE_STORE = JsonStore(STATE_PATH)
+DEDUPE_STORE = JsonStore(DEDUPE_PATH)
+MEMORY_STORE = JsonStore(MEMORY_PATH)
+
+
+# =============================================================================
+# Coach profile / teaching mode state
+# =============================================================================
+
+DEFAULT_COACH_PROFILE = {
+    "teaching_mode": True,
+    "micro_lessons": True,
+    "show_your_work": True,
+    "quiz_mode": False,
+    "explain_like_im_10": False,
+    "audience_level": "beginner",
+    "tone": "simple_coach",
+}
+
+
+def get_coach_profiles() -> Dict[str, Any]:
+    data = STATE_STORE.read()
+    profiles = data.get("coach_profiles")
+    return profiles if isinstance(profiles, dict) else {}
+
+
+def get_coach_profile(chat_id: int) -> Dict[str, Any]:
+    profiles = get_coach_profiles()
+    existing = profiles.get(str(chat_id))
+    if isinstance(existing, dict):
+        merged = dict(DEFAULT_COACH_PROFILE)
+        merged.update(existing)
+        return merged
+    return dict(DEFAULT_COACH_PROFILE)
+
+
+def set_coach_profile(chat_id: int, **updates: Any) -> Dict[str, Any]:
+    data = STATE_STORE.read()
+    profiles = data.get("coach_profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+
+    current = profiles.get(str(chat_id))
+    if not isinstance(current, dict):
+        current = dict(DEFAULT_COACH_PROFILE)
+    else:
+        merged = dict(DEFAULT_COACH_PROFILE)
+        merged.update(current)
+        current = merged
+
+    for key, value in updates.items():
+        if value is not None:
+            current[key] = value
+
+    profiles[str(chat_id)] = current
+    data["coach_profiles"] = profiles
+    STATE_STORE.write(data)
+    return current
+
+
+def render_coach_profile(profile: Dict[str, Any]) -> str:
+    return "\n".join([
+        "<b>CHAD COACH MODE</b>",
+        "",
+        f"teaching_mode={escape_html(str(profile.get('teaching_mode')))}",
+        f"micro_lessons={escape_html(str(profile.get('micro_lessons')))}",
+        f"show_your_work={escape_html(str(profile.get('show_your_work')))}",
+        f"quiz_mode={escape_html(str(profile.get('quiz_mode')))}",
+        f"explain_like_im_10={escape_html(str(profile.get('explain_like_im_10')))}",
+        f"audience_level={escape_html(str(profile.get('audience_level')))}",
+        f"tone={escape_html(str(profile.get('tone')))}",
+    ])
+
+
+# =============================================================================
+# Single instance lock
+# =============================================================================
+
+class SingleInstanceLock:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fh: Optional[Any] = None
+
+    def acquire(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self._path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"telegram_bot_lock_already_held:{self._path}") from exc
+
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(
+            safe_json_dumps(
+                {
+                    "pid": os.getpid(),
+                    "ts_utc": utc_now_iso(),
+                    "path": str(self._path),
+                },
+                pretty=True,
+            )
+            + "\n"
+        )
+        self._fh.flush()
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
+INSTANCE_LOCK = SingleInstanceLock(LOCK_PATH)
+
+
+# =============================================================================
+# Authorization / memory / dedupe
+# =============================================================================
+
+def allowed_chat_id() -> int:
+    return int(require_env("TELEGRAM_ALLOWED_CHAT_ID"))
+
+
+def is_allowed(update: Update) -> bool:
+    actual = int(update.effective_chat.id) if update.effective_chat else None
+    user_id = int(update.effective_user.id) if update.effective_user else None
+    raw_text = ""
+    try:
+        if update.effective_message and getattr(update.effective_message, "text", None):
+            raw_text = str(update.effective_message.text or "")
+    except Exception:
+        raw_text = ""
+
+    try:
+        allowed = allowed_chat_id()
+        ok = actual == allowed
+        LOGGER.info("telegram_auth_check actual_chat_id=%s allowed_chat_id=%s ok=%s", actual, allowed, ok)
+        if raw_text.startswith("/"):
+            LOGGER.info(
+                "telegram_command_received chat_id=%s user_id=%s text=%r allowed=%s",
+                actual,
+                user_id,
+                raw_text,
+                ok,
+            )
+        return ok
+    except Exception as exc:
+        LOGGER.warning("telegram_auth_check_failed err=%s", exc)
+        return False
+
+
+def normalize_question(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def is_duplicate_message(chat_id: int, text: str) -> bool:
+    key = f"{chat_id}:{normalize_question(text)}"
+    now = time.time()
+
+    def mutate(payload: Dict[str, Any]) -> Dict[str, Any]:
+        last_seen = float(payload.get(key, 0.0) or 0.0)
+        payload[key] = now
+
+        # clean old entries
+        stale_keys = [k for k, v in payload.items() if isinstance(v, (int, float)) and now - float(v) > 86400]
+        for k in stale_keys[:500]:
+            payload.pop(k, None)
+
+        payload["_last_duplicate"] = {
+            "key": key,
+            "last_seen": last_seen,
+            "now": now,
+        }
+        return payload
+
+    snapshot = DEDUPE_STORE.update(mutate)
+    last_seen = snapshot.get("_last_duplicate", {}).get("last_seen", 0.0)
+    if isinstance(last_seen, (int, float)) and now - float(last_seen) < DEDUPE_WINDOW_SECONDS:
+        LOGGER.info("telegram_duplicate_message_skipped chat_id=%s text=%r", chat_id, text)
+        return True
+    return False
+
+
+def append_memory(chat_id: int, role: str, text: str) -> List[Dict[str, str]]:
+    text = (text or "").strip()
+    if not text:
+        return get_memory(chat_id)
+
+    text = text[:MEMORY_MAX_CHARS_PER_MESSAGE]
+
+    def mutate(payload: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(chat_id)
+        history = payload.get(key, [])
+        if not isinstance(history, list):
+            history = []
+        history.append({"role": role, "text": text, "ts_utc": utc_now_iso()})
+        payload[key] = history[-MEMORY_MAX_MESSAGES:]
+        return payload
+
+    updated = MEMORY_STORE.update(mutate)
+    value = updated.get(str(chat_id), [])
+    return value if isinstance(value, list) else []
+
+
+def get_memory(chat_id: int) -> List[Dict[str, str]]:
+    data = MEMORY_STORE.read().get(str(chat_id), [])
+    return data if isinstance(data, list) else []
+
+
+def memory_as_prompt_lines(chat_id: int) -> List[str]:
+    out: List[str] = []
+    for item in get_memory(chat_id):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user")
+        text = str(item.get("text") or "").strip()
+        if text:
+            out.append(f"{role}: {text}")
+    return out
+
+
+# =============================================================================
+# Backend client
 # =============================================================================
 
 class BackendClientError(RuntimeError):
@@ -192,29 +497,19 @@ class BackendClientError(RuntimeError):
 @dataclass(frozen=True)
 class BackendClientConfig:
     base_url: str
-    timeout_s: float = HTTP_TIMEOUT_S
     connect_timeout_s: float = HTTP_CONNECT_TIMEOUT_S
+    read_timeout_s: float = HTTP_READ_TIMEOUT_S
 
 
 class BackendClient:
-    """
-    Thin, robust client. Only GET/POST read-only endpoints.
-
-    Used endpoints:
-    - Operator Surface V2: /op/status /op/why_blocked /op/risk_explain /op/perf_snapshot /op/readiness /op/what_if_caps
-    - Core gateway: /live-gate /risk-state /shadow /health
-    - Portfolio surface: /portfolio/active /portfolio/targets/{PROFILE} /portfolio/rebalance/latest?profile=...
-    - AI: /ai/price (GET) /ai/research (POST)
-    """
-
-    def __init__(self, cfg: BackendClientConfig) -> None:
-        self.cfg = cfg
+    def __init__(self, config: BackendClientConfig) -> None:
+        self._config = config
         self._session = requests.Session()
 
     def _url(self, path: str) -> str:
-        return f"{self.cfg.base_url}{path}"
+        return f"{self._config.base_url}{path}"
 
-    def _request(
+    def request_json(
         self,
         method: str,
         path: str,
@@ -224,600 +519,264 @@ class BackendClient:
     ) -> Dict[str, Any]:
         url = self._url(path)
         try:
-            resp = self._session.request(
+            response = self._session.request(
                 method=method,
                 url=url,
                 params=params,
                 json=json_body,
-                timeout=(self.cfg.connect_timeout_s, self.cfg.timeout_s),
+                timeout=(self._config.connect_timeout_s, self._config.read_timeout_s),
             )
         except requests.RequestException as exc:
-            raise BackendClientError(f"network_error {path}: {exc}") from exc
+            raise BackendClientError(f"network_error:{path}:{exc}") from exc
 
-        # Allow 200 only (stable for operator surfaces)
-        if resp.status_code != 200:
-            detail = ""
-            try:
-                j = resp.json()
-                if isinstance(j, dict):
-                    detail = str(j.get("detail") or j)
-                else:
-                    detail = str(j)
-            except Exception:
-                detail = (resp.text or "").strip()
-            raise BackendClientError(f"http_{resp.status_code} {path}: {detail[:300]}")
+        if response.status_code != 200:
+            body = response.text[:500]
+            raise BackendClientError(f"http_{response.status_code}:{path}:{body}")
 
         try:
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            raise BackendClientError(f"bad_json {path}: {exc}") from exc
+            payload = response.json()
+        except Exception as exc:
+            raise BackendClientError(f"bad_json:{path}:{exc}") from exc
 
-        if not isinstance(data, dict):
-            raise BackendClientError(f"bad_shape {path}: expected dict")
-        return data
+        if not isinstance(payload, dict):
+            raise BackendClientError(f"bad_shape:{path}:expected_dict")
+        return payload
 
-    # --- Operator Surface V2 ---
     def op_status(self) -> Dict[str, Any]:
-        return self._request("GET", "/op/status")
+        try:
+            return self.request_json("GET", "/op/status")
+        except BackendClientError:
+            return self.request_json("GET", "/status")
 
     def op_readiness(self) -> Dict[str, Any]:
-        return self._request("GET", "/op/readiness")
+        return self.request_json("GET", "/op/readiness")
 
     def op_why_blocked(self) -> Dict[str, Any]:
-        return self._request("GET", "/op/why_blocked")
+        try:
+            return self.request_json("GET", "/op/why_blocked")
+        except BackendClientError:
+            return self.request_json("GET", "/live-gate")
 
     def op_risk_explain(self) -> Dict[str, Any]:
-        return self._request("GET", "/op/risk_explain")
+        return self.request_json("GET", "/op/risk_explain")
 
     def op_perf_snapshot(self) -> Dict[str, Any]:
-        return self._request("GET", "/op/perf_snapshot")
-
-    def op_what_if_caps(self, *, equity: float, daily_risk_fraction: float) -> Dict[str, Any]:
-        return self._request("GET", "/op/what_if_caps", params={"equity": equity, "daily_risk_fraction": daily_risk_fraction})
-
-    # --- Core gateway ---
-    def health(self) -> Dict[str, Any]:
-        return self._request("GET", "/health")
+        return self.request_json("GET", "/op/perf_snapshot")
 
     def live_gate(self) -> Dict[str, Any]:
-        return self._request("GET", "/live-gate")
+        return self.request_json("GET", "/live-gate")
 
-    def risk_state(self) -> Dict[str, Any]:
-        return self._request("GET", "/risk-state")
-
-    def shadow(self) -> Dict[str, Any]:
-        return self._request("GET", "/shadow")
-
-    # --- Portfolio surface ---
     def portfolio_active(self) -> Dict[str, Any]:
-        return self._request("GET", "/portfolio/active")
+        return self.request_json("GET", "/portfolio/active")
 
     def portfolio_targets(self, profile: str) -> Dict[str, Any]:
-        return self._request("GET", f"/portfolio/targets/{profile.strip().upper()}")
+        return self.request_json("GET", f"/portfolio/targets/{profile.strip().upper()}")
 
     def portfolio_rebalance_latest(self, profile: str) -> Dict[str, Any]:
-        return self._request("GET", "/portfolio/rebalance/latest", params={"profile": profile.strip().upper()})
+        return self.request_json("GET", "/portfolio/rebalance/latest", params={"profile": profile.strip().upper()})
 
-    # --- AI ---
     def ai_price(self, symbol: str) -> Dict[str, Any]:
-        return self._request("GET", "/ai/price", params={"symbol": symbol.strip().upper()})
+        return self.request_json("GET", "/ai/price", params={"symbol": symbol.strip().upper()})
 
     def ai_research(self, symbol: str, question: str, timeframe: str = "1m") -> Dict[str, Any]:
-        payload = {
-            "symbol": symbol.strip().upper(),
-            "scenario_timeframe": timeframe,
-            "question": question.strip() or "High-level macro and risk context.",
-        }
-        return self._request("POST", "/ai/research", json_body=payload)
-
-
-# =============================================================================
-# Optional Teaching Mode (OpenAI) — safe degradation
-# =============================================================================
-
-@dataclass(frozen=True)
-class OpenAIConfig:
-    intent_model: str = os.environ.get("OPENAI_INTENT_MODEL", "gpt-4.1-mini")
-    coach_model: str = os.environ.get("OPENAI_COACH_MODEL", "gpt-4.1-mini")
-
-
-def _openai_enabled() -> bool:
-    if _env_bool("TELEGRAM_DISABLE_OPENAI", default=False):
-        return False
-    return OpenAI is not None
-
-
-def _get_openai_client() -> Optional[Any]:
-    if not _openai_enabled():
-        return None
-    if not os.environ.get("OPENAI_API_KEY"):
-        _load_env_file("/etc/chad/openai.env")
-    if not os.environ.get("OPENAI_API_KEY"):
-        return None
-    try:
-        return OpenAI()
-    except Exception:
-        return None
-
-
-def _teach_brief(text: str) -> str:
-    """
-    Best-effort “teaching mode” rewrite:
-    - Short
-    - Beginner-friendly
-    - Ends with "Why this matters: …"
-    If OpenAI not available, returns original.
-    """
-    client = _get_openai_client()
-    if client is None:
-        return text
-
-    cfg = OpenAIConfig()
-    prompt = (
-        "Rewrite this for a beginner in 3-4 sentences. "
-        "Be direct, no hype, no trading advice. "
-        "End with: 'Why this matters: ...'\n\n"
-        f"TEXT:\n{text}"
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=cfg.coach_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        return out or text
-    except Exception:
-        return text
-
-
-# =============================================================================
-# Telegram guard + message send
-# =============================================================================
-
-def _allowed_chat_id() -> int:
-    # best-effort load from /etc/chad/telegram.env
-    if not os.environ.get("TELEGRAM_ALLOWED_CHAT_ID"):
-        _load_env_file("/etc/chad/telegram.env")
-    v = _env("TELEGRAM_ALLOWED_CHAT_ID", required=True)
-    try:
-        return int(str(v).strip())
-    except Exception as exc:
-        raise RuntimeError(f"Invalid TELEGRAM_ALLOWED_CHAT_ID: {v!r}") from exc
-
-
-def _is_allowed(update: Update) -> bool:
-    try:
-        allowed = _allowed_chat_id()
-    except Exception:
-        return False
-    chat = update.effective_chat
-    if chat is None:
-        return False
-    return int(chat.id) == int(allowed)
-
-
-def _send(update: Update, context: CallbackContext, text: str, *, html: bool = True) -> None:
-    if update.effective_chat is None:
-        return
-    chunks = _chunks(text)
-    for part in chunks:
-        context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=_clip(part),
-            parse_mode=ParseMode.HTML if html else None,
-            disable_web_page_preview=True,
+        return self.request_json(
+            "POST",
+            "/ai/research",
+            json_body={
+                "symbol": symbol.strip().upper(),
+                "scenario_timeframe": timeframe,
+                "question": question.strip(),
+            },
         )
 
 
+def backend_client() -> BackendClient:
+    return BackendClient(BackendClientConfig(base_url=get_backend_base_url()))
+
+
 # =============================================================================
-# Formatting: operator + risk + portfolio
+# Formatting
 # =============================================================================
 
-def _fmt_kv(title: str, kv: List[Tuple[str, Any]]) -> str:
-    lines = [f"<b>{_escape_html(title)}</b>"]
-    for k, v in kv:
-        lines.append(f"{_escape_html(str(k))}: {_escape_html(str(v))}")
+def fmt_status(payload: Dict[str, Any]) -> str:
+    runtime_files = payload.get("runtime_files") if isinstance(payload.get("runtime_files"), dict) else {}
+    timers = payload.get("timers") if isinstance(payload.get("timers"), dict) else {}
+    lines = [f"<b>CHAD STATUS</b>", ""]
+
+    if timers:
+        lines.append("<b>Timers</b>")
+        for name, info in list(timers.items())[:12]:
+            if not isinstance(info, dict):
+                continue
+            enabled = info.get("enabled", {})
+            active = info.get("active", {})
+            enabled_state = enabled.get("state") if isinstance(enabled, dict) else enabled
+            active_state = active.get("state") if isinstance(active, dict) else active
+            lines.append(escape_html(f"{name}: enabled={enabled_state} active={active_state}"))
+        lines.append("")
+
+    if runtime_files:
+        lines.append("<b>Runtime</b>")
+        for key in ("feed_state", "positions_snapshot", "reconciliation_state", "dynamic_caps", "scr_state", "tier_state"):
+            meta = runtime_files.get(key, {})
+            if not isinstance(meta, dict):
+                continue
+            lines.append(
+                escape_html(
+                    f"{key}: exists={meta.get('exists')} ts={meta.get('ts_utc', '')}"
+                )
+            )
+
     return "\n".join(lines)
 
 
-def _fmt_status_min(op_status: Dict[str, Any]) -> str:
-    # stable, compact operator status
-    ts = op_status.get("ts_utc", "")
-    failed = (op_status.get("failed_units") or {}).get("failed_units") if isinstance(op_status.get("failed_units"), dict) else []
-    failed_count = len(failed) if isinstance(failed, list) else 0
+def fmt_why_blocked(payload: Dict[str, Any]) -> str:
+    if "summary" in payload:
+        return "<b>WHY BLOCKED</b>\n\n" + escape_html(str(payload.get("summary", "")))
 
-    timers = op_status.get("timers") if isinstance(op_status.get("timers"), dict) else {}
-    t_lines = []
-    for name, st in timers.items():
-        if not isinstance(st, dict):
-            continue
-        enabled = ((st.get("enabled") or {}).get("state")) if isinstance(st.get("enabled"), dict) else st.get("enabled")
-        active = ((st.get("active") or {}).get("state")) if isinstance(st.get("active"), dict) else st.get("active")
-        t_lines.append(f"{name}: enabled={enabled} active={active}")
-
-    runtime_files = op_status.get("runtime_files") if isinstance(op_status.get("runtime_files"), dict) else {}
-    # show 6 key files only
-    key_files = ["feed_state", "positions_snapshot", "reconciliation_state", "dynamic_caps", "scr_state", "tier_state"]
-    f_lines = []
-    for k in key_files:
-        meta = runtime_files.get(k)
-        if not isinstance(meta, dict):
-            f_lines.append(f"{k}: missing_meta")
-            continue
-        exists = bool(meta.get("exists"))
-        ts_utc = meta.get("ts_utc") or ""
-        f_lines.append(f"{k}: exists={exists} ts={ts_utc}")
-
-    msg = "\n".join(
-        [
-            f"<b>CHAD STATUS</b> (ts={_escape_html(str(ts))})",
-            "",
-            "<b>Timers</b>",
-            _escape_html("\n".join(t_lines) if t_lines else "none"),
-            "",
-            f"<b>Failed units</b>: {failed_count}",
-            "",
-            "<b>Runtime artifacts</b>",
-            _escape_html("\n".join(f_lines)),
-        ]
-    )
-    return msg
+    reasons = payload.get("reasons") if isinstance(payload.get("reasons"), list) else []
+    lines = ["<b>WHY BLOCKED</b>", ""]
+    if reasons:
+        for reason in reasons[:10]:
+            lines.append(escape_html(f"• {reason}"))
+    else:
+        lines.append(escape_html(safe_json_dumps(payload, pretty=True)))
+    return "\n".join(lines)
 
 
-def _fmt_why_blocked(payload: Dict[str, Any]) -> str:
-    summary = payload.get("summary") or ""
-    # keep it short and human
-    s = "<b>WHY BLOCKED</b>\n\n" + _escape_html(str(summary))
-    return s
-
-
-def _fmt_risk_explain(payload: Dict[str, Any]) -> str:
-    posture = payload.get("posture_summary") or ""
-    why = payload.get("why_blocked_summary") or []
-    caps = payload.get("strategy_caps") or []
-
-    lines = ["<b>RISK EXPLAIN</b>", "", _escape_html(str(posture)), ""]
-    if isinstance(why, list) and why:
-        lines.append("<b>Main blockers</b>")
-        lines.append(_escape_html(_bullets([str(x) for x in why], max_items=8)))
+def fmt_risk(payload: Dict[str, Any]) -> str:
+    lines = ["<b>RISK</b>", ""]
+    posture = payload.get("posture_summary")
+    if posture:
+        lines.append(escape_html(str(posture)))
         lines.append("")
-    if isinstance(caps, list) and caps:
-        lines.append("<b>Strategy caps (share of portfolio_risk_cap)</b>")
-        for row in caps[:10]:
+
+    blockers = payload.get("why_blocked_summary") if isinstance(payload.get("why_blocked_summary"), list) else []
+    if blockers:
+        lines.append("<b>Main blockers</b>")
+        for item in blockers[:10]:
+            lines.append(escape_html(f"• {item}"))
+        lines.append("")
+
+    caps = payload.get("strategy_caps") if isinstance(payload.get("strategy_caps"), list) else []
+    if caps:
+        lines.append("<b>Strategy caps</b>")
+        for row in caps[:12]:
             if not isinstance(row, dict):
                 continue
-            strat = row.get("strategy")
-            pct = row.get("cap_pct_of_portfolio_risk_cap")
-            cap = row.get("cap_usd")
-            lines.append(_escape_html(f"{strat}: ${cap:.2f} ({pct:.4f}%)" if isinstance(cap, (int, float)) and isinstance(pct, (int, float)) else f"{strat}: {cap} / {pct}"))
+            lines.append(
+                escape_html(
+                    f"{row.get('strategy')}: cap=${row.get('cap_usd')} frac={row.get('fraction')}"
+                )
+            )
     return "\n".join(lines)
 
 
-def _fmt_perf_snapshot(payload: Dict[str, Any]) -> str:
-    narrative = payload.get("operator_narrative") or ""
-    scr = payload.get("scr") or {}
-    stats = (scr.get("stats") if isinstance(scr, dict) else {}) or {}
-    lines = ["<b>PERF SNAPSHOT</b>", ""]
+def fmt_perf(payload: Dict[str, Any]) -> str:
+    lines = ["<b>PERFORMANCE</b>", ""]
+    narrative = payload.get("operator_narrative")
     if narrative:
-        lines.append(_escape_html(str(narrative)))
+        lines.append(escape_html(str(narrative)))
         lines.append("")
-    if isinstance(stats, dict) and stats:
-        keys = ["total_trades", "effective_trades", "win_rate", "sharpe_like", "max_drawdown", "total_pnl"]
-        lines.append("<b>SCR stats</b>")
-        for k in keys:
-            if k in stats:
-                lines.append(_escape_html(f"{k}: {stats.get(k)}"))
+
+    scr = payload.get("scr") if isinstance(payload.get("scr"), dict) else {}
+    stats = scr.get("stats") if isinstance(scr.get("stats"), dict) else {}
+    for key in ("total_trades", "effective_trades", "win_rate", "sharpe_like", "max_drawdown", "total_pnl"):
+        if key in stats:
+            lines.append(escape_html(f"{key}: {stats[key]}"))
     return "\n".join(lines)
 
 
-def _fmt_portfolio_active(payload: Dict[str, Any]) -> str:
-    if not payload.get("ok"):
-        return "<b>PORTFOLIO ACTIVE</b>\n\n" + _escape_html(str(payload))
-    positions = payload.get("positions") if isinstance(payload.get("positions"), list) else []
-    total = payload.get("total_notional_proxy")
-    lines = ["<b>PORTFOLIO ACTIVE</b>"]
-    lines.append(_escape_html(f"total_notional_proxy≈{total}"))
+def fmt_live_gate(payload: Dict[str, Any]) -> str:
+    lines = [
+        "<b>LIVE GATE</b>",
+        "",
+        escape_html(f"allow_ibkr_paper={payload.get('allow_ibkr_paper')}"),
+        escape_html(f"allow_ibkr_live={payload.get('allow_ibkr_live')}"),
+        escape_html(f"allow_exits_only={payload.get('allow_exits_only')}"),
+        escape_html(f"operator_mode={payload.get('operator_mode')}"),
+        "",
+    ]
+    reasons = payload.get("reasons") if isinstance(payload.get("reasons"), list) else []
+    if reasons:
+        lines.append("<b>Reasons</b>")
+        for reason in reasons[:8]:
+            lines.append(escape_html(f"• {reason}"))
+    return "\n".join(lines)
+
+
+def fmt_portfolio_active(payload: Dict[str, Any]) -> str:
+    if not payload.get("ok", True):
+        return "<b>PORTFOLIO ACTIVE</b>\n\n" + escape_html(safe_json_dumps(payload, pretty=True))
+
+    lines = ["<b>PORTFOLIO ACTIVE</b>", ""]
+    lines.append(escape_html(f"total_notional_proxy={payload.get('total_notional_proxy')}"))
     lines.append("")
-    for p in positions[:20]:
-        if not isinstance(p, dict):
+
+    positions = payload.get("positions") if isinstance(payload.get("positions"), list) else []
+    for item in positions[:20]:
+        if not isinstance(item, dict):
             continue
-        sym = p.get("symbol")
-        qty = p.get("qty")
-        notional = p.get("notional_proxy")
-        avg = p.get("avg_cost")
-        lines.append(_escape_html(f"{sym}: qty={qty} notional≈{notional} avg_cost={avg}"))
+        lines.append(
+            escape_html(
+                f"{item.get('symbol')}: qty={item.get('qty')} "
+                f"avg_cost={item.get('avg_cost')} "
+                f"notional≈{item.get('notional_proxy')}"
+            )
+        )
     return "\n".join(lines)
 
 
-def _fmt_portfolio_targets(payload: Dict[str, Any]) -> str:
-    if not payload.get("ok"):
-        return "<b>PORTFOLIO TARGETS</b>\n\n" + _escape_html(str(payload))
-    prof = payload.get("profile")
+def fmt_portfolio_targets(payload: Dict[str, Any]) -> str:
+    lines = [f"<b>PORTFOLIO TARGETS</b> ({escape_html(str(payload.get('profile', 'UNKNOWN')))})", ""]
     targets = payload.get("targets") if isinstance(payload.get("targets"), list) else []
-    lines = [f"<b>PORTFOLIO TARGETS</b> ({_escape_html(str(prof))})", ""]
-    for t in targets[:25]:
-        if not isinstance(t, dict):
+    for item in targets[:25]:
+        if not isinstance(item, dict):
             continue
-        sym = t.get("symbol")
-        w = t.get("weight")
-        lines.append(_escape_html(f"{sym}: {w:.4f}" if isinstance(w, (int, float)) else f"{sym}: {w}"))
+        lines.append(escape_html(f"{item.get('symbol')}: weight={item.get('weight')}"))
     return "\n".join(lines)
 
 
-def _fmt_portfolio_rebalance(payload: Dict[str, Any]) -> str:
-    if not payload.get("ok"):
-        return "<b>REBALANCE PREVIEW</b>\n\n" + _escape_html(str(payload))
-    prof = payload.get("profile")
+def fmt_portfolio_rebalance(payload: Dict[str, Any]) -> str:
+    lines = [f"<b>REBALANCE PREVIEW</b> ({escape_html(str(payload.get('profile', 'UNKNOWN')))})", ""]
     diffs = payload.get("diffs") if isinstance(payload.get("diffs"), list) else []
-    lines = [f"<b>REBALANCE PREVIEW</b> ({_escape_html(str(prof))})", ""]
-    for d in diffs[:25]:
-        if not isinstance(d, dict):
+    for item in diffs[:25]:
+        if not isinstance(item, dict):
             continue
-        sym = d.get("symbol")
-        cur = d.get("current_weight")
-        tgt = d.get("target_weight")
-        delta = d.get("delta_weight")
-        if isinstance(cur, (int, float)) and isinstance(tgt, (int, float)) and isinstance(delta, (int, float)):
-            lines.append(_escape_html(f"{sym}: current={cur:.4f} target={tgt:.4f} delta={delta:+.4f}"))
-        else:
-            lines.append(_escape_html(f"{sym}: {d}"))
-    notes = payload.get("notes")
-    if isinstance(notes, list) and notes:
+        lines.append(
+            escape_html(
+                f"{item.get('symbol')}: current={item.get('current_weight')} "
+                f"target={item.get('target_weight')} delta={item.get('delta_weight')}"
+            )
+        )
+    notes = payload.get("notes") if isinstance(payload.get("notes"), list) else []
+    if notes:
         lines.append("")
         lines.append("<b>Notes</b>")
-        lines.append(_escape_html(_bullets([str(x) for x in notes], max_items=6)))
+        for note in notes[:10]:
+            lines.append(escape_html(f"• {note}"))
+    return "\n".join(lines)
+
+
+def render_advisory_answer(result: Dict[str, Any]) -> str:
+    analysis = str(result.get("analysis_text") or "").strip()
+
+    lines = ["<b>CHADGPT</b>", ""]
+    if analysis:
+        lines.append(escape_html(analysis))
+    else:
+        lines.append(escape_html("No advisory text was produced."))
     return "\n".join(lines)
 
 
 # =============================================================================
-# Command handlers
+# Routing / extraction
 # =============================================================================
 
-def _client() -> BackendClient:
-    return BackendClient(BackendClientConfig(base_url=_get_backend_base_url()))
+PRICE_RX = re.compile(r"\bprice\b|\bquote\b", re.IGNORECASE)
 
-
-def cmd_ping(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    _send(update, context, f"<b>PONG</b> {_escape_html(_utc_now_iso())}")
-
-
-def cmd_help(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    msg = textwrap.dedent(
-        """
-        <b>CHAD Coach — commands</b>
-
-        <b>System</b>
-        • /ping
-        • /status          (operator snapshot)
-        • /readiness       (operator gate checklist)
-        • /why_blocked     (why live is blocked)
-        • /risk            (risk posture + caps)
-        • /perf            (SCR performance snapshot)
-        • /live_gate       (raw LiveGate snapshot)
-
-        <b>Portfolio (read-only)</b>
-        • /portfolio_active
-        • /portfolio_targets BALANCED
-        • /portfolio_rebalance BALANCED
-
-        <b>Caps “what-if”</b>
-        • /caps 20000 0.05   (equity, daily_risk_fraction)
-
-        <b>Prices / Research</b>
-        • /price AAPL
-        • /ai_research AAPL what’s the macro risk?
-
-        You can also ask in plain English:
-        “why is it blocked?”, “risk posture”, “portfolio targets balanced”, “rebalance balanced”, “price of AAPL”
-        """
-    ).strip()
-    _send(update, context, msg)
-
-
-def cmd_status(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().op_status()
-        _send(update, context, _fmt_status_min(data))
-    except Exception as exc:
-        _send(update, context, "<b>STATUS ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_readiness(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().op_readiness()
-        ok = bool(data.get("ok"))
-        blockers = data.get("blockers") if isinstance(data.get("blockers"), list) else []
-        warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
-        msg = [f"<b>READINESS</b> ok={_escape_html(str(ok))}", ""]
-        if blockers:
-            msg.append("<b>Blockers</b>")
-            msg.append(_escape_html(_bullets([str(x) for x in blockers], max_items=10)))
-            msg.append("")
-        if warnings:
-            msg.append("<b>Warnings</b>")
-            msg.append(_escape_html(_bullets([str(x) for x in warnings], max_items=10)))
-        if not blockers and not warnings:
-            msg.append(_escape_html("No blockers/warnings reported by /op/readiness."))
-        _send(update, context, "\n".join(msg))
-    except Exception as exc:
-        _send(update, context, "<b>READINESS ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_why_blocked(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().op_why_blocked()
-        _send(update, context, _fmt_why_blocked(data))
-    except Exception as exc:
-        _send(update, context, "<b>WHY_BLOCKED ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_risk(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().op_risk_explain()
-        _send(update, context, _fmt_risk_explain(data))
-    except Exception as exc:
-        _send(update, context, "<b>RISK ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_perf(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().op_perf_snapshot()
-        _send(update, context, _fmt_perf_snapshot(data))
-    except Exception as exc:
-        _send(update, context, "<b>PERF ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_live_gate(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().live_gate()
-        # keep small: show key fields + first reasons
-        reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
-        msg = [
-            "<b>LIVE GATE</b>",
-            "",
-            _escape_html(f"allow_ibkr_paper={data.get('allow_ibkr_paper')}"),
-            _escape_html(f"allow_ibkr_live={data.get('allow_ibkr_live')}"),
-            _escape_html(f"allow_exits_only={data.get('allow_exits_only')}"),
-            _escape_html(f"operator_mode={data.get('operator_mode')}"),
-            "",
-        ]
-        if reasons:
-            msg.append("<b>Reasons</b>")
-            msg.append(_escape_html(_bullets([str(x) for x in reasons], max_items=8)))
-        _send(update, context, "\n".join(msg))
-    except Exception as exc:
-        _send(update, context, "<b>LIVE_GATE ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_caps(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    # /caps EQUITY DRF
-    try:
-        args = context.args or []
-        if len(args) < 2:
-            _send(update, context, "<b>USAGE</b>\n\n/caps 20000 0.05")
-            return
-        equity = float(args[0])
-        drf = float(args[1])
-        data = _client().op_what_if_caps(equity=equity, daily_risk_fraction=drf)
-        caps = data.get("strategy_caps") if isinstance(data.get("strategy_caps"), list) else []
-        lines = [
-            "<b>WHAT-IF CAPS</b>",
-            _escape_html(f"equity={equity} drf={drf}"),
-            _escape_html(f"portfolio_risk_cap={data.get('portfolio_risk_cap')}"),
-            "",
-        ]
-        for row in caps[:20]:
-            if not isinstance(row, dict):
-                continue
-            lines.append(_escape_html(f"{row.get('strategy')}: cap=${row.get('cap_usd')} (frac={row.get('fraction')})"))
-        _send(update, context, "\n".join(lines))
-    except Exception as exc:
-        _send(update, context, "<b>CAPS ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_portfolio_active(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    try:
-        data = _client().portfolio_active()
-        _send(update, context, _fmt_portfolio_active(data))
-    except Exception as exc:
-        _send(update, context, "<b>PORTFOLIO ACTIVE ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_portfolio_targets(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    args = context.args or []
-    if not args:
-        _send(update, context, "<b>USAGE</b>\n\n/portfolio_targets BALANCED")
-        return
-    profile = str(args[0]).strip().upper()
-    try:
-        data = _client().portfolio_targets(profile)
-        _send(update, context, _fmt_portfolio_targets(data))
-    except Exception as exc:
-        _send(update, context, "<b>PORTFOLIO TARGETS ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_portfolio_rebalance(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    args = context.args or []
-    if not args:
-        _send(update, context, "<b>USAGE</b>\n\n/portfolio_rebalance BALANCED")
-        return
-    profile = str(args[0]).strip().upper()
-    try:
-        data = _client().portfolio_rebalance_latest(profile)
-        _send(update, context, _fmt_portfolio_rebalance(data))
-    except Exception as exc:
-        _send(update, context, "<b>REBALANCE ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_price(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    args = context.args or []
-    if not args:
-        _send(update, context, "<b>USAGE</b>\n\n/price AAPL")
-        return
-    sym = str(args[0]).strip().upper()
-    try:
-        data = _client().ai_price(sym)
-        _send(update, context, "<b>PRICE</b>\n\n" + _escape_html(json.dumps(data, indent=2, sort_keys=True)))
-    except Exception as exc:
-        _send(update, context, "<b>PRICE ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-def cmd_ai_research(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
-        return
-    args = context.args or []
-    if not args:
-        _send(update, context, "<b>USAGE</b>\n\n/ai_research AAPL what’s the macro risk?")
-        return
-    sym = str(args[0]).strip().upper()
-    question = " ".join(args[1:]).strip() or "High-level macro and risk context."
-    try:
-        data = _client().ai_research(sym, question)
-        # keep it readable
-        text = json.dumps(data, indent=2, sort_keys=True)
-        _send(update, context, "<b>AI RESEARCH</b>\n\n" + _escape_html(_clip(text, 3600)))
-    except Exception as exc:
-        _send(update, context, "<b>AI RESEARCH ERROR</b>\n\n" + _escape_html(str(exc)))
-
-
-# =============================================================================
-# Natural language handler (best-effort routing)
-# =============================================================================
-
-_RX_PRICE = re.compile(r"\bprice\b|\bquote\b", re.IGNORECASE)
-_RX_SYMBOL = re.compile(r"\b([A-Z]{1,5})\b")
-
-
-def _nl_route(text: str) -> str:
-    t = (text or "").strip()
-    low = t.lower()
+def nl_route(text: str) -> str:
+    low = (text or "").strip().lower()
 
     if "why" in low and ("blocked" in low or "stuck" in low):
         return "why_blocked"
@@ -835,25 +794,472 @@ def _nl_route(text: str) -> str:
         return "portfolio_targets"
     if "rebalance" in low:
         return "portfolio_rebalance"
-    if _RX_PRICE.search(t):
+    if any(
+        phrase in low
+        for phrase in (
+            "how much do i have",
+            "what do i have",
+            "what am i holding",
+            "what are my holdings",
+            "show my holdings",
+            "show my positions",
+            "what are my positions",
+            "my positions",
+            "my holdings",
+            "how much am i holding",
+            "how much do i own",
+            "what do i own",
+        )
+    ):
+        return "portfolio_active"
+    if PRICE_RX.search(low):
         return "price"
-    if low in ("status", "health"):
+    if low in {"status", "health"}:
         return "status"
-    return "unknown"
+    return "advisory_chat"
+
+
+def extract_symbol_for_advisory(text: str) -> str:
+    raw = (text or "").strip()
+    upper = raw.upper()
+
+    explicit_patterns = [
+        r"\$([A-Z]{1,5})\b",
+        r"\b(?:BUY|SELL|HOLD|ADD|TRIM|SHORT|LONG|PRICE OF|QUOTE FOR|THINK ABOUT|ON|COMPARE|VS)\s+([A-Z]{1,5})\b",
+        r"\b([A-Z]{2,5})\b",
+    ]
+
+    stopwords = {
+        "I", "A", "AN", "THE", "DO", "IS", "IT", "TO", "FOR", "AND", "OR",
+        "YOU", "ME", "WE", "US", "NOW", "RIGHT", "WHAT", "WHEN", "WHY", "HOW",
+        "WITH", "THIS", "THAT", "THESE", "THOSE", "SHOULD", "WOULD", "COULD",
+        "ABOUT", "OVER", "UNDER", "FROM", "INTO", "ONTO", "THEN", "THAN",
+        "RISK", "PERF", "LIVE", "GATE", "CHAD", "PRICE", "READY", "BLOCK",
+        "HELP", "NOTE", "TERM", "SHORT", "LONG", "MONTH", "MONTHS", "WEEK",
+        "WEEKS", "YEAR", "YEARS", "PORTFOLIO", "TARGETS", "REBALANCE",
+        "BALANCED", "CAUTIOUS", "CONFIDENT", "STATUS", "HEALTH",
+        "MUCH", "HAVE", "HOLD", "HOLDING", "HOLDINGS", "OWN", "POSITIONS",
+        "POSITION", "AM", "MY", "SHOW"
+    }
+
+    for pattern in explicit_patterns:
+        for match in re.finditer(pattern, upper):
+            sym = str(match.group(1)).strip().upper()
+            if 1 <= len(sym) <= 5 and sym not in stopwords:
+                return sym
+
+    return "SPY"
+
+
+def infer_horizon(text: str) -> str:
+    low = (text or "").lower()
+    if any(x in low for x in ["today", "tomorrow", "this week", "short term", "short-term", "intraday", "day trade"]):
+        return "1w"
+    if any(x in low for x in ["this month", "next month", "medium term", "medium-term", "swing"]):
+        return "1m"
+    if any(x in low for x in ["long term", "long-term", "few months", "3 months", "quarter", "over 3 months"]):
+        return "3m"
+    return "1m"
+
+
+# =============================================================================
+# Telegram send / state
+# =============================================================================
+
+def send_message(update: Update, context: CallbackContext, text: str, *, html: bool = True) -> None:
+    if update.effective_chat is None:
+        return
+
+    parts = chunk_text(clip_text(text))
+    LOGGER.info(
+        "telegram_send_start chat_id=%s chunks=%s html=%s chars=%s",
+        update.effective_chat.id,
+        len(parts),
+        html,
+        len(text or ""),
+    )
+
+    for idx, part in enumerate(parts, start=1):
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=part,
+            parse_mode=ParseMode.HTML if html else None,
+            disable_web_page_preview=True,
+        )
+        LOGGER.info(
+            "telegram_send_chunk_ok chat_id=%s chunk=%s/%s chars=%s",
+            update.effective_chat.id,
+            idx,
+            len(parts),
+            len(part),
+        )
+
+
+def persist_state(**kwargs: Any) -> None:
+    def mutate(payload: Dict[str, Any]) -> Dict[str, Any]:
+        payload.update(kwargs)
+        payload["ts_utc"] = utc_now_iso()
+        return payload
+    STATE_STORE.update(mutate)
+
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+def cmd_ping(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    send_message(update, context, f"<b>PONG</b> {escape_html(utc_now_iso())}")
+
+
+def cmd_coach_mode(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+
+    chat_id = int(update.effective_chat.id) if update.effective_chat else 0
+    args = list(context.args or [])
+
+    if not args:
+        profile = get_coach_profile(chat_id)
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    arg = str(args[0]).strip().lower()
+
+    if arg in {"on", "teach", "teaching"}:
+        profile = set_coach_profile(
+            chat_id,
+            teaching_mode=True,
+            micro_lessons=True,
+            show_your_work=True,
+            explain_like_im_10=False,
+            audience_level="beginner",
+            tone="simple_coach",
+        )
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    if arg in {"off"}:
+        profile = set_coach_profile(
+            chat_id,
+            teaching_mode=False,
+            micro_lessons=False,
+            show_your_work=False,
+            explain_like_im_10=False,
+            tone="standard",
+        )
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    if arg in {"simple", "beginner"}:
+        profile = set_coach_profile(
+            chat_id,
+            teaching_mode=True,
+            micro_lessons=True,
+            show_your_work=True,
+            explain_like_im_10=False,
+            audience_level="beginner",
+            tone="simple_coach",
+        )
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    if arg in {"eli10", "kid", "10"}:
+        profile = set_coach_profile(
+            chat_id,
+            teaching_mode=True,
+            micro_lessons=True,
+            show_your_work=True,
+            explain_like_im_10=True,
+            audience_level="beginner",
+            tone="explain_like_im_10",
+        )
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    if arg == "quiz":
+        profile = set_coach_profile(chat_id, quiz_mode=True)
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    if arg == "noquiz":
+        profile = set_coach_profile(chat_id, quiz_mode=False)
+        send_message(update, context, render_coach_profile(profile))
+        return
+
+    send_message(
+        update,
+        context,
+        "<b>USAGE</b>\n\n/coach_mode\n/coach_mode on\n/coach_mode off\n/coach_mode simple\n/coach_mode eli10\n/coach_mode quiz\n/coach_mode noquiz",
+    )
+
+
+def cmd_help(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    msg = textwrap.dedent(
+        """
+        <b>CHAD Bot Commands</b>
+
+        <b>System</b>
+        /ping
+        /status
+        /readiness
+        /why_blocked
+        /risk
+        /perf
+        /live_gate
+
+        <b>Portfolio</b>
+        /portfolio_active
+        /portfolio_targets BALANCED
+        /portfolio_rebalance BALANCED
+
+        <b>Market</b>
+        /price AAPL
+        /ai_research AAPL what is the macro risk?
+
+        <b>Freeform CHADGPT</b>
+        Ask:
+        should i buy aapl right now?
+        what do you think about nvda over 3 months
+        should i trim msft
+
+        <b>Safety</b>
+        This bot is read-only. It does not place trades.
+        """
+    ).strip()
+    send_message(update, context, msg)
+
+
+def cmd_status(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        send_message(update, context, fmt_status(backend_client().op_status()))
+    except Exception as exc:
+        send_message(update, context, "<b>STATUS ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_readiness(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        payload = backend_client().op_readiness()
+        lines = [f"<b>READINESS</b> ok={escape_html(str(payload.get('ok')))}", ""]
+        blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
+        warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
+        if blockers:
+            lines.append("<b>Blockers</b>")
+            for item in blockers[:10]:
+                lines.append(escape_html(f"• {item}"))
+            lines.append("")
+        if warnings:
+            lines.append("<b>Warnings</b>")
+            for item in warnings[:10]:
+                lines.append(escape_html(f"• {item}"))
+        send_message(update, context, "\n".join(lines))
+    except Exception as exc:
+        send_message(update, context, "<b>READINESS ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_why_blocked(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        send_message(update, context, fmt_why_blocked(backend_client().op_why_blocked()))
+    except Exception as exc:
+        send_message(update, context, "<b>WHY BLOCKED ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_risk(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        send_message(update, context, fmt_risk(backend_client().op_risk_explain()))
+    except Exception as exc:
+        send_message(update, context, "<b>RISK ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_perf(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        send_message(update, context, fmt_perf(backend_client().op_perf_snapshot()))
+    except Exception as exc:
+        send_message(update, context, "<b>PERF ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_live_gate(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        send_message(update, context, fmt_live_gate(backend_client().live_gate()))
+    except Exception as exc:
+        send_message(update, context, "<b>LIVE GATE ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_portfolio_active(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    try:
+        send_message(update, context, fmt_portfolio_active(backend_client().portfolio_active()))
+    except Exception as exc:
+        send_message(update, context, "<b>PORTFOLIO ACTIVE ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_portfolio_targets(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    profile = (context.args[0] if context.args else "BALANCED").strip().upper()
+    try:
+        send_message(update, context, fmt_portfolio_targets(backend_client().portfolio_targets(profile)))
+    except Exception as exc:
+        send_message(update, context, "<b>PORTFOLIO TARGETS ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_portfolio_rebalance(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    profile = (context.args[0] if context.args else "BALANCED").strip().upper()
+    try:
+        send_message(update, context, fmt_portfolio_rebalance(backend_client().portfolio_rebalance_latest(profile)))
+    except Exception as exc:
+        send_message(update, context, "<b>REBALANCE ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_price(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    if not context.args:
+        send_message(update, context, "<b>USAGE</b>\n\n/price AAPL")
+        return
+    symbol = str(context.args[0]).strip().upper()
+    try:
+        payload = backend_client().ai_price(symbol)
+        send_message(update, context, "<b>PRICE</b>\n\n" + escape_html(safe_json_dumps(payload, pretty=True)))
+    except Exception as exc:
+        send_message(update, context, "<b>PRICE ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+def cmd_ai_research(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    if not context.args:
+        send_message(update, context, "<b>USAGE</b>\n\n/ai_research AAPL what is the macro risk?")
+        return
+    symbol = str(context.args[0]).strip().upper()
+    question = " ".join(context.args[1:]).strip() or "High-level macro and risk context."
+    try:
+        payload = backend_client().ai_research(symbol, question)
+        send_message(update, context, "<b>AI RESEARCH</b>\n\n" + escape_html(safe_json_dumps(payload, pretty=True)))
+    except Exception as exc:
+        send_message(update, context, "<b>AI RESEARCH ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+# =============================================================================
+# CHADGPT free-text advisory
+# =============================================================================
+
+def handle_advisory_chat(update: Update, context: CallbackContext, text: str) -> None:
+    question = (text or "").strip()
+    if not question:
+        send_message(update, context, "<b>CHADGPT</b>\n\nPlease send a real question.")
+        return
+
+    question = question[:ADVISORY_MAX_QUESTION_CHARS]
+    chat_id = int(update.effective_chat.id) if update.effective_chat else 0
+    user_id = int(update.effective_user.id) if update.effective_user else 0
+
+    if is_duplicate_message(chat_id, question):
+        return
+
+    symbol = extract_symbol_for_advisory(question)
+    horizon = infer_horizon(question)
+
+    LOGGER.info(
+        "telegram_advisory_start symbol=%s horizon=%s question=%r",
+        symbol,
+        horizon,
+        question,
+    )
+
+    append_memory(chat_id, "user", question)
+    recent_messages = memory_as_prompt_lines(chat_id)
+
+    try:
+        coach_profile = get_coach_profile(chat_id)
+
+        result = run_full_advisory(
+            symbol=symbol,
+            user_question=question,
+            horizon=horizon,
+            risk_profile="unspecified",
+            user_context={
+                "source": "telegram",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "recent_messages": recent_messages,
+                "coach_profile": coach_profile,
+            },
+            as_dict=True,
+        )
+
+        analysis_text = str(result.get("analysis_text") or "")
+        append_memory(chat_id, "assistant", analysis_text[:MEMORY_MAX_CHARS_PER_MESSAGE])
+
+        diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+        failed = diagnostics.get("engines_failed") if isinstance(diagnostics.get("engines_failed"), list) else []
+
+        LOGGER.info(
+            "telegram_advisory_done symbol=%s horizon=%s synthesis_ok=%s engines_failed=%s",
+            symbol,
+            horizon,
+            result.get("synthesis_ok"),
+            failed,
+        )
+
+        persist_state(
+            last_advisory={
+                "symbol": symbol,
+                "horizon": horizon,
+                "question": question,
+                "synthesis_ok": result.get("synthesis_ok"),
+                "ts_utc": utc_now_iso(),
+            }
+        )
+
+        send_message(update, context, render_advisory_answer(result))
+
+    except Exception as exc:
+        LOGGER.exception("telegram_advisory_failed symbol=%s question=%r err=%s", symbol, question, exc)
+        send_message(update, context, "<b>CHADGPT ERROR</b>\n\n" + escape_html(str(exc)))
+
+
+# =============================================================================
+# Free-text handler
+# =============================================================================
+
+def fake_args_context(context: CallbackContext, args: List[str]) -> CallbackContext:
+    context.args = args
+    return context
 
 
 def handle_free_text(update: Update, context: CallbackContext) -> None:
-    if not _is_allowed(update):
+    if not is_allowed(update):
         return
-    text = (update.message.text if update.message else "") or ""
-    route = _nl_route(text)
 
-    # Attempt to extract a profile/symbol where needed
-    profile = "BALANCED"
-    sym = None
-    m = _RX_SYMBOL.search(text.upper())
-    if m:
-        sym = m.group(1)
+    text = (update.message.text if update.message else "") or ""
+    LOGGER.info(
+        "telegram_inbound_text chat_id=%s user_id=%s text=%r",
+        update.effective_chat.id if update.effective_chat else None,
+        update.effective_user.id if update.effective_user else None,
+        text,
+    )
+
+    route = nl_route(text)
+    LOGGER.info("telegram_route_selected route=%s text=%r", route, text)
 
     try:
         if route == "why_blocked":
@@ -875,86 +1281,128 @@ def handle_free_text(update: Update, context: CallbackContext) -> None:
             cmd_portfolio_active(update, context)
             return
         if route == "portfolio_targets":
-            # try: “targets balanced”
-            if "balanced" in text.lower():
-                profile = "BALANCED"
-            cmd_portfolio_targets(update, _fake_context_args(context, [profile]))
+            profile = "BALANCED" if "balanced" in text.lower() else "BALANCED"
+            cmd_portfolio_targets(update, fake_args_context(context, [profile]))
             return
         if route == "portfolio_rebalance":
-            if "balanced" in text.lower():
-                profile = "BALANCED"
-            cmd_portfolio_rebalance(update, _fake_context_args(context, [profile]))
+            profile = "BALANCED" if "balanced" in text.lower() else "BALANCED"
+            cmd_portfolio_rebalance(update, fake_args_context(context, [profile]))
             return
-        if route == "price" and sym:
-            cmd_price(update, _fake_context_args(context, [sym]))
+        if route == "price":
+            symbol = extract_symbol_for_advisory(text)
+            cmd_price(update, fake_args_context(context, [symbol]))
             return
         if route == "status":
             cmd_status(update, context)
             return
 
-        # fallback: short teaching response, no trading advice
-        msg = _teach_brief(
-            "I can help with CHAD status, why it’s blocked, risk posture, portfolio previews, and prices. "
-            "Try: /status, /why_blocked, /risk, /portfolio_rebalance BALANCED, /price AAPL."
-        )
-        _send(update, context, _escape_html(msg))
+        handle_advisory_chat(update, context, text)
+
     except Exception as exc:
-        _send(update, context, "<b>ERROR</b>\n\n" + _escape_html(str(exc)))
+        LOGGER.exception("telegram_handle_free_text_failed err=%s", exc)
+        send_message(update, context, "<b>ERROR</b>\n\n" + escape_html(str(exc)))
 
 
-def _fake_context_args(context: CallbackContext, args: List[str]) -> CallbackContext:
-    # python-telegram-bot v13 stores args on context, so we can temporarily override.
-    context.args = args
-    return context
+# =============================================================================
+# Global error handling
+# =============================================================================
+
+def error_handler(update: object, context: CallbackContext) -> None:
+    err = context.error
+    LOGGER.exception("telegram_dispatch_error err=%s", err)
+
+    if isinstance(err, NetworkError):
+        return
+
+    try:
+        if isinstance(update, Update) and update.effective_chat is not None:
+            context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="<b>BOT ERROR</b>\n\nSomething failed internally. Check server logs.",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception:
+        pass
 
 
 # =============================================================================
 # Main
 # =============================================================================
 
-def main() -> int:
-    _init_logger()
-
-    # best-effort load env files
-    _load_env_file("/etc/chad/telegram.env")
-    _load_env_file("/etc/chad/openai.env")
-
-    token = _env("TELEGRAM_BOT_TOKEN", required=True)
-    _ = _allowed_chat_id()  # validates
-
-    base_url = _get_backend_base_url()
-    LOGGER.info("telegram_bot_start ts=%s base_url=%s", _utc_now_iso(), base_url)
-
+def build_updater() -> Updater:
+    token = require_env("TELEGRAM_BOT_TOKEN")
     updater = Updater(token=token, use_context=True)
     dp = updater.dispatcher
 
-    # Commands
+    dp.add_error_handler(error_handler)
+
     dp.add_handler(CommandHandler("ping", cmd_ping))
     dp.add_handler(CommandHandler("help", cmd_help))
-
+    dp.add_handler(CommandHandler("coach_mode", cmd_coach_mode))
     dp.add_handler(CommandHandler("status", cmd_status))
     dp.add_handler(CommandHandler("readiness", cmd_readiness))
     dp.add_handler(CommandHandler("why_blocked", cmd_why_blocked))
     dp.add_handler(CommandHandler("risk", cmd_risk))
     dp.add_handler(CommandHandler("perf", cmd_perf))
     dp.add_handler(CommandHandler("live_gate", cmd_live_gate))
-
-    dp.add_handler(CommandHandler("caps", cmd_caps))
-
     dp.add_handler(CommandHandler("portfolio_active", cmd_portfolio_active))
     dp.add_handler(CommandHandler("portfolio_targets", cmd_portfolio_targets))
     dp.add_handler(CommandHandler("portfolio_rebalance", cmd_portfolio_rebalance))
-
     dp.add_handler(CommandHandler("price", cmd_price))
     dp.add_handler(CommandHandler("ai_research", cmd_ai_research))
-
-    # Free text
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_free_text))
 
-    # Start polling
-    updater.start_polling(drop_pending_updates=True)
-    updater.idle()
-    return 0
+    return updater
+
+
+def main() -> int:
+    ensure_dirs()
+    init_logging()
+    load_all_env_files()
+
+    INSTANCE_LOCK.acquire()
+    atexit.register(INSTANCE_LOCK.release)
+
+    require_env("TELEGRAM_BOT_TOKEN")
+    _ = allowed_chat_id()
+
+    persist_state(
+        status="starting",
+        pid=os.getpid(),
+        base_url=get_backend_base_url(),
+    )
+
+    LOGGER.info("telegram_bot_start ts=%s base_url=%s", utc_now_iso(), get_backend_base_url())
+
+    updater = build_updater()
+
+    def _shutdown_handler(signum: int, _frame: Any) -> None:
+        LOGGER.info("telegram_bot_signal_received signal=%s", signum)
+        try:
+            updater.stop()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    try:
+        updater.start_polling(drop_pending_updates=True)
+        persist_state(status="running", pid=os.getpid(), started_at=utc_now_iso())
+        updater.idle()
+        persist_state(status="stopped", pid=os.getpid(), stopped_at=utc_now_iso())
+        return 0
+
+    except Exception as exc:
+        LOGGER.exception("telegram_bot_fatal err=%s", exc)
+        persist_state(
+            status="fatal",
+            pid=os.getpid(),
+            error=str(exc),
+            traceback=traceback.format_exc(limit=20),
+            failed_at=utc_now_iso(),
+        )
+        raise
 
 
 if __name__ == "__main__":

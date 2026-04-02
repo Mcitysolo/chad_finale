@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional
 
 
 # Authoritative runtime config path on your host
-SCR_CONFIG_PATH = Path("/home/ubuntu/CHAD FINALE/runtime/scr_config.json")
+SCR_CONFIG_PATH = Path("/home/ubuntu/chad_finale/runtime/scr_config.json")
 
 
 # -----------------------------

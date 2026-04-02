@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, Any, List
+
+
+def _read_ndjson(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows
+
+
+def _latest_file(dir_path: Path, prefix: str) -> Path | None:
+    files = sorted(dir_path.glob(f"{prefix}_*.ndjson"))
+    return files[-1] if files else None
+
+
+def load_evidence(data_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
+    fills_file = _latest_file(data_dir / "fills", "FILLS")
+    fees_file = _latest_file(data_dir / "fees", "FEES")
+
+    fills = _read_ndjson(fills_file) if fills_file else []
+    fees = _read_ndjson(fees_file) if fees_file else []
+
+    return {
+        "fills": fills,
+        "fees": fees,
+    }
+
+
+def replay_positions(evidence: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Deterministic position rebuild from fills only.
+    (fees ignored for now — phase 3B will integrate PnL)
+    """
+    positions: Dict[str, Dict[str, Any]] = {}
+
+    for row in evidence["fills"]:
+        payload = row.get("payload", {})
+        symbol = payload.get("symbol")
+        qty = float(payload.get("quantity", 0))
+        side = payload.get("side")
+        price = float(payload.get("fill_price", 0))
+
+        if not symbol or qty == 0:
+            continue
+
+        pos = positions.setdefault(symbol, {
+            "qty": 0.0,
+            "notional": 0.0
+        })
+
+        signed_qty = qty if side == "BUY" else -qty
+
+        pos["qty"] += signed_qty
+        pos["notional"] += signed_qty * price
+
+    # finalize avg cost
+    final: Dict[str, Dict[str, Any]] = {}
+    for symbol, p in positions.items():
+        qty = p["qty"]
+        if qty == 0:
+            continue
+
+        avg_cost = abs(p["notional"] / qty)
+
+        final[symbol] = {
+            "qty": qty,
+            "avg_cost": avg_cost
+        }
+
+    return final
+
+
+def build_replay_state(repo_root: Path) -> Dict[str, Any]:
+    data_dir = repo_root / "data"
+
+    evidence = load_evidence(data_dir)
+    positions = replay_positions(evidence)
+
+    return {
+        "schema_version": "lifecycle_replay_state.v1",
+        "positions": positions,
+        "positions_count": len(positions),
+    }
+
+
+def main():
+    repo_root = Path("/home/ubuntu/chad_finale")
+    out = build_replay_state(repo_root)
+
+    print(json.dumps(out, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

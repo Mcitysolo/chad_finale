@@ -9,7 +9,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/chad_finale
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && exec "/home/ubuntu/CHAD FINALE/venv/bin/python3" -m chad.portfolio.merge_kraken_into_snapshot'
+ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && exec "/home/ubuntu/chad_finale/venv/bin/python3" -m chad.portfolio.merge_kraken_into_snapshot'
 
 [Install]
 WantedBy=multi-user.target

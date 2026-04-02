@@ -1,32 +1,23 @@
 #!/usr/bin/env python3
 """
-CHAD Rotation Rules Layer — bootstrap publisher (Production, advisory-only)
+CHAD Rotation Rules Layer — config-driven publisher (Production, advisory-only)
 
 File: ops/rotation_publish.py
 
 Outputs:
-  /home/ubuntu/CHAD FINALE/reports/rotation/ROTATION_<ts>.json
+  /home/ubuntu/chad_finale/reports/rotation/ROTATION_<ts>.json
 Optional pointer:
-  /home/ubuntu/CHAD FINALE/runtime/rotation_state.json
+  /home/ubuntu/chad_finale/runtime/rotation_state.json
 
 SSOT v4.2 contract:
 - Rotation Rules produce tilts + blocks as advisory proposals, never direct execution.
 - Outputs must be bounded and fail-closed if inputs are stale/unknown.
-- Artifacts logged under reports/rotation/ and referenced by the system. :contentReference[oaicite:0]{index=0}
+- Artifacts logged under reports/rotation/ and referenced by the system.
 
-Bootstrap Strategy (honest + bounded)
--------------------------------------
-Inputs:
-- runtime/macro_state.json (risk_label)
-- runtime/event_risk.json (severity/windows)
-- runtime/sector_rotation.json (bootstrap ranks currently empty)
-
-Outputs:
-- tilt suggestions at the sleeve level (growth_momo vs hedge) with bounded delta_weight
-- symbol_blocks empty by default (until earnings/calendar provider exists)
-- notes explain bootstrap logic
-
-No broker calls. No secrets. Advisory-only.
+Config contract:
+- Reads config/rotation_rules.json when present.
+- Preserves prior bootstrap behavior by default.
+- No broker calls. No secrets. Advisory-only.
 """
 
 from __future__ import annotations
@@ -36,33 +27,13 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-# -----------------------------
-# Paths / Config
-# -----------------------------
-
-RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", "/home/ubuntu/CHAD FINALE/runtime"))
-REPORTS_DIR = Path(os.environ.get("CHAD_ROTATION_REPORTS_DIR", "/home/ubuntu/CHAD FINALE/reports/rotation"))
-
-MACRO_PATH = RUNTIME_DIR / "macro_state.json"
-EVENT_RISK_PATH = RUNTIME_DIR / "event_risk.json"
-SECTOR_ROT_PATH = RUNTIME_DIR / "sector_rotation.json"
-
-ROTATION_STATE_PATH = RUNTIME_DIR / "rotation_state.json"
-
-TTL_SECONDS = int(os.environ.get("CHAD_ROTATION_TTL_SECONDS", "3600"))
-
-# Hard bounds (bootstrap): never tilt more than 5% in one step
-MAX_ABS_TILT = float(os.environ.get("CHAD_ROTATION_MAX_ABS_TILT", "0.05"))
-
-# If true, write rotation_state.json pointer
-WRITE_POINTER = os.environ.get("CHAD_ROTATION_WRITE_POINTER", "1").lower() in ("1", "true", "yes", "on")
+from typing import Any, Dict, List, Tuple
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
+DEFAULT_REPORTS_DIR = Path("/home/ubuntu/chad_finale/reports/rotation")
+DEFAULT_CONFIG_PATH = Path("/home/ubuntu/chad_finale/config/rotation_rules.json")
+
 
 def utc_now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -113,108 +84,327 @@ def _safe_str(d: Dict[str, Any], k: str) -> str:
     return str(v) if v is not None else ""
 
 
-# -----------------------------
-# Rotation logic (bootstrap)
-# -----------------------------
+def _safe_bool(v: Any, default: bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
 
-def compute_bootstrap_tilts(macro: Dict[str, Any], event_risk: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Returns (regime_label, tilts list)
-    Tilts are bounded and advisory.
-    """
+
+def _safe_float(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def load_rotation_rules() -> Dict[str, Any]:
+    runtime_dir = Path(os.environ.get("CHAD_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
+    reports_dir = Path(os.environ.get("CHAD_ROTATION_REPORTS_DIR", str(DEFAULT_REPORTS_DIR)))
+    config_path = Path(os.environ.get("CHAD_ROTATION_RULES_PATH", str(DEFAULT_CONFIG_PATH)))
+
+    base: Dict[str, Any] = {
+        "schema_version": "rotation_rules.v1",
+        "enabled": True,
+        "advisory_only": True,
+        "write_pointer": _safe_bool(os.environ.get("CHAD_ROTATION_WRITE_POINTER", "1"), True),
+        "ttl_seconds": _safe_int(os.environ.get("CHAD_ROTATION_TTL_SECONDS", "3600"), 3600),
+        "fail_closed_on_missing_inputs": True,
+        "fail_closed_event_risk_severities": ["high", "unknown"],
+        "max_abs_tilt": _safe_float(os.environ.get("CHAD_ROTATION_MAX_ABS_TILT", "0.05"), 0.05),
+        "inputs": {
+            "macro_state_path": str(runtime_dir / "macro_state.json"),
+            "event_risk_path": str(runtime_dir / "event_risk.json"),
+            "sector_rotation_path": str(runtime_dir / "sector_rotation.json"),
+        },
+        "output": {
+            "reports_dir": str(reports_dir),
+            "pointer_path": str(runtime_dir / "rotation_state.json"),
+        },
+        "regime_rules": {
+            "event_risk_override": {
+                "growth_momo": -0.05,
+                "hedge": 0.05,
+                "reason": "event_risk_high_or_unknown",
+            },
+            "risk_off": {
+                "growth_momo": -0.05,
+                "hedge": 0.05,
+                "reason": "macro_risk_off",
+            },
+            "risk_on": {
+                "growth_momo": 0.05,
+                "hedge": -0.05,
+                "reason": "macro_risk_on",
+            },
+            "neutral": {
+                "growth_momo": 0.0,
+                "hedge": 0.0,
+                "reason": "macro_neutral",
+            },
+        },
+        "symbol_blocks": [],
+        "notes": [
+            "Bootstrap fallback contract active.",
+            "No broker calls. Advisory-only.",
+        ],
+        "_meta": {
+            "config_path": str(config_path),
+            "config_loaded": False,
+        },
+    }
+
+    if not config_path.is_file():
+        return base
+
+    raw = read_json_dict(config_path)
+
+    cfg = dict(base)
+    cfg["schema_version"] = str(raw.get("schema_version", base["schema_version"]))
+    cfg["enabled"] = _safe_bool(raw.get("enabled"), True)
+    cfg["advisory_only"] = _safe_bool(raw.get("advisory_only"), True)
+    cfg["write_pointer"] = _safe_bool(raw.get("write_pointer"), base["write_pointer"])
+    cfg["ttl_seconds"] = _safe_int(raw.get("ttl_seconds"), base["ttl_seconds"])
+    cfg["fail_closed_on_missing_inputs"] = _safe_bool(raw.get("fail_closed_on_missing_inputs"), True)
+    cfg["fail_closed_event_risk_severities"] = list(
+        raw.get("fail_closed_event_risk_severities", base["fail_closed_event_risk_severities"])
+    )
+    cfg["max_abs_tilt"] = abs(_safe_float(raw.get("max_abs_tilt"), base["max_abs_tilt"]))
+
+    raw_inputs = raw.get("inputs", {})
+    if not isinstance(raw_inputs, dict):
+        raw_inputs = {}
+    cfg["inputs"] = {
+        "macro_state_path": str(raw_inputs.get("macro_state_path", base["inputs"]["macro_state_path"])),
+        "event_risk_path": str(raw_inputs.get("event_risk_path", base["inputs"]["event_risk_path"])),
+        "sector_rotation_path": str(raw_inputs.get("sector_rotation_path", base["inputs"]["sector_rotation_path"])),
+    }
+
+    raw_output = raw.get("output", {})
+    if not isinstance(raw_output, dict):
+        raw_output = {}
+    cfg["output"] = {
+        "reports_dir": str(raw_output.get("reports_dir", base["output"]["reports_dir"])),
+        "pointer_path": str(raw_output.get("pointer_path", base["output"]["pointer_path"])),
+    }
+
+    raw_regime_rules = raw.get("regime_rules", {})
+    if not isinstance(raw_regime_rules, dict):
+        raw_regime_rules = {}
+    regime_rules: Dict[str, Dict[str, Any]] = {}
+    for key, fallback_rule in base["regime_rules"].items():
+        candidate = raw_regime_rules.get(key, {})
+        if not isinstance(candidate, dict):
+            candidate = {}
+        regime_rules[key] = {
+            "growth_momo": clamp(
+                _safe_float(candidate.get("growth_momo"), fallback_rule["growth_momo"]),
+                -cfg["max_abs_tilt"],
+                cfg["max_abs_tilt"],
+            ),
+            "hedge": clamp(
+                _safe_float(candidate.get("hedge"), fallback_rule["hedge"]),
+                -cfg["max_abs_tilt"],
+                cfg["max_abs_tilt"],
+            ),
+            "reason": str(candidate.get("reason", fallback_rule["reason"])),
+        }
+    cfg["regime_rules"] = regime_rules
+
+    symbol_blocks = raw.get("symbol_blocks", [])
+    cfg["symbol_blocks"] = symbol_blocks if isinstance(symbol_blocks, list) else []
+
+    notes = raw.get("notes", [])
+    cfg["notes"] = notes if isinstance(notes, list) else base["notes"]
+
+    cfg["_meta"] = {
+        "config_path": str(config_path),
+        "config_loaded": True,
+    }
+    return cfg
+
+
+def build_tilts_from_rule(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
+    reason = str(rule.get("reason", "rotation_rule"))
+    return [
+        {
+            "sleeve": "growth_momo",
+            "delta_weight": float(rule.get("growth_momo", 0.0)),
+            "reason": reason,
+        },
+        {
+            "sleeve": "hedge",
+            "delta_weight": float(rule.get("hedge", 0.0)),
+            "reason": reason,
+        },
+    ]
+
+
+def compute_tilts(
+    macro: Dict[str, Any],
+    event_risk: Dict[str, Any],
+    rules: Dict[str, Any],
+) -> Tuple[str, List[Dict[str, Any]], str]:
     risk_label = _safe_str(macro, "risk_label").strip().lower()
     sev = _safe_str(event_risk, "severity").strip().lower()
 
-    # Default neutral
-    regime = "neutral"
-    tilts: List[Dict[str, Any]] = []
+    fail_closed_sev = {
+        str(x).strip().lower()
+        for x in rules.get("fail_closed_event_risk_severities", ["high", "unknown"])
+    }
+    regime_rules = rules["regime_rules"]
 
-    # If event risk is high/unknown, fail-closed => increase hedge, reduce growth
-    if sev in ("high", "unknown"):
-        regime = "risk_off"
-        tilts.append({"sleeve": "growth_momo", "delta_weight": clamp(-MAX_ABS_TILT, -MAX_ABS_TILT, MAX_ABS_TILT), "reason": "event_risk_high_or_unknown"})
-        tilts.append({"sleeve": "hedge", "delta_weight": clamp(MAX_ABS_TILT, -MAX_ABS_TILT, MAX_ABS_TILT), "reason": "event_risk_high_or_unknown"})
-        return regime, tilts
+    if sev in fail_closed_sev:
+        return "risk_off", build_tilts_from_rule(regime_rules["event_risk_override"]), "event_risk_override"
 
-    # Macro-driven
     if risk_label == "risk_off":
-        regime = "risk_off"
-        tilts.append({"sleeve": "growth_momo", "delta_weight": clamp(-MAX_ABS_TILT, -MAX_ABS_TILT, MAX_ABS_TILT), "reason": "macro_risk_off"})
-        tilts.append({"sleeve": "hedge", "delta_weight": clamp(MAX_ABS_TILT, -MAX_ABS_TILT, MAX_ABS_TILT), "reason": "macro_risk_off"})
-    elif risk_label == "risk_on":
-        regime = "risk_on"
-        tilts.append({"sleeve": "growth_momo", "delta_weight": clamp(MAX_ABS_TILT, -MAX_ABS_TILT, MAX_ABS_TILT), "reason": "macro_risk_on"})
-        tilts.append({"sleeve": "hedge", "delta_weight": clamp(-MAX_ABS_TILT, -MAX_ABS_TILT, MAX_ABS_TILT), "reason": "macro_risk_on"})
-    else:
-        regime = "neutral"
-        tilts.append({"sleeve": "growth_momo", "delta_weight": 0.0, "reason": "macro_neutral"})
-        tilts.append({"sleeve": "hedge", "delta_weight": 0.0, "reason": "macro_neutral"})
-
-    return regime, tilts
+        return "risk_off", build_tilts_from_rule(regime_rules["risk_off"]), "risk_off"
+    if risk_label == "risk_on":
+        return "risk_on", build_tilts_from_rule(regime_rules["risk_on"]), "risk_on"
+    return "neutral", build_tilts_from_rule(regime_rules["neutral"]), "neutral"
 
 
 def build_rotation_payload() -> Dict[str, Any]:
     ts = utc_now_iso()
+    rules = load_rotation_rules()
 
-    # Fail-closed if any required file is missing/unreadable
+    macro_path = Path(rules["inputs"]["macro_state_path"])
+    event_risk_path = Path(rules["inputs"]["event_risk_path"])
+    sector_rot_path = Path(rules["inputs"]["sector_rotation_path"])
+
+    ttl_seconds = _safe_int(rules.get("ttl_seconds"), 3600)
+
+    if not _safe_bool(rules.get("enabled"), True):
+        return {
+            "ts_utc": ts,
+            "ttl_seconds": ttl_seconds,
+            "schema_version": "rotation.v1",
+            "regime": "disabled",
+            "tilts": [],
+            "symbol_blocks": [],
+            "notes": "rotation_rules_disabled",
+            "inputs": {
+                "macro_state": {"path": str(macro_path), "exists": macro_path.is_file()},
+                "event_risk": {"path": str(event_risk_path), "exists": event_risk_path.is_file()},
+                "sector_rotation": {"path": str(sector_rot_path), "exists": sector_rot_path.is_file()},
+            },
+            "config": {
+                "schema_version": rules.get("schema_version"),
+                "advisory_only": _safe_bool(rules.get("advisory_only"), True),
+                "config_path": rules["_meta"]["config_path"],
+                "config_loaded": rules["_meta"]["config_loaded"],
+            },
+        }
+
     try:
-        macro = read_json_dict(MACRO_PATH)
-        event_risk = read_json_dict(EVENT_RISK_PATH)
-        sector_rot = read_json_dict(SECTOR_ROT_PATH)
+        macro = read_json_dict(macro_path)
+        event_risk = read_json_dict(event_risk_path)
+        sector_rot = read_json_dict(sector_rot_path)
     except Exception as exc:
         return {
             "ts_utc": ts,
-            "ttl_seconds": TTL_SECONDS,
+            "ttl_seconds": ttl_seconds,
             "schema_version": "rotation.v1",
             "regime": "unknown",
             "tilts": [],
             "symbol_blocks": [],
             "notes": f"fail_closed_missing_inputs:{type(exc).__name__}",
             "inputs": {
-                "macro_state": {"path": str(MACRO_PATH), "exists": MACRO_PATH.is_file()},
-                "event_risk": {"path": str(EVENT_RISK_PATH), "exists": EVENT_RISK_PATH.is_file()},
-                "sector_rotation": {"path": str(SECTOR_ROT_PATH), "exists": SECTOR_ROT_PATH.is_file()},
+                "macro_state": {"path": str(macro_path), "exists": macro_path.is_file()},
+                "event_risk": {"path": str(event_risk_path), "exists": event_risk_path.is_file()},
+                "sector_rotation": {"path": str(sector_rot_path), "exists": sector_rot_path.is_file()},
+            },
+            "config": {
+                "schema_version": rules.get("schema_version"),
+                "advisory_only": _safe_bool(rules.get("advisory_only"), True),
+                "config_path": rules["_meta"]["config_path"],
+                "config_loaded": rules["_meta"]["config_loaded"],
             },
         }
 
-    regime, tilts = compute_bootstrap_tilts(macro, event_risk)
+    regime, tilts, rule_key = compute_tilts(macro, event_risk, rules)
+
+    notes = [
+        f"rotation_rule_applied:{rule_key}",
+        f"config_loaded:{rules['_meta']['config_loaded']}",
+    ]
+    for n in rules.get("notes", []):
+        notes.append(str(n))
 
     return {
         "ts_utc": ts,
-        "ttl_seconds": TTL_SECONDS,
+        "ttl_seconds": ttl_seconds,
         "schema_version": "rotation.v1",
         "regime": regime,
         "tilts": tilts,
-        "symbol_blocks": [],  # bootstrap: empty
-        "notes": "bootstrap rotation: bounded sleeve tilts derived from macro_state + event_risk; no sector ranks yet",
+        "symbol_blocks": list(rules.get("symbol_blocks", [])),
+        "notes": "; ".join(notes),
         "inputs": {
             "macro_state": {"ts_utc": macro.get("ts_utc"), "risk_label": macro.get("risk_label")},
             "event_risk": {"ts_utc": event_risk.get("ts_utc"), "severity": event_risk.get("severity")},
             "sector_rotation": {"ts_utc": sector_rot.get("ts_utc"), "provider_status": sector_rot.get("provider_status")},
+        },
+        "config": {
+            "schema_version": rules.get("schema_version"),
+            "advisory_only": _safe_bool(rules.get("advisory_only"), True),
+            "max_abs_tilt": _safe_float(rules.get("max_abs_tilt"), 0.05),
+            "config_path": rules["_meta"]["config_path"],
+            "config_loaded": rules["_meta"]["config_loaded"],
         },
     }
 
 
 def main() -> int:
     payload = build_rotation_payload()
-    ts_compact = utc_now_compact()
+    rules = load_rotation_rules()
 
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = REPORTS_DIR / f"ROTATION_{ts_compact}.json"
+    reports_dir = Path(rules["output"]["reports_dir"])
+    pointer_path = Path(rules["output"]["pointer_path"])
+    write_pointer = _safe_bool(rules.get("write_pointer"), True)
+
+    ts_compact = utc_now_compact()
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    out = reports_dir / f"ROTATION_{ts_compact}.json"
     atomic_write_json(out, payload)
 
-    # pointer
-    if WRITE_POINTER:
+    if write_pointer:
         pointer = {
             "ts_utc": payload.get("ts_utc"),
             "ttl_seconds": payload.get("ttl_seconds"),
             "latest_rotation_path": str(out),
-            "latest_rotation_sha256": sha256_hex(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)),
+            "latest_rotation_sha256": sha256_hex(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            ),
             "schema_version": "rotation_state.v1",
         }
-        atomic_write_json(ROTATION_STATE_PATH, pointer)
+        atomic_write_json(pointer_path, pointer)
 
-    print(json.dumps({"ok": True, "out": str(out), "ts_utc": payload.get("ts_utc")}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "out": str(out),
+                "ts_utc": payload.get("ts_utc"),
+                "config_loaded": rules["_meta"]["config_loaded"],
+                "config_path": rules["_meta"]["config_path"],
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 

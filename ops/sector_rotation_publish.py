@@ -5,7 +5,7 @@ CHAD Market Radar — sector_rotation publisher (Production, bootstrap)
 File: ops/sector_rotation_publish.py
 
 Outputs:
-  /home/ubuntu/CHAD FINALE/runtime/sector_rotation.json
+  /home/ubuntu/chad_finale/runtime/sector_rotation.json
 
 SSOT contract (v4.2):
 - runtime/sector_rotation.json exists, includes ts_utc + ttl_seconds, safe to read while running (atomic write)
@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Paths / Config
 # -----------------------------
 
-DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/CHAD FINALE/runtime")
+DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 RUNTIME_DIR = Path(os.environ.get("CHAD_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
 
 OUT_PATH = RUNTIME_DIR / "sector_rotation.json"

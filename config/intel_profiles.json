@@ -1,0 +1,48 @@
+{
+  "schema_version": "intel_profiles.v1",
+  "ts_utc": "BOOTSTRAP_STATIC",
+  "notes": "Phase11 additions: intel profiles select which cached sensors are required. Required sensors must be fresh; stale tightens risk and may block entries depending on policy.",
+  "profiles": {
+    "BUDGET": {
+      "description": "Low-cost sensors. No paid calendars. Conservative fail-closed tightening.",
+      "required_sensors": [
+        { "name": "macro_state", "path": "runtime/macro_state.json", "ttl_seconds": 1800 },
+        { "name": "event_risk", "path": "runtime/event_risk.json", "ttl_seconds": 1800 }
+      ],
+      "optional_sensors": [
+        { "name": "earnings_state", "path": "runtime/earnings_state.json", "ttl_seconds": 3600 },
+        { "name": "sector_rotation", "path": "runtime/sector_rotation.json", "ttl_seconds": 3600 }
+      ],
+      "on_required_stale": "TIGHTEN_ONLY"
+    },
+    "STANDARD": {
+      "description": "Adds basic rotation + earnings windows (still can be bootstrap providers until upgraded).",
+      "required_sensors": [
+        { "name": "macro_state", "path": "runtime/macro_state.json", "ttl_seconds": 1800 },
+        { "name": "event_risk", "path": "runtime/event_risk.json", "ttl_seconds": 1800 },
+        { "name": "earnings_state", "path": "runtime/earnings_state.json", "ttl_seconds": 3600 },
+        { "name": "sector_rotation", "path": "runtime/sector_rotation.json", "ttl_seconds": 3600 }
+      ],
+      "optional_sensors": [],
+      "on_required_stale": "TIGHTEN_ONLY"
+    },
+    "PREMIUM": {
+      "description": "Reserved for future paid feeds (flows/short/sentiment/options). Not enabled until providers are allowlisted.",
+      "required_sensors": [
+        { "name": "macro_state", "path": "runtime/macro_state.json", "ttl_seconds": 1800 },
+        { "name": "event_risk", "path": "runtime/event_risk.json", "ttl_seconds": 1800 },
+        { "name": "earnings_state", "path": "runtime/earnings_state.json", "ttl_seconds": 3600 },
+        { "name": "sector_rotation", "path": "runtime/sector_rotation.json", "ttl_seconds": 3600 }
+      ],
+      "optional_sensors": [
+        { "name": "altdata_state", "path": "runtime/altdata_state.json", "ttl_seconds": 3600 },
+        { "name": "options_state", "path": "runtime/intel_cache/options_state.json", "ttl_seconds": 300 }
+      ],
+      "on_required_stale": "TIGHTEN_ONLY"
+    }
+  },
+  "defaults": {
+    "active_profile_env": "CHAD_INTEL_PROFILE",
+    "default_profile": "BUDGET"
+  }
+}

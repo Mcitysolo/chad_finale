@@ -289,6 +289,96 @@ class PortfolioEngine:
             out.append(t)
         return out
 
+
+    def _enforce_income_sleeve_min(self, prof: dict, targets: list[dict]) -> tuple[list[dict], dict]:
+        """SSOT Phase 9 income constraint: enforce income sleeve minimum (fail-closed baseline).
+        - Uses prof['income_symbols'] allowlist and prof['income_rule'] type sleeve_min.
+        - Does NOT compute yield; yield_status remains UNKNOWN unless providers are added.
+        """
+        income_meta = {
+            "enforced": False,
+            "rule": None,
+            "yield_status": "UNKNOWN",
+            "income_symbols": [],
+            "income_min_weight": None,
+        }
+
+        income_rule = prof.get("income_rule") if isinstance(prof.get("income_rule"), dict) else {}
+        if not isinstance(income_rule, dict):
+            return targets, income_meta
+        if str(income_rule.get("type") or "").strip() != "sleeve_min":
+            return targets, income_meta
+
+        income_min = float(income_rule.get("income_min_weight") or 0.0)
+        income_syms = prof.get("income_symbols") if isinstance(prof.get("income_symbols"), list) else []
+        income_syms = [str(x).strip().upper() for x in income_syms if str(x).strip()]
+        income_syms = list(dict.fromkeys(income_syms))
+
+        income_meta["rule"] = "sleeve_min"
+        income_meta["yield_status"] = str(income_rule.get("yield_status") or "UNKNOWN")
+        income_meta["income_symbols"] = income_syms
+        income_meta["income_min_weight"] = income_min
+
+        if income_min <= 0.0 or not income_syms:
+            return targets, income_meta
+
+        # Build weights map
+        tw = {}
+        for t in targets:
+            if not isinstance(t, dict):
+                continue
+            sym = str(t.get("symbol") or "").strip().upper()
+            w = float(t.get("weight") or 0.0)
+            if sym:
+                tw[sym] = tw.get(sym, 0.0) + max(0.0, w)
+
+        # Compute current income weight
+        income_w = sum(tw.get(sym, 0.0) for sym in income_syms)
+
+        # If already satisfies, just normalize and return
+        if income_w >= income_min:
+            income_meta["enforced"] = True
+            ssum = sum(tw.values())
+            if ssum > 0:
+                out = [{"symbol": k, "weight": float(v/ssum)} for k, v in sorted(tw.items()) if v > 0]
+                return out, income_meta
+            return targets, income_meta
+
+        # Need to allocate additional weight to income symbols
+        need = income_min - income_w
+
+        non_syms = [k for k in tw.keys() if k not in income_syms]
+        non_total = sum(tw.get(k, 0.0) for k in non_syms)
+
+        # If no non-income weight exists (e.g., empty targets), fail-closed: build from income symbols only
+        if non_total <= 0.0:
+            per = 1.0 / float(len(income_syms))
+            out = [{"symbol": sym, "weight": per} for sym in income_syms]
+            income_meta["enforced"] = True
+            return out, income_meta
+
+        take = min(need, non_total)
+
+        # Reduce non-income proportionally
+        for k in non_syms:
+            share = tw.get(k, 0.0) / non_total if non_total > 0 else 0.0
+            tw[k] = max(0.0, tw.get(k, 0.0) - take * share)
+
+        # Add to income symbols evenly (also creates them if missing)
+        per = take / float(len(income_syms))
+        for sym in income_syms:
+            tw[sym] = tw.get(sym, 0.0) + per
+
+        # Normalize
+        ssum = sum(tw.values())
+        if ssum > 0:
+            out = [{"symbol": k, "weight": float(v/ssum)} for k, v in sorted(tw.items()) if v > 0]
+        else:
+            out = targets
+
+        income_meta["enforced"] = True
+        return out, income_meta
+
     def get_targets(self, profile: str) -> Dict[str, Any]:
         profile_key = _safe_str(profile).strip().upper()
         cfg, err = self._load_profiles()
@@ -331,10 +421,14 @@ class PortfolioEngine:
         else:
             norm = []
 
+        # Phase 9 income constraint (sleeve_min). Fail-closed baseline; yield UNKNOWN unless providers exist.
+        norm, income_meta = self._enforce_income_sleeve_min(prof, norm)
+
         return {
             "ok": True,
             "ts_utc": utc_now_iso(),
             "schema_version": "portfolio_targets.v1",
+            "income_meta": income_meta,
             "profile": profile_key,
             "max_symbols": max_symbols,
             "targets": norm,
@@ -352,9 +446,9 @@ class PortfolioEngine:
         targets = self.get_targets(profile)
 
         if not active.get("ok"):
-            return {"ok": False, "error": f"active_positions_error:{active.get(error)}", "ts_utc": utc_now_iso()}
+            return {"ok": False, "error": f"active_positions_error:{active.get('error')}", "diffs": [], "ts_utc": utc_now_iso()}
         if not targets.get("ok"):
-            return {"ok": False, "error": f"targets_error:{targets.get(error)}", "ts_utc": utc_now_iso()}
+            return {"ok": False, "error": f"targets_error:{targets.get('error')}", "diffs": [], "ts_utc": utc_now_iso()}
 
         pos_list = active.get("positions") or []
         total = _safe_float(active.get("total_notional_proxy"), 0.0)

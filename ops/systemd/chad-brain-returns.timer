@@ -1,0 +1,13 @@
+[Unit]
+Description=CHAD Phase 11.5 Brain Returns Publisher (every 5 minutes)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+Persistent=true
+AccuracySec=10
+
+Unit=chad-brain-returns.service
+
+[Install]
+WantedBy=timers.target

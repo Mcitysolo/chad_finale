@@ -11,7 +11,7 @@ Usage
 -----
 From the CHAD runtime root:
 
-    PYTHONPATH="/home/ubuntu/CHAD FINALE" python -m chad.core.show_execution_config
+    PYTHONPATH="/home/ubuntu/chad_finale" python -m chad.core.show_execution_config
 
 This is a *read-only* diagnostic. It never touches any broker.
 """

@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "mode": "paper",
+  "positions_snapshot_path": "/home/ubuntu/chad_finale/runtime/positions_snapshot.json",
+  "preview_dir": "/home/ubuntu/chad_finale/reports/ledger",
+  "state_path": "/home/ubuntu/chad_finale/runtime/ibkr_paper_ledger_state.json",
+  "ttl_seconds": 300
+}

@@ -29,8 +29,8 @@ from chad.analytics.shadow_confidence_router import evaluate_confidence
 from chad.core.mode import get_chad_mode, is_live_mode_enabled
 
 # runtime paths used by orchestrator + collectors
-DYNAMIC_CAPS_PATH = Path("/home/ubuntu/CHAD FINALE/runtime/dynamic_caps.json")
-PORTFOLIO_SNAPSHOT_PATH = Path("/home/ubuntu/CHAD FINALE/runtime/portfolio_snapshot.json")
+DYNAMIC_CAPS_PATH = Path("/home/ubuntu/chad_finale/runtime/dynamic_caps.json")
+PORTFOLIO_SNAPSHOT_PATH = Path("/home/ubuntu/chad_finale/runtime/portfolio_snapshot.json")
 
 
 def _load_dynamic_caps() -> Optional[Dict[str, Any]]:

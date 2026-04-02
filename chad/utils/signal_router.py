@@ -138,3 +138,14 @@ class SignalRouter:
         # Stable ordering: symbol then side
         routed.sort(key=lambda rs: (rs.symbol, rs.side.value))
         return routed
+# -----------------------------
+# Backwards-compatible functional entrypoint
+# -----------------------------
+def route_signals(signals: Iterable[TradeSignal], config: RouterConfig | None = None) -> List[RoutedSignal]:
+    """
+    Compatibility wrapper expected by chad.utils.pipeline.
+
+    Phase-3 router lives as SignalRouter.route(); pipeline imports route_signals().
+    """
+    return SignalRouter(config=config).route(signals)
+

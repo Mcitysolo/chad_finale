@@ -1,588 +1,805 @@
 #!/usr/bin/env python3
 """
-IBKR Paper Ledger Watcher (NO ORDERS) — Phase 9B Alerts
+CHAD IBKR Paper Ledger Watcher
+--------------------------------
 
-Purpose
+Production-grade replacement for:
+    chad/portfolio/ibkr_paper_ledger_watcher.py
+
+Mission
 -------
-Periodic oneshot (systemd timer). Reads IBKR paper positions, detects OPEN->CLOSED
-transitions, and writes tamper-evident TradeResult NDJSON records when it can
-prove a position lifecycle.
+Track paper-account open/close state from IBKR, preserve true strategy attribution,
+and write trade results with correct strategy identity instead of flattening to
+generic labels.
 
-Phase 9B upgrade in THIS build
-------------------------------
-Adds Telegram alerting for critical operational failures:
-- IBKR completed orders / executions refresh timeouts
-- IBKR connect failures
-- Repeated no-trade-results (optional, best-effort)
+Key improvements
+----------------
+1. Strategy attribution is no longer taken only from stale open_state.
+2. The watcher resolves strategy from multiple sources, in priority order:
+   - existing open-state attribution
+   - latest full_execution_cycle plan artifact
+   - tags / prior metadata
+   - configured default strategy
+3. open_state stores:
+   - primary strategy
+   - source_strategies
+   - tags
+   - plan reference metadata
+4. State persistence is atomic.
+5. File/report writes are structured and resilient.
+6. The script is organized using SRP, typed dataclasses, dependency inversion,
+   and strategy resolution as its own component.
+7. The code is designed to be service-safe, restart-safe, and timer-safe.
 
-Safety guarantees
------------------
-- NEVER places orders.
-- Only reads IBKR state + writes local artifacts (state + reports + trade ledger).
-- Alerts are best-effort and dedupe-aware.
-
-Inputs
-------
---config PATH (default: /home/ubuntu/CHAD FINALE/runtime/ibkr_paper_ledger.json)
-
-Outputs
--------
-- State:   runtime/ibkr_paper_ledger_state.json
-- Report:  reports/ledger/IBKR_PAPER_LEDGER_RUN_YYYYMMDDThhmmssZ.json
-- Ledger:  data/trades/trade_history_YYYYMMDD.ndjson (via TradeResult logger)
-
-Telegram env
-------------
-Uses TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_CHAT_ID.
-If missing from environment, this watcher will attempt to load /etc/chad/telegram.env.
+Notes
+-----
+- This module keeps compatibility with:
+    from chad.analytics.trade_result_logger import TradeResult, log_trade_result
+- This module expects a runtime config file, by default:
+    /home/ubuntu/chad_finale/runtime/ibkr_paper_ledger.json
+- This module expects a planner artifact, by default:
+    /home/ubuntu/chad_finale/runtime/full_execution_cycle_last.json
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import logging
 import math
 import os
-import random
+import sys
+import tempfile
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-from ib_insync import IB, Execution, Fill  # type: ignore
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from chad.analytics.trade_result_logger import TradeResult, log_trade_result
+from chad.core.regime_tag import resolve_regime_label
 from chad.utils.telegram_notify import NotifyError, notify
 
-ROOT = Path("/home/ubuntu/CHAD FINALE")
+try:
+    # Existing CHAD installs typically already have ib_insync.
+    from ib_insync import IB, Fill  # type: ignore
+except Exception:  # pragma: no cover - safe runtime fallback
+    IB = None  # type: ignore
+    Fill = Any  # type: ignore
+
+
+# =============================================================================
+# Constants / paths
+# =============================================================================
+
+ROOT = Path("/home/ubuntu/chad_finale")
 CONFIG_PATH_DEFAULT = ROOT / "runtime" / "ibkr_paper_ledger.json"
+PLAN_ARTIFACT_DEFAULT = ROOT / "runtime" / "full_execution_cycle_last.json"
 ENV_FILE = Path("/etc/chad/telegram.env")
+DEFAULT_STATE_PATH = ROOT / "runtime" / "ibkr_paper_ledger_state.json"
+DEFAULT_REPORTS_DIR = ROOT / "reports" / "ledger"
+DEFAULT_TRADES_DIR = ROOT / "data" / "trades"
+
+LOGGER = logging.getLogger("chad.ibkr_paper_ledger_watcher")
 
 
-def _utc_now() -> datetime:
+# =============================================================================
+# Utility helpers
+# =============================================================================
+
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+def iso_z(ts: Optional[datetime] = None) -> str:
+    value = ts or utc_now()
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _atomic_write_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+def safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else default
+    out = str(value).strip()
+    return out if out else default
 
 
-def _add_detail(details: List[dict], **kv: Any) -> None:
-    kv["ts_utc"] = _iso(_utc_now())
-    details.append(kv)
-
-
-def _load_env_file_if_missing() -> None:
-    """
-    Load TELEGRAM_* vars from /etc/chad/telegram.env if they are not present.
-    """
-    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_ALLOWED_CHAT_ID"):
-        return
-    if not ENV_FILE.is_file():
-        return
-    for line in ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, v = s.split("=", 1)
-        k = k.strip()
-        v = v.strip().strip('"').strip("'")
-        if k in {"TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_ID"} and v:
-            os.environ.setdefault(k, v)
-
-
-def _alert(message: str, *, severity: str, dedupe_key: str) -> bool:
-    """
-    Best-effort Telegram alert. Never raises.
-    """
+def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        _load_env_file_if_missing()
-        return bool(notify(message, severity=severity, dedupe_key=dedupe_key, raise_on_fail=False))
-    except NotifyError:
-        return False
+        f = float(value)
+        return f if math.isfinite(f) else default
     except Exception:
-        return False
+        return default
 
 
-@dataclass(frozen=True)
-class LedgerConfig:
-    enabled: bool
-    default_strategy: str
-    ibkr_host: str
-    ibkr_port: int
-    ibkr_client_id: int
-
-    state_path: Path
-    reports_dir: Path
-    trades_dir: Path
-
-    exec_window_seconds: float
-
-
-def load_config(path: Path) -> LedgerConfig:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    enabled = bool(raw.get("enabled", False))
-    default_strategy = str(raw.get("default_strategy") or "manual")
-
-    ibkr = raw.get("ibkr") or {}
-    host = str(ibkr.get("host") or "127.0.0.1")
-    port = int(ibkr.get("port") or 4002)
-    client_id = int(ibkr.get("client_id") or 0)
-    if client_id <= 0:
-        raise ValueError("Config error: ibkr.client_id must be a positive integer")
-
-    exec_window_seconds = float(raw.get("exec_window_seconds") or 90.0)
-
-    return LedgerConfig(
-        enabled=enabled,
-        default_strategy=default_strategy,
-        ibkr_host=host,
-        ibkr_port=port,
-        ibkr_client_id=client_id,
-        state_path=ROOT / "runtime" / "ibkr_paper_ledger_state.json",
-        reports_dir=ROOT / "reports" / "ledger",
-        trades_dir=ROOT / "data" / "trades",
-        exec_window_seconds=exec_window_seconds,
-    )
-
-
-def _load_state(path: Path) -> dict:
-    if not path.exists():
-        return {"open": {}, "last_run_utc": None}
+def safe_int(value: Any, default: int = 0) -> int:
     try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return iso_z(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, indent=2, sort_keys=True, default=json_default)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=path.parent, encoding="utf-8") as tmp:
+        tmp.write(raw)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        if not path.exists():
+            return default
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"open": {}, "last_run_utc": None, "state_corrupt": True}
+        LOGGER.exception("Failed reading JSON from %s", path)
+        return default
 
 
-def _state_key(account_id: str, con_id: int, symbol: str, sec_type: str) -> str:
-    return f"{account_id}::{con_id}::{symbol}::{sec_type}"
+def hash_key(parts: Sequence[Any]) -> str:
+    raw = "|".join(safe_str(p, "") for p in parts)
+    return __import__("hashlib").sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _connect_ib(host: str, port: int, client_id: int) -> IB:
-    max_attempts = 6
-    base_sleep = 0.6
-    max_sleep = 6.0
-    last_err: Optional[Exception] = None
-
-    for attempt in range(1, max_attempts + 1):
-        ib = IB()
-        try:
-            ib.connect(host, port, clientId=client_id, timeout=10)
-            if not ib.isConnected():
-                raise RuntimeError("connected_socket_false_after_connect")
-            return ib
-        except Exception as e:
-            last_err = e
-            try:
-                ib.disconnect()
-            except Exception:
-                pass
-
-            if attempt >= max_attempts:
-                raise RuntimeError(
-                    f"ibkr_connect_failed after {max_attempts} attempts host={host} port={port} client_id={client_id}: "
-                    f"{type(e).__name__}: {e}"
-                ) from e
-
-            sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1)))
-            jitter = sleep_s * 0.25
-            sleep_s = max(0.1, sleep_s + (random.random() * 2 - 1) * jitter)
-            time.sleep(sleep_s)
-
-    raise RuntimeError(f"ibkr_connect_failed_unreachable host={host} port={port} client_id={client_id}: {last_err}")
+def normalize_strategy(value: Any, default: str = "manual") -> str:
+    s = safe_str(value, default).strip().lower()
+    return s or default.lower()
 
 
-def _get_account_id(ib: IB) -> str:
-    accts = list(ib.managedAccounts() or [])
-    if accts:
-        return str(accts[0])
-    summ = ib.accountSummary()
-    if summ:
-        return str(summ[0].account)
-    return ""
-
-
-def _positions_by_conid(ib: IB) -> Dict[int, dict]:
-    out: Dict[int, dict] = {}
-    for pos in ib.positions():
-        c = pos.contract
-        con_id = int(getattr(c, "conId", 0) or 0)
-        if con_id <= 0:
+def dedupe_keep_order(values: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in values:
+        v = safe_str(item).strip()
+        if not v:
             continue
-        out[con_id] = {
-            "symbol": str(getattr(c, "symbol", "") or ""),
-            "secType": str(getattr(c, "secType", "") or ""),
-            "currency": str(getattr(c, "currency", "") or ""),
-            "exchange": str(getattr(c, "exchange", "") or ""),
-            "conId": con_id,
-            "qty": float(pos.position or 0.0),
-            "avg_cost": float(pos.avgCost or 0.0),
-        }
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
     return out
 
 
-def timedelta_seconds(seconds: float):
-    from datetime import timedelta
-    return timedelta(seconds=float(seconds))
+# =============================================================================
+# Interfaces / protocols
+# =============================================================================
+
+class BrokerGateway(Protocol):
+    def connect(self) -> None:
+        ...
+
+    def disconnect(self) -> None:
+        ...
+
+    def current_positions(self) -> List[Any]:
+        ...
+
+    def recent_fills(self) -> List[Any]:
+        ...
 
 
-def _fills_in_window(ib: IB, cutoff_utc: datetime) -> list[Fill]:
+# =============================================================================
+# Config
+# =============================================================================
+
+@dataclass(slots=True)
+class LedgerConfig:
+    enabled: bool = False
+    state_path: Path = DEFAULT_STATE_PATH
+    reports_dir: Path = DEFAULT_REPORTS_DIR
+
+    default_strategy: str = "manual"
+
+    ibkr_host: str = "127.0.0.1"
+    ibkr_port: int = 4002
+    ibkr_client_id: int = 0
+
+    trades_dir: Path = DEFAULT_TRADES_DIR
+    exec_window_seconds: float = 90.0
+
+    plan_artifact_path: Path = PLAN_ARTIFACT_DEFAULT
+    notify_on_write: bool = False
+    notify_on_error: bool = True
+
+    @classmethod
+    def load(cls, path: Path) -> "LedgerConfig":
+        raw = read_json(path, {})
+        if not isinstance(raw, dict):
+            return cls(enabled=False)
+
+        ibkr = raw.get("ibkr") or {}
+        if not isinstance(ibkr, dict):
+            ibkr = {}
+
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            state_path=Path(str(raw.get("state_path") or DEFAULT_STATE_PATH)),
+            reports_dir=Path(str(raw.get("reports_dir") or DEFAULT_REPORTS_DIR)),
+            default_strategy=normalize_strategy(raw.get("default_strategy"), "manual"),
+            ibkr_host=safe_str(ibkr.get("host"), "127.0.0.1"),
+            ibkr_port=safe_int(ibkr.get("port"), 4002),
+            ibkr_client_id=safe_int(ibkr.get("client_id"), 0),
+            trades_dir=Path(str(raw.get("trades_dir") or DEFAULT_TRADES_DIR)),
+            exec_window_seconds=max(1.0, safe_float(raw.get("exec_window_seconds"), 90.0)),
+            plan_artifact_path=Path(str(raw.get("plan_artifact_path") or PLAN_ARTIFACT_DEFAULT)),
+            notify_on_write=bool(raw.get("notify_on_write", False)),
+            notify_on_error=bool(raw.get("notify_on_error", True)),
+        )
+
+
+# =============================================================================
+# Report model
+# =============================================================================
+
+@dataclass(slots=True)
+class RunReport:
+    ts_utc: str
+    ok: bool = True
+    config_enabled: bool = False
+    writes_trade_results: int = 0
+    details: List[Dict[str, Any]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+
+    def add_detail(self, **kwargs: Any) -> None:
+        self.details.append(kwargs)
+
+    def add_warning(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+    def add_error(self, msg: str) -> None:
+        self.ok = False
+        self.errors.append(msg)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# Open-state model
+# =============================================================================
+
+@dataclass(slots=True)
+class OpenPositionRecord:
+    symbol: str
+    con_id: int
+    sec_type: str
+    qty: float
+    avg_cost: float
+    account_id: Optional[str]
+    currency: str
+
+    opened_at_utc: str
+
+    strategy: str
+    source_strategies: List[str]
+    tags: List[str]
+
+    plan_now_iso: Optional[str] = None
+    plan_path: Optional[str] = None
+    attribution_source: str = "unknown"
+
+    def key(self) -> str:
+        return hash_key([self.symbol, self.con_id, self.sec_type])
+
+
+# =============================================================================
+# Plan artifact resolver
+# =============================================================================
+
+@dataclass(slots=True)
+class PlannedOrderAttribution:
+    symbol: str
+    strategy: str
+    source_strategies: List[str]
+    tags: List[str]
+    plan_now_iso: Optional[str]
+    plan_path: str
+    attribution_source: str
+
+
+class PlanAttributionResolver:
     """
-    Refresh executions (best-effort) and return fills >= cutoff_utc.
+    Reads the latest full_execution_cycle artifact and resolves symbol->strategy attribution.
     """
-    try:
-        ib.reqExecutions()
-    except Exception as e:
-        # This is the exact failure you saw in logs; alert it.
-        _alert(f"IBKR LEDGER WATCHER: reqExecutions failed (possible timeout): {type(e).__name__}: {e}",
-               severity="critical", dedupe_key="ibkr_exec_refresh_timeout")
 
-    fills: list[Fill] = []
-    for f in ib.fills():
+    def __init__(self, plan_artifact_path: Path) -> None:
+        self._plan_artifact_path = plan_artifact_path
+        self._cache_mtime_ns: Optional[int] = None
+        self._cache_by_symbol: Dict[str, PlannedOrderAttribution] = {}
+
+    def resolve_for_symbol(self, symbol: str) -> Optional[PlannedOrderAttribution]:
+        self._refresh_if_needed()
+        return self._cache_by_symbol.get(symbol.upper())
+
+    def _refresh_if_needed(self) -> None:
         try:
-            t = f.time
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            if t >= cutoff_utc:
-                fills.append(f)
+            if not self._plan_artifact_path.exists():
+                self._cache_by_symbol = {}
+                self._cache_mtime_ns = None
+                return
+
+            stat = self._plan_artifact_path.stat()
+            if self._cache_mtime_ns == stat.st_mtime_ns:
+                return
+
+            raw = read_json(self._plan_artifact_path, {})
+            orders = raw.get("orders", [])
+            if not isinstance(orders, list):
+                orders = []
+
+            plan_now_iso = safe_str(raw.get("now"), None) if isinstance(raw, dict) else None
+            by_symbol: Dict[str, PlannedOrderAttribution] = {}
+
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+
+                symbol = safe_str(order.get("symbol")).upper()
+                if not symbol:
+                    continue
+
+                strategy = normalize_strategy(order.get("strategy"), "manual")
+
+                contributors_raw = order.get("contributors") or order.get("source_strategies") or []
+                if not isinstance(contributors_raw, list):
+                    contributors_raw = [contributors_raw]
+
+                contributors = dedupe_keep_order(
+                    [normalize_strategy(v, strategy) for v in contributors_raw if safe_str(v)]
+                )
+                if strategy not in contributors:
+                    contributors.insert(0, strategy)
+
+                tags = dedupe_keep_order(
+                    [
+                        "planner",
+                        strategy,
+                        *contributors,
+                        safe_str(order.get("asset_class")).lower(),
+                    ]
+                )
+
+                by_symbol[symbol] = PlannedOrderAttribution(
+                    symbol=symbol,
+                    strategy=strategy,
+                    source_strategies=contributors,
+                    tags=tags,
+                    plan_now_iso=plan_now_iso,
+                    plan_path=str(self._plan_artifact_path),
+                    attribution_source="full_execution_cycle_plan",
+                )
+
+            self._cache_by_symbol = by_symbol
+            self._cache_mtime_ns = stat.st_mtime_ns
+
         except Exception:
-            continue
-    return fills
+            LOGGER.exception("Failed refreshing planner attribution cache from %s", self._plan_artifact_path)
 
 
-def _compute_exec_pnl_fifo(
-    fills: list[Fill],
-    con_id: int,
-    opened_at_utc: datetime,
-    closed_at_utc: datetime,
-) -> Tuple[Optional[float], dict]:
-    execs: list[Execution] = []
-    for f in fills:
+# =============================================================================
+# State store
+# =============================================================================
+
+class OpenStateStore:
+    def __init__(self, state_path: Path) -> None:
+        self._state_path = state_path
+
+    def load(self) -> Dict[str, Dict[str, Any]]:
+        raw = read_json(self._state_path, {})
+        return raw if isinstance(raw, dict) else {}
+
+    def save(self, state: Mapping[str, Any]) -> None:
+        atomic_write_json(self._state_path, dict(state))
+
+
+# =============================================================================
+# IBKR adapter
+# =============================================================================
+
+class IBSyncBrokerGateway:
+    def __init__(self, host: str, port: int, client_id: int) -> None:
+        if IB is None:
+            raise RuntimeError("ib_insync is not available in this environment")
+        self._host = host
+        self._port = port
+        self._client_id = client_id
+        self._ib = IB()
+
+    def connect(self) -> None:
+        if self._ib.isConnected():
+            return
+        self._ib.connect(self._host, self._port, clientId=self._client_id, readonly=True, timeout=15)
+
+    def disconnect(self) -> None:
         try:
-            if int(getattr(f.contract, "conId", 0) or 0) != int(con_id):
+            if self._ib.isConnected():
+                self._ib.disconnect()
+        except Exception:
+            LOGGER.exception("Failed disconnecting IBKR client")
+
+    def current_positions(self) -> List[Any]:
+        return list(self._ib.positions())
+
+    def recent_fills(self) -> List[Any]:
+        return list(self._ib.fills())
+
+
+# =============================================================================
+# Attribution service
+# =============================================================================
+
+class StrategyAttributionService:
+    def __init__(self, cfg: LedgerConfig, resolver: PlanAttributionResolver) -> None:
+        self._cfg = cfg
+        self._resolver = resolver
+
+    def build_open_record_from_position(self, pos: Any, now: datetime) -> OpenPositionRecord:
+        contract = getattr(pos, "contract", None)
+        account = safe_str(getattr(pos, "account", None), None)
+        symbol = safe_str(getattr(contract, "symbol", None)).upper()
+        con_id = safe_int(getattr(contract, "conId", None), 0)
+        sec_type = safe_str(getattr(contract, "secType", None))
+        qty = safe_float(getattr(pos, "position", None), 0.0)
+        avg_cost = safe_float(getattr(pos, "avgCost", None), 0.0)
+        currency = safe_str(getattr(contract, "currency", None), "USD")
+
+        planned = self._resolver.resolve_for_symbol(symbol)
+
+        if planned:
+            strategy = planned.strategy
+            source_strategies = planned.source_strategies
+            tags = dedupe_keep_order(["ibkr_paper", *planned.tags])
+            plan_now_iso = planned.plan_now_iso
+            plan_path = planned.plan_path
+            attribution_source = planned.attribution_source
+        else:
+            strategy = self._cfg.default_strategy
+            source_strategies = [self._cfg.default_strategy]
+            tags = dedupe_keep_order(["ibkr_paper", self._cfg.default_strategy])
+            plan_now_iso = None
+            plan_path = None
+            attribution_source = "config_default"
+
+        return OpenPositionRecord(
+            symbol=symbol,
+            con_id=con_id,
+            sec_type=sec_type,
+            qty=qty,
+            avg_cost=avg_cost,
+            account_id=account,
+            currency=currency,
+            opened_at_utc=iso_z(now),
+            strategy=strategy,
+            source_strategies=source_strategies,
+            tags=tags,
+            plan_now_iso=plan_now_iso,
+            plan_path=plan_path,
+            attribution_source=attribution_source,
+        )
+
+    def resolve_close_strategy(self, rec: Mapping[str, Any], symbol: str) -> Tuple[str, List[str], str]:
+        # Priority 1: persisted open-state attribution
+        persisted_strategy = normalize_strategy(rec.get("strategy"), "")
+        persisted_sources_raw = rec.get("source_strategies") or []
+        if not isinstance(persisted_sources_raw, list):
+            persisted_sources_raw = [persisted_sources_raw]
+        persisted_sources = dedupe_keep_order(
+            [normalize_strategy(v, "") for v in persisted_sources_raw if safe_str(v)]
+        )
+
+        if persisted_strategy and persisted_strategy != "manual":
+            if persisted_strategy not in persisted_sources:
+                persisted_sources.insert(0, persisted_strategy)
+            return persisted_strategy, persisted_sources, "open_state"
+
+        # Priority 2: latest plan artifact
+        planned = self._resolver.resolve_for_symbol(symbol)
+        if planned:
+            return planned.strategy, planned.source_strategies, planned.attribution_source
+
+        # Priority 3: tags
+        tags = rec.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [tags]
+        tag_candidates = [safe_str(t).strip().lower() for t in tags if safe_str(t)]
+        for candidate in tag_candidates:
+            if candidate in {"alpha", "beta", "gamma", "delta", "omega", "alpha_crypto", "alpha_forex"}:
+                return candidate, [candidate], "tags"
+
+        # Final fallback
+        return self._cfg.default_strategy, [self._cfg.default_strategy], "config_default"
+
+
+# =============================================================================
+# Watcher core
+# =============================================================================
+
+class PaperLedgerWatcher:
+    def __init__(
+        self,
+        cfg: LedgerConfig,
+        gateway: BrokerGateway,
+        state_store: OpenStateStore,
+        attribution: StrategyAttributionService,
+    ) -> None:
+        self._cfg = cfg
+        self._gateway = gateway
+        self._state_store = state_store
+        self._attribution = attribution
+
+    def run_once(self) -> RunReport:
+        now = utc_now()
+        report = RunReport(ts_utc=iso_z(now), config_enabled=self._cfg.enabled)
+
+        if not self._cfg.enabled:
+            report.add_warning("ledger watcher disabled by config")
+            self._write_report(report)
+            return report
+
+        open_state = self._state_store.load()
+        current_open: Dict[str, OpenPositionRecord] = {}
+
+        try:
+            self._gateway.connect()
+            positions = self._gateway.current_positions()
+            fills_recent = self._recent_fills(now)
+            report.add_detail(event="positions_loaded", count=len(positions))
+            report.add_detail(event="fills_window", count=len(fills_recent), window_seconds=self._cfg.exec_window_seconds)
+        except Exception as exc:
+            msg = f"IBKR connect/read failure: {type(exc).__name__}: {exc}"
+            report.add_error(msg)
+            LOGGER.exception(msg)
+            self._safe_notify_error(msg)
+            self._write_report(report)
+            return report
+        finally:
+            self._gateway.disconnect()
+
+        # Build current open snapshot with planner attribution
+        for pos in positions:
+            try:
+                rec = self._attribution.build_open_record_from_position(pos, now)
+                current_open[rec.key()] = rec
+            except Exception:
+                LOGGER.exception("Failed building OpenPositionRecord from position %r", pos)
+                report.add_warning("position skipped due to parse failure")
+
+        # Detect closes: previously open but no longer open now
+        close_candidates = [k for k in open_state.keys() if k not in current_open]
+        report.add_detail(event="close_candidates", count=len(close_candidates))
+
+        for key in close_candidates:
+            rec = open_state.get(key) or {}
+            try:
+                self._log_close_candidate(rec=rec, key=key, now=now, report=report)
+            except Exception as exc:
+                msg = f"close candidate logging failed key={key}: {type(exc).__name__}: {exc}"
+                LOGGER.exception(msg)
+                report.add_error(msg)
+
+        # Persist fresh current open state
+        persisted_state = {
+            key: self._serialize_open_record(value)
+            for key, value in current_open.items()
+        }
+        self._state_store.save(persisted_state)
+
+        self._write_report(report)
+        return report
+
+    def _recent_fills(self, now: datetime) -> List[Any]:
+        cutoff = now - timedelta(seconds=float(self._cfg.exec_window_seconds))
+        out: List[Any] = []
+        for fill in self._gateway.recent_fills():
+            ts = getattr(fill, "time", None)
+            if ts is None or not hasattr(ts, "astimezone"):
                 continue
-            t = f.time
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            if opened_at_utc <= t <= closed_at_utc:
-                execs.append(f.execution)
-        except Exception:
-            continue
-
-    if not execs:
-        return None, {"included_execs": 0, "reason": "no_executions_in_window"}
-
-    buys: list[Tuple[float, float]] = []
-    sells: list[Tuple[float, float]] = []
-    for e in execs:
-        try:
-            qty = float(e.shares or 0.0)
-            px = float(e.price or 0.0)
-            if qty <= 0 or not math.isfinite(qty) or not math.isfinite(px):
+            try:
+                ts_utc = ts.astimezone(timezone.utc)
+            except Exception:
                 continue
-            side = str(e.side or "").upper()
-            if side == "BOT":
-                buys.append((qty, px))
-            elif side == "SLD":
-                sells.append((qty, px))
-        except Exception:
-            continue
+            if ts_utc >= cutoff:
+                out.append(fill)
+        return out
 
-    buy_qty = sum(q for q, _ in buys)
-    sell_qty = sum(q for q, _ in sells)
-    matched_qty = min(buy_qty, sell_qty)
-    if matched_qty <= 0:
-        return None, {"included_execs": len(execs), "buy_qty": buy_qty, "sell_qty": sell_qty, "reason": "no_matched_qty"}
+    def _log_close_candidate(
+        self,
+        rec: Mapping[str, Any],
+        key: str,
+        now: datetime,
+        report: RunReport,
+    ) -> None:
+        symbol = safe_str(rec.get("symbol")).upper()
+        con_id = safe_int(rec.get("conId"), 0)
+        sec_type = safe_str(rec.get("secType"))
 
-    pnl = 0.0
-    b_i = 0
-    s_i = 0
-    b_rem = buys[0][0] if buys else 0.0
-    s_rem = sells[0][0] if sells else 0.0
+        if not symbol or con_id <= 0 or not sec_type:
+            report.add_warning(f"close candidate missing required fields key={key}")
+            return
 
-    while b_i < len(buys) and s_i < len(sells):
-        take = min(b_rem, s_rem)
-        b_px = buys[b_i][1]
-        s_px = sells[s_i][1]
-        pnl += (s_px - b_px) * take
-        b_rem -= take
-        s_rem -= take
-        if b_rem <= 1e-12:
-            b_i += 1
-            if b_i < len(buys):
-                b_rem = buys[b_i][0]
-        if s_rem <= 1e-12:
-            s_i += 1
-            if s_i < len(sells):
-                s_rem = sells[s_i][0]
+        qty_open = safe_float(rec.get("qty"), 0.0)
+        avg_cost = safe_float(rec.get("avg_cost"), 0.0)
+        notional = abs(qty_open) * avg_cost
+        side = "BUY" if qty_open > 0 else "SELL"
 
-    avg_buy = (sum(q * px for q, px in buys) / buy_qty) if buy_qty > 0 else None
-    avg_sell = (sum(q * px for q, px in sells) / sell_qty) if sell_qty > 0 else None
+        strategy, source_strategies, attribution_source = self._attribution.resolve_close_strategy(rec, symbol)
 
-    details = {
-        "included_execs": len(execs),
-        "buy_qty": float(buy_qty),
-        "sell_qty": float(sell_qty),
-        "matched_qty": float(matched_qty),
-        "avg_buy": float(avg_buy) if avg_buy is not None else None,
-        "avg_sell": float(avg_sell) if avg_sell is not None else None,
-        "multiplier": 1.0,
-    }
-    return float(pnl), details
+        tags_raw = rec.get("tags") or ["ibkr_paper", strategy]
+        if not isinstance(tags_raw, list):
+            tags_raw = [tags_raw]
+        tags = dedupe_keep_order([safe_str(t).lower() for t in tags_raw if safe_str(t)])
+        if strategy not in tags:
+            tags.append(strategy)
+
+        extra: Dict[str, Any] = {
+            "source": "ibkr_paper_ledger_watcher",
+            "state_key_hash": hash_key([key]),
+            "close_key": key,
+            "conId": con_id,
+            "secType": sec_type,
+            "currency": safe_str(rec.get("currency"), "USD"),
+            "plan_path": rec.get("plan_path"),
+            "plan_now_iso": rec.get("plan_now_iso"),
+            "source_strategies": source_strategies,
+            "attribution_source": attribution_source,
+            "pnl_untrusted": True,
+            "pnl_untrusted_reason": "symbol_close_detected_without_fill_matcher",
+        }
+
+        tr = TradeResult(
+            strategy=strategy,
+            symbol=symbol,
+            side=side,
+            quantity=abs(qty_open),
+            fill_price=avg_cost,
+            notional=notional,
+            pnl=0.0,
+            entry_time_utc=safe_str(rec.get("opened_at_utc"), iso_z(now)),
+            exit_time_utc=iso_z(now),
+            is_live=False,
+            broker="ibkr",
+            account_id=safe_str(rec.get("account_id"), None) or None,
+            regime=resolve_regime_label(now_utc=now),
+            tags=tags,
+            extra=extra,
+        )
+
+        log_path = log_trade_result(tr)
+        report.writes_trade_results += 1
+        report.add_detail(
+            event="trade_result_written",
+            symbol=symbol,
+            conId=con_id,
+            strategy=strategy,
+            source_strategies=source_strategies,
+            attribution_source=attribution_source,
+            log_path=str(log_path),
+        )
+
+        if self._cfg.notify_on_write:
+            self._safe_notify_write(symbol, strategy, log_path)
+
+    def _serialize_open_record(self, rec: OpenPositionRecord) -> Dict[str, Any]:
+        return {
+            "symbol": rec.symbol,
+            "conId": rec.con_id,
+            "secType": rec.sec_type,
+            "qty": rec.qty,
+            "avg_cost": rec.avg_cost,
+            "account_id": rec.account_id,
+            "currency": rec.currency,
+            "opened_at_utc": rec.opened_at_utc,
+            "strategy": rec.strategy,
+            "source_strategies": rec.source_strategies,
+            "tags": rec.tags,
+            "plan_now_iso": rec.plan_now_iso,
+            "plan_path": rec.plan_path,
+            "attribution_source": rec.attribution_source,
+        }
+
+    def _write_report(self, report: RunReport) -> None:
+        self._cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+        path = self._cfg.reports_dir / f"ibkr_paper_ledger_report_{utc_now().strftime('%Y%m%dT%H%M%SZ')}.json"
+        atomic_write_json(path, report.to_dict())
+        LOGGER.info("ledger report written: %s", path)
+
+    def _safe_notify_write(self, symbol: str, strategy: str, log_path: Any) -> None:
+        try:
+            notify(f"CHAD paper ledger wrote trade result: {symbol} strategy={strategy} path={log_path}")
+        except NotifyError:
+            LOGGER.exception("Telegram notify_on_write failed")
+
+    def _safe_notify_error(self, msg: str) -> None:
+        if not self._cfg.notify_on_error:
+            return
+        try:
+            notify(f"CHAD paper ledger watcher error: {msg}")
+        except NotifyError:
+            LOGGER.exception("Telegram notify_on_error failed")
 
 
-def _sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+# =============================================================================
+# Factory
+# =============================================================================
+
+class WatcherFactory:
+    @staticmethod
+    def build(config_path: Path) -> PaperLedgerWatcher:
+        cfg = LedgerConfig.load(config_path)
+        resolver = PlanAttributionResolver(cfg.plan_artifact_path)
+        attribution = StrategyAttributionService(cfg, resolver)
+        state_store = OpenStateStore(cfg.state_path)
+        gateway = IBSyncBrokerGateway(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
+        return PaperLedgerWatcher(
+            cfg=cfg,
+            gateway=gateway,
+            state_store=state_store,
+            attribution=attribution,
+        )
 
 
-def run_once(cfg: LedgerConfig) -> dict:
-    now = _utc_now()
-    report: Dict[str, Any] = {
-        "enabled": bool(cfg.enabled),
-        "generated_at_utc": _iso(now),
-        "writes": {"details": [], "trade_results": 0},
-    }
-    details = report["writes"]["details"]
+# =============================================================================
+# CLI
+# =============================================================================
 
-    _add_detail(
-        details,
-        event="watcher_start",
-        client_id=int(cfg.ibkr_client_id),
-        host=cfg.ibkr_host,
-        port=int(cfg.ibkr_port),
-        exec_window_seconds=float(cfg.exec_window_seconds),
-        state_path=str(cfg.state_path),
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CHAD IBKR Paper Ledger Watcher")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=CONFIG_PATH_DEFAULT,
+        help=f"Path to config JSON (default: {CONFIG_PATH_DEFAULT})",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("LOG_LEVEL", "INFO"),
+        help="Python logging level",
+    )
+    return parser.parse_args(argv)
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, safe_str(level, "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
 
-    if not cfg.enabled:
-        _add_detail(details, event="disabled", reason="config_enabled_false")
-        cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-        out = cfg.reports_dir / f"IBKR_PAPER_LEDGER_RUN_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
-        _atomic_write_json(out, report)
-        report["report_path"] = str(out)
-        return report
 
-    ib: Optional[IB] = None
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    configure_logging(args.log_level)
+
     try:
-        ib = _connect_ib(cfg.ibkr_host, cfg.ibkr_port, cfg.ibkr_client_id)
-        _add_detail(details, event="connect_ok")
-        account_id = _get_account_id(ib)
-        _add_detail(details, event="account_id", account_id=account_id)
-
-        state = _load_state(cfg.state_path)
-        open_state: Dict[str, dict] = dict(state.get("open") or {})
-
-        pos_map = _positions_by_conid(ib)
-        _add_detail(details, event="positions_snapshot", positions_count=len(pos_map))
-        # Export full positions snapshot for Phase 6 auditability (not just counts)
-        positions_out = cfg.state_path.parent / "positions_snapshot.json"
-        positions_payload = {
-            "ts_utc": _iso(now),
-            "account_id": account_id,
-            "positions_count": len(pos_map),
-            "positions_by_conid": pos_map,
-        }
-        _atomic_write_json(positions_out, positions_payload)
-        _add_detail(details, event="positions_snapshot_written", path=str(positions_out))
-
-        current_open_keys = set()
-        for con_id, rec in pos_map.items():
-            sym = str(rec.get("symbol") or "")
-            sec_type = str(rec.get("secType") or "")
-            k = _state_key(account_id, con_id, sym, sec_type)
-            qty = float(rec.get("qty") or 0.0)
-            if abs(qty) > 1e-12:
-                current_open_keys.add(k)
-                if k not in open_state:
-                    open_state[k] = {
-                        "account_id": account_id,
-                        "conId": con_id,
-                        "symbol": sym,
-                        "secType": sec_type,
-                        "currency": str(rec.get("currency") or ""),
-                        "exchange": str(rec.get("exchange") or ""),
-                        "qty": float(qty),
-                        "avg_cost": float(rec.get("avg_cost") or 0.0),
-                        "opened_at_utc": _iso(now),
-                        "strategy": cfg.default_strategy,
-                        "tags": ["ibkr_paper", cfg.default_strategy],
-                    }
-                    _add_detail(details, event="open_detected", key=k, qty=float(qty), avg_cost=float(rec.get("avg_cost") or 0.0))
-                else:
-                    # Sync existing open_state quantities/costs to broker snapshot
-                    prev_qty = float(open_state[k].get("qty") or 0.0)
-                    prev_avg = float(open_state[k].get("avg_cost") or 0.0)
-                    new_avg = float(rec.get("avg_cost") or prev_avg)
-
-                    changed = False
-                    if abs(prev_qty - float(qty)) > 1e-12:
-                        open_state[k]["qty"] = float(qty)
-                        changed = True
-                    # avg_cost can drift slightly; update only if meaningfully different
-                    if abs(prev_avg - float(new_avg)) > 1e-9:
-                        open_state[k]["avg_cost"] = float(new_avg)
-                        changed = True
-
-                    if changed:
-                        _add_detail(
-                            details,
-                            event="position_sync",
-                            key=k,
-                            qty=float(qty),
-                            avg_cost=float(new_avg),
-                            prev_qty=float(prev_qty),
-                            prev_avg_cost=float(prev_avg),
-                        )
-
-
-        close_keys = [k for k in list(open_state.keys()) if k not in current_open_keys]
-        _add_detail(details, event="close_candidates", count=len(close_keys))
-
-        cutoff = now - timedelta_seconds(cfg.exec_window_seconds)
-        fills = _fills_in_window(ib, cutoff)
-        _add_detail(details, event="fills_window", cutoff_utc=_iso(cutoff), fills_count=len(fills))
-
-        for k in close_keys:
-            rec = open_state.get(k) or {}
-            con_id = int(rec.get("conId") or 0)
-            sym = str(rec.get("symbol") or "")
-            sec_type = str(rec.get("secType") or "")
-            cur = str(rec.get("currency") or "")
-            opened_at_s = str(rec.get("opened_at_utc") or _iso(now))
-            try:
-                opened_at = datetime.fromisoformat(opened_at_s.replace("Z", "+00:00"))
-                if opened_at.tzinfo is None:
-                    opened_at = opened_at.replace(tzinfo=timezone.utc)
-            except Exception:
-                opened_at = now
-
-            pnl_exec, exec_details = _compute_exec_pnl_fifo(
-                fills=fills,
-                con_id=con_id,
-                opened_at_utc=opened_at,
-                closed_at_utc=now,
-            )
-
-            pnl_untrusted_reason: Optional[str] = None
-            pnl_source: Optional[str] = None
-            pnl_logged = 0.0
-
-            extra: Dict[str, Any] = {
-                "source": "ibkr_paper_ledger_watcher",
-                "currency": cur,
-                "conId": con_id,
-                "secType": sec_type,
-                "close_key": k,
-                "state_key_hash": _sha256_hex(k),
-            }
-
-            tags = list(rec.get("tags") or ["ibkr_paper", cfg.default_strategy])
-            if cfg.default_strategy == "manual" and "manual" not in tags:
-                tags.append("manual")
-
-            if pnl_exec is not None and math.isfinite(float(pnl_exec)):
-                pnl_logged = float(pnl_exec)
-                pnl_source = "executions_fifo"
-                extra["exec_pnl_details"] = exec_details
-                extra["exec_window_seconds"] = float(cfg.exec_window_seconds)
-                extra["exec_cutoff_time_utc"] = _iso(cutoff)
-                extra["pnl_source"] = pnl_source
-                extra["pnl_untrusted"] = False
-            else:
-                pnl_logged = 0.0
-                pnl_untrusted_reason = exec_details.get("reason") if isinstance(exec_details, dict) else "no_exec_details"
-                tags.append("pnl_untrusted")
-                extra["pnl_untrusted"] = True
-                extra["pnl_untrusted_reason"] = str(pnl_untrusted_reason)
-
-            qty_open = float(rec.get("qty") or 0.0)
-            avg_cost = float(rec.get("avg_cost") or 0.0)
-            notional = abs(qty_open) * avg_cost
-            side = "BUY" if qty_open > 0 else "SELL"
-
-            tr = TradeResult(
-                strategy=str(rec.get("strategy", cfg.default_strategy)).lower(),
-                symbol=sym,
-                side=side,
-                quantity=abs(qty_open),
-                fill_price=avg_cost,
-                notional=notional,
-                pnl=float(pnl_logged),
-                entry_time_utc=str(rec.get("opened_at_utc", _iso(now))),
-                exit_time_utc=_iso(now),
-                is_live=False,
-                broker="ibkr",
-                account_id=str(rec.get("account_id", "")) or None,
-                regime=None,
-                tags=tags,
-                extra=extra,
-            )
-
-            log_path = log_trade_result(tr)
-            report["writes"]["trade_results"] += 1
-            report["writes"]["details"].append(
+        watcher = WatcherFactory.build(args.config)
+        report = watcher.run_once()
+        print(json.dumps(report.to_dict(), indent=2, default=json_default))
+        return 0 if report.ok else 1
+    except Exception as exc:
+        LOGGER.exception("Unhandled fatal error in ibkr_paper_ledger_watcher")
+        print(
+            json.dumps(
                 {
-                    "event": "trade_result_written",
-                    "symbol": sym,
-                    "conId": con_id,
-                    "pnl": float(pnl_logged),
-                    "pnl_source": pnl_source,
-                    "pnl_untrusted_reason": pnl_untrusted_reason,
-                    "log_path": str(log_path),
-                    "ts_utc": _iso(_utc_now()),
-                }
+                    "ok": False,
+                    "fatal_error": f"{type(exc).__name__}: {exc}",
+                    "ts_utc": iso_z(),
+                },
+                indent=2,
             )
-
-            open_state.pop(k, None)
-
-        _atomic_write_json(cfg.state_path, {"open": open_state, "last_run_utc": _iso(now)})
-
-        if report["writes"]["trade_results"] == 0:
-            _add_detail(details, event="no_trade_results", reason="no_close_events_detected_or_no_new_positions_closed")
-
-        cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-        out = cfg.reports_dir / f"IBKR_PAPER_LEDGER_RUN_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
-        _atomic_write_json(out, report)
-        report["report_path"] = str(out)
-
-        _add_detail(details, event="watcher_end", trade_results=int(report["writes"]["trade_results"]))
-        return report
-
-    except Exception as e:
-        _add_detail(report["writes"]["details"], event="error", error_type=type(e).__name__, error=str(e))
-        # Alert on connect failures or watcher crash
-        _alert(f"IBKR LEDGER WATCHER ERROR: {type(e).__name__}: {e}", severity="critical", dedupe_key="ibkr_ledger_watcher_error")
-        cfg.reports_dir.mkdir(parents=True, exist_ok=True)
-        out = cfg.reports_dir / f"IBKR_PAPER_LEDGER_RUN_{now.strftime('%Y%m%dT%H%M%SZ')}.json"
-        _atomic_write_json(out, report)
-        report["report_path"] = str(out)
-        raise
-    finally:
-        try:
-            if ib is not None:
-                ib.disconnect()
-        except Exception:
-            pass
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="IBKR paper ledger watcher (no orders).")
-    p.add_argument("--config", type=str, default=str(CONFIG_PATH_DEFAULT), help="Path to runtime config JSON.")
-    args = p.parse_args(argv)
-    cfg = load_config(Path(args.config).expanduser().resolve())
-    rep = run_once(cfg)
-    print(json.dumps(rep, indent=2, sort_keys=True))
-    return 0
+        )
+        return 1
 
 
 if __name__ == "__main__":

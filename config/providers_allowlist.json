@@ -1,0 +1,155 @@
+{
+  "disallowed_examples": [
+    {
+      "name": "ui_only_vendor_example",
+      "reason": "Requires human UI interaction or scraping. Not automatable."
+    }
+  ],
+  "notes": "Phase11 additions: explicit provider allowlist. Only programmatic providers permitted. Scraping-only sources are explicitly disallowed by policy.",
+  "policy": {
+    "deny_by_default": true,
+    "max_http_timeout_seconds": 6.0,
+    "max_retries": 2,
+    "on_provider_failure": "FAIL_CLOSED_TIGHTEN",
+    "reject_scraping_required": true,
+    "require_ttl_seconds": true,
+    "retry_backoff_ms": [
+      250,
+      750
+    ]
+  },
+  "providers": [
+    {
+      "category": "rates_curve",
+      "endpoints": [
+        {
+          "name": "DGS2",
+          "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2"
+        },
+        {
+          "name": "DGS10",
+          "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+        }
+      ],
+      "failure_semantics": {
+        "on_http_error": "USE_LAST_IF_FRESH_ELSE_FAIL_CLOSED_TIGHTEN",
+        "on_parse_error": "FAIL_CLOSED_TIGHTEN",
+        "on_timeout": "USE_LAST_IF_FRESH_ELSE_FAIL_CLOSED_TIGHTEN"
+      },
+      "implementation_hint": "FredYieldProvider",
+      "provider_id": "fred_yields",
+      "rate_limits": {
+        "burst": 3,
+        "rpm": 30
+      },
+      "transport": {
+        "auth": "none",
+        "type": "http"
+      },
+      "ttl_seconds": 1800
+    },
+    {
+      "category": "event_risk",
+      "endpoints": [],
+      "failure_semantics": {
+        "on_error": "FAIL_CLOSED_TIGHTEN"
+      },
+      "implementation_hint": "MarketHoursRiskProvider",
+      "provider_id": "market_hours_event_risk",
+      "rate_limits": {
+        "burst": 0,
+        "rpm": 0
+      },
+      "transport": {
+        "auth": "none",
+        "type": "local"
+      },
+      "ttl_seconds": 1800
+    },
+    {
+      "category": "earnings_calendar",
+      "endpoints": [],
+      "failure_semantics": {
+        "on_error": "FAIL_CLOSED_TIGHTEN"
+      },
+      "implementation_hint": "bootstrap_no_provider",
+      "provider_id": "bootstrap_earnings",
+      "rate_limits": {
+        "burst": 0,
+        "rpm": 0
+      },
+      "transport": {
+        "auth": "none",
+        "type": "local"
+      },
+      "ttl_seconds": 3600
+    },
+    {
+      "category": "sector_rotation",
+      "endpoints": [],
+      "failure_semantics": {
+        "on_error": "FAIL_CLOSED_TIGHTEN"
+      },
+      "implementation_hint": "bootstrap_no_provider",
+      "provider_id": "bootstrap_sector_rotation",
+      "rate_limits": {
+        "burst": 0,
+        "rpm": 0
+      },
+      "transport": {
+        "auth": "none",
+        "type": "local"
+      },
+      "ttl_seconds": 3600
+    },
+    {
+      "category": "rates_curve",
+      "endpoints": [
+        {
+          "name": "DGS2",
+          "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2"
+        },
+        {
+          "name": "DGS10",
+          "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+        }
+      ],
+      "failure_semantics": {
+        "on_http_error": "USE_LAST_IF_FRESH_ELSE_FAIL_CLOSED_TIGHTEN",
+        "on_parse_error": "FAIL_CLOSED_TIGHTEN",
+        "on_timeout": "USE_LAST_IF_FRESH_ELSE_FAIL_CLOSED_TIGHTEN"
+      },
+      "implementation_hint": "FredYieldProvider",
+      "provider_id": "FredYieldProvider",
+      "rate_limits": {
+        "burst": 3,
+        "rpm": 30
+      },
+      "transport": {
+        "auth": "none",
+        "type": "http"
+      },
+      "ttl_seconds": 1800
+    },
+    {
+      "category": "event_risk",
+      "endpoints": [],
+      "failure_semantics": {
+        "on_error": "FAIL_CLOSED_TIGHTEN"
+      },
+      "implementation_hint": "MarketHoursRiskProvider",
+      "provider_id": "MarketHoursRiskProvider",
+      "rate_limits": {
+        "burst": 0,
+        "rpm": 0
+      },
+      "transport": {
+        "auth": "none",
+        "type": "local"
+      },
+      "ttl_seconds": 1800
+    }
+  ],
+  "schema_version": "providers_allowlist.v1",
+  "ts_utc": "BOOTSTRAP_STATIC"
+}

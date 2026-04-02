@@ -19,7 +19,7 @@ Key fix in this version:
   can be eligible in extended hours (subject to IBKR rules).
 
 All actions are written to an auditable JSON report in:
-  /home/ubuntu/CHAD FINALE/reports/closer/
+  /home/ubuntu/chad_finale/reports/closer/
 """
 
 from __future__ import annotations
@@ -33,7 +33,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from ib_insync import IB, MarketOrder, LimitOrder, Stock  # type: ignore
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ib_insync import IB, MarketOrder, LimitOrder, Stock  # type: ignore
+
+
+def _lazy_ibkr_types() -> tuple[Any, Any, Any, Any]:
+    """
+    Lazy import to keep ib_insync out of sys.modules unless execution code runs.
+    Returns: (IB, MarketOrder, LimitOrder, Stock)
+    """
+    from ib_insync import IB, MarketOrder, LimitOrder, Stock  # type: ignore
+    return IB, MarketOrder, LimitOrder, Stock
 
 
 # ----------------------------- helpers ---------------------------------
@@ -104,7 +116,7 @@ class CloserConfig:
 
 
 def load_config(args: argparse.Namespace) -> CloserConfig:
-    base = Path("/home/ubuntu/CHAD FINALE")
+    base = Path("/home/ubuntu/chad_finale")
     allow_symbols = [s.strip().upper() for s in args.allow_symbols.split(",") if s.strip()]
     if not allow_symbols:
         allow_symbols = ["AAPL"]

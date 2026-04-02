@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from chad.analytics.trade_result_logger import TradeResult, log_trade_result
+from chad.core.regime_tag import resolve_regime_label
+from datetime import datetime, timezone
 
 
 def _utc_now_iso() -> str:
@@ -89,6 +91,7 @@ def log_kraken_trade_event(
 
     tags = [
         "kraken_live",
+        "pnl_untrusted",
         event.strategy,
         event.side.lower(),
         event.ordertype.lower(),
@@ -100,6 +103,8 @@ def log_kraken_trade_event(
         "pair": event.pair,
         "ordertype": event.ordertype,
         "raw": event.raw,
+        "pnl_untrusted": True,
+        "pnl_untrusted_reason": "kraken_fill_price_and_realized_pnl_not_available_yet",
     }
 
     tr = TradeResult(
@@ -115,7 +120,7 @@ def log_kraken_trade_event(
         is_live=True,
         broker="kraken",
         account_id=account_id,
-        regime=None,
+        regime=resolve_regime_label(now_utc=datetime.now(timezone.utc)),
         tags=tags,
         extra=extra,
     )

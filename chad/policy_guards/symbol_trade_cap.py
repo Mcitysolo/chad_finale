@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-REPO_ROOT = Path("/home/ubuntu/CHAD FINALE")
+REPO_ROOT = Path("/home/ubuntu/chad_finale")
 TRADES_DIR = REPO_ROOT / "data" / "trades"
 RUNTIME_DIR = REPO_ROOT / "runtime"
 

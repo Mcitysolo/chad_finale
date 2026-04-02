@@ -4,12 +4,10 @@ CHAD — Price Cache Refresher (FINAL, PRODUCTION)
 
 Writes runtime/price_cache.json from the latest Polygon NDJSON feed.
 
-This is the missing producer in the system:
-- Polygon streamer writes NDJSON feeds
-- ContextBuilder reads runtime/price_cache.json
-- BUT nothing was updating price_cache.json
-
-This script is now the single source of truth.
+Production rules:
+- Trade events (ev="T"): use trade price field `p`
+- Quote events (ev="Q"): use midpoint from `bp` and `ap`
+- Never treat generic fields like `c` as a price
 """
 
 from __future__ import annotations
@@ -23,13 +21,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 
-# ============================ CONSTANTS ============================
-
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_TAIL_LINES = 20_000
 
 SYMBOL_KEYS = ("symbol", "sym", "ticker", "S")
-PRICE_KEYS = ("price", "p", "last_price", "last", "close", "c")
 TS_KEYS = (
     "ts_utc",
     "timestamp",
@@ -40,8 +35,6 @@ TS_KEYS = (
     "last_timestamp",
 )
 
-
-# ============================ UTILITIES ============================
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -106,8 +99,6 @@ def parse_ts(val: Any) -> Optional[str]:
     return None
 
 
-# ============================ FEED READER ============================
-
 def tail_lines(path: Path, max_lines: int) -> Iterable[str]:
     buf: list[str] = []
     with path.open("r", encoding="utf-8") as f:
@@ -125,6 +116,30 @@ class CacheStats:
     symbols_written: int
     bad_json_lines: int
     source_feed: str
+
+
+def extract_polygon_price(rec: Dict[str, Any]) -> Optional[float]:
+    """
+    Event-aware Polygon price extraction.
+
+    Rules:
+    - ev="T": use trade price `p`
+    - ev="Q": use midpoint of bid/ask if both exist and are valid
+    - otherwise: ignore record
+    """
+    ev = str(rec.get("ev") or "").strip().upper()
+
+    if ev == "T":
+        return safe_float(rec.get("p"))
+
+    if ev == "Q":
+        bp = safe_float(rec.get("bp"))
+        ap = safe_float(rec.get("ap"))
+        if bp is not None and ap is not None and ap >= bp:
+            return float((bp + ap) / 2.0)
+        return None
+
+    return None
 
 
 def build_price_cache(
@@ -154,7 +169,7 @@ def build_price_cache(
         if not sym:
             continue
 
-        px = safe_float(extract_first(rec, PRICE_KEYS))
+        px = extract_polygon_price(rec)
         if px is None:
             continue
 
@@ -183,18 +198,30 @@ def build_price_cache(
 
 
 def find_latest_feed(feed_dir: Path) -> Path:
-    feeds = sorted(feed_dir.glob("polygon_stocks_*.ndjson"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not feeds:
-        raise FileNotFoundError(f"No polygon_stocks_*.ndjson in {feed_dir}")
-    return feeds[0]
+    candidates = []
+    modern_dir = feed_dir / "polygon_stocks"
+    if modern_dir.is_dir():
+        candidates += list(modern_dir.glob("*.ndjson"))
+    candidates += list(feed_dir.glob("polygon_stocks_*.ndjson"))
 
+    candidates = sorted(
+        [c for c in candidates if c.is_file()],
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+    for c in candidates:
+        try:
+            if c.stat().st_size > 0:
+                return c
+        except Exception:
+            continue
+    raise FileNotFoundError(f"No non-empty Polygon NDJSON feeds found under {feed_dir}")
 
-# ============================ CLI ============================
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Refresh runtime/price_cache.json from Polygon NDJSON feed")
-    ap.add_argument("--feed-dir", default="/home/ubuntu/CHAD FINALE/data/feeds")
-    ap.add_argument("--runtime-dir", default="/home/ubuntu/CHAD FINALE/runtime")
+    ap.add_argument("--feed-dir", default="/home/ubuntu/chad_finale/data/feeds")
+    ap.add_argument("--runtime-dir", default="/home/ubuntu/chad_finale/runtime")
     ap.add_argument("--tail-lines", type=int, default=DEFAULT_TAIL_LINES)
     ap.add_argument("--ttl-seconds", type=int, default=DEFAULT_TTL_SECONDS)
     args = ap.parse_args()
@@ -216,6 +243,7 @@ def main() -> int:
     print(f"  source_feed={stats.source_feed}")
     print(f"  symbols_written={stats.symbols_written}")
     print(f"  bad_json_lines={stats.bad_json_lines}")
+    print(f"  spy_price={payload.get('prices', {}).get('SPY')}")
     return 0
 
 
