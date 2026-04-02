@@ -1,0 +1,48 @@
+{
+  "domain": 7,
+  "title": "Synthetic Validation Proof",
+  "ts_utc": "2026-04-02T17:58:45.929141+00:00",
+  "status": "VERIFIED",
+  "ssot_classification": "VERIFIED \u2014 full_cycle_preview and synthetic futures both pass cleanly",
+  "what_is_proven": [
+    "full_cycle_preview runs cleanly with no broker calls",
+    "All 8 strategy lanes load and register without errors",
+    "alpha, beta, gamma, omega, delta, alpha_crypto, alpha_forex, alpha_futures all enabled",
+    "Synthetic futures produce 4 deterministic signals: MES SELL 1.0, MNQ BUY 1.0, MCL SELL 2.0, MGC SELL 2.0",
+    "All signals include side, size, and confidence metadata",
+    "mode: synthetic, ok: True, signal_count: 4",
+    "Zero broker calls in either preview mode"
+  ],
+  "synthetic_signals": [
+    {
+      "symbol": "MES",
+      "side": "SELL",
+      "size": 1.0,
+      "confidence": 0.778
+    },
+    {
+      "symbol": "MNQ",
+      "side": "BUY",
+      "size": 1.0,
+      "confidence": 0.748
+    },
+    {
+      "symbol": "MCL",
+      "side": "SELL",
+      "size": 2.0,
+      "confidence": 0.897
+    },
+    {
+      "symbol": "MGC",
+      "side": "SELL",
+      "size": 2.0,
+      "confidence": 0.805
+    }
+  ],
+  "base_preview_returncode": 0,
+  "synthetic_preview_returncode": 0,
+  "base_preview_stdout_tail": "=== CHAD Full Cycle Preview (Read-Only) ===\nnow: 2026-04-02T17:58:45.750909Z\npython: 3.12.3\nplatform: Linux-6.14.0-1017-aws-x86_64-with-glibc2.39\n\n--- Strategy Registry ---\nregistered_strategies: 8\n  strategy: alpha enabled=True target_universe_count=0 max_gross_exposure=None\n  strategy: beta enabled=True target_universe_count=0 max_gross_exposure=None\n  strategy: gamma enabled=True target_universe_count=2 max_gross_exposure=None\n  strategy: omega enabled=True target_universe_count=4 max_gross_exposure=None\n  strategy: delta enabled=True target_universe_count=2 max_gross_exposure=None\n  strategy: alpha_crypto enabled=True target_universe_count=3 max_gross_exposure=None\n  strategy: alpha_forex enabled=True target_universe_count=4 max_gross_exposure=None\n  strategy: alpha_futures enabled=True target_universe_count=4 max_gross_exposure=0.25\n\n--- Latest Runtime Artifact ---\nartifact_exists: True\ntop_keys: ['counts', 'ibkr_intents', 'orders', 'summary']\ncounts: {'evaluated_signals': 0, 'ibkr_intents_count': 0, 'orders_count': 0, 'raw_signals': 0, 'routed_signals': 0, 'total_notional': 0}\n\n--- ExecutionPlan ---\norders_count:   0\ntotal_notional: 0.00\nfutures_orders: 0\n\n--- IBKR StrategyTradeIntents (preview only) ---\nintents_count: 0\n\n--- Dynamic Caps ---\nartifact_exists: True\nts_utc: 2026-04-02T17:58:35.034802Z\ntotal_equity: 997538.68\nportfolio_risk_cap: 49876.93\nnormalized_weights: {'alpha': 0.15418475410790086, 'beta': 0.38503879238737054, 'crypto': 0.02246627331134553, 'delta': 0.15113978854052304, 'forex': 0.02246627331134553, 'gamma': 0.15993919068398466, 'omega': 0.10476492765752986}\n\n--- Alpha Futures Smoke Test ---\nexecuted: False\nmode: disabled\nok: True\nsignal_count: 0\n\n[full_cycle_preview] NOTE: No broker calls were made. This is a logical preview only.\n",
+  "base_preview_stderr_tail": "",
+  "synthetic_preview_stdout_tail": "=== CHAD Full Cycle Preview (Read-Only) ===\nnow: 2026-04-02T17:58:45.903635Z\npython: 3.12.3\nplatform: Linux-6.14.0-1017-aws-x86_64-with-glibc2.39\n\n--- Strategy Registry ---\nregistered_strategies: 8\n  strategy: alpha enabled=True target_universe_count=0 max_gross_exposure=None\n  strategy: beta enabled=True target_universe_count=0 max_gross_exposure=None\n  strategy: gamma enabled=True target_universe_count=2 max_gross_exposure=None\n  strategy: omega enabled=True target_universe_count=4 max_gross_exposure=None\n  strategy: delta enabled=True target_universe_count=2 max_gross_exposure=None\n  strategy: alpha_crypto enabled=True target_universe_count=3 max_gross_exposure=None\n  strategy: alpha_forex enabled=True target_universe_count=4 max_gross_exposure=None\n  strategy: alpha_futures enabled=True target_universe_count=4 max_gross_exposure=0.25\n\n--- Latest Runtime Artifact ---\nartifact_exists: True\ntop_keys: ['counts', 'ibkr_intents', 'orders', 'summary']\ncounts: {'evaluated_signals': 0, 'ibkr_intents_count': 0, 'orders_count': 0, 'raw_signals': 0, 'routed_signals': 0, 'total_notional': 0}\n\n--- ExecutionPlan ---\norders_count:   0\ntotal_notional: 0.00\nfutures_orders: 0\n\n--- IBKR StrategyTradeIntents (preview only) ---\nintents_count: 0\n\n--- Dynamic Caps ---\nartifact_exists: True\nts_utc: 2026-04-02T17:58:35.034802Z\ntotal_equity: 997538.68\nportfolio_risk_cap: 49876.93\nnormalized_weights: {'alpha': 0.15418475410790086, 'beta': 0.38503879238737054, 'crypto': 0.02246627331134553, 'delta': 0.15113978854052304, 'forex': 0.02246627331134553, 'gamma': 0.15993919068398466, 'omega': 0.10476492765752986}\n\n--- Alpha Futures Smoke Test ---\nexecuted: True\nmode: synthetic\nok: True\nsignal_count: 4\n  futures_signal: strategy=alpha_futures symbol=MES side=SELL size=1.0 confidence=0.7775622869410193 asset_class=futures\n  futures_signal: strategy=alpha_futures symbol=MNQ side=BUY size=1.0 confidence=0.7483599021027872 asset_class=futures\n  futures_signal: strategy=alpha_futures symbol=MCL side=SELL size=2.0 confidence=0.8967084929515631 asset_class=futures\n  futures_signal: strategy=alpha_futures symbol=MGC side=SELL size=2.0 confidence=0.805295433519687 asset_class=futures\n\n[full_cycle_preview] NOTE: No broker calls were made. This is a logical preview only.\n",
+  "synthetic_preview_stderr_tail": ""
+}
