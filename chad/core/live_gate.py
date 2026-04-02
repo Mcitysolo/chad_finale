@@ -159,12 +159,24 @@ class ExecutionQualityState:
 
 
 @dataclass(frozen=True)
+class ProfitLockGateState:
+    ok: bool
+    stop_new_entries: bool
+    profit_lock_active: bool
+    mode: str
+    sizing_factor: float
+    reason: str
+    details: Dict[str, Any]
+
+
+@dataclass(frozen=True)
 class LiveGateContext:
     execution: ExecutionConfig
     mode: ModeState
     shadow: ShadowState
     operator_intent: OperatorIntent
     stop_state: StopState
+    profit_lock: ProfitLockGateState
     live_readiness: LiveReadinessState
     execution_quality: ExecutionQualityState
     reconciliation: ReconciliationState
@@ -188,6 +200,7 @@ class LiveGateDecision:
             "execution": asdict(self.context.execution),
             "mode": asdict(self.context.mode),
             "shadow": asdict(self.context.shadow),
+            "profit_lock": asdict(self.context.profit_lock),
             "operator_mode": self.context.operator_intent.operator_mode,
             "operator_reason": self.context.operator_intent.operator_reason,
             "allow_exits_only": bool(self.allow_exits_only),
@@ -351,6 +364,46 @@ def _load_stop_state() -> StopState:
     stop = bool(obj.get("stop", True))
     reason = str(obj.get("reason") or "unspecified").strip()
     return StopState(stop=stop, reason=reason)
+
+
+def _load_profit_lock_state() -> ProfitLockGateState:
+    p = _runtime_dir() / "profit_lock_state.json"
+    obj, fr = read_runtime_state_json(p, default_ttl_s=120)
+    if obj is None:
+        # Fail-open: missing profit lock state should not block on its own —
+        # the dynamic_risk_allocator independently reads the same file.
+        return ProfitLockGateState(
+            ok=False,
+            stop_new_entries=False,
+            profit_lock_active=False,
+            mode="UNKNOWN",
+            sizing_factor=1.0,
+            reason=f"profit_lock_state_{fr.reason}",
+            details={"path": str(p), "freshness": asdict(fr)},
+        )
+
+    stop_new_entries = bool(obj.get("stop_new_entries", False))
+    profit_lock_active = bool(obj.get("profit_lock_active", False))
+    mode = str(obj.get("mode") or "NORMAL").strip().upper()
+    sizing_factor = _safe_float(obj.get("sizing_factor"), 1.0)
+    sizing_factor = min(max(sizing_factor, 0.0), 1.0)
+
+    return ProfitLockGateState(
+        ok=True,
+        stop_new_entries=stop_new_entries,
+        profit_lock_active=profit_lock_active,
+        mode=mode,
+        sizing_factor=sizing_factor,
+        reason="PROFIT_TARGET_REACHED" if stop_new_entries else "ok",
+        details={
+            "path": str(p),
+            "mode": mode,
+            "sizing_factor": sizing_factor,
+            "stop_new_entries": stop_new_entries,
+            "profit_lock_active": profit_lock_active,
+            "explain": str(obj.get("explain") or ""),
+        },
+    )
 
 
 def _load_operator_intent() -> OperatorIntent:
@@ -712,6 +765,7 @@ def evaluate_live_gate() -> LiveGateDecision:
 
     0) ExecutionConfig / Mode snapshot (not permission)
     1) STOP gate
+    1.5) Profit Lock gate (PROFIT_TARGET_REACHED)
     2) Operator intent gate
     3) Live readiness gate
     4) Execution quality gate
@@ -733,6 +787,7 @@ def evaluate_live_gate() -> LiveGateDecision:
     shadow = _load_shadow_state()
     operator = _load_operator_intent()
     stop_state = _load_stop_state()
+    profit_lock = _load_profit_lock_state()
     live_readiness = _load_live_readiness_state()
     execution_quality = _load_execution_quality_state()
     recon = _load_reconciliation_state()
@@ -749,10 +804,36 @@ def evaluate_live_gate() -> LiveGateDecision:
     if stop_state.stop:
         gates.append(GateResult(name="STOP", passed=False, reason="STOP_ENGAGED", details={"reason": stop_state.reason}))
         reasons.append(f"STOP is ENABLED (DENY_ALL). reason={stop_state.reason!r}.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="STOP", passed=True, reason="not_engaged", details={}))
+
+    # Gate 1.5: Profit Lock
+    if profit_lock.stop_new_entries:
+        gates.append(
+            GateResult(
+                name="PROFIT_LOCK",
+                passed=False,
+                reason="PROFIT_TARGET_REACHED",
+                details=profit_lock.details,
+            )
+        )
+        reasons.append(
+            f"PROFIT_TARGET_REACHED: profit lock mode={profit_lock.mode}, "
+            f"sizing_factor={profit_lock.sizing_factor:.4f}. Block all new entries."
+        )
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
+
+    gates.append(
+        GateResult(
+            name="PROFIT_LOCK",
+            passed=True,
+            reason="ok" if not profit_lock.profit_lock_active else f"active_mode={profit_lock.mode}",
+            details=profit_lock.details,
+        )
+    )
 
     # Gate 2: Operator intent
     if operator.operator_mode != "ALLOW_LIVE":
@@ -765,7 +846,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append(f"OperatorIntent={operator.operator_mode} reason={operator.operator_reason!r}. Deny all lanes.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="OPERATOR_INTENT", passed=True, reason="ALLOW_LIVE", details={"operator_reason": operator.operator_reason}))
@@ -774,13 +855,13 @@ def evaluate_live_gate() -> LiveGateDecision:
     if not live_readiness.ok:
         gates.append(GateResult(name="LIVE_READINESS", passed=False, reason="LIVE_READINESS_UNAVAILABLE", details=live_readiness.details))
         reasons.append(f"LIVE_READINESS_UNAVAILABLE: {live_readiness.reason}. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if not live_readiness.ready_for_live:
         gates.append(GateResult(name="LIVE_READINESS", passed=False, reason="LIVE_READINESS_FALSE", details=live_readiness.details))
         reasons.append("LIVE_READINESS_FALSE: readiness publisher does not consider the system ready for live trading.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="LIVE_READINESS", passed=True, reason="ok", details=live_readiness.details))
@@ -789,19 +870,19 @@ def evaluate_live_gate() -> LiveGateDecision:
     if not execution_quality.ok:
         gates.append(GateResult(name="EXECUTION_QUALITY", passed=False, reason="EXECUTION_QUALITY_UNAVAILABLE", details=execution_quality.details))
         reasons.append(f"EXECUTION_QUALITY_UNAVAILABLE: {execution_quality.reason}. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if execution_quality.env_label == "dangerous":
         gates.append(GateResult(name="EXECUTION_QUALITY", passed=False, reason="EXECUTION_ENV_DANGEROUS", details=execution_quality.details))
         reasons.append("EXECUTION_ENV_DANGEROUS: broker execution environment is classified as dangerous.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if execution_quality.env_label == "unknown":
         gates.append(GateResult(name="EXECUTION_QUALITY", passed=False, reason="EXECUTION_ENV_UNKNOWN", details=execution_quality.details))
         reasons.append("EXECUTION_ENV_UNKNOWN: execution environment is not proven. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="EXECUTION_QUALITY", passed=True, reason=execution_quality.env_label, details=execution_quality.details))
@@ -822,7 +903,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append("SCR_PAPER_ONLY: shadow state indicates paper_only/paused. Block LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="SCR", passed=True, reason="ok", details={"state": shadow.state, "sizing_factor": shadow.sizing_factor}))
@@ -831,7 +912,7 @@ def evaluate_live_gate() -> LiveGateDecision:
     if not mutation.ok:
         gates.append(GateResult(name="MUTATION_STATE", passed=False, reason="MUTATION_STATE_UNAVAILABLE", details=mutation.details))
         reasons.append(f"MUTATION_STATE_UNAVAILABLE: {mutation.reason}. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if mutation.pending_count > 0:
@@ -844,7 +925,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append(f"PENDING_ACTIONS_UNAPPLIED: pending_count={mutation.pending_count}. Block LIVE until queue is cleared.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if mutation.rejected_count > 0:
@@ -857,7 +938,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append(f"UNAPPROVED_MUTATION_DETECTED: rejected_count={mutation.rejected_count}. Block LIVE until investigated.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if mutation.lockout_until_ts_utc and _is_future_ts(mutation.lockout_until_ts_utc):
@@ -870,7 +951,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append(f"ACTION_APPLIER_LOCKOUT_ACTIVE until {mutation.lockout_until_ts_utc}. Block LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(
@@ -890,7 +971,7 @@ def evaluate_live_gate() -> LiveGateDecision:
     if not canary.ok:
         gates.append(GateResult(name="CHANGE_CANARY", passed=False, reason="CHANGE_CANARY_UNAVAILABLE", details=canary.details))
         reasons.append(f"CHANGE_CANARY_UNAVAILABLE: {canary.reason}. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if canary.canary_factor < 1.0:
@@ -907,7 +988,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append(f"CHANGE_CANARY_ACTIVE: canary_factor={canary.canary_factor:.4f}. Block LIVE while canary is active.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if canary.canary_until_ts_utc and _is_future_ts(canary.canary_until_ts_utc):
@@ -924,7 +1005,7 @@ def evaluate_live_gate() -> LiveGateDecision:
             )
         )
         reasons.append(f"CHANGE_CANARY_ACTIVE until {canary.canary_until_ts_utc}. Block LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(
@@ -943,13 +1024,13 @@ def evaluate_live_gate() -> LiveGateDecision:
     if not recon.ok:
         gates.append(GateResult(name="RECONCILIATION", passed=False, reason=recon.reason, details=recon.details))
         reasons.append(f"RECONCILIATION gate failed: {recon.reason}. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if recon.status != "GREEN":
         gates.append(GateResult(name="RECONCILIATION", passed=False, reason="RECONCILIATION_RED", details=recon.details))
         reasons.append("RECONCILIATION_RED: broker vs ledger mismatch beyond tolerance. Block LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="RECONCILIATION", passed=True, reason="GREEN", details=recon.details))
@@ -958,25 +1039,25 @@ def evaluate_live_gate() -> LiveGateDecision:
     if not lifecycle.ok:
         gates.append(GateResult(name="LIFECYCLE_TRUTH", passed=False, reason=lifecycle.reason, details=lifecycle.details))
         reasons.append(f"LIFECYCLE_TRUTH unavailable: {lifecycle.reason}. Fail-closed for LIVE execution.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if not lifecycle.truth_ok:
         gates.append(GateResult(name="LIFECYCLE_TRUTH", passed=False, reason="TRUTH_NOT_PROVEN", details=lifecycle.details))
         reasons.append("LIFECYCLE_TRUTH not proven. Block LIVE until deterministic truth rebuild is available.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if lifecycle.gap_flag:
         gates.append(GateResult(name="LIFECYCLE_TRUTH", passed=False, reason="LIFECYCLE_GAP_FLAG", details=lifecycle.details))
         reasons.append("LIFECYCLE_GAP_FLAG is true. Block LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     if lifecycle.backlog_flag:
         gates.append(GateResult(name="LIFECYCLE_TRUTH", passed=False, reason="LIFECYCLE_BACKLOG_FLAG", details=lifecycle.details))
         reasons.append("LIFECYCLE_BACKLOG_FLAG is true. Block LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="LIFECYCLE_TRUTH", passed=True, reason="ok", details=lifecycle.details))
@@ -985,7 +1066,7 @@ def evaluate_live_gate() -> LiveGateDecision:
     if exec_cfg.exec_mode != "live":
         gates.append(GateResult(name="EXEC_MODE", passed=False, reason="MODE_NOT_LIVE", details={"exec_mode": exec_cfg.exec_mode}))
         reasons.append(f"Execution mode is {exec_cfg.exec_mode!r}, not 'live'. Deny LIVE.")
-        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+        ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
         return LiveGateDecision(ctx, "DENY_ALL", reasons, False, False, allow_ibkr_paper)
 
     gates.append(GateResult(name="EXEC_MODE", passed=True, reason="live", details={}))
@@ -1003,7 +1084,7 @@ def evaluate_live_gate() -> LiveGateDecision:
     else:
         reasons.append("LIVE denied by final allow flags (ibkr_enabled/ibkr_dry_run/operator flags).")
 
-    ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
+    ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
     return LiveGateDecision(ctx, mode, reasons, allow_exits_only, allow_ibkr_live, allow_ibkr_paper)
 
 
