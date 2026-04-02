@@ -1,0 +1,122 @@
+{
+  "document": "CHAD Ratification Master Index",
+  "version": "v6.4",
+  "ts_utc": "2026-04-02T19:03:14.196802+00:00",
+  "prepared": "2026-04-02",
+  "git_tags": [
+    "PRE_HARDENING_20260402",
+    "P0_1_COMPLETE_20260402",
+    "P0_2_COMPLETE_20260402",
+    "P0_3_COMPLETE_20260402",
+    "P0_4_COMPLETE_20260402",
+    "P1_1_COMPLETE_20260402",
+    "P1_2_COMPLETE_20260402",
+    "P1_3_COMPLETE_20260402",
+    "P2_1_COMPLETE_20260402",
+    "P2_2_COMPLETE_20260402",
+    "P2_3_COMPLETE_20260402",
+    "RATIFICATION_D1_COMPLETE_20260402",
+    "RATIFICATION_D2_COMPLETE_20260402",
+    "RATIFICATION_D3_COMPLETE_20260402",
+    "RATIFICATION_D4_COMPLETE_20260402",
+    "RATIFICATION_D5_COMPLETE_20260402",
+    "RATIFICATION_D6_COMPLETE_20260402",
+    "RATIFICATION_D7_COMPLETE_20260402",
+    "RATIFICATION_D8_COMPLETE_20260402",
+    "RATIFICATION_D9_COMPLETE_20260402",
+    "RATIFICATION_D10_COMPLETE_20260402"
+  ],
+  "summary": {
+    "total_domains": 10,
+    "verified": 5,
+    "partial": 5,
+    "failed": 0,
+    "test_suite": "92 passed, 0 failed, 0 collection errors",
+    "overall_posture": "RATIFICATION CANDIDATE \u2014 all P0/P1/P2 items complete, all 10 proof domains documented, operator actions identified"
+  },
+  "domains": [
+    {
+      "domain": 1,
+      "title": "Canonical Runtime Snapshot",
+      "status": "VERIFIED",
+      "ssot_classification": "VERIFIED \u2014 13 active services, all runtime artifacts present and valid",
+      "file": "PROOF_DOMAIN_1_RUNTIME_SNAPSHOT_20260402.json"
+    },
+    {
+      "domain": 2,
+      "title": "DecisionTrace Sample Set",
+      "status": "VERIFIED",
+      "ssot_classification": "VERIFIED \u2014 DecisionTrace schema v2 with all required fields, 5920 records",
+      "file": "PROOF_DOMAIN_2_DECISION_TRACE_20260402.json"
+    },
+    {
+      "domain": 3,
+      "title": "Exactly-Once Proof",
+      "status": "VERIFIED",
+      "ssot_classification": "VERIFIED \u2014 idempotency SQLite schema proven, action_applier state file confirmed",
+      "file": "PROOF_DOMAIN_3_EXACTLY_ONCE_20260402.json"
+    },
+    {
+      "domain": 4,
+      "title": "Lifecycle Truth Proof",
+      "status": "PARTIAL",
+      "ssot_classification": "PARTIAL \u2014 consistent with SSOT v6.4 Section 2.2",
+      "file": "PROOF_DOMAIN_4_LIFECYCLE_TRUTH_20260402.json"
+    },
+    {
+      "domain": 5,
+      "title": "Execution Quality Proof",
+      "status": "PARTIAL",
+      "ssot_classification": "PARTIAL \u2014 consistent with SSOT v6.4 Section 2.2",
+      "file": "PROOF_DOMAIN_5_EXECUTION_QUALITY_20260402.json"
+    },
+    {
+      "domain": 6,
+      "title": "Mutation Governance Proof",
+      "status": "PARTIAL",
+      "ssot_classification": "PARTIAL \u2014 core pipeline proven, config snapshots and canary not yet fully implemented",
+      "file": "PROOF_DOMAIN_6_MUTATION_GOVERNANCE_20260402.json"
+    },
+    {
+      "domain": 7,
+      "title": "Synthetic Validation Proof",
+      "status": "VERIFIED",
+      "ssot_classification": "VERIFIED \u2014 full_cycle_preview and synthetic futures both pass cleanly",
+      "file": "PROOF_DOMAIN_7_SYNTHETIC_VALIDATION_20260402.json"
+    },
+    {
+      "domain": 8,
+      "title": "Profit Lock Proof",
+      "status": "PARTIAL",
+      "ssot_classification": "PARTIAL \u2014 LiveGate wired and cap consistency proven, pnl_state.json stub created",
+      "file": "PROOF_DOMAIN_8_PROFIT_LOCK_20260402.json"
+    },
+    {
+      "domain": 9,
+      "title": "Attribution Proof",
+      "status": "VERIFIED",
+      "ssot_classification": "VERIFIED \u2014 v4 schema records preserve real strategy lineage, paper_exec eliminated as primary_strategy",
+      "file": "PROOF_DOMAIN_9_ATTRIBUTION_20260402.json"
+    },
+    {
+      "domain": 10,
+      "title": "Release and Ops Proof",
+      "status": "PARTIAL",
+      "ssot_classification": "PARTIAL \u2014 test surface repaired, backup proven, services active, OS reboot and disk space require operator action",
+      "file": "PROOF_DOMAIN_10_RELEASE_OPS_20260402.json"
+    }
+  ],
+  "operator_actions_before_live_promotion": [
+    "OS reboot required \u2014 kernel update pending (/var/run/reboot-required)",
+    "Disk at 84% \u2014 clean backups or expand volume before live promotion",
+    "IB Gateway health check latency 8.2s exceeds 750ms threshold \u2014 reconfigure to persistent connection measurement",
+    "pnl_state.json is a bootstrap stub \u2014 live PnL publisher needed before real profit lock activation",
+    "Config snapshots not implemented \u2014 data/config_snapshots/ missing",
+    "Change canary never triggered \u2014 post-apply canary workflow not yet implemented",
+    "Chaos drills required before live promotion: feed stall, broker disconnect mid-cycle, disk-full",
+    "MES futures short position in ledger not in positions_snapshot \u2014 resolve or document as intentional",
+    "S3 backup upload not configured \u2014 off-site backup not active",
+    "Lifecycle truth will remain PARTIAL until CHAD executes real orders through its own pipeline"
+  ],
+  "rollback_command": "git checkout PRE_HARDENING_20260402"
+}
