@@ -1,0 +1,109 @@
+{
+  "domain": 5,
+  "title": "Execution Quality Proof",
+  "ts_utc": "2026-04-02T17:04:16.362134+00:00",
+  "status": "PARTIAL",
+  "ssot_classification": "PARTIAL \u2014 consistent with SSOT v6.4 Section 2.2",
+  "what_is_proven": [
+    "execution_quality.json present and updated on 300s TTL timer",
+    "latency_state.json present and updated on 300s TTL timer",
+    "Execution metrics ledger exists \u2014 10 daily files, 142 hash-chained records",
+    "Hash-chain integrity verified \u2014 prev_hash chain intact, schema v4",
+    "Quality publisher service running on timer",
+    "EXECUTION RESULT log emission points added in P1-2 \u2014 10 points across 4 lanes",
+    "No EXECUTION RESULT logs missing \u2014 absence is correct (no signals fired)"
+  ],
+  "what_is_not_proven": [
+    "No real fill data \u2014 all metrics BOOTSTRAP_ONLY",
+    "Slippage, reject rate, partial fill rate all NULL",
+    "Execution metrics ledger stalled since 2026-03-28",
+    "env_label dangerous due to 8.2s IB Gateway connect/disconnect latency",
+    "BROKER_ACK_LATENCY_HIGH will block LiveGate entries until resolved"
+  ],
+  "operator_action_required": "IB Gateway health check latency (8.2s) exceeds dangerous_ms threshold (750ms). This measures connect/disconnect overhead not order ack latency. Consider reconfiguring chad-ibkr-health to use a persistent connection for latency measurement before live promotion.",
+  "execution_quality_snapshot": {
+    "by_venue_symbol": {
+      "IBKR:AAPL": {
+        "ack_latency_ms_p95": 8641.877135261893,
+        "flags": [
+          "BOOTSTRAP_ONLY"
+        ],
+        "partial_fill_rate": null,
+        "reject_rate": null,
+        "slippage_bps_p50": null
+      },
+      "IBKR:MSFT": {
+        "ack_latency_ms_p95": 8641.877135261893,
+        "flags": [
+          "BOOTSTRAP_ONLY"
+        ],
+        "partial_fill_rate": null,
+        "reject_rate": null,
+        "slippage_bps_p50": null
+      },
+      "IBKR:SPY": {
+        "ack_latency_ms_p95": 8641.877135261893,
+        "flags": [
+          "BOOTSTRAP_ONLY"
+        ],
+        "partial_fill_rate": null,
+        "reject_rate": null,
+        "slippage_bps_p50": null
+      }
+    },
+    "env_label": "dangerous",
+    "flags": [
+      "BROKER_ACK_LATENCY_HIGH"
+    ],
+    "hash_sha256": "sha256:4f32806e1e50594229558e544c0f3a2ba9a3bf06757efee6617cd1de023276f3",
+    "ts_utc": "2026-04-02T17:03:11.490562Z",
+    "ttl_seconds": 300,
+    "worst_offenders": []
+  },
+  "latency_state_snapshot": {
+    "broker": {
+      "latency_ms": 8641.877135261893,
+      "name": "IBKR",
+      "ok": true,
+      "source_path": "/home/ubuntu/chad_finale/runtime/ibkr_status.json"
+    },
+    "env_label": "dangerous",
+    "notes": "Bootstrap latency classifier from runtime/ibkr_status.json when available. UNKNOWN means insufficient evidence; higher layers should tighten, not loosen.",
+    "system": {
+      "loadavg_15m": 1.81,
+      "loadavg_1m": 1.59,
+      "loadavg_5m": 1.76
+    },
+    "thresholds_ms": {
+      "dangerous_ms": 750,
+      "thin_ms": 250
+    },
+    "ts_utc": "2026-04-02T17:03:11.485749Z",
+    "ttl_seconds": 300
+  },
+  "sample_execution_metrics": [
+    {
+      "ts_utc": null,
+      "symbol": null,
+      "status": null,
+      "sequence_id": 140,
+      "schema_version": null
+    },
+    {
+      "ts_utc": null,
+      "symbol": null,
+      "status": null,
+      "sequence_id": 141,
+      "schema_version": null
+    },
+    {
+      "ts_utc": null,
+      "symbol": null,
+      "status": null,
+      "sequence_id": 142,
+      "schema_version": null
+    }
+  ],
+  "metric_files_count": 13,
+  "metric_record_count": 142
+}
