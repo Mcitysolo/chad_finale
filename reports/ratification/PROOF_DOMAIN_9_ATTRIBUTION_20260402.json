@@ -1,0 +1,29 @@
+{
+  "domain": 9,
+  "title": "Attribution Proof",
+  "ts_utc": "2026-04-02T18:13:57.650756+00:00",
+  "status": "VERIFIED",
+  "ssot_classification": "VERIFIED \u2014 v4 schema records preserve real strategy lineage, paper_exec eliminated as primary_strategy",
+  "what_is_proven": [
+    "All v4 fill records contain primary_strategy (strategy field) with real strategy names",
+    "All v4 fee records preserve source_strategies array",
+    "All v4 execution metric records carry plan_path linkage",
+    "Zero paper_exec occurrences in v4 schema across fills, fees, and metrics",
+    "P0-4 StrategyAttributionError fix working \u2014 no new tainted records since 2026-03-25",
+    "Real strategies proven in evidence: beta (310), alpha_futures (170), gamma (7), delta (3)"
+  ],
+  "what_is_noted": [
+    "1845 legacy v1 records with paper_exec \u2014 immutable append-only ledger, pre-fix history",
+    "6 legacy v1 records with unknown \u2014 same timeframe, same cause",
+    "Legacy records excluded from allocator scoring per dominance_allocator PLACEHOLDERS set"
+  ],
+  "v4_strategy_distribution": {
+    "beta": 310,
+    "alpha_futures": 170,
+    "gamma": 7,
+    "delta": 3
+  },
+  "v4_sample_records": [],
+  "legacy_v1_paper_exec_count": 1845,
+  "legacy_v1_unknown_count": 6
+}
