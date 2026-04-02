@@ -66,7 +66,90 @@ def _attach_strategy_to_intent(intent: object, routed_signal_map: Dict[Tuple[str
             return
 
 
+def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
+    """
+    Reconcile position_guard.json against actual broker positions.
+
+    Called at the top of every cycle so the guard state reflects broker truth
+    before any signal evaluation or entry logic runs.
+    """
+    import json
+    from chad.core.position_guard import _load_state, _save_state
+
+    broker_positions = position_sync.fetch_positions()
+    guard_state = _load_state()
+
+    broker_symbols = {sym for sym, pos in broker_positions.items() if abs(pos.quantity) > 1e-9}
+    corrections_closed = 0
+    corrections_opened = 0
+
+    # Close guard entries that the broker no longer holds
+    for key, entry in list(guard_state.items()):
+        if not entry.get("open"):
+            continue
+        symbol = entry.get("symbol", "")
+        if symbol and symbol not in broker_symbols:
+            entry["open"] = False
+            entry["closed_by"] = "broker_truth_rebuild"
+            corrections_closed += 1
+
+    # Add broker positions the guard doesn't know about
+    for sym, bp in broker_positions.items():
+        if abs(bp.quantity) < 1e-9:
+            continue
+        # Guard keys are strategy|symbol — broker doesn't know strategy,
+        # so we check if ANY guard entry covers this symbol as open.
+        symbol_covered = any(
+            e.get("symbol") == sym and e.get("open")
+            for e in guard_state.values()
+        )
+        if not symbol_covered:
+            side = "BUY" if bp.quantity > 0 else "SELL"
+            fallback_key = f"broker_sync|{sym}"
+            guard_state[fallback_key] = {
+                "open": True,
+                "updated_at_utc": __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc
+                ).isoformat(),
+                "strategy": "broker_sync",
+                "symbol": sym,
+                "side": side,
+                "quantity": abs(bp.quantity),
+                "source": "broker_truth_rebuild",
+            }
+            corrections_opened += 1
+
+    if corrections_closed or corrections_opened:
+        _save_state(guard_state)
+        logger.info(
+            "BROKER_TRUTH_REBUILD",
+            extra={
+                "corrections_closed": corrections_closed,
+                "corrections_opened": corrections_opened,
+                "broker_position_count": len(broker_symbols),
+                "guard_open_count": sum(1 for e in guard_state.values() if e.get("open")),
+            },
+        )
+    else:
+        logger.info(
+            "BROKER_TRUTH_REBUILD",
+            extra={
+                "corrections_closed": 0,
+                "corrections_opened": 0,
+                "broker_position_count": len(broker_symbols),
+                "guard_open_count": sum(1 for e in guard_state.values() if e.get("open")),
+                "status": "no_corrections_needed",
+            },
+        )
+
+
 def run_once(logger: logging.Logger) -> None:
+    # P1-3: Rebuild position guard from broker truth before any signal evaluation
+    try:
+        _rebuild_guard_from_broker(logger)
+    except Exception as exc:
+        logger.warning("Broker truth rebuild failed (non-fatal): %s", exc)
+
     routed_signals = build_live_signals(logger)
     routed_signal_map = _build_router_signal_map(list(routed_signals or []))
 
