@@ -349,6 +349,21 @@ class KrakenExecutor:
                     )
                     log_kraken_trade_event(event)
 
+            LOGGER.info(
+                "EXECUTION_RESULT",
+                extra={
+                    "symbol": intent.pair,
+                    "sec_type": "CRYPTO",
+                    "exchange": "KRAKEN",
+                    "side": intent.side,
+                    "quantity": float(intent.volume),
+                    "status": "submitted",
+                    "classification": "SUBMITTED",
+                    "error": None,
+                    "strategy": intent.strategy,
+                    "ts_utc": _utc_now_iso(),
+                },
+            )
             return risk_result, resp
 
         except Exception as exc:  # noqa: BLE001
@@ -362,6 +377,21 @@ class KrakenExecutor:
                     "side": intent.side,
                     "volume": float(intent.volume),
                     "error": err,
+                },
+            )
+            LOGGER.info(
+                "EXECUTION_RESULT",
+                extra={
+                    "symbol": intent.pair,
+                    "sec_type": "CRYPTO",
+                    "exchange": "KRAKEN",
+                    "side": intent.side,
+                    "quantity": float(intent.volume),
+                    "status": "error",
+                    "classification": "FAILED",
+                    "error": err,
+                    "strategy": intent.strategy,
+                    "ts_utc": _utc_now_iso(),
                 },
             )
             raise

@@ -1100,6 +1100,21 @@ class IbkrAdapter:
                     "exchange": intent.exchange,
                 },
             )
+            LOGGER.info(
+                "EXECUTION_RESULT",
+                extra={
+                    "symbol": intent.symbol,
+                    "sec_type": intent.sec_type,
+                    "exchange": intent.exchange,
+                    "side": intent.side,
+                    "quantity": prepared.quantity,
+                    "status": "dry_run",
+                    "classification": "DRY_RUN",
+                    "error": None,
+                    "strategy": intent.strategy,
+                    "ts_utc": now.isoformat(),
+                },
+            )
             return result
 
         if ib is None:
@@ -1141,6 +1156,21 @@ class IbkrAdapter:
                 if prepared.what_if:
                     what_if_order = _call_with_timeout(ib.whatIfOrder, qualified_contract, prepared.order, label="whatIfOrder")
                     raw = {"what_if_order": _jsonable(what_if_order)}
+                    LOGGER.info(
+                        "EXECUTION_RESULT",
+                        extra={
+                            "symbol": intent.symbol,
+                            "sec_type": intent.sec_type,
+                            "exchange": intent.exchange,
+                            "side": intent.side,
+                            "quantity": prepared.quantity,
+                            "status": "what-if",
+                            "classification": "WHAT_IF",
+                            "error": None,
+                            "strategy": intent.strategy,
+                            "ts_utc": submitted_at.isoformat(),
+                        },
+                    )
                     return SubmittedOrder(
                         symbol=intent.symbol,
                         side=intent.side,
@@ -1192,6 +1222,23 @@ class IbkrAdapter:
                     "trade": _jsonable(trade),
                 }
 
+                _live_status = _safe_str(getattr(order_status, "status", ""), "submitted")
+                LOGGER.info(
+                    "EXECUTION_RESULT",
+                    extra={
+                        "symbol": intent.symbol,
+                        "sec_type": intent.sec_type,
+                        "exchange": intent.exchange,
+                        "side": intent.side,
+                        "quantity": prepared.quantity,
+                        "status": _live_status,
+                        "classification": "SUBMITTED",
+                        "error": None,
+                        "strategy": intent.strategy,
+                        "ts_utc": submitted_at.isoformat(),
+                    },
+                )
+
                 return SubmittedOrder(
                     symbol=intent.symbol,
                     side=intent.side,
@@ -1226,6 +1273,22 @@ class IbkrAdapter:
                 if attempt < self._config.max_submit_retries:
                     time.sleep(self._config.retry_backoff_s * attempt)
 
+        _fail_class = "TIMEOUT" if isinstance(last_exc, BrokerTimeoutError) else "FAILED"
+        LOGGER.info(
+            "EXECUTION_RESULT",
+            extra={
+                "symbol": intent.symbol,
+                "sec_type": intent.sec_type,
+                "exchange": intent.exchange,
+                "side": intent.side,
+                "quantity": prepared.quantity,
+                "status": "error",
+                "classification": _fail_class,
+                "error": str(last_exc),
+                "strategy": intent.strategy,
+                "ts_utc": self._now_fn().isoformat(),
+            },
+        )
         raise SubmissionError(f"Failed to submit order for {intent.symbol}: {last_exc}") from last_exc
 
     def _qualify_if_possible(self, ib: IBLike, contract: Any) -> Any:

@@ -898,6 +898,21 @@ def run_ibkr_execution(cfg: RunnerConfig) -> RunnerSummary:
                 orig_qty,
                 result_repr,
             )
+            logger.info(
+                "EXECUTION_RESULT",
+                extra={
+                    "symbol": symbol,
+                    "sec_type": getattr(intent, "sec_type", ""),
+                    "exchange": getattr(intent, "exchange", ""),
+                    "side": getattr(intent, "side", ""),
+                    "quantity": submitted_qty,
+                    "status": str(classification.get("broker_status") or classification.get("response_quality") or "unknown"),
+                    "classification": str(classification.get("response_quality") or "unknown"),
+                    "error": None,
+                    "strategy": getattr(intent, "strategy", ""),
+                    "ts_utc": _utc_now_iso(),
+                },
+            )
 
             records.append(
                 ExecutionRecord(
@@ -937,6 +952,21 @@ def run_ibkr_execution(cfg: RunnerConfig) -> RunnerSummary:
         except Exception as exc:  # noqa: BLE001
             failures += 1
             logger.exception("Intent[%d] failed. symbol=%s error=%s", idx, symbol, exc)
+            logger.info(
+                "EXECUTION_RESULT",
+                extra={
+                    "symbol": symbol,
+                    "sec_type": getattr(intent, "sec_type", ""),
+                    "exchange": getattr(intent, "exchange", ""),
+                    "side": getattr(intent, "side", ""),
+                    "quantity": _intent_quantity(intent),
+                    "status": "error",
+                    "classification": "FAILED",
+                    "error": f"{type(exc).__name__}:{exc}",
+                    "strategy": getattr(intent, "strategy", ""),
+                    "ts_utc": _utc_now_iso(),
+                },
+            )
             records.append(
                 ExecutionRecord(
                     index=idx,

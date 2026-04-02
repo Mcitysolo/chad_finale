@@ -4,6 +4,7 @@ import argparse
 import logging
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 import os
@@ -167,6 +168,21 @@ class IBKRTradeRouter:
                 "what_if_order": what_if_order.__dict__ if what_if_order else {},
             }
             # In what-if mode, IB doesn't allocate a real orderId; use 0.
+            LOGGER.info(
+                "EXECUTION_RESULT",
+                extra={
+                    "symbol": req.symbol,
+                    "sec_type": req.sec_type,
+                    "exchange": req.exchange,
+                    "side": req.side,
+                    "quantity": req.quantity,
+                    "status": "what-if",
+                    "classification": "WHAT_IF",
+                    "error": None,
+                    "strategy": "",
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             return IBKRTradeResponse(
                 order_id=getattr(what_if_order, "orderId", 0),
                 status="what-if",
@@ -191,6 +207,21 @@ class IBKRTradeRouter:
             "commissions": [c.__dict__ for c in trade.commissionReport] if trade.commissionReport else [],
         }
 
+        LOGGER.info(
+            "EXECUTION_RESULT",
+            extra={
+                "symbol": req.symbol,
+                "sec_type": req.sec_type,
+                "exchange": req.exchange,
+                "side": req.side,
+                "quantity": req.quantity,
+                "status": status,
+                "classification": "SUBMITTED",
+                "error": None,
+                "strategy": "",
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return IBKRTradeResponse(
             order_id=getattr(live_order, "orderId", 0),
             status=status,
