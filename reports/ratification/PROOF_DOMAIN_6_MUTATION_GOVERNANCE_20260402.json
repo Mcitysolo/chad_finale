@@ -1,0 +1,250 @@
+{
+  "domain": 6,
+  "title": "Mutation Governance Proof",
+  "ts_utc": "2026-04-02T17:08:22.383506+00:00",
+  "status": "PARTIAL",
+  "ssot_classification": "PARTIAL \u2014 core pipeline proven, config snapshots and canary not yet fully implemented",
+  "what_is_proven": [
+    "Pending Actions -> ActionApplier -> ledger chain proven end-to-end with 1 real action",
+    "Action 88da8664 completed full lifecycle: created -> approved -> applied",
+    "Action ledger NDJSON files present with hash-chained events",
+    "ActionApplier scanning on 60s timer, ok: true, no failures",
+    "Mutation state publisher running on 60s timer",
+    "Change canary infrastructure present and publishing on schedule",
+    "Queue clean: 0 pending, 0 approved, 0 rejected",
+    "Applied actions archive present with full action JSON"
+  ],
+  "what_is_not_proven": [
+    "Config snapshots not implemented \u2014 data/config_snapshots/ does not exist",
+    "Change canary never triggered \u2014 canary_factor: 1.0 permissive, no post-apply canary workflow",
+    "Only 1 action has ever gone through the pipeline \u2014 limited evidence base"
+  ],
+  "proven_action_lifecycle": [
+    {
+      "action_id": "88da8664e0efb34342fde245",
+      "approvals": [
+        {
+          "decided_by": "extension_mode",
+          "decided_ts_utc": "2026-03-13T17:44:24Z",
+          "decision": "approved",
+          "decision_reason": "finalize action applier verify"
+        }
+      ],
+      "expected_post_state_hash": null,
+      "expected_pre_state_hash": null,
+      "expires_ts_utc": "2026-03-13T18:44:24Z",
+      "kind": "rebalance_execute",
+      "legacy_request_id": "88da8664e0efb34342fde245",
+      "notes": "Bridge document generated from legacy /approvals API for SSOT v5 queue parity.",
+      "payload": {
+        "profile": "CAPS_PASS_DRILL"
+      },
+      "permission_class": "live_operator",
+      "requested_by": "approvals_api",
+      "status": "approved",
+      "summary": "finalize action applier verify",
+      "ts_utc": "2026-03-13T17:44:24Z",
+      "type": "APPROVAL_REQUEST"
+    }
+  ],
+  "ledger_sample": [
+    {
+      "action_doc": {
+        "action_id": "371b1f2821f5221c5bfda8f2",
+        "approvals": [
+          {
+            "decided_by": "extension_mode",
+            "decided_ts_utc": "2026-03-13T16:49:02Z",
+            "decision": "approved",
+            "decision_reason": "approval recovery push"
+          }
+        ],
+        "expected_post_state_hash": null,
+        "expected_pre_state_hash": null,
+        "expires_ts_utc": "2026-03-13T17:47:05Z",
+        "kind": "rebalance_execute",
+        "legacy_request_id": "371b1f2821f5221c5bfda8f2",
+        "notes": "Bridge document generated from legacy /approvals API for SSOT v5 queue parity.",
+        "payload": {
+          "profile": "CAPS_PASS_DRILL"
+        },
+        "permission_class": "live_operator",
+        "requested_by": "approvals_api",
+        "status": "approved",
+        "summary": "api backed caps pass test",
+        "ts_utc": "2026-03-13T16:47:05Z",
+        "type": "APPROVAL_REQUEST"
+      },
+      "actor": "extension_mode",
+      "decided_by": "extension_mode",
+      "decided_ts_utc": "2026-03-13T16:49:02Z",
+      "decision_reason": "approval recovery push",
+      "deployment_id": "primary",
+      "event_type": "approval_decided",
+      "kind": "rebalance_execute",
+      "payload": {
+        "profile": "CAPS_PASS_DRILL"
+      },
+      "reason": "approval recovery push",
+      "request_id": "371b1f2821f5221c5bfda8f2",
+      "status": "approved",
+      "summary": "api backed caps pass test",
+      "ts_utc": "2026-03-13T16:49:03Z"
+    },
+    {
+      "action_doc": {
+        "action_id": "88da8664e0efb34342fde245",
+        "approvals": [],
+        "expected_post_state_hash": null,
+        "expected_pre_state_hash": null,
+        "expires_ts_utc": "2026-03-13T18:44:24Z",
+        "kind": "rebalance_execute",
+        "legacy_request_id": "88da8664e0efb34342fde245",
+        "notes": "Bridge document generated from legacy /approvals API for SSOT v5 queue parity.",
+        "payload": {
+          "profile": "CAPS_PASS_DRILL"
+        },
+        "permission_class": "live_operator",
+        "requested_by": "approvals_api",
+        "status": "pending",
+        "summary": "finalize action applier verify",
+        "ts_utc": "2026-03-13T17:44:24Z",
+        "type": "APPROVAL_REQUEST"
+      },
+      "actor": "approvals_api",
+      "decided_by": null,
+      "decided_ts_utc": null,
+      "decision_reason": null,
+      "deployment_id": "primary",
+      "event_type": "approval_created",
+      "kind": "rebalance_execute",
+      "payload": {
+        "profile": "CAPS_PASS_DRILL"
+      },
+      "reason": "create",
+      "request_id": "88da8664e0efb34342fde245",
+      "status": "pending",
+      "summary": "finalize action applier verify",
+      "ts_utc": "2026-03-13T17:44:24Z"
+    },
+    {
+      "action_doc": {
+        "action_id": "88da8664e0efb34342fde245",
+        "approvals": [
+          {
+            "decided_by": "extension_mode",
+            "decided_ts_utc": "2026-03-13T17:44:24Z",
+            "decision": "approved",
+            "decision_reason": "finalize action applier verify"
+          }
+        ],
+        "expected_post_state_hash": null,
+        "expected_pre_state_hash": null,
+        "expires_ts_utc": "2026-03-13T18:44:24Z",
+        "kind": "rebalance_execute",
+        "legacy_request_id": "88da8664e0efb34342fde245",
+        "notes": "Bridge document generated from legacy /approvals API for SSOT v5 queue parity.",
+        "payload": {
+          "profile": "CAPS_PASS_DRILL"
+        },
+        "permission_class": "live_operator",
+        "requested_by": "approvals_api",
+        "status": "approved",
+        "summary": "finalize action applier verify",
+        "ts_utc": "2026-03-13T17:44:24Z",
+        "type": "APPROVAL_REQUEST"
+      },
+      "actor": "extension_mode",
+      "decided_by": "extension_mode",
+      "decided_ts_utc": "2026-03-13T17:44:24Z",
+      "decision_reason": "finalize action applier verify",
+      "deployment_id": "primary",
+      "event_type": "approval_decided",
+      "kind": "rebalance_execute",
+      "payload": {
+        "profile": "CAPS_PASS_DRILL"
+      },
+      "reason": "finalize action applier verify",
+      "request_id": "88da8664e0efb34342fde245",
+      "status": "approved",
+      "summary": "finalize action applier verify",
+      "ts_utc": "2026-03-13T17:44:24Z"
+    }
+  ],
+  "action_state": {
+    "approved_count": 0,
+    "debug": {
+      "action_applier_exists": true,
+      "applied_actions_count": 1,
+      "approved_sample": [],
+      "last_action_id": "88da8664e0efb34342fde245",
+      "pending_sample": [],
+      "queue_scan": {
+        "already_applied_archived": 0,
+        "applied_now": 0,
+        "approved_seen": 0,
+        "expired_archived": 0,
+        "unsupported_archived": 0
+      },
+      "rejected_sample": [],
+      "scan_ts_utc": "2026-04-02T17:08:21Z"
+    },
+    "last_apply_ts_utc": "2026-03-13T18:02:05Z",
+    "last_failure": null,
+    "lockout_until_ts_utc": null,
+    "notes": "Bridged mutation state publisher. Queue counts come from control/*_actions and apply history comes from runtime/action_applier_state.json.",
+    "ok": true,
+    "paths": {
+      "action_applier_state_path": "/home/ubuntu/chad_finale/runtime/action_applier_state.json",
+      "approved_actions_dir": "/home/ubuntu/chad_finale/control/approved_actions",
+      "control_dir": "/home/ubuntu/chad_finale/control",
+      "pending_actions_dir": "/home/ubuntu/chad_finale/control/pending_actions",
+      "rejected_actions_dir": "/home/ubuntu/chad_finale/control/rejected_actions",
+      "repo_root": "/home/ubuntu/chad_finale",
+      "runtime_dir": "/home/ubuntu/chad_finale/runtime"
+    },
+    "pending_count": 0,
+    "rejected_count": 0,
+    "schema_version": "action_state.v1",
+    "ts_utc": "2026-04-02T17:08:21.363382Z",
+    "ttl_seconds": 60
+  },
+  "applier_state": {
+    "applied_action_meta": {
+      "88da8664e0efb34342fde245": {
+        "applied_ts_utc": "2026-03-13T18:02:05Z",
+        "source": "action_applier_recovery_patch"
+      }
+    },
+    "applied_actions": [
+      "88da8664e0efb34342fde245"
+    ],
+    "last_action_id": "88da8664e0efb34342fde245",
+    "last_apply_ts_utc": "2026-03-13T18:02:05Z",
+    "last_failure": null,
+    "queue_scan": {
+      "already_applied_archived": 0,
+      "applied_now": 0,
+      "approved_seen": 0,
+      "expired_archived": 0,
+      "unsupported_archived": 0
+    },
+    "scan_ts_utc": "2026-04-02T17:08:21Z",
+    "schema_version": "action_applier_state.v2"
+  },
+  "canary_state": {
+    "canary_factor": 1.0,
+    "canary_until_ts_utc": null,
+    "last_action_id": null,
+    "notes": "No active canary yet. This remains permissive until a real post-apply canary workflow is implemented.",
+    "paths": {
+      "control_dir": "/home/ubuntu/chad_finale/control",
+      "repo_root": "/home/ubuntu/chad_finale",
+      "runtime_dir": "/home/ubuntu/chad_finale/runtime"
+    },
+    "reason": "none",
+    "schema_version": "change_canary_state.v1",
+    "ts_utc": "2026-04-02T17:08:21.369290Z",
+    "ttl_seconds": 60
+  }
+}
