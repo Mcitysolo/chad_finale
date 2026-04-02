@@ -220,6 +220,18 @@ def load_chad_state_positions(path: Path) -> Tuple[Dict[int, Pos], Dict[str, Any
             out[conId] = Pos(conId=conId, symbol=sym, qty=float(qty))
         return out, obj, None
 
+    # Shape D: flat dict keyed by SHA-256 hashes
+    # {"hash1": {"conId":..., "symbol":..., "qty":...}, ...}
+    if obj and all(isinstance(v, dict) and "conId" in v for v in obj.values()):
+        for v in obj.values():
+            conId = safe_int(v.get("conId"), 0)
+            sym = str(v.get("symbol") or "").strip()
+            qty = safe_float(v.get("qty", 0.0), 0.0)
+            if conId <= 0 or not sym:
+                continue
+            out[conId] = Pos(conId=conId, symbol=sym, qty=float(qty))
+        return out, obj, None
+
     return out, obj, "unknown_chad_state_shape"
 
 
