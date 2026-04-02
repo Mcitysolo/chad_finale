@@ -1,0 +1,85 @@
+{
+  "domain": 8,
+  "title": "Profit Lock Proof",
+  "ts_utc": "2026-04-02T18:08:40.095978+00:00",
+  "status": "PARTIAL",
+  "ssot_classification": "PARTIAL \u2014 LiveGate wired and cap consistency proven, pnl_state.json stub created",
+  "what_is_proven": [
+    "profit_lock_state.json present with correct 5-tier schema",
+    "PROFIT_TARGET_REACHED reason code wired in LiveGate at gate step 1.5",
+    "_load_profit_lock_state() reads and validates the file on every cycle",
+    "stop_new_entries=True will block all new entries via LiveGate DENY_ALL",
+    "portfolio_risk_cap consistent with sum(strategy_caps) \u2014 delta < 0.001",
+    "sizing_factor correctly integrated into dynamic_risk_allocator",
+    "pnl_state.json stub created as canonical PnL source"
+  ],
+  "what_is_not_proven": [
+    "pnl_state.json is a bootstrap stub \u2014 no live PnL publisher writes to it yet",
+    "profit_lock_state.json timestamp stale (4 days) \u2014 publisher paused with system",
+    "No live profit lock activation has ever occurred \u2014 NORMAL mode only",
+    "Profit lock tiers (WARN/LOCK1/LOCK2/LOCK3/HARD_STOP) untested with real PnL"
+  ],
+  "profit_lock_state": {
+    "config": {
+      "enable_on_negative_equity_unknown": false,
+      "hard_stop_profit_pct": 10.0,
+      "hard_stop_sizing_factor": 0.0,
+      "lock1_profit_pct": 3.0,
+      "lock1_sizing_factor": 0.5,
+      "lock2_profit_pct": 5.0,
+      "lock2_sizing_factor": 0.25,
+      "lock3_profit_pct": 8.0,
+      "lock3_sizing_factor": 0.1,
+      "ttl_seconds": 60,
+      "warn_profit_pct": 1.5
+    },
+    "explain": "profit lock inactive",
+    "factors": {
+      "hard_stop": 0.0,
+      "lock1": 0.5,
+      "lock2": 0.25,
+      "lock3": 0.1
+    },
+    "inputs": {
+      "account_equity": 994429.42,
+      "equity_known": true,
+      "equity_source": "/home/ubuntu/chad_finale/runtime/dynamic_caps.json",
+      "pnl_pct_of_equity": 0.0,
+      "pnl_sources": [],
+      "realized_pnl": 0.0,
+      "trade_count": 0
+    },
+    "mode": "NORMAL",
+    "profit_lock_active": false,
+    "sizing_factor": 1.0,
+    "stop_new_entries": false,
+    "thresholds_pct": {
+      "hard_stop": 10.0,
+      "lock1": 3.0,
+      "lock2": 5.0,
+      "lock3": 8.0,
+      "warn": 1.5
+    },
+    "ts_utc": "2026-03-29T21:37:44Z",
+    "ttl_seconds": 60
+  },
+  "pnl_state": {
+    "schema_version": "pnl_state.v1",
+    "ts_utc": "2026-04-02T18:08:06.346008+00:00",
+    "ttl_seconds": 300,
+    "realized_pnl": 0.0,
+    "trade_count": 0,
+    "pnl_pct_of_equity": 0.0,
+    "account_equity": 994429.42,
+    "equity_known": true,
+    "pnl_sources": [],
+    "source": "pnl_state_bootstrap",
+    "note": "Canonical pnl_state stub \u2014 will be replaced by live PnL publisher when real executions occur"
+  },
+  "cap_consistency": {
+    "portfolio_risk_cap": 49889.346000000005,
+    "sum_strategy_caps": 49889.346,
+    "delta": 0.0,
+    "consistent": true
+  }
+}
