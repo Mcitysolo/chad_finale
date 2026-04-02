@@ -410,18 +410,24 @@ class DecisionTraceRecorder:
         dynamic_caps_path: str,
         dynamic_caps_hash: str,
         dynamic_caps: Dict[str, Any],
+        execution_mode: str = "unknown",
+        gate_results: Optional[Dict[str, Any]] = None,
+        submitted_orders: Optional[list] = None,
     ) -> None:
         if not self._cfg.enabled:
             return
 
         # Minimal SSOT-grade record: one per cycle, reconstructable without code.
         rec: Dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "trace_id": str(trace_id),
             "cycle_id": str(cycle_id),
             "ts_utc": str(ts_utc),
             "component": "orchestrator",
+            "mode": str(execution_mode),
             "allocator_mode": str(allocator_mode),
+            "gate_results": gate_results if gate_results else {},
+            "submitted_orders": submitted_orders if submitted_orders is not None else [],
             "inputs": {
                 "portfolio_snapshot_path": str(snapshot_path),
                 "used_fallback_snapshot": bool(snapshot_used_fallback),
@@ -613,6 +619,10 @@ class Orchestrator:
 
         snapshot, used_fallback = self._load_portfolio_snapshot()
         allocator, allocator_mode = self._build_allocator()
+
+        # Domain 2: read execution state and gate for trace enrichment (best-effort)
+        _full_cycle = _safe_json_load(RUNTIME_DIR / "full_execution_cycle_last.json")
+        _heartbeat = _safe_json_load(RUNTIME_DIR / "decision_trace_heartbeat.json")
         payload = allocator.build_payload(snapshot=snapshot)
 
         out_path = self._settings.dynamic_caps_path
@@ -636,6 +646,9 @@ class Orchestrator:
                 dynamic_caps_path=str(out_path),
                 dynamic_caps_hash=caps_hash,
                 dynamic_caps=payload,
+                execution_mode=(_full_cycle or {}).get("summary", {}).get("execution_mode", "unknown"),
+                gate_results=(_heartbeat or {}).get("live_gate", {}),
+                submitted_orders=(_full_cycle or {}).get("orders", []),
             )
         except Exception:
             # absolute fail-soft
