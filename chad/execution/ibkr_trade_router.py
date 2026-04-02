@@ -102,34 +102,33 @@ class IBKRTradeRouter:
         * Deal with portfolio logic (that lives in the collector/executor).
     """
 
-    def __init__(self, host: str, port: int, client_id: int) -> None:
+    def __init__(self, host: str, port: int, client_id: int, *, ib: Any = None) -> None:
         self._host = host
         self._port = port
         self._client_id = client_id
+        # P0-3: Accept an injected, externally managed IB session.
+        # When provided, the router reuses it instead of creating a new one.
+        self._ib = ib
 
-    def _connect_ib(self):
-        try:
-            from ib_insync import IB  # type: ignore[import]
-        except ImportError as exc:  # pragma: no cover
+    def _get_ib(self) -> Any:
+        """Return the injected IB session, or raise if none was provided."""
+        if self._ib is None:
             raise RuntimeError(
-                "ib_insync is not installed. Install it with 'pip install ib-insync' "
-                "inside the CHAD venv."
-            ) from exc
-
-        ib = IB()
-        ib.connect(
-            host=self._host,
-            port=self._port,
-            clientId=self._client_id,
-            timeout=10.0,
-        )
-        return ib
+                "No IB session injected — IBKRTradeRouter requires an "
+                "externally managed IB session passed via the ib= kwarg"
+            )
+        if hasattr(self._ib, "isConnected") and not self._ib.isConnected():
+            raise RuntimeError(
+                "Injected IB session is not connected — caller must "
+                "ensure the session is connected before routing trades"
+            )
+        return self._ib
 
     def execute(self, req: IBKRTradeRequest) -> IBKRTradeResponse:
         """
         Execute a trade via IBKR. Uses what-if mode by default (no real execution).
         """
-        from ib_insync import IB, Contract, Order  # type: ignore[import]
+        from ib_insync import Contract, Order  # type: ignore[import]
 
         side = req.side.upper()
         if side not in ("BUY", "SELL"):
@@ -157,51 +156,46 @@ class IBKRTradeRouter:
         # what-if mode: IB simulates margin/commission/impact without executing
         order.whatIf = bool(req.what_if)
 
-        ib = self._connect_ib()
-        try:
-            # For what-if orders, we use whatIfOrder() which returns a fully
-            # simulated Order object with margin/commission details.
-            if req.what_if:
-                what_if_order = _call_with_timeout(ib.whatIfOrder, contract, order, label="whatIfOrder")
-                # No real trade object in what-if mode.
-                response_raw: Dict[str, Any] = {
-                    "what_if_order": what_if_order.__dict__ if what_if_order else {},
-                }
-                # In what-if mode, IB doesn't allocate a real orderId; use 0.
-                return IBKRTradeResponse(
-                    order_id=getattr(what_if_order, "orderId", 0),
-                    status="what-if",
-                    raw=response_raw,
-                )
+        ib = self._get_ib()
 
-            # LIVE order path
-            def _place_and_wait() -> Any:
-                t = ib.placeOrder(contract, order)
-                ib.sleep(1.0)
-                return t
-            trade = _call_with_timeout(_place_and_wait, label="placeOrder")
-
-            # Extract order id and status
-            live_order = trade.order
-            status = trade.orderStatus.status
-
-            response_raw = {
-                "order": live_order.__dict__ if live_order else {},
-                "status": trade.orderStatus.__dict__,
-                "fills": [f.__dict__ for f in trade.fills],
-                "commissions": [c.__dict__ for c in trade.commissionReport] if trade.commissionReport else [],
+        # For what-if orders, we use whatIfOrder() which returns a fully
+        # simulated Order object with margin/commission details.
+        if req.what_if:
+            what_if_order = _call_with_timeout(ib.whatIfOrder, contract, order, label="whatIfOrder")
+            # No real trade object in what-if mode.
+            response_raw: Dict[str, Any] = {
+                "what_if_order": what_if_order.__dict__ if what_if_order else {},
             }
-
+            # In what-if mode, IB doesn't allocate a real orderId; use 0.
             return IBKRTradeResponse(
-                order_id=getattr(live_order, "orderId", 0),
-                status=status,
+                order_id=getattr(what_if_order, "orderId", 0),
+                status="what-if",
                 raw=response_raw,
             )
-        finally:
-            try:
-                ib.disconnect()
-            except Exception:
-                pass
+
+        # LIVE order path
+        def _place_and_wait() -> Any:
+            t = ib.placeOrder(contract, order)
+            ib.sleep(1.0)
+            return t
+        trade = _call_with_timeout(_place_and_wait, label="placeOrder")
+
+        # Extract order id and status
+        live_order = trade.order
+        status = trade.orderStatus.status
+
+        response_raw = {
+            "order": live_order.__dict__ if live_order else {},
+            "status": trade.orderStatus.__dict__,
+            "fills": [f.__dict__ for f in trade.fills],
+            "commissions": [c.__dict__ for c in trade.commissionReport] if trade.commissionReport else [],
+        }
+
+        return IBKRTradeResponse(
+            order_id=getattr(live_order, "orderId", 0),
+            status=status,
+            raw=response_raw,
+        )
 
 
 # --------------------------------------------------------------------------- #

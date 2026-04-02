@@ -546,14 +546,13 @@ class _SQLiteIdempotencyStore:
 
 
 def _lazy_import_ib_factory() -> IBFactory:
+    # P0-3: No implicit IB() creation in the hot path.
+    # Callers must inject a pre-managed IB session via ib_factory.
     def factory() -> IBLike:
-        try:
-            from ib_insync import IB  # type: ignore[import]
-        except ImportError as exc:  # pragma: no cover
-            raise ConnectionError(
-                "ib_insync is not installed. Install it inside the CHAD venv."
-            ) from exc
-        return IB()
+        raise ConnectionError(
+            "No IB session injected — hot-path execution requires an "
+            "externally managed IB session passed via ib_factory"
+        )
 
     return factory
 
