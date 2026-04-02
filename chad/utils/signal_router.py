@@ -78,6 +78,20 @@ class SignalRouter:
         - Opposite-side signals on the same symbol remain as separate
           RoutedSignals — netting is deferred to risk/execution.
         - Buckets with net_size == 0 are dropped (configurable via drop_zero_net).
+
+        Cross-strategy duplicate handling:
+        When two or more strategies produce signals for the same symbol+side,
+        this is NOT treated as a duplicate or conflict — it is a MERGE.
+        No signal is ever lost: every input TradeSignal contributes to exactly
+        one output RoutedSignal bucket keyed by (symbol, side, asset_class).
+
+        Example:
+          alpha:  BUY AAPL size=100 confidence=0.8
+          gamma:  BUY AAPL size=50  confidence=0.6
+          →  RoutedSignal BUY AAPL net_size=150
+             confidence=(100*0.8 + 50*0.6)/150 = 0.733
+             source_strategies=(alpha, gamma)
+             primary_strategy=alpha  (largest size contributor)
         """
         buckets: Dict[
             Tuple[str, SignalSide, AssetClass],

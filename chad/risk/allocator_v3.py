@@ -314,11 +314,13 @@ def compute_allocator_v3(
     # If disabled, return base
     if not cfg.enabled:
         state["notes"].append("disabled: returning base weights")
+        state["per_strategy_reasons"] = {s: "allocator_disabled" for s in sorted(base_weights.keys())}
         return dict(base_weights), state
 
     rets, rows, err = _load_active_returns(repo_root)
     if err is not None or rows < 50:
         state["notes"].append(f"returns_unavailable_or_too_short:{err}:rows={rows}")
+        state["per_strategy_reasons"] = {s: "insufficient_return_data" for s in sorted(base_weights.keys())}
         return dict(base_weights), state
 
     # Compute mean/var per strategy (active minutes)
@@ -350,6 +352,15 @@ def compute_allocator_v3(
 
     if not eligible:
         state["notes"].append("no_eligible_strategies_nonzero_variance: returning base")
+        reasons_early: Dict[str, str] = {}
+        for s in sorted(base_weights.keys()):
+            if float(base_weights.get(s, 0.0)) <= 0.0:
+                reasons_early[s] = "base_weight_zero"
+            elif s not in sd:
+                reasons_early[s] = "no_return_data"
+            else:
+                reasons_early[s] = "below_min_variance"
+        state["per_strategy_reasons"] = reasons_early
         return dict(base_weights), state
 
     # Regime tilt (mild)
@@ -465,6 +476,23 @@ def compute_allocator_v3(
     state["metrics"]["corr_factor"] = {k: float(corr_factor.get(k, 0.0)) for k in eligible}
     state["metrics"]["kelly_cap"] = {k: float(kelly_cap.get(k, 0.0)) for k in eligible}
     state["outputs"]["adjusted_raw_weights"] = {k: float(adjusted.get(k, 0.0)) for k in sorted(adjusted.keys())}
+
+    # Per-strategy selection/suppression reason (SSOT v6.4 allocation explainability)
+    per_strategy_reasons: Dict[str, str] = {}
+    for s in sorted(base_weights.keys()):
+        if float(base_weights.get(s, 0.0)) <= 0.0:
+            per_strategy_reasons[s] = "base_weight_zero"
+        elif s not in sd:
+            per_strategy_reasons[s] = "no_return_data"
+        elif var.get(s, 0.0) <= cfg.min_variance:
+            per_strategy_reasons[s] = "below_min_variance"
+        elif s not in eligible:
+            per_strategy_reasons[s] = "not_eligible"
+        elif kelly_cap.get(s, 0.0) <= 0.0:
+            per_strategy_reasons[s] = "kelly_negative_excluded"
+        else:
+            per_strategy_reasons[s] = "active_weighted"
+    state["per_strategy_reasons"] = per_strategy_reasons
 
     return adjusted, state
 

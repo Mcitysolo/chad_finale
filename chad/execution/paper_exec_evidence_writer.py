@@ -463,6 +463,28 @@ class PaperExecEvidence:
 # =============================================================================
 
 class StrategyAttributionEngine:
+    """
+    Resolve strategy attribution for paper execution evidence records.
+
+    Contributor merge contract (SSOT v6.4):
+    ────────────────────────────────────────
+    1. One primary_strategy — always a real strategy name, never a placeholder.
+    2. One source_strategies list — always contains primary_strategy; preserves
+       all real contributors in order, no deduplication loss.
+    3. No flattening — placeholder values (unknown, manual, paper_exec) never
+       override a real strategy when one is available at any precedence level.
+    4. No lineage loss — if no real strategy can be resolved from any source,
+       StrategyAttributionError is raised rather than silently writing a
+       placeholder as primary_strategy.
+
+    Attribution precedence (highest to lowest):
+      A. Explicit strategy kwarg, if real
+      B. Explicit source_strategies kwarg, if any are real
+      C. Planner artifact by symbol (runtime/full_execution_cycle_last.json)
+      D. Tags fallback
+      E. Raise StrategyAttributionError — never silently degrade
+    """
+
     def __init__(self, planner: Optional[PlannerAttributionResolver] = None) -> None:
         self._planner = planner or PlannerAttributionResolver()
 

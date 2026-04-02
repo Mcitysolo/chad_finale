@@ -91,6 +91,22 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
 
     Called at the top of every cycle so the guard state reflects broker truth
     before any signal evaluation or entry logic runs.
+
+    Local guard reset conditions (SSOT v6.4):
+    ──────────────────────────────────────────
+    COVERED:
+    1. Stale local memory — guard entry shows open but broker has no position
+       for that symbol → entry closed, closed_by="broker_truth_rebuild".
+    2. Broker-truth contradiction — broker holds a position the guard doesn't
+       know about → new entry created with strategy="broker_sync".
+    3. Broker reconnect (implicit) — this function runs every cycle; after a
+       broker disconnect/reconnect, the next successful cycle reconciles.
+
+    KNOWN GAPS (not yet implemented):
+    4. Symbol normalization mismatch — comparison is plain string equality;
+       variants like "BRK.B" vs "BRK B" are not normalized.
+    5. Reconciliation repair tracking — no concept of marking a previously-
+       broken entry as "repaired" vs "newly corrected".
     """
     import json
     from chad.core.position_guard import _load_state, _save_state
@@ -163,6 +179,21 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
 
 
 def run_once(logger: logging.Logger) -> None:
+    """
+    Execute one CHAD live cycle.
+
+    Guard precedence order (SSOT v6.4):
+    1. Broker truth rebuild — reconcile local guard against broker positions
+    2. Strategy routing — evaluate and select strategy signals
+    3. Intent planning — pipeline: strategies → policy → routing → plan → intents
+    4. Position guard — block same-side duplicate positions (MAINTAINED state)
+    5. Signal dedup — cooldown check on non-flip signals (COOLDOWN_BLOCKED state)
+    6. Execution — flip (replace_position / FLIPPED) or open (mark_position_open / OPEN)
+
+    This ordering is load-bearing: broker truth MUST run before any guard
+    check so that stale local state does not suppress valid signals or
+    allow phantom positions.
+    """
     # P1-3: Rebuild position guard from broker truth before any signal evaluation
     try:
         _rebuild_guard_from_broker(logger)
