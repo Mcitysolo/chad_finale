@@ -75,6 +75,54 @@ class SubmissionError(IbkrAdapterError):
     """Raised when order submission fails after retries."""
 
 
+class BrokerTimeoutError(SubmissionError):
+    """Raised when a broker call exceeds the 10-second liveness deadline."""
+
+
+# ---------------------------------------------------------------------------
+# P0-2: Failure classification and 10-second liveness timeout
+# ---------------------------------------------------------------------------
+
+FAILURE_CLASSES = ("TIMEOUT", "BLOCKED", "REJECTED", "FAILED", "UNKNOWN")
+
+_BROKER_TIMEOUT_S = 10.0
+
+
+def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout_s: float = _BROKER_TIMEOUT_S, label: str = "broker_call") -> Any:
+    """
+    Run *fn(*args)* in a daemon thread with a hard wall-clock timeout.
+
+    On timeout: logs TIMEOUT classification and raises BrokerTimeoutError.
+    On inner exception: re-raises as-is so the caller can classify.
+    """
+    result_box: list = []
+    error_box: list = []
+
+    def _target() -> None:
+        try:
+            result_box.append(fn(*args))
+        except BaseException as exc:
+            error_box.append(exc)
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_s)
+
+    if worker.is_alive():
+        LOGGER.error(
+            "ibkr.broker_call_timeout",
+            extra={"label": label, "timeout_s": timeout_s, "failure_class": "TIMEOUT"},
+        )
+        raise BrokerTimeoutError(
+            f"Broker call {label!r} exceeded {timeout_s}s liveness deadline — failure_class=TIMEOUT"
+        )
+
+    if error_box:
+        raise error_box[0]
+
+    return result_box[0] if result_box else None
+
+
 # ---------------------------------------------------------------------------
 # Public data models
 # ---------------------------------------------------------------------------
@@ -1092,7 +1140,7 @@ class IbkrAdapter:
             try:
                 qualified_contract = self._qualify_if_possible(ib, resolved_contract.contract)
                 if prepared.what_if:
-                    what_if_order = ib.whatIfOrder(qualified_contract, prepared.order)
+                    what_if_order = _call_with_timeout(ib.whatIfOrder, qualified_contract, prepared.order, label="whatIfOrder")
                     raw = {"what_if_order": _jsonable(what_if_order)}
                     return SubmittedOrder(
                         symbol=intent.symbol,
@@ -1126,8 +1174,11 @@ class IbkrAdapter:
                         "exchange": intent.exchange,
                     },
                 )
-                trade = ib.placeOrder(qualified_contract, prepared.order)
-                ib.sleep(float(self._config.initial_status_wait_s))
+                def _place_and_wait() -> Any:
+                    t = ib.placeOrder(qualified_contract, prepared.order)
+                    ib.sleep(float(self._config.initial_status_wait_s))
+                    return t
+                trade = _call_with_timeout(_place_and_wait, label="placeOrder")
 
                 order = getattr(trade, "order", None)
                 order_status = getattr(trade, "orderStatus", None)
@@ -1180,7 +1231,7 @@ class IbkrAdapter:
 
     def _qualify_if_possible(self, ib: IBLike, contract: Any) -> Any:
         try:
-            qualified = list(ib.qualifyContracts(contract) or [])
+            qualified = list(_call_with_timeout(ib.qualifyContracts, contract, label="qualifyContracts") or [])
         except BaseException as exc:  # noqa: BLE001
             LOGGER.warning("ibkr.qualify_contract_failed", extra={"error": str(exc)})
             return contract

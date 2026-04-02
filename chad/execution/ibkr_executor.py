@@ -12,6 +12,7 @@ from chad.execution.ibkr_trade_router import (
     IBKRTradeRequest,
     IBKRTradeResponse,
     IBKRTradeRouter,
+    _call_with_timeout,
 )
 
 
@@ -267,7 +268,7 @@ class IBKRExecutor:
             what_if=not live,
         )
 
-        resp = self._router.execute(req)
+        resp = _call_with_timeout(self._router.execute, req, label="IBKRExecutor.execute")
         return risk_result, resp
 
 

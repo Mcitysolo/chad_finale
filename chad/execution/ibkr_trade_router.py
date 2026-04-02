@@ -1,10 +1,46 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import os
+
+LOGGER = logging.getLogger("chad.execution.ibkr_trade_router")
+
+_BROKER_TIMEOUT_S = 10.0
+
+
+def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout_s: float = _BROKER_TIMEOUT_S, label: str = "broker_call") -> Any:
+    """Run *fn(*args)* in a daemon thread with a hard wall-clock timeout."""
+    result_box: list = []
+    error_box: list = []
+
+    def _target() -> None:
+        try:
+            result_box.append(fn(*args))
+        except BaseException as exc:
+            error_box.append(exc)
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout=timeout_s)
+
+    if worker.is_alive():
+        LOGGER.error(
+            "ibkr.broker_call_timeout",
+            extra={"label": label, "timeout_s": timeout_s, "failure_class": "TIMEOUT"},
+        )
+        raise TimeoutError(
+            f"Broker call {label!r} exceeded {timeout_s}s liveness deadline — failure_class=TIMEOUT"
+        )
+
+    if error_box:
+        raise error_box[0]
+
+    return result_box[0] if result_box else None
 
 
 @dataclass(frozen=True)
@@ -126,7 +162,7 @@ class IBKRTradeRouter:
             # For what-if orders, we use whatIfOrder() which returns a fully
             # simulated Order object with margin/commission details.
             if req.what_if:
-                what_if_order = ib.whatIfOrder(contract, order)
+                what_if_order = _call_with_timeout(ib.whatIfOrder, contract, order, label="whatIfOrder")
                 # No real trade object in what-if mode.
                 response_raw: Dict[str, Any] = {
                     "what_if_order": what_if_order.__dict__ if what_if_order else {},
@@ -139,9 +175,11 @@ class IBKRTradeRouter:
                 )
 
             # LIVE order path
-            trade = ib.placeOrder(contract, order)
-            # Wait for at least an initial status update
-            ib.sleep(1.0)
+            def _place_and_wait() -> Any:
+                t = ib.placeOrder(contract, order)
+                ib.sleep(1.0)
+                return t
+            trade = _call_with_timeout(_place_and_wait, label="placeOrder")
 
             # Extract order id and status
             live_order = trade.order
