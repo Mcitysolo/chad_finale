@@ -13,12 +13,23 @@ Choose which strategy lane should be preferred right now based on:
 
 This is NOT execution.
 This is routing preference logic.
+
+Failure mode (SSOT v6.4)
+-------------------------
+The router is **fail-closed**: on any internal exception or invariant
+violation it returns selected_strategy=None with a diagnostic reason
+code.  It never guesses, never silently picks an arbitrary strategy,
+and never raises past its public API boundary.  Callers already handle
+None correctly (log warning, return empty signal list).
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -40,6 +51,27 @@ PREFERRED_ORDER: Sequence[str] = (
 )
 
 
+def _fail_closed(
+    weights: Mapping[str, float] | None,
+    reason: str,
+) -> RouteDecision:
+    """Return a safe fail-closed decision with no selected strategy."""
+    safe_weights: Dict[str, float] = {}
+    if weights is not None:
+        try:
+            safe_weights = {str(k): float(v) for k, v in weights.items()}
+        except Exception:
+            pass
+    return RouteDecision(
+        selected_strategy=None,
+        selected_symbols=[],
+        reason=reason,
+        available_counts={},
+        weights=safe_weights,
+        rejected_strategies={},
+    )
+
+
 def choose_strategy_route(
     *,
     available_signals: Mapping[str, Sequence[object]],
@@ -52,7 +84,26 @@ def choose_strategy_route(
     1. A strategy must have at least 1 signal to be considered.
     2. Among available strategies, higher allocator weight wins.
     3. Tie-break by preferred order.
+
+    Fail-closed: returns selected_strategy=None on any exception or
+    invariant violation.  Never raises past this boundary.
     """
+    try:
+        return _choose_strategy_route_inner(
+            available_signals=available_signals,
+            weights=weights,
+        )
+    except Exception as exc:
+        logger.error("Router exception (fail-closed): %s", exc, exc_info=True)
+        return _fail_closed(weights, "router_error")
+
+
+def _choose_strategy_route_inner(
+    *,
+    available_signals: Mapping[str, Sequence[object]],
+    weights: Mapping[str, float],
+) -> RouteDecision:
+    """Core routing logic — may raise; caller wraps in fail-closed."""
 
     counts = {
         name: len(list(signals or []))
@@ -90,6 +141,14 @@ def choose_strategy_route(
     chosen = sorted(candidates, key=sort_key)[0]
     chosen_weight = float(weights.get(chosen, 0.0))
     chosen_rank = preferred_rank.get(chosen, 999)
+
+    # Invariant check: selected strategy must have >0 signals
+    if counts.get(chosen, 0) <= 0:
+        logger.error(
+            "Router invariant violation: selected %s has 0 signals (fail-closed)",
+            chosen,
+        )
+        return _fail_closed(weights, "router_invariant_violation")
 
     # Build rejection reasons for losing candidates
     for name in candidates:

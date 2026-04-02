@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""
+chad/core/signal_guard.py
+
+Signal deduplication and cooldown guard for CHAD.
+
+Cooldown scope contract (SSOT v6.4)
+------------------------------------
+- Fingerprint key: (strategy, symbol, side, size).
+- Size-sensitive by design: changing quantity produces a distinct
+  fingerprint, so a resized order is treated as a new signal.
+- Opposite-side signals have distinct fingerprints and are never
+  cross-blocked (BUY AAPL 100 vs SELL AAPL 100 are independent).
+- Cooldown window: 10 minutes (COOLDOWN_MINUTES = 10, i.e. 600 s).
+  Purely time-based; evaluated against updated_at_utc of the last
+  emission for the same fingerprint.
+- Known gap: broker-confirmed position closes do NOT reset cooldown.
+  clear_signal() sets active=False / EXPIRED, but no broker
+  confirmation path currently calls it.  Cooldown expires only by
+  the passage of time.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +52,7 @@ class SignalFingerprint:
     size: float
 
     def key(self) -> str:
+        """Cooldown identity: strategy|symbol|side|size — all four components must match."""
         return f"{self.strategy}|{self.symbol}|{self.side}|{self.size}"
 
 
