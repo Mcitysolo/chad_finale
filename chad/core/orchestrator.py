@@ -632,6 +632,7 @@ class Orchestrator:
         # Domain 2: read execution state and gate for trace enrichment (best-effort)
         _full_cycle = _safe_json_load(RUNTIME_DIR / "full_execution_cycle_last.json")
         _heartbeat = _safe_json_load(RUNTIME_DIR / "decision_trace_heartbeat.json")
+        _route_decision = _safe_json_load(RUNTIME_DIR / "last_route_decision.json")
         payload = allocator.build_payload(snapshot=snapshot)
 
         out_path = self._settings.dynamic_caps_path
@@ -658,6 +659,7 @@ class Orchestrator:
                 execution_mode=(_full_cycle or {}).get("summary", {}).get("execution_mode", "unknown"),
                 gate_results=(_heartbeat or {}).get("live_gate", {}),
                 submitted_orders=(_full_cycle or {}).get("orders", []),
+                strategy_detail=_route_decision if isinstance(_route_decision, dict) else None,
             )
         except Exception:
             # absolute fail-soft

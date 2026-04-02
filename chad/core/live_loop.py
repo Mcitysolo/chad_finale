@@ -15,9 +15,11 @@ Current behavior
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from chad.core.live_execution_router import (
     build_live_signals,
@@ -25,6 +27,7 @@ from chad.core.live_execution_router import (
     is_always_active_routing,
 )
 from chad.core.ibkr_execution_runner import _build_plan_and_intents
+from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
 from ib_insync import IB
 
@@ -33,6 +36,18 @@ ib.connect("127.0.0.1", 4002, clientId=99)
 
 position_sync = BrokerPositionSync(ib)
 LOOP_INTERVAL_SECONDS = 60
+_ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
+
+
+def _write_route_decision(detail: Dict[str, Any]) -> None:
+    """Write strategy_detail bridge file for orchestrator DecisionTrace pickup."""
+    try:
+        _ROUTE_DECISION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ROUTE_DECISION_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(detail, indent=2, default=str), encoding="utf-8")
+        tmp.replace(_ROUTE_DECISION_PATH)
+    except Exception:
+        pass
 
 
 def _build_router_signal_map(signals: List[object]) -> Dict[Tuple[str, str, str, float], object]:
@@ -154,20 +169,50 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as exc:
         logger.warning("Broker truth rebuild failed (non-fatal): %s", exc)
 
+    strategy_detail: Dict[str, Any] = {
+        "available_strategies": {},
+        "rejected_strategies": {},
+        "selected_strategy": None,
+        "selected_strategy_reason": None,
+        "affordability_rejections": [],
+        "guard_rejections": [],
+    }
+
     if is_always_active_routing():
         all_result = build_all_live_signals(logger)
         routed_signals = all_result.all_signals
         routed_signal_map = _build_router_signal_map(list(routed_signals or []))
+        decision = all_result.decision
+        strategy_detail["available_strategies"] = decision.available_counts
+        strategy_detail["rejected_strategies"] = decision.rejected_strategies
+        strategy_detail["selected_strategy"] = decision.primary_strategy
+        strategy_detail["selected_strategy_reason"] = decision.reason
+        _write_route_decision(strategy_detail)
 
         if not routed_signals:
-            logger.info("No routed signals available (always-active). Sleeping.")
+            logger.info(
+                "CYCLE_IDLE suppression=%s",
+                SuppressionReason.NO_SIGNAL.value,
+                extra={"suppression_reason": SuppressionReason.NO_SIGNAL.value, "routing_mode": "always_active"},
+            )
             return
     else:
-        routed_signals = build_live_signals(logger)
+        result = build_live_signals(logger)
+        routed_signals = result.signals
         routed_signal_map = _build_router_signal_map(list(routed_signals or []))
+        decision = result.decision
+        strategy_detail["available_strategies"] = decision.available_counts
+        strategy_detail["rejected_strategies"] = decision.rejected_strategies or {}
+        strategy_detail["selected_strategy"] = decision.selected_strategy
+        strategy_detail["selected_strategy_reason"] = decision.reason
+        _write_route_decision(strategy_detail)
 
         if not routed_signals:
-            logger.info("No routed signals available. Sleeping.")
+            logger.info(
+                "CYCLE_IDLE suppression=%s",
+                SuppressionReason.NO_SIGNAL.value,
+                extra={"suppression_reason": SuppressionReason.NO_SIGNAL.value, "routing_mode": "single_winner"},
+            )
             return
 
     _ctx, _plan, intents = _build_plan_and_intents(logger)
@@ -202,22 +247,26 @@ def run_once(logger: logging.Logger) -> None:
 
         if is_same_side_open(intent):
             logger.info(
-                "SKIP open-position intent → %s %s %s qty=%s",
+                "SKIP suppression=%s → %s %s %s qty=%s",
+                SuppressionReason.SAME_SIDE_POSITION_OPEN.value,
                 getattr(intent, "symbol", None),
                 getattr(intent, "sec_type", None),
                 getattr(intent, "side", None),
                 getattr(intent, "quantity", None),
+                extra={"suppression_reason": SuppressionReason.SAME_SIDE_POSITION_OPEN.value},
             )
             continue
 
         if not is_flip_signal(intent):
             if not should_emit_signal(adapted):
                 logger.info(
-                    "SKIP duplicate intent → %s %s %s qty=%s",
+                    "SKIP suppression=%s → %s %s %s qty=%s",
+                    SuppressionReason.COOLDOWN_ACTIVE.value,
                     getattr(intent, "symbol", None),
                     getattr(intent, "sec_type", None),
                     getattr(intent, "side", None),
                     getattr(intent, "quantity", None),
+                    extra={"suppression_reason": SuppressionReason.COOLDOWN_ACTIVE.value},
                 )
                 continue
 

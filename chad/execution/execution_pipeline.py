@@ -401,6 +401,14 @@ def build_execution_plan(
         bucket = buckets[symbol]
 
         if _is_effectively_zero(bucket.net_signed_size):
+            rejections.append(
+                PlanRejection(
+                    symbol=symbol,
+                    reason="zero_net_size",
+                    severity=PlanRejectionSeverity.INFO,
+                    detail="net_signed_size_effectively_zero",
+                )
+            )
             continue
 
         side = SignalSide.BUY if bucket.net_signed_size > 0 else SignalSide.SELL

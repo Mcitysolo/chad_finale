@@ -67,8 +67,15 @@ def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], D
     return available_signals, weights
 
 
-def build_live_signals(logger: logging.Logger | None = None):
-    """Single-winner routing: returns only the top strategy's signals."""
+@dataclass
+class SingleWinnerResult:
+    """Result from single-winner routing, preserving the RouteDecision for tracing."""
+    signals: List
+    decision: RouteDecision
+
+
+def build_live_signals(logger: logging.Logger | None = None) -> SingleWinnerResult:
+    """Single-winner routing: returns the top strategy's signals + RouteDecision."""
     logger = logger or logging.getLogger("chad.live_router")
 
     available_signals, weights = _build_available_signals(logger)
@@ -82,7 +89,7 @@ def build_live_signals(logger: logging.Logger | None = None):
 
     if selected is None:
         logger.warning("No strategies available. System idle.")
-        return []
+        return SingleWinnerResult(signals=[], decision=decision)
 
     signals = available_signals.get(selected, [])
 
@@ -92,7 +99,7 @@ def build_live_signals(logger: logging.Logger | None = None):
         decision.selected_symbols,
     )
 
-    return signals
+    return SingleWinnerResult(signals=signals, decision=decision)
 
 
 @dataclass
