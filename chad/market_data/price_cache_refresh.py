@@ -100,14 +100,13 @@ def parse_ts(val: Any) -> Optional[str]:
 
 
 def tail_lines(path: Path, max_lines: int) -> Iterable[str]:
-    buf: list[str] = []
+    from collections import deque
+    buf: deque[str] = deque(maxlen=max_lines)
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             if not line:
                 continue
             buf.append(line)
-            if len(buf) > max_lines:
-                buf.pop(0)
     return buf
 
 
