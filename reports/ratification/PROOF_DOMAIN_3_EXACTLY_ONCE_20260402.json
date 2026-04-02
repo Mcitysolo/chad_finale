@@ -1,0 +1,88 @@
+{
+  "domain": 3,
+  "title": "Exactly-Once Proof",
+  "ts_utc": "2026-04-02T16:49:49.760139Z",
+  "sqlite_schema": "CREATE TABLE ibkr_exec_state (\n                    idempotency_key TEXT PRIMARY KEY,\n                    status TEXT NOT NULL,\n                    created_at_utc TEXT NOT NULL,\n                    updated_at_utc TEXT NOT NULL,\n                    broker_order_id INTEGER,\n                    payload_json TEXT NOT NULL,\n                    result_json TEXT\n                )",
+  "recent_claims": [
+    {
+      "idempotency_key": "53a84d0382be2530...",
+      "status": "claimed",
+      "created_at_utc": "2026-04-02T16:47:51.371302+00:00"
+    },
+    {
+      "idempotency_key": "718a023dfda858ba...",
+      "status": "claimed",
+      "created_at_utc": "2026-04-02T16:47:26.522021+00:00"
+    },
+    {
+      "idempotency_key": "def5bca4f1131831...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-29T11:35:14.380140+00:00"
+    },
+    {
+      "idempotency_key": "6fe98652b917ddba...",
+      "status": "PreSubmitted",
+      "created_at_utc": "2026-03-29T11:30:23.602781+00:00"
+    },
+    {
+      "idempotency_key": "696ea9e0dd9dbace...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-29T11:19:48.356181+00:00"
+    },
+    {
+      "idempotency_key": "bc5c4742852d6eda...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-28T22:43:48.677011+00:00"
+    },
+    {
+      "idempotency_key": "74219cd91b254f10...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-28T22:21:32.769634+00:00"
+    },
+    {
+      "idempotency_key": "8b28040d3e71c706...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-28T22:20:32.733676+00:00"
+    },
+    {
+      "idempotency_key": "aa9c8b25d9966934...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-28T22:08:55.266753+00:00"
+    },
+    {
+      "idempotency_key": "486048872a34df85...",
+      "status": "claimed",
+      "created_at_utc": "2026-03-28T22:07:51.480798+00:00"
+    }
+  ],
+  "claim_count": 10,
+  "action_applier_applied_count": 1,
+  "action_applier_state": {
+    "applied_action_meta": {
+      "88da8664e0efb34342fde245": {
+        "applied_ts_utc": "2026-03-13T18:02:05Z",
+        "source": "action_applier_recovery_patch"
+      }
+    },
+    "applied_actions": [
+      "88da8664e0efb34342fde245"
+    ],
+    "last_action_id": "88da8664e0efb34342fde245",
+    "last_apply_ts_utc": "2026-03-13T18:02:05Z",
+    "last_failure": null,
+    "queue_scan": {
+      "already_applied_archived": 0,
+      "applied_now": 0,
+      "approved_seen": 0,
+      "expired_archived": 0,
+      "unsupported_archived": 0
+    },
+    "scan_ts_utc": "2026-04-02T16:49:29Z",
+    "schema_version": "action_applier_state.v2"
+  },
+  "dry_run_bypass_removed": true,
+  "duplicate_suppression_layers": [
+    "SQLite WAL idempotency store",
+    "ActionApplier applied_actions set"
+  ]
+}

@@ -1030,7 +1030,7 @@ class IbkrAdapter:
 
         now = self._now_fn()
         idempotency_key = self._compute_idempotency_key(intent)
-        if self._idempotency and not self._config.dry_run:
+        if self._idempotency:
             claimed = self._idempotency.claim(idempotency_key, self._intent_payload(intent), now)
             if not claimed:
                 existing = self._idempotency.get(idempotency_key) or {}
@@ -1128,7 +1128,7 @@ class IbkrAdapter:
             submitted_at=now,
             idempotency_key=idempotency_key,
         )
-        if self._idempotency and not self._config.dry_run:
+        if self._idempotency:
             self._idempotency.mark(
                 idempotency_key,
                 status=result.status,
