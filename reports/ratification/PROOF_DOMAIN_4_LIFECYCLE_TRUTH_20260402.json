@@ -1,0 +1,36 @@
+{
+  "domain": 4,
+  "title": "Lifecycle Truth Proof",
+  "ts_utc": "2026-04-02T16:55:45.132797Z",
+  "status": "PARTIAL",
+  "ssot_classification": "PARTIAL \u2014 consistent with SSOT v6.4 Section 2.2",
+  "what_is_proven": [
+    "Broker event ledgers present and continuous \u2014 43 daily files through today",
+    "Fill and fee ledgers present \u2014 13 files, 1279 fills, 1279 fees",
+    "Lifecycle truth publisher running on 60s timer cycle",
+    "Deterministic fill replay produces 3 positions reproducibly",
+    "Gap detection active \u2014 backlog_flag correctly set, gap_flag false",
+    "Publisher correctly fails closed when reconciliation is RED"
+  ],
+  "what_is_not_proven": [
+    "truth_ok is False \u2014 reconciliation RED due to SCOPE_MISMATCH_MANUAL_VS_PAPER_EXEC",
+    "Fill/fee ledgers stalled since 2026-03-28 \u2014 5-day gap in new fills",
+    "Zero non-heartbeat broker events \u2014 no order-state-machine replay possible",
+    "Full lifecycle replay not yet implemented per publisher notes",
+    "Manual IBKR holdings (AAPL) not in same authority scope as paper_exec replay (QQQ)"
+  ],
+  "resolution_path": "truth_ok will turn True when CHAD executes real orders through its own pipeline, producing non-heartbeat broker events and fill/fee ledgers in a consistent authority scope",
+  "broker_events_count": 7688,
+  "fills_count": 1279,
+  "fees_count": 1279,
+  "replay_positions": [
+    "MSFT",
+    "QQQ",
+    "SPY"
+  ],
+  "manual_positions": [
+    "AAPL",
+    "MSFT",
+    "SPY"
+  ]
+}
