@@ -4,12 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Dict
 import json
 
 STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/signal_guard.json")
 COOLDOWN_MINUTES = 10
+
+
+class SignalState(str, Enum):
+    """Formal signal lifecycle states (SSOT v6.4)."""
+    NEW = "NEW"                                        # First occurrence of this fingerprint
+    DUPLICATE = "DUPLICATE"                            # Active entry past cooldown — re-emitted
+    COOLDOWN_BLOCKED = "COOLDOWN_BLOCKED"              # Active entry within cooldown — blocked
+    EXPIRED = "EXPIRED"                                # Entry cleared (active=False)
+    REACTIVATABLE = "REACTIVATABLE"                    # Expired entry seen again — will re-emit
+    SUPPRESSED_BY_POSITION = "SUPPRESSED_BY_POSITION"  # Blocked by position guard (assigned by caller)
+    EXECUTABLE = "EXECUTABLE"                          # Passed all guards, ready to execute
 
 
 @dataclass(frozen=True)
@@ -54,6 +66,32 @@ def fingerprint_signal(signal) -> SignalFingerprint:
     )
 
 
+def classify_signal(signal) -> SignalState:
+    """Classify a signal's lifecycle state without side effects (pure read)."""
+    fp = fingerprint_signal(signal)
+    state = _load_state()
+    key = fp.key()
+    existing = state.get(key)
+
+    if existing is None:
+        return SignalState.NEW
+
+    if existing.get("active") is not True:
+        return SignalState.REACTIVATABLE
+
+    last_ts = existing.get("updated_at_utc")
+    if last_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            if now_dt - last_dt < timedelta(minutes=COOLDOWN_MINUTES):
+                return SignalState.COOLDOWN_BLOCKED
+        except Exception:
+            return SignalState.COOLDOWN_BLOCKED
+
+    return SignalState.DUPLICATE
+
+
 def should_emit_signal(signal) -> bool:
     fp = fingerprint_signal(signal)
     state = _load_state()
@@ -71,9 +109,21 @@ def should_emit_signal(signal) -> bool:
                 now_dt = datetime.now(timezone.utc)
 
                 if now_dt - last_dt < timedelta(minutes=COOLDOWN_MINUTES):
+                    existing["last_state"] = SignalState.COOLDOWN_BLOCKED.value
+                    _save_state(state)
                     return False
             except Exception:
+                existing["last_state"] = SignalState.COOLDOWN_BLOCKED.value
+                _save_state(state)
                 return False
+
+    # Determine lifecycle state for the record
+    if existing is None:
+        sig_state = SignalState.NEW
+    elif existing.get("active") is not True:
+        sig_state = SignalState.REACTIVATABLE
+    else:
+        sig_state = SignalState.DUPLICATE
 
     # store/update signal
     state[key] = {
@@ -83,6 +133,7 @@ def should_emit_signal(signal) -> bool:
         "symbol": fp.symbol,
         "side": fp.side,
         "size": fp.size,
+        "last_state": sig_state.value,
     }
 
     _save_state(state)
@@ -97,6 +148,7 @@ def clear_signal(signal) -> None:
     if key in state:
         state[key]["active"] = False
         state[key]["updated_at_utc"] = _utc_now_iso()
+        state[key]["last_state"] = SignalState.EXPIRED.value
         _save_state(state)
 
 

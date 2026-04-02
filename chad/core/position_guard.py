@@ -15,11 +15,21 @@ Track currently open strategy/symbol positions and allow:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
 import json
 
 STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/position_guard.json")
+
+
+class PositionState(str, Enum):
+    """Formal position lifecycle states (SSOT v6.4)."""
+    OPEN = "OPEN"                                          # Fresh position opened
+    MAINTAINED = "MAINTAINED"                              # Same-side signal on existing open — no change
+    FLIPPED = "FLIPPED"                                    # Opposite-side replaced existing position
+    CLOSED = "CLOSED"                                      # Position explicitly closed
+    RESET_FROM_BROKER_TRUTH = "RESET_FROM_BROKER_TRUTH"    # Reconciled from broker state
 
 
 def _utc_now_iso() -> str:
@@ -74,7 +84,15 @@ def is_same_side_open(intent) -> bool:
     record = get_open_position(intent)
     if not record:
         return False
-    return str(record.get("side", "")) == _intent_side(intent)
+    match = str(record.get("side", "")) == _intent_side(intent)
+    if match:
+        # Record MAINTAINED state — position unchanged by this signal
+        state = _load_state()
+        key = _position_key(_intent_strategy(intent), _intent_symbol(intent))
+        if key in state:
+            state[key]["last_state"] = PositionState.MAINTAINED.value
+            _save_state(state)
+    return match
 
 
 def is_flip_signal(intent) -> bool:
@@ -96,6 +114,7 @@ def mark_position_open(intent) -> None:
         "symbol": _intent_symbol(intent),
         "side": _intent_side(intent),
         "quantity": float(getattr(intent, "quantity", 0.0) or 0.0),
+        "last_state": PositionState.OPEN.value,
     }
     _save_state(state)
 
@@ -106,6 +125,7 @@ def mark_position_closed(intent) -> None:
     if key in state:
         state[key]["open"] = False
         state[key]["updated_at_utc"] = _utc_now_iso()
+        state[key]["last_state"] = PositionState.CLOSED.value
         _save_state(state)
 
 
@@ -124,7 +144,29 @@ def replace_position(intent) -> None:
         "symbol": _intent_symbol(intent),
         "side": _intent_side(intent),
         "quantity": float(getattr(intent, "quantity", 0.0) or 0.0),
+        "last_state": PositionState.FLIPPED.value,
     }
+    _save_state(state)
+
+
+def reset_from_broker(strategy: str, symbol: str) -> None:
+    """Reconcile a position from broker truth — marks entry as reset."""
+    state = _load_state()
+    key = _position_key(strategy, symbol)
+    if key in state:
+        state[key]["open"] = False
+        state[key]["updated_at_utc"] = _utc_now_iso()
+        state[key]["last_state"] = PositionState.RESET_FROM_BROKER_TRUTH.value
+    else:
+        state[key] = {
+            "open": False,
+            "updated_at_utc": _utc_now_iso(),
+            "strategy": strategy,
+            "symbol": symbol,
+            "side": "",
+            "quantity": 0.0,
+            "last_state": PositionState.RESET_FROM_BROKER_TRUTH.value,
+        }
     _save_state(state)
 
 
