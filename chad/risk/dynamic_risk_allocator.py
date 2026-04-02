@@ -16,8 +16,20 @@ logger = logging.getLogger(__name__)
 # Defaults
 # ---------------------------------------------------------------------------
 
-# These are the weights that previously summed to 1.03 and triggered the error.
-# We now treat them as RELATIVE WEIGHTS and normalize them internally.
+# ── Baseline Fallback Mode Definition (SSOT v6.4) ─────────────────────
+# "Conservative mode" / "baseline fallback" means:
+#   - DEFAULT_STRATEGY_WEIGHTS applied as-is (normalized to 1.0)
+#   - No savage overlay, no v3 overlay, no regime tilt, no Kelly constraint
+#   - Pure proportional allocation based on the base chassis below
+#   - daily_risk_fraction unchanged (not reduced)
+# This mode activates when ANY of:
+#   - Savage allocator is disabled or returns all-zero adjusted weights
+#   - Allocator v3 is disabled or has insufficient return data
+#   - Any overlay raises an exception (orchestrator fail-closed to base)
+# The base weights are the absolute floor — overlays may adjust upward
+# or downward, but on failure the system reverts to exactly these weights.
+# Zero-weight strategies are never resurrected by any overlay.
+# ──────────────────────────────────────────────────────────────────────
 DEFAULT_STRATEGY_WEIGHTS: Dict[str, float] = {
     "alpha": 0.35,
     "beta": 0.30,
@@ -156,6 +168,15 @@ class DynamicRiskAllocator:
     The allocator is deliberately stateless: all configuration is passed in via
     StrategyAllocation and the daily_risk_fraction, and all results are
     returned as a pure dict payload.
+
+    Execution-first promotion gate (SSOT v6.4):
+    The allocator has no runtime gate checking P0 execution contract health
+    (10s timeout, single IB session, reqContractDetails removal, attribution).
+    Overlay aggressiveness (savage/v3) is controlled by env var enablement and
+    data availability, not by execution subsystem health.  The P0-before-P1
+    ordering is enforced by operational governance (CLAUDE.md work order), not
+    by code.  This is a known architectural decision: the allocator is stateless
+    and deliberately decoupled from execution health.
     """
 
     strategy_allocation: StrategyAllocation

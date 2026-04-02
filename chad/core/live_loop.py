@@ -2,15 +2,58 @@
 """
 chad/core/live_loop.py
 
-Autonomous live loop for CHAD.
+Autonomous live loop for CHAD — runtime behavior layer summary (SSOT v6.4).
 
-Current behavior
+Cadence
+-------
+One cycle every LOOP_INTERVAL_SECONDS (default 60s).  Each cycle is
+independent: no cross-cycle state except position_guard.json,
+signal_guard.json, and the bridge file last_route_decision.json.
+
+Full cycle sequence
+-------------------
+1. Broker truth rebuild — reconcile position_guard.json against actual
+   broker positions.  Closes stale local entries, adds unknown broker
+   positions.  Runs FIRST so all downstream guards see broker reality.
+
+2. Strategy routing — evaluate all strategy handlers, produce signals.
+   Two modes controlled by CHAD_ALWAYS_ACTIVE_ROUTING:
+     OFF (default): single-winner via choose_strategy_route() — highest
+         weight+preference strategy with signals wins; others rejected.
+     ON:  always-active via evaluate_all_strategies() — all strategies
+         with signals contribute.
+   RouteDecision / AllStrategiesDecision written to
+   runtime/last_route_decision.json for orchestrator DecisionTrace pickup.
+
+3. Intent planning — DecisionPipeline runs ALL strategies through
+   StrategyEngine → PolicyEngine (affordability, sizing) → SignalRouter
+   (merge same-symbol-same-side) → ExecutionPlan → IBKR intents.
+   Zero-net-size buckets produce PlanRejection(reason="zero_net_size").
+
+4. Per-intent guard evaluation (in priority order):
+   a. Strategy attribution — attach strategy label from routed_signal_map.
+   b. Position guard — is_same_side_open() blocks same-side duplicates
+      (SuppressionReason.SAME_SIDE_POSITION_OPEN).
+   c. Signal dedup — should_emit_signal() enforces 10-min cooldown per
+      (strategy, symbol, side, size) fingerprint
+      (SuppressionReason.COOLDOWN_ACTIVE).  Skipped for flip signals.
+
+5. Execution — surviving intents are executed:
+   - Flip: replace_position() (PositionState.FLIPPED)
+   - New:  mark_position_open() (PositionState.OPEN)
+
+6. Idle detection — if no signals from any strategy, cycle emits
+   CYCLE_IDLE with SuppressionReason.NO_SIGNAL and strategies_checked
+   counts proving all strategies were evaluated.
+
+Evidence logging
 ----------------
-- builds routed signals
-- builds execution plan/intents
-- prevents duplicate repeats
-- prevents reopening same-side positions
-- allows flip detection (SELL -> BUY, BUY -> SELL)
+- Paper execution evidence: hash-chained NDJSON in data/fills/, data/fees/,
+  data/execution_metrics/ via paper_exec_evidence_writer.
+- DecisionTrace: NDJSON in data/traces/decision_trace_YYYYMMDD.ndjson
+  (schema v3, includes strategy_detail from last_route_decision.json).
+- Signal/position guard state: runtime/signal_guard.json,
+  runtime/position_guard.json (last_state field tracks lifecycle enum).
 """
 
 from __future__ import annotations
@@ -222,9 +265,14 @@ def run_once(logger: logging.Logger) -> None:
 
         if not routed_signals:
             logger.info(
-                "CYCLE_IDLE suppression=%s",
+                "CYCLE_IDLE suppression=%s strategies_checked=%s",
                 SuppressionReason.NO_SIGNAL.value,
-                extra={"suppression_reason": SuppressionReason.NO_SIGNAL.value, "routing_mode": "always_active"},
+                strategy_detail["available_strategies"],
+                extra={
+                    "suppression_reason": SuppressionReason.NO_SIGNAL.value,
+                    "routing_mode": "always_active",
+                    "strategies_checked": strategy_detail["available_strategies"],
+                },
             )
             return
     else:
@@ -240,9 +288,14 @@ def run_once(logger: logging.Logger) -> None:
 
         if not routed_signals:
             logger.info(
-                "CYCLE_IDLE suppression=%s",
+                "CYCLE_IDLE suppression=%s strategies_checked=%s",
                 SuppressionReason.NO_SIGNAL.value,
-                extra={"suppression_reason": SuppressionReason.NO_SIGNAL.value, "routing_mode": "single_winner"},
+                strategy_detail["available_strategies"],
+                extra={
+                    "suppression_reason": SuppressionReason.NO_SIGNAL.value,
+                    "routing_mode": "single_winner",
+                    "strategies_checked": strategy_detail["available_strategies"],
+                },
             )
             return
 
