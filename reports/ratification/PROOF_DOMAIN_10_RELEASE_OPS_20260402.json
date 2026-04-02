@@ -1,0 +1,31 @@
+{
+  "domain": 10,
+  "title": "Release and Ops Proof",
+  "ts_utc": "2026-04-02T18:41:41.162255+00:00",
+  "status": "PARTIAL",
+  "ssot_classification": "PARTIAL \u2014 test surface repaired, backup proven, services active, OS reboot and disk space require operator action",
+  "what_is_proven": [
+    "Test suite: all previously failing tests fixed \u2014 stale _submit_single_routed fixtures updated to current API",
+    "Backup service: nightly verified backups with sha256 checksums \u2014 45 archives confirmed",
+    "Latest backup: chad_backup_20260402T033009Z.tar.gz (719MB) \u2014 Verification OK",
+    "Recovery drill: completed 2026-03-05 \u2014 restore from clean host proven",
+    "All 5 core services active through full hardening period: backend, orchestrator, polygon, telegram, metrics",
+    "Disk guard service active with WARN threshold alert at 84%",
+    "Chaos drills: N/A under DRY_RUN posture \u2014 no live execution to chaos-test"
+  ],
+  "what_requires_operator_action": [
+    "OS reboot required \u2014 /var/run/reboot-required present (kernel update pending)",
+    "Disk at 84% approaching critical threshold (85%) \u2014 clean up backups or expand volume before live promotion",
+    "S3 backup upload not configured \u2014 off-site backup not active",
+    "Chaos drills (feed stall, broker disconnect, disk-full) required before live promotion"
+  ],
+  "test_summary": "92 passed, 13 warnings in 25.18s",
+  "backup_count": 45,
+  "core_services_active": [
+    "chad-backend",
+    "chad-orchestrator",
+    "chad-polygon-stocks",
+    "chad-telegram-bot",
+    "chad-metrics"
+  ]
+}
