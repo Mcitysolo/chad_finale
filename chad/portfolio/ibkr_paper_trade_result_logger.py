@@ -55,6 +55,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+from chad.execution.paper_exec_evidence_writer import StrategyAttributionError
+
 LOGGER = logging.getLogger("chad.ibkr_paper_trade_result_logger")
 
 
@@ -375,21 +377,27 @@ class StrategyResolver:
             primary = explicit
         elif contributors:
             primary = contributors[0]
-        elif explicit:
+        elif explicit and explicit not in {"paper_exec", "unknown"}:
             primary = explicit
         else:
-            primary = "paper_exec"
+            # P0-4: raise — never silently flatten to paper_exec
+            raise StrategyAttributionError(
+                f"No real strategy resolved for {event.symbol} — "
+                f"all attribution sources exhausted (explicit, source_strategies, raw_intent, tags, extra)"
+            )
 
         # Ensure primary is included
-        if primary not in contributors and primary not in {"paper_exec", "unknown"}:
+        if primary not in contributors:
             contributors.insert(0, primary)
 
         # De-dup while preserving order
         normalized = _normalize_strategy_list(contributors)
 
-        # Final fallback if nothing real exists
-        if not normalized and primary == "paper_exec":
-            normalized = ("paper_exec",)
+        if not normalized:
+            raise StrategyAttributionError(
+                f"No real strategy resolved for {event.symbol} — "
+                f"contributors list empty after normalization"
+            )
 
         return primary, normalized
 

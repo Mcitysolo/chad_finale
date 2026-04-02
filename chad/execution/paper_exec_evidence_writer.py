@@ -29,13 +29,15 @@ Primary goals
    B. explicit source_strategies, if real
    C. planner artifact by symbol (runtime/full_execution_cycle_last.json)
    D. tags fallback
-   E. final fallback = "paper_exec"
+   E. raise StrategyAttributionError — never silently flatten to paper_exec
 
 5. Never allow placeholder values like:
    - "unknown"
    - "manual"
    - "paper_exec"
    to outrank a real strategy when one is available.
+   If no real strategy can be resolved at all, raise rather than
+   silently writing paper_exec as primary_strategy.
 
 Python
 ------
@@ -55,6 +57,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+
+class StrategyAttributionError(RuntimeError):
+    """Raised when no real strategy can be resolved for a paper execution record."""
 
 
 # =============================================================================
@@ -305,15 +316,14 @@ class PlannerAttributionResolver:
                 if not strategy and contributors:
                     strategy = contributors[0]
 
-                # final fallback if still nothing
-                if not strategy:
-                    strategy = "paper_exec"
+                # P0-4: pass through empty if no real strategy found —
+                # the attribution engine decides whether to raise.
 
                 if _is_real_strategy(strategy) and strategy not in contributors:
                     contributors.insert(0, strategy)
 
-                # if still empty, keep explicit fallback only
-                if not contributors:
+                # if still empty, leave contributors empty
+                if not contributors and _is_real_strategy(strategy):
                     contributors = [strategy]
 
                 by_symbol[symbol] = {
@@ -487,8 +497,8 @@ class StrategyAttributionEngine:
         # 3) planner artifact by symbol
         planned = self._planner.resolve(ev.symbol)
         if planned:
-            strategy = _normalize_strategy(planned.get("strategy"), "paper_exec")
-            contributors = planned.get("contributors") or [strategy]
+            strategy = _normalize_strategy(planned.get("strategy"), "")
+            contributors = planned.get("contributors") or []
             if not isinstance(contributors, list):
                 contributors = [contributors]
 
@@ -499,19 +509,22 @@ class StrategyAttributionEngine:
             elif real_contributors:
                 primary = real_contributors[0]
             else:
-                primary = "paper_exec"
+                # P0-4: planner artifact exists but has no real strategy —
+                # fall through to tags / final raise rather than flatten.
+                planned = None  # force fall-through
 
-            source_strategies = real_contributors[:] if real_contributors else [primary]
-            if _is_real_strategy(primary) and primary not in source_strategies:
-                source_strategies.insert(0, primary)
+            if planned is not None:
+                source_strategies = real_contributors[:] if real_contributors else [primary]
+                if _is_real_strategy(primary) and primary not in source_strategies:
+                    source_strategies.insert(0, primary)
 
-            return {
-                "primary_strategy": primary,
-                "source_strategies": source_strategies,
-                "asset_class": _safe_str(ev.asset_class, _safe_str(planned.get("asset_class"), "")),
-                "plan_now_iso": _safe_str(ev.plan_now_iso, _safe_str(planned.get("plan_now_iso"), "")),
-                "plan_path": _safe_str(ev.plan_path, _safe_str(planned.get("plan_path"), "")),
-            }
+                return {
+                    "primary_strategy": primary,
+                    "source_strategies": source_strategies,
+                    "asset_class": _safe_str(ev.asset_class, _safe_str(planned.get("asset_class"), "")),
+                    "plan_now_iso": _safe_str(ev.plan_now_iso, _safe_str(planned.get("plan_now_iso"), "")),
+                    "plan_path": _safe_str(ev.plan_path, _safe_str(planned.get("plan_path"), "")),
+                }
 
         # 4) tags fallback
         if tag_candidates:
@@ -523,14 +536,11 @@ class StrategyAttributionEngine:
                 "plan_path": _safe_str(ev.plan_path, ""),
             }
 
-        # 5) final fallback
-        return {
-            "primary_strategy": "paper_exec",
-            "source_strategies": ["paper_exec"],
-            "asset_class": _safe_str(ev.asset_class, ""),
-            "plan_now_iso": _safe_str(ev.plan_now_iso, ""),
-            "plan_path": _safe_str(ev.plan_path, ""),
-        }
+        # 5) P0-4: raise — never silently flatten to paper_exec
+        raise StrategyAttributionError(
+            f"No real strategy resolved for {ev.symbol} — "
+            f"all attribution sources exhausted (explicit, source_strategies, planner, tags)"
+        )
 
 
 # =============================================================================
@@ -679,7 +689,7 @@ class EvidencePayloadFactory:
                 f"{_safe_float(ev.quantity, 0.0):.12f}",
                 f"{_safe_float(ev.fill_price, 0.0):.12f}",
                 _safe_str(ev.fill_time_utc, ""),
-                _safe_str(attr.get("primary_strategy"), "paper_exec"),
+                _safe_str(attr.get("primary_strategy"), ""),
             ]
         )
         return _hash_text(raw)
@@ -692,7 +702,7 @@ class EvidencePayloadFactory:
                 _safe_str(ev.side, "BUY").upper(),
                 _safe_str(ev.fill_time_utc, ""),
                 f"{_safe_float(ev.fee_amount, 0.0):.12f}",
-                _safe_str(attr.get("primary_strategy"), "paper_exec"),
+                _safe_str(attr.get("primary_strategy"), ""),
             ]
         )
         return _hash_text(raw)
@@ -704,7 +714,7 @@ class EvidencePayloadFactory:
                 _safe_str(ev.symbol, "UNKNOWN").upper(),
                 _safe_str(ev.side, "BUY").upper(),
                 _safe_str(ev.fill_time_utc, ""),
-                _safe_str(attr.get("primary_strategy"), "paper_exec"),
+                _safe_str(attr.get("primary_strategy"), ""),
                 f"{_safe_float(ev.quantity, 0.0):.12f}",
             ]
         )
