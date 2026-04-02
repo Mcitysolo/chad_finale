@@ -178,45 +178,34 @@ def assert_safe_to_run(cfg: CloserConfig) -> Tuple[bool, List[str]]:
 
 def _is_rth_open_for_symbol(ib: IB, symbol: str) -> Tuple[bool, str]:
     """
-    Conservative RTH check using IBKR liquidHours for the symbol.
+    Conservative RTH check — safety gate only (avoid MKT orders outside RTH).
 
-    This is a safety gate only (avoid MKT orders outside RTH by default).
+    P0-1: No live reqContractDetails in hot path. Uses the file-backed
+    calendar cache from paper_shadow_runner when available, otherwise
+    defaults to CLOSED (conservative — forces LIMIT orders).
     """
-    c = Stock(symbol, "SMART", "USD")
-    cds = ib.reqContractDetails(c)
-    lh = cds[0].liquidHours if cds else ""
+    from chad.core.paper_shadow_runner import ibkr_is_liquid_open_now, _cache_path  # noqa: E402
+    runtime_dir = Path(__file__).resolve().parent.parent / "runtime"
+    cache_file = _cache_path(runtime_dir)
 
-    now_utc = datetime.now(timezone.utc)
-    now_s = now_utc.strftime("%Y%m%d%H%M")
-    open_now = False
+    if cache_file.exists():
+        now = datetime.now(timezone.utc)
+        try:
+            is_open, status, _dbg = ibkr_is_liquid_open_now(
+                ib,
+                runtime_dir=runtime_dir,
+                symbol=symbol,
+                exchange="SMART",
+                currency="USD",
+                now=now,
+                details_retries=0,
+                cache_ttl_s=7200,
+            )
+            return is_open, _dbg.get("liquidHours", "")
+        except Exception:
+            pass
 
-    for part in (lh or "").split(";"):
-        part = part.strip()
-        if not part or ":" not in part:
-            continue
-        date_s, window = part.split(":", 1)
-        if window.upper() == "CLOSED":
-            continue
-        for seg in window.split(","):
-            seg = seg.strip()
-            if "-" not in seg:
-                continue
-            a, b = seg.split("-", 1)
-            a = a.strip().replace(":", "")
-            b = b.strip().replace(":", "")
-            if len(a) == 4:
-                a = f"{date_s}{a}"
-            if len(b) == 4:
-                b = f"{date_s}{b}"
-            if len(a) != 12 or len(b) != 12:
-                continue
-            if a <= now_s <= b:
-                open_now = True
-                break
-        if open_now:
-            break
-
-    return open_now, lh
+    return False, ""
 
 
 def _snapshot_price_best_effort(ib: IB, symbol: str) -> Optional[float]:

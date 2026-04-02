@@ -684,57 +684,17 @@ def ibkr_is_liquid_open_now(
 
     dbg["cache_hit"] = False
 
-    # Fetch contractDetails
-    from ib_insync import Stock  # type: ignore
-
-    contract = Stock(symbol, exchange, currency)
-    last: Optional[Exception] = None
-    details = None
-    for attempt in range(max(0, details_retries) + 1):
-        try:
-            details_list = ib.reqContractDetails(contract)
-            if not details_list:
-                raise RuntimeError("contractDetails_empty")
-            details = details_list[0]
-            break
-        except Exception as e:
-            last = e
-            if attempt >= details_retries:
-                raise
-            jitter_sleep(0.6 * (2 ** attempt), jitter_frac=0.25)
-    if details is None and last:
-        raise last
-
-    # Extract hours
-    liquid = ""
-    trading = ""
-    try:
-        liquid = str(getattr(details, "liquidHours", "") or "")
-        trading = str(getattr(details, "tradingHours", "") or "")
-    except Exception:
-        liquid = ""
-        trading = ""
-
-    dbg["liquidHours"] = liquid
-    dbg["tradingHours"] = trading
-
-    # Update cache
-    try:
-        if not isinstance(items, dict):
-            items = {}
-        items[key] = {
-            "fetched_ts_utc": iso_utc(now),
-            "liquidHours": liquid,
-            "tradingHours": trading,
-        }
-        cache["items"] = items
-        cache["ts_utc"] = iso_utc(now)
-        _save_contract_cache(runtime_dir, cache)
-    except Exception:
-        pass
-
-    ok = _hours_open_now(liquid_hours=liquid or trading, now=now, dbg=dbg)
-    return ok, ("OPEN" if ok else "CLOSED"), dbg
+    # P0-1: No live reqContractDetails in hot path.
+    # If the cache is stale/missing, fail-safe to CLOSED (conservative).
+    LOGGER.warning(
+        "ibkr_is_liquid_open_now: cache miss for %s::%s::%s — "
+        "defaulting to CLOSED (no live reqContractDetails in hot path)",
+        symbol, exchange, currency,
+    )
+    dbg["liquidHours"] = ""
+    dbg["tradingHours"] = ""
+    dbg["fallback"] = "CLOSED_no_network"
+    return False, "CLOSED", dbg
 
 
 def _hours_open_now(*, liquid_hours: str, now: datetime, dbg: Dict[str, Any]) -> bool:

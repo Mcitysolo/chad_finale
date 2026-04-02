@@ -257,7 +257,6 @@ class IBLike(Protocol):
     def disconnect(self) -> Any: ...
     def managedAccounts(self) -> Sequence[str]: ...
     def qualifyContracts(self, *contracts: Any) -> Sequence[Any]: ...
-    def reqContractDetails(self, contract: Any) -> Sequence[Any]: ...
     def whatIfOrder(self, contract: Any, order: Any) -> Any: ...
     def placeOrder(self, contract: Any, order: Any) -> Any: ...
     def sleep(self, seconds: float) -> Any: ...
@@ -637,62 +636,13 @@ class _ContractResolver:
             }
             return _ResolvedContract(contract=contract, summary=summary)
 
-        query = Future(
-            symbol=spec.symbol,
-            exchange=spec.exchange,
-            currency=spec.currency,
-            multiplier=multiplier or None,
+        # P0-1: No live network lookup in hot path.
+        # contract_month MUST be provided via intent.meta for futures execution.
+        raise ContractResolutionError(
+            f"Futures contract resolution for {spec.symbol} on {spec.exchange} "
+            f"requires explicit contract_month in intent.meta — "
+            f"live reqContractDetails lookup is prohibited in the hot path"
         )
-        details = list(ib.reqContractDetails(query) or [])
-        if not details:
-            raise ContractResolutionError(
-                f"No IBKR contract details returned for futures root {spec.symbol} on {spec.exchange}"
-            )
-
-        chosen = self._choose_front_month(details)
-        contract = chosen.contract
-        summary = {
-            "symbol": getattr(contract, "symbol", spec.symbol),
-            "sec_type": getattr(contract, "secType", "FUT"),
-            "exchange": getattr(contract, "exchange", spec.exchange),
-            "currency": getattr(contract, "currency", spec.currency),
-            "contract_month": getattr(contract, "lastTradeDateOrContractMonth", None),
-            "local_symbol": getattr(contract, "localSymbol", None),
-            "multiplier": getattr(contract, "multiplier", multiplier or None),
-            "con_id": getattr(contract, "conId", None),
-            "resolution": "front_month",
-        }
-        return _ResolvedContract(contract=contract, summary=summary)
-
-    def _choose_front_month(self, details: Sequence[Any]) -> Any:
-        today = self._now_fn().date()
-
-        def score(detail: Any) -> Tuple[int, str]:
-            contract = getattr(detail, "contract", None)
-            month = _safe_str(getattr(contract, "lastTradeDateOrContractMonth", ""))
-            parsed = self._parse_contract_month(month)
-            if parsed is None:
-                return (1, month)
-            if parsed < today:
-                return (2, month)
-            return (0, month)
-
-        sorted_details = sorted(details, key=score)
-        return sorted_details[0]
-
-    @staticmethod
-    def _parse_contract_month(raw: str) -> Optional[date]:
-        if len(raw) >= 8 and raw[:8].isdigit():
-            try:
-                return datetime.strptime(raw[:8], "%Y%m%d").date()
-            except ValueError:
-                return None
-        if len(raw) >= 6 and raw[:6].isdigit():
-            try:
-                return datetime.strptime(raw[:6], "%Y%m").date()
-            except ValueError:
-                return None
-        return None
 
 
 # ---------------------------------------------------------------------------
