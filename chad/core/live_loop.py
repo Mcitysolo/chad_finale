@@ -19,7 +19,11 @@ import logging
 import time
 from typing import Dict, List, Tuple
 
-from chad.core.live_execution_router import build_live_signals
+from chad.core.live_execution_router import (
+    build_live_signals,
+    build_all_live_signals,
+    is_always_active_routing,
+)
 from chad.core.ibkr_execution_runner import _build_plan_and_intents
 from chad.core.broker_position_sync import BrokerPositionSync
 from ib_insync import IB
@@ -150,12 +154,21 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as exc:
         logger.warning("Broker truth rebuild failed (non-fatal): %s", exc)
 
-    routed_signals = build_live_signals(logger)
-    routed_signal_map = _build_router_signal_map(list(routed_signals or []))
+    if is_always_active_routing():
+        all_result = build_all_live_signals(logger)
+        routed_signals = all_result.all_signals
+        routed_signal_map = _build_router_signal_map(list(routed_signals or []))
 
-    if not routed_signals:
-        logger.info("No routed signals available. Sleeping.")
-        return
+        if not routed_signals:
+            logger.info("No routed signals available (always-active). Sleeping.")
+            return
+    else:
+        routed_signals = build_live_signals(logger)
+        routed_signal_map = _build_router_signal_map(list(routed_signals or []))
+
+        if not routed_signals:
+            logger.info("No routed signals available. Sleeping.")
+            return
 
     _ctx, _plan, intents = _build_plan_and_intents(logger)
 
