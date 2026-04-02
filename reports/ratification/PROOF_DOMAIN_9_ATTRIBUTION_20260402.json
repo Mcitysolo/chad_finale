@@ -1,7 +1,7 @@
 {
   "domain": 9,
   "title": "Attribution Proof",
-  "ts_utc": "2026-04-02T18:13:57.650756+00:00",
+  "ts_utc": "2026-04-02T18:18:21.898840+00:00",
   "status": "VERIFIED",
   "ssot_classification": "VERIFIED \u2014 v4 schema records preserve real strategy lineage, paper_exec eliminated as primary_strategy",
   "what_is_proven": [
@@ -23,7 +23,35 @@
     "gamma": 7,
     "delta": 3
   },
-  "v4_sample_records": [],
+  "v4_sample_records": [
+    {
+      "schema_version": "paper_exec_fill.v4",
+      "strategy": "alpha_futures",
+      "source_strategies": [
+        "alpha_futures"
+      ],
+      "symbol": "MCL",
+      "timestamp_utc": "2026-03-28T00:08:05.902641Z"
+    },
+    {
+      "schema_version": "paper_exec_fill.v4",
+      "strategy": "alpha_futures",
+      "source_strategies": [
+        "alpha_futures"
+      ],
+      "symbol": "MES",
+      "timestamp_utc": "2026-03-28T00:08:05.916878Z"
+    },
+    {
+      "schema_version": "paper_exec_fill.v4",
+      "strategy": "alpha_futures",
+      "source_strategies": [
+        "alpha_futures"
+      ],
+      "symbol": "MCL",
+      "timestamp_utc": "2026-03-28T00:18:15.758024Z"
+    }
+  ],
   "legacy_v1_paper_exec_count": 1845,
   "legacy_v1_unknown_count": 6
 }
