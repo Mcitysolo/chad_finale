@@ -1,0 +1,270 @@
+{
+  "domain": 2,
+  "title": "DecisionTrace Sample Set",
+  "ts_utc": "2026-04-02T14:06:19Z",
+  "schema_version": 2,
+  "record_count": 3,
+  "fields_verified": [
+    "ts_utc",
+    "cycle_id",
+    "mode",
+    "gate_results",
+    "submitted_orders",
+    "artifacts",
+    "schema_version"
+  ],
+  "sample_records": [
+    {
+      "allocator_mode": "correlation_overlay",
+      "artifacts": {
+        "dynamic_caps_hash": "sha256:72bdef73dd5c2ae7789dd0a9c20448250ccacef43a000e98427f4ed884dc43ac",
+        "dynamic_caps_path": "/home/ubuntu/chad_finale/runtime/dynamic_caps.json",
+        "trace_file_hint": "data/traces/decision_trace_YYYYMMDD.ndjson"
+      },
+      "caps_summary": {
+        "daily_risk_fraction": 0.05,
+        "portfolio_risk_cap": 49807.1765,
+        "strategy_caps_keys": [
+          "alpha",
+          "beta",
+          "crypto",
+          "delta",
+          "forex",
+          "gamma",
+          "omega"
+        ],
+        "total_equity": 996143.53
+      },
+      "component": "orchestrator",
+      "cycle_id": "20260402T140419Z",
+      "gate_results": {
+        "allow_exits_only": false,
+        "allow_ibkr_live": false,
+        "allow_ibkr_paper": true,
+        "execution": {
+          "exec_mode": "dry_run",
+          "ibkr_dry_run": true,
+          "ibkr_enabled": true,
+          "kraken_enabled": true,
+          "raw_mode_enum": "dry_run"
+        },
+        "mode": {
+          "chad_mode": "dry_run",
+          "live_enabled": false
+        },
+        "operator_mode": "ALLOW_LIVE",
+        "operator_reason": "auto_refresh_allow_entries_non_live",
+        "reasons": [
+          "LIVE_READINESS_FALSE: readiness publisher does not consider the system ready for live trading."
+        ],
+        "shadow": {
+          "paper_only": true,
+          "reasons": [
+            "CONFIDENT blocked: win_rate=0.018 < 0.550",
+            "CONFIDENT blocked: sharpe_like=0.627 < 0.700",
+            "CAUTIOUS blocked by win_rate=0.018 < 0.450",
+            "PAUSED: performance below cautious thresholds \u2013 live trading should be disabled.",
+            "Summary: total_trades=500, effective_trades=500, win_rate=0.018, sharpe_like=0.627, max_drawdown=-0.21, total_pnl=0.17"
+          ],
+          "sizing_factor": 0.0,
+          "state": "PAUSED",
+          "stats": {
+            "effective_trades": 500,
+            "excluded_manual": 0,
+            "excluded_nonfinite": 0,
+            "excluded_untrusted": 0,
+            "live_trades": 0,
+            "max_drawdown": -0.21436537249999998,
+            "paper_trades": 500,
+            "sharpe_like": 0.6274870291766321,
+            "total_pnl": 0.16822486125,
+            "total_trades": 500,
+            "win_rate": 0.018
+          }
+        }
+      },
+      "inputs": {
+        "portfolio_snapshot_path": "/home/ubuntu/chad_finale/runtime/portfolio_snapshot.json",
+        "used_fallback_snapshot": false
+      },
+      "mode": "dry_run",
+      "notes": {
+        "best_effort_trace": true,
+        "deterministic": true,
+        "no_broker_calls": true
+      },
+      "schema_version": 2,
+      "submitted_orders": [],
+      "trace_id": "09c41331-d929-42c5-b39b-1f97747813d0",
+      "ts_utc": "2026-04-02T14:04:19Z"
+    },
+    {
+      "allocator_mode": "correlation_overlay",
+      "artifacts": {
+        "dynamic_caps_hash": "sha256:b9921a809ff9c0dc35072509520070a6a64e3985644fadc752205203469556fc",
+        "dynamic_caps_path": "/home/ubuntu/chad_finale/runtime/dynamic_caps.json",
+        "trace_file_hint": "data/traces/decision_trace_YYYYMMDD.ndjson"
+      },
+      "caps_summary": {
+        "daily_risk_fraction": 0.05,
+        "portfolio_risk_cap": 49807.1765,
+        "strategy_caps_keys": [
+          "alpha",
+          "beta",
+          "crypto",
+          "delta",
+          "forex",
+          "gamma",
+          "omega"
+        ],
+        "total_equity": 996143.53
+      },
+      "component": "orchestrator",
+      "cycle_id": "20260402T140519Z",
+      "gate_results": {
+        "allow_exits_only": false,
+        "allow_ibkr_live": false,
+        "allow_ibkr_paper": true,
+        "execution": {
+          "exec_mode": "dry_run",
+          "ibkr_dry_run": true,
+          "ibkr_enabled": true,
+          "kraken_enabled": true,
+          "raw_mode_enum": "dry_run"
+        },
+        "mode": {
+          "chad_mode": "dry_run",
+          "live_enabled": false
+        },
+        "operator_mode": "ALLOW_LIVE",
+        "operator_reason": "auto_refresh_allow_entries_non_live",
+        "reasons": [
+          "LIVE_READINESS_FALSE: readiness publisher does not consider the system ready for live trading."
+        ],
+        "shadow": {
+          "paper_only": true,
+          "reasons": [
+            "CONFIDENT blocked: win_rate=0.018 < 0.550",
+            "CONFIDENT blocked: sharpe_like=0.627 < 0.700",
+            "CAUTIOUS blocked by win_rate=0.018 < 0.450",
+            "PAUSED: performance below cautious thresholds \u2013 live trading should be disabled.",
+            "Summary: total_trades=500, effective_trades=500, win_rate=0.018, sharpe_like=0.627, max_drawdown=-0.21, total_pnl=0.17"
+          ],
+          "sizing_factor": 0.0,
+          "state": "PAUSED",
+          "stats": {
+            "effective_trades": 500,
+            "excluded_manual": 0,
+            "excluded_nonfinite": 0,
+            "excluded_untrusted": 0,
+            "live_trades": 0,
+            "max_drawdown": -0.21436537249999998,
+            "paper_trades": 500,
+            "sharpe_like": 0.6274870291766321,
+            "total_pnl": 0.16822486125,
+            "total_trades": 500,
+            "win_rate": 0.018
+          }
+        }
+      },
+      "inputs": {
+        "portfolio_snapshot_path": "/home/ubuntu/chad_finale/runtime/portfolio_snapshot.json",
+        "used_fallback_snapshot": false
+      },
+      "mode": "dry_run",
+      "notes": {
+        "best_effort_trace": true,
+        "deterministic": true,
+        "no_broker_calls": true
+      },
+      "schema_version": 2,
+      "submitted_orders": [],
+      "trace_id": "f9eb32e8-656e-442a-9f2b-75d86779b0d2",
+      "ts_utc": "2026-04-02T14:05:19Z"
+    },
+    {
+      "allocator_mode": "correlation_overlay",
+      "artifacts": {
+        "dynamic_caps_hash": "sha256:e9c9c5748afcf49ea82580a03ed9b7af6115db25f69799c70e52d54f531beffc",
+        "dynamic_caps_path": "/home/ubuntu/chad_finale/runtime/dynamic_caps.json",
+        "trace_file_hint": "data/traces/decision_trace_YYYYMMDD.ndjson"
+      },
+      "caps_summary": {
+        "daily_risk_fraction": 0.05,
+        "portfolio_risk_cap": 49807.1765,
+        "strategy_caps_keys": [
+          "alpha",
+          "beta",
+          "crypto",
+          "delta",
+          "forex",
+          "gamma",
+          "omega"
+        ],
+        "total_equity": 996143.53
+      },
+      "component": "orchestrator",
+      "cycle_id": "20260402T140619Z",
+      "gate_results": {
+        "allow_exits_only": false,
+        "allow_ibkr_live": false,
+        "allow_ibkr_paper": true,
+        "execution": {
+          "exec_mode": "dry_run",
+          "ibkr_dry_run": true,
+          "ibkr_enabled": true,
+          "kraken_enabled": true,
+          "raw_mode_enum": "dry_run"
+        },
+        "mode": {
+          "chad_mode": "dry_run",
+          "live_enabled": false
+        },
+        "operator_mode": "ALLOW_LIVE",
+        "operator_reason": "auto_refresh_allow_entries_non_live",
+        "reasons": [
+          "LIVE_READINESS_FALSE: readiness publisher does not consider the system ready for live trading."
+        ],
+        "shadow": {
+          "paper_only": true,
+          "reasons": [
+            "CONFIDENT blocked: win_rate=0.018 < 0.550",
+            "CONFIDENT blocked: sharpe_like=0.627 < 0.700",
+            "CAUTIOUS blocked by win_rate=0.018 < 0.450",
+            "PAUSED: performance below cautious thresholds \u2013 live trading should be disabled.",
+            "Summary: total_trades=500, effective_trades=500, win_rate=0.018, sharpe_like=0.627, max_drawdown=-0.21, total_pnl=0.17"
+          ],
+          "sizing_factor": 0.0,
+          "state": "PAUSED",
+          "stats": {
+            "effective_trades": 500,
+            "excluded_manual": 0,
+            "excluded_nonfinite": 0,
+            "excluded_untrusted": 0,
+            "live_trades": 0,
+            "max_drawdown": -0.21436537249999998,
+            "paper_trades": 500,
+            "sharpe_like": 0.6274870291766321,
+            "total_pnl": 0.16822486125,
+            "total_trades": 500,
+            "win_rate": 0.018
+          }
+        }
+      },
+      "inputs": {
+        "portfolio_snapshot_path": "/home/ubuntu/chad_finale/runtime/portfolio_snapshot.json",
+        "used_fallback_snapshot": false
+      },
+      "mode": "dry_run",
+      "notes": {
+        "best_effort_trace": true,
+        "deterministic": true,
+        "no_broker_calls": true
+      },
+      "schema_version": 2,
+      "submitted_orders": [],
+      "trace_id": "ed1ed484-e6c7-4426-a96a-67d44bab6f95",
+      "ts_utc": "2026-04-02T14:06:19Z"
+    }
+  ]
+}
