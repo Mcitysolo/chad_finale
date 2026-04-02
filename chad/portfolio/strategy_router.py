@@ -28,6 +28,7 @@ class RouteDecision:
     reason: str
     available_counts: Dict[str, int]
     weights: Dict[str, float]
+    rejected_strategies: Dict[str, str] = None  # type: ignore[assignment]
 
 
 PREFERRED_ORDER: Sequence[str] = (
@@ -63,6 +64,12 @@ def choose_strategy_route(
         if count > 0
     ]
 
+    # Build rejection reasons for strategies with no signals
+    rejected: Dict[str, str] = {}
+    for name, count in counts.items():
+        if count == 0:
+            rejected[name] = "no_signal"
+
     if not candidates:
         return RouteDecision(
             selected_strategy=None,
@@ -70,6 +77,7 @@ def choose_strategy_route(
             reason="no_available_signals",
             available_counts=counts,
             weights={str(k): float(v) for k, v in weights.items()},
+            rejected_strategies=rejected,
         )
 
     preferred_rank = {name: idx for idx, name in enumerate(PREFERRED_ORDER)}
@@ -80,6 +88,20 @@ def choose_strategy_route(
         return (-weight, rank)
 
     chosen = sorted(candidates, key=sort_key)[0]
+    chosen_weight = float(weights.get(chosen, 0.0))
+    chosen_rank = preferred_rank.get(chosen, 999)
+
+    # Build rejection reasons for losing candidates
+    for name in candidates:
+        if name == chosen:
+            continue
+        cand_weight = float(weights.get(name, 0.0))
+        if cand_weight < chosen_weight:
+            rejected[name] = "lower_weight_than_selected"
+        else:
+            # Equal weight but lost on preference tie-break
+            rejected[name] = "lower_priority_than_selected"
+
     chosen_signals = list(available_signals.get(chosen, []) or [])
     chosen_symbols = [
         getattr(sig, "symbol", None)
@@ -93,6 +115,7 @@ def choose_strategy_route(
         reason="selected_best_available_strategy",
         available_counts=counts,
         weights={str(k): float(v) for k, v in weights.items()},
+        rejected_strategies=rejected,
     )
 
 

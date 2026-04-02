@@ -671,7 +671,16 @@ def apply_savage_overlay(
     report["multipliers"] = {k: float(multipliers.get(k, 1.0)) for k in sorted(base_weights.keys())}
     report["adjusted_raw_weights"] = {k: float(adjusted[k]) for k in sorted(adjusted.keys())}
 
-    # If everything got zeroed (shouldn't happen), fail-closed to base.
+    # ── Baseline Fallback Mode (SSOT v6.4) ──────────────────────────
+    # Invariant: base_weights are the allocation floor.
+    # If the savage overlay drives all adjusted weights to zero (or
+    # negative), the system reverts to base_weights exactly rather
+    # than producing an un-investable zero-allocation.
+    # - Zero or negative base weights are never resurrected (see
+    #   the guard at line 662 above): a disabled brain stays disabled.
+    # - This ensures the system always has a valid allocation to
+    #   publish, even under worst-case overlay failures.
+    # ──────────────────────────────────────────────────────────────────
     if sum(adjusted.values()) <= 0.0:
         report["notes"].append("all_adjusted_weights_zero: reverting_to_base_weights")
         adjusted = {k: float(max(0.0, float(v))) for k, v in base_weights.items()}

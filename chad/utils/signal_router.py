@@ -67,6 +67,17 @@ class SignalRouter:
     def route(self, signals: Iterable[TradeSignal]) -> List[RoutedSignal]:
         """
         Merge a sequence of TradeSignals into a list of RoutedSignals.
+
+        Merge contract (SSOT v6.4):
+        - Same-symbol, same-side signals are merged additively (sizes sum).
+        - source_strategies lists all contributing strategies (sorted by name).
+        - primary_strategy is the contributor with the largest total size;
+          ties broken alphabetically by strategy name.
+        - Confidence is the size-weighted average across contributors,
+          clamped to [0.0, 1.0].
+        - Opposite-side signals on the same symbol remain as separate
+          RoutedSignals — netting is deferred to risk/execution.
+        - Buckets with net_size == 0 are dropped (configurable via drop_zero_net).
         """
         buckets: Dict[
             Tuple[str, SignalSide, AssetClass],
@@ -80,6 +91,7 @@ class SignalRouter:
                     "size": 0.0,
                     "weighted_conf": 0.0,
                     "strategies": set(),  # type: ignore[var-annotated]
+                    "size_by_strategy": {},  # type: ignore[var-annotated]
                     "created_at": sig.created_at,
                 }
 
@@ -91,6 +103,11 @@ class SignalRouter:
                 sig.confidence
             )
             bucket["strategies"].add(sig.strategy)  # type: ignore[union-attr]
+
+            # Track per-strategy size for primary_strategy resolution
+            strat_key = sig.strategy
+            sbs = bucket["size_by_strategy"]  # type: ignore[assignment]
+            sbs[strat_key] = float(sbs.get(strat_key, 0.0)) + size  # type: ignore[union-attr]
 
             # Track the most recent timestamp for the bucket
             if sig.created_at > bucket["created_at"]:  # type: ignore[operator]
@@ -120,6 +137,13 @@ class SignalRouter:
                 )
             )
 
+            # Resolve primary_strategy: largest size contributor, alphabetical tie-break
+            sbs = data["size_by_strategy"]  # type: ignore[assignment]
+            primary = sorted(
+                sbs.items(),  # type: ignore[union-attr]
+                key=lambda kv: (-float(kv[1]), kv[0].value),
+            )[0][0]
+
             created_at = data["created_at"]  # type: ignore[assignment]
 
             routed.append(
@@ -128,6 +152,7 @@ class SignalRouter:
                     side=side,
                     net_size=net_size,
                     source_strategies=source_strategies,
+                    primary_strategy=primary.value if hasattr(primary, "value") else str(primary),
                     confidence=confidence,
                     asset_class=asset_class,
                     created_at=created_at,

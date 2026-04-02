@@ -140,6 +140,9 @@ class RoutedSignal:
     # Best-effort market price for notional estimation (may be 0.0 if unknown)
     price: float = 0.0
 
+    # Primary strategy: highest-size contributor, alphabetical tie-break
+    primary_strategy: Optional[str] = None
+
     # Optional upstream idempotency + tags
     idempotency_key: Optional[str] = None
     tags: Tuple[str, ...] = ()
