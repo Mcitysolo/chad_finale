@@ -413,13 +413,14 @@ class DecisionTraceRecorder:
         execution_mode: str = "unknown",
         gate_results: Optional[Dict[str, Any]] = None,
         submitted_orders: Optional[list] = None,
+        strategy_detail: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self._cfg.enabled:
             return
 
         # Minimal SSOT-grade record: one per cycle, reconstructable without code.
         rec: Dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "trace_id": str(trace_id),
             "cycle_id": str(cycle_id),
             "ts_utc": str(ts_utc),
@@ -442,6 +443,14 @@ class DecisionTraceRecorder:
                 "daily_risk_fraction": _finite_float(dynamic_caps.get("daily_risk_fraction"), 0.0),
                 "portfolio_risk_cap": _finite_float(dynamic_caps.get("portfolio_risk_cap"), 0.0),
                 "strategy_caps_keys": sorted(list((dynamic_caps.get("strategy_caps") or {}).keys())),
+            },
+            "strategy_detail": strategy_detail if strategy_detail is not None else {
+                "available_strategies": {},
+                "rejected_strategies": {},
+                "selected_strategy": None,
+                "selected_strategy_reason": None,
+                "affordability_rejections": [],
+                "guard_rejections": [],
             },
             "notes": {
                 "deterministic": True,
