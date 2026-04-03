@@ -56,6 +56,7 @@ class StrategyName(str, Enum):
     ALPHA_FOREX = "alpha_forex"
     ALPHA_FUTURES = "alpha_futures"
     GAMMA_FUTURES = "gamma_futures"
+    OMEGA_MACRO = "omega_macro"
 
 class AssetClass(str, Enum):
     EQUITY = "equity"

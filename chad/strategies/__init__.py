@@ -23,6 +23,7 @@ Strategies Covered
 - ALPHA_FOREX   – Intraday FX
 - ALPHA_FUTURES – Futures momentum
 - GAMMA_FUTURES – Futures mean-reversion
+- OMEGA_MACRO  – Macro regime futures
 """
 
 from __future__ import annotations
@@ -45,6 +46,8 @@ from .alpha_futures import alpha_futures_handler
 from .alpha_futures_config import build_alpha_futures_config
 from .gamma_futures import gamma_futures_handler
 from .gamma_futures_config import build_gamma_futures_config
+from .omega_macro import omega_macro_handler
+from .omega_macro_config import build_omega_macro_config
 # ---------------------------------------------------------------------------
 # Protocols & Dataclasses
 # ---------------------------------------------------------------------------
@@ -142,6 +145,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.GAMMA_FUTURES,
             build_config=build_gamma_futures_config,
             handler=gamma_futures_handler,
+        ),
+        StrategyName.OMEGA_MACRO: StrategyRegistration(
+            name=StrategyName.OMEGA_MACRO,
+            build_config=build_omega_macro_config,
+            handler=omega_macro_handler,
         ),
     }
     return registrations
