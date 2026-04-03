@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from chad.ops.config_snapshot import create_config_snapshot, get_current_composite_hash
 from chad.utils.runtime_json import write_runtime_state_json
 
 LOG = logging.getLogger("chad.ops.mutation_state_publisher")
@@ -166,21 +167,63 @@ def build_action_state(*, repo_root: Path, runtime_dir: Path, control_dir: Path)
     return payload
 
 
+_last_known_composite_hash: Optional[str] = None
+
+
 def build_change_canary_state(*, repo_root: Path, runtime_dir: Path, control_dir: Path) -> Dict[str, Any]:
+    global _last_known_composite_hash
+
+    # Compute current config composite hash
+    try:
+        current_hash = get_current_composite_hash(repo_root=repo_root)
+    except Exception:
+        LOG.exception("config hash computation failed")
+        current_hash = None
+
+    # Detect drift against last known hash
+    tamper_detected = False
+    if current_hash and _last_known_composite_hash and current_hash != _last_known_composite_hash:
+        tamper_detected = True
+        LOG.warning(
+            "config tamper detected: previous=%s current=%s",
+            _last_known_composite_hash[:16],
+            current_hash[:16],
+        )
+
+    # Take periodic snapshot (best-effort)
+    snap_ts = None
+    try:
+        snap_path = create_config_snapshot(repo_root=repo_root, trigger="periodic")
+        snap_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        LOG.debug("periodic config snapshot: %s", snap_path)
+    except Exception:
+        LOG.exception("periodic config snapshot failed (non-fatal)")
+
+    # Update last known hash
+    if current_hash:
+        _last_known_composite_hash = current_hash
+
+    # Load last action_id from applier state
+    applier = _load_action_applier_state(runtime_dir)
+    last_action_id = applier.get("last_action_id")
+
     payload: Dict[str, Any] = {
         "schema_version": "change_canary_state.v1",
-        "canary_factor": 1.0,
+        "canary_factor": 0.5 if tamper_detected else 1.0,
         "canary_until_ts_utc": None,
-        "reason": "none",
-        "last_action_id": None,
+        "reason": "config_drift_detected" if tamper_detected else "none",
+        "tamper_detected": tamper_detected,
+        "config_composite_hash": current_hash,
+        "last_snapshot_ts": snap_ts,
+        "last_action_id": last_action_id,
         "paths": {
             "repo_root": str(repo_root),
             "runtime_dir": str(runtime_dir),
             "control_dir": str(control_dir),
         },
         "notes": (
-            "No active canary yet. This remains permissive until a real post-apply "
-            "canary workflow is implemented."
+            "Config tamper detection active. Compares config/*.json composite hash "
+            "across cycles. Tamper triggers canary_factor=0.5 sizing reduction."
         ),
     }
     return payload

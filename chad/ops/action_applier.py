@@ -18,12 +18,16 @@ Responsibilities
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from chad.ops.config_snapshot import create_config_snapshot
+
+LOG = logging.getLogger("chad.ops.action_applier")
 
 ROOT = Path("/home/ubuntu/chad_finale")
 CONTROL_DIR = ROOT / "control"
@@ -224,6 +228,16 @@ def main() -> int:
             continue
 
         try:
+            # Pre-apply config snapshot for tamper detection
+            try:
+                snap_path = create_config_snapshot(
+                    repo_root=ROOT, trigger=f"pre_apply:{action_id}"
+                )
+                LOG.info("pre-apply snapshot: %s", snap_path)
+            except Exception:
+                LOG.exception("config snapshot failed (non-fatal)")
+                snap_path = None
+
             receipt_path = apply_rebalance(action)
 
             archive_applied_action(p)
@@ -236,6 +250,7 @@ def main() -> int:
                 "kind": kind,
                 "applied_ts_utc": utc_now(),
                 "receipt_path": receipt_path,
+                "pre_apply_snapshot": str(snap_path) if snap_path else None,
             }
 
             state["last_apply_ts_utc"] = utc_now()
