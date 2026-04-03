@@ -1,20 +1,6 @@
 {
-  "applied_action_id": "8cd7b89adafb359333cb6f12",
+  "applied_action_id": "ddf73876ee043b02c6a65c92",
   "previous_weights": {
-    "alpha": 0.23,
-    "alpha_futures": 0.12,
-    "beta": 0.19,
-    "crypto": 0.08,
-    "delta": 0.04,
-    "gamma": 0.11,
-    "gamma_futures": 0.08,
-    "omega": 0.08,
-    "omega_macro": 0.07
-  },
-  "reason": "gamma_reversion backtest validated: SPY 80% win/4.07 Sharpe, QQQ 75%/3.04, TLT 100%/16.15 \u2014 IWM removed (negative Sharpe)",
-  "schema_version": "strategy_weights.v1",
-  "updated_ts_utc": "2026-04-03T18:51:38Z",
-  "weights": {
     "alpha": 0.22,
     "alpha_futures": 0.11,
     "beta": 0.18,
@@ -25,5 +11,21 @@
     "gamma_reversion": 0.06,
     "omega": 0.08,
     "omega_macro": 0.06
+  },
+  "reason": "ALPHA_OPTIONS infrastructure complete \u2014 309 tests passing, OPT lane in adapter, chain provider + strike selector live",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-03T19:31:17Z",
+  "weights": {
+    "alpha": 0.21,
+    "alpha_futures": 0.1,
+    "alpha_options": 0.08,
+    "beta": 0.17,
+    "crypto": 0.08,
+    "delta": 0.04,
+    "gamma": 0.09,
+    "gamma_futures": 0.06,
+    "gamma_reversion": 0.05,
+    "omega": 0.07,
+    "omega_macro": 0.05
   }
 }
