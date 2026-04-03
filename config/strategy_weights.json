@@ -1,21 +1,6 @@
 {
-  "applied_action_id": "ddf73876ee043b02c6a65c92",
+  "applied_action_id": "db36b40eabbf4cfd7c6035d4",
   "previous_weights": {
-    "alpha": 0.22,
-    "alpha_futures": 0.11,
-    "beta": 0.18,
-    "crypto": 0.08,
-    "delta": 0.04,
-    "gamma": 0.1,
-    "gamma_futures": 0.07,
-    "gamma_reversion": 0.06,
-    "omega": 0.08,
-    "omega_macro": 0.06
-  },
-  "reason": "ALPHA_OPTIONS infrastructure complete \u2014 309 tests passing, OPT lane in adapter, chain provider + strike selector live",
-  "schema_version": "strategy_weights.v1",
-  "updated_ts_utc": "2026-04-03T19:31:17Z",
-  "weights": {
     "alpha": 0.21,
     "alpha_futures": 0.1,
     "alpha_options": 0.08,
@@ -27,5 +12,22 @@
     "gamma_reversion": 0.05,
     "omega": 0.07,
     "omega_macro": 0.05
+  },
+  "reason": "OMEGA_VOL validated \u2014 5-regime vol classifier, SVXY short vol + UVXY long vol, strict decay controls",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-03T19:47:27Z",
+  "weights": {
+    "alpha": 0.2,
+    "alpha_futures": 0.09,
+    "alpha_options": 0.08,
+    "beta": 0.16,
+    "crypto": 0.06,
+    "delta": 0.04,
+    "gamma": 0.08,
+    "gamma_futures": 0.06,
+    "gamma_reversion": 0.05,
+    "omega": 0.07,
+    "omega_macro": 0.05,
+    "omega_vol": 0.06
   }
 }

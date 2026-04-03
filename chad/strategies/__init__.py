@@ -26,6 +26,7 @@ Strategies Covered
 - OMEGA_MACRO      – Macro regime futures
 - GAMMA_REVERSION  – ETF mean reversion
 - ALPHA_OPTIONS    – Vertical spread options
+- OMEGA_VOL       – Volatility regime alpha
 """
 
 from __future__ import annotations
@@ -54,6 +55,8 @@ from .gamma_reversion import gamma_reversion_handler
 from .gamma_reversion_config import build_gamma_reversion_config
 from .alpha_options import alpha_options_handler
 from .alpha_options_config import build_alpha_options_config
+from .omega_vol import omega_vol_handler
+from .omega_vol_config import build_omega_vol_config
 # ---------------------------------------------------------------------------
 # Protocols & Dataclasses
 # ---------------------------------------------------------------------------
@@ -166,6 +169,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.ALPHA_OPTIONS,
             build_config=build_alpha_options_config,
             handler=alpha_options_handler,
+        ),
+        StrategyName.OMEGA_VOL: StrategyRegistration(
+            name=StrategyName.OMEGA_VOL,
+            build_config=build_omega_vol_config,
+            handler=omega_vol_handler,
         ),
     }
     return registrations
