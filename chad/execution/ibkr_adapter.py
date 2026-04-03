@@ -567,6 +567,16 @@ def _lazy_import_contract_classes() -> Tuple[Any, Any, Any, Any, Any]:
     return Contract, Future, Forex, Order, Stock
 
 
+def _lazy_import_option_class() -> Any:
+    try:
+        from ib_insync import Option  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover
+        raise ConnectionError(
+            "ib_insync is not installed. Install it inside the CHAD venv."
+        ) from exc
+    return Option
+
+
 # ---------------------------------------------------------------------------
 # Contract resolution
 # ---------------------------------------------------------------------------
@@ -598,6 +608,8 @@ class _ContractResolver:
             resolved = self._resolve_forex(intent)
         elif sec_type == "FUT":
             resolved = self._resolve_future(ib, intent)
+        elif sec_type == "OPT":
+            resolved = self._resolve_option(ib, intent)
         else:
             raise ContractResolutionError(f"Unsupported sec_type: {intent.sec_type!r}")
 
@@ -690,6 +702,83 @@ class _ContractResolver:
             f"requires explicit contract_month in intent.meta — "
             f"live reqContractDetails lookup is prohibited in the hot path"
         )
+
+    def _resolve_option(self, ib: Optional[IBLike], intent: NormalizedIntent) -> _ResolvedContract:
+        """
+        Resolve an options contract from intent metadata.
+
+        Required meta fields:
+          - expiry: str (YYYYMMDD format)
+          - strike: float
+          - right: str ("C" or "P")
+
+        Optional meta fields:
+          - exchange: str (default "SMART")
+          - multiplier: str (default "100")
+        """
+        Option = _lazy_import_option_class()
+
+        expiry = _safe_str(intent.meta.get("expiry") or intent.meta.get("lastTradeDateOrContractMonth"))
+        if not expiry:
+            raise ContractResolutionError(
+                f"Options contract for {intent.symbol} requires 'expiry' in intent.meta"
+            )
+
+        strike_raw = intent.meta.get("strike")
+        if strike_raw is None:
+            raise ContractResolutionError(
+                f"Options contract for {intent.symbol} requires 'strike' in intent.meta"
+            )
+        try:
+            strike = float(strike_raw)
+        except (TypeError, ValueError):
+            raise ContractResolutionError(
+                f"Options contract for {intent.symbol}: invalid strike value {strike_raw!r}"
+            )
+
+        right = _safe_upper(_safe_str(intent.meta.get("right")))
+        if right not in ("C", "P"):
+            raise ContractResolutionError(
+                f"Options contract for {intent.symbol} requires 'right' (C or P) in intent.meta, got {right!r}"
+            )
+
+        exchange = _safe_str(intent.meta.get("exchange")) or intent.exchange or "SMART"
+        multiplier = _safe_str(intent.meta.get("multiplier")) or "100"
+
+        contract = Option(
+            symbol=intent.symbol,
+            lastTradeDateOrContractMonth=expiry,
+            strike=strike,
+            right=right,
+            exchange=exchange,
+            currency=intent.currency,
+            multiplier=multiplier,
+        )
+
+        # Qualify contract if IB session available (non-hot-path)
+        if ib is not None:
+            try:
+                qualified = ib.qualifyContracts(contract)
+                if qualified:
+                    contract = qualified[0]
+            except Exception as exc:
+                LOGGER.warning(
+                    "ibkr_adapter.option_qualify_failed",
+                    extra={"symbol": intent.symbol, "expiry": expiry, "strike": strike, "error": str(exc)},
+                )
+
+        summary = {
+            "symbol": intent.symbol,
+            "sec_type": "OPT",
+            "expiry": expiry,
+            "strike": strike,
+            "right": right,
+            "exchange": exchange,
+            "currency": intent.currency,
+            "multiplier": multiplier,
+            "resolution": "qualified" if ib is not None else "unqualified",
+        }
+        return _ResolvedContract(contract=contract, summary=summary)
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +1082,8 @@ class IbkrAdapter:
             asset_class = "futures"
         elif sec_type == "CASH":
             asset_class = "forex"
+        elif sec_type == "OPT":
+            asset_class = "options"
         else:
             asset_class = "unknown"
 

@@ -58,6 +58,7 @@ class StrategyName(str, Enum):
     GAMMA_FUTURES = "gamma_futures"
     OMEGA_MACRO = "omega_macro"
     GAMMA_REVERSION = "gamma_reversion"
+    ALPHA_OPTIONS = "alpha_options"
 
 class AssetClass(str, Enum):
     EQUITY = "equity"
@@ -66,6 +67,7 @@ class AssetClass(str, Enum):
     FOREX = "forex"
     CASH = "cash"
     FUTURES = "futures"
+    OPTIONS = "options"
 
 class SignalSide(str, Enum):
     BUY = "BUY"
