@@ -1,18 +1,6 @@
 {
-  "applied_action_id": "1b02df862c211f7a187405ee",
+  "applied_action_id": "ebb4f5b54c368258ce2b179f",
   "previous_weights": {
-    "alpha": 0.27,
-    "alpha_futures": 0.15,
-    "beta": 0.22,
-    "crypto": 0.08,
-    "delta": 0.05,
-    "gamma": 0.13,
-    "omega": 0.1
-  },
-  "reason": "GAMMA_FUTURES strategy added and validated \u2014 fund at 9%, futures total now 22%",
-  "schema_version": "strategy_weights.v1",
-  "updated_ts_utc": "2026-04-03T12:30:05Z",
-  "weights": {
     "alpha": 0.25,
     "alpha_futures": 0.13,
     "beta": 0.2,
@@ -21,5 +9,19 @@
     "gamma": 0.12,
     "gamma_futures": 0.09,
     "omega": 0.09
+  },
+  "reason": "OMEGA_MACRO validated with 62 tests \u2014 fund at 7%, futures+macro total now 27%",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-03T18:28:35Z",
+  "weights": {
+    "alpha": 0.23,
+    "alpha_futures": 0.12,
+    "beta": 0.19,
+    "crypto": 0.08,
+    "delta": 0.04,
+    "gamma": 0.11,
+    "gamma_futures": 0.08,
+    "omega": 0.08,
+    "omega_macro": 0.07
   }
 }
