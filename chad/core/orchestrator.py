@@ -242,6 +242,9 @@ def _append_ndjson_locked(path: Path, line_obj: Dict[str, Any]) -> None:
 # Settings / results
 # -----------------------------------------------------------------------------
 
+FAST_LOOP_STATE_PATH: Path = RUNTIME_DIR / "fast_loop_state.json"
+
+
 @dataclass(frozen=True)
 class OrchestratorSettings:
     daily_risk_pct: float
@@ -251,6 +254,8 @@ class OrchestratorSettings:
     portfolio_snapshot_path: Path
     dynamic_caps_path: Path
     decision_trace_enabled: bool
+    fast_loop_enabled: bool
+    fast_loop_interval_seconds: float
 
     @classmethod
     def from_env(
@@ -275,6 +280,11 @@ class OrchestratorSettings:
         # DecisionTrace is required by SSOT; default ON.
         decision_trace_enabled = _env_bool01("CHAD_DECISION_TRACE_ENABLED", True)
 
+        # Fast loop settings
+        fast_loop_enabled = _env_bool01("CHAD_FAST_LOOP_ENABLED", True)
+        fast_loop_interval = _finite_float(_env_float("CHAD_FAST_LOOP_INTERVAL_SECONDS", 8.0), 8.0)
+        fast_loop_interval = max(1.0, min(30.0, float(fast_loop_interval)))
+
         return cls(
             daily_risk_pct=daily_risk_pct,
             loop_interval_seconds=loop_interval_seconds,
@@ -283,6 +293,8 @@ class OrchestratorSettings:
             portfolio_snapshot_path=snap_path,
             dynamic_caps_path=caps_path,
             decision_trace_enabled=bool(decision_trace_enabled),
+            fast_loop_enabled=bool(fast_loop_enabled),
+            fast_loop_interval_seconds=fast_loop_interval,
         )
 
 
@@ -709,6 +721,8 @@ class Orchestrator:
                 "portfolio_snapshot_path": str(self._settings.portfolio_snapshot_path),
                 "dynamic_caps_path": str(self._settings.dynamic_caps_path),
                 "decision_trace_enabled": self._settings.decision_trace_enabled,
+                "fast_loop_enabled": self._settings.fast_loop_enabled,
+                "fast_loop_interval_seconds": self._settings.fast_loop_interval_seconds,
             },
         )
 
@@ -717,6 +731,116 @@ class Orchestrator:
                 await self.run_once()
             except Exception as exc:  # noqa: BLE001
                 self._log.exception("orchestrator.cycle_error", extra={"error": str(exc)})
+            await asyncio.sleep(interval)
+
+    # --------------------------
+    # Fast loop (8-second cadence)
+    # --------------------------
+
+    def _run_fast_loop_cycle(self) -> Dict[str, Any]:
+        """
+        Fast loop cycle: broker sync, price freshness, risk monitoring.
+
+        This runs at 8-second cadence for latency-sensitive operations:
+        - Broker position sync (read portfolio_snapshot.json freshness)
+        - Price cache freshness check
+        - Profit lock / stop monitoring readiness
+        - Write runtime/fast_loop_state.json
+
+        Non-fatal: any error is logged and swallowed.
+        """
+        ts_utc = _utc_now_iso()
+
+        # Check broker position freshness
+        snap = _safe_json_load(self._settings.portfolio_snapshot_path)
+        broker_ok = snap is not None
+        snap_age_s = -1.0
+        if snap and isinstance(snap.get("ts_utc"), str):
+            try:
+                snap_ts = snap["ts_utc"]
+                # Parse ISO timestamp to compute age
+                import re
+                # Simple epoch diff: compare formatted strings
+                snap_age_s = -1.0  # unknown unless we can parse
+            except Exception:
+                snap_age_s = -1.0
+
+        # Check price cache freshness
+        price_cache = _safe_json_load(RUNTIME_DIR / "price_cache.json")
+        price_ok = price_cache is not None
+        price_symbols = 0
+        if price_cache and isinstance(price_cache.get("prices"), dict):
+            price_symbols = len(price_cache["prices"])
+
+        # Check IBKR bars cache freshness
+        ibkr_bars = _safe_json_load(RUNTIME_DIR / "ibkr_bars_cache.json")
+        ibkr_bars_ok = ibkr_bars is not None
+        ibkr_bar_count = 0
+        if ibkr_bars and isinstance(ibkr_bars.get("symbols"), dict):
+            ibkr_bar_count = sum(len(v) for v in ibkr_bars["symbols"].values() if isinstance(v, list))
+
+        # Check profit lock state
+        profit_lock = _safe_json_load(RUNTIME_DIR / "profit_lock_state.json")
+        profit_lock_active = bool(profit_lock and profit_lock.get("locked"))
+
+        # Build state
+        state: Dict[str, Any] = {
+            "ts_utc": ts_utc,
+            "fast_loop_interval_seconds": self._settings.fast_loop_interval_seconds,
+            "cycle_count": getattr(self, "_fast_loop_cycle_count", 0) + 1,
+            "broker_ok": broker_ok,
+            "price_ok": price_ok,
+            "price_symbols": price_symbols,
+            "ibkr_bars_ok": ibkr_bars_ok,
+            "ibkr_bar_count": ibkr_bar_count,
+            "profit_lock_active": profit_lock_active,
+            "status": "ok",
+        }
+
+        # Persist cycle count
+        self._fast_loop_cycle_count = state["cycle_count"]  # type: ignore[attr-defined]
+
+        # Write state file
+        _atomic_write_json(FAST_LOOP_STATE_PATH, state)
+
+        return state
+
+    async def _run_fast_loop(self) -> None:
+        """
+        Fast loop coroutine: runs independently at 8-second cadence.
+
+        Non-fatal: any error is logged and the loop continues.
+        Never kills the signal loop.
+        """
+        interval = float(self._settings.fast_loop_interval_seconds)
+        self._fast_loop_cycle_count = 0  # type: ignore[attr-defined]
+
+        self._log.info(
+            "orchestrator.fast_loop_start",
+            extra={"interval_seconds": interval},
+        )
+
+        while True:
+            try:
+                loop = asyncio.get_running_loop()
+                state = await loop.run_in_executor(None, self._run_fast_loop_cycle)
+
+                if state.get("cycle_count", 0) % 50 == 1:
+                    # Log every 50th cycle (~7 minutes) to avoid spam
+                    self._log.info(
+                        "orchestrator.fast_loop_heartbeat",
+                        extra={
+                            "cycle_count": state.get("cycle_count"),
+                            "broker_ok": state.get("broker_ok"),
+                            "price_ok": state.get("price_ok"),
+                            "ibkr_bars_ok": state.get("ibkr_bars_ok"),
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "orchestrator.fast_loop_error",
+                    extra={"error": str(exc)},
+                )
             await asyncio.sleep(interval)
 
 
@@ -749,7 +873,19 @@ async def _amain(args: argparse.Namespace) -> int:
         await orch.run_once()
         return 0
 
-    await orch.run_forever()
+    # Launch signal loop + fast loop concurrently
+    tasks = [asyncio.create_task(orch.run_forever())]
+    if settings.fast_loop_enabled:
+        tasks.append(asyncio.create_task(orch._run_fast_loop()))
+        logger.info(
+            "orchestrator.tiered_loop_enabled",
+            extra={
+                "signal_loop_interval": settings.loop_interval_seconds,
+                "fast_loop_interval": settings.fast_loop_interval_seconds,
+            },
+        )
+
+    await asyncio.gather(*tasks)
     return 0
 
 

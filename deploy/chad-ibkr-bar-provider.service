@@ -1,0 +1,20 @@
+[Unit]
+Description=CHAD IBKR Bar Provider — Native bar data via reqHistoricalData + reqRealTimeBars
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=CHAD_BAR_PROVIDER=hybrid
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.ibkr_bar_provider --port 4002 --client-id 9021 --cache-interval 30 --log-level INFO
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-ibkr-bar-provider
+
+[Install]
+WantedBy=multi-user.target
