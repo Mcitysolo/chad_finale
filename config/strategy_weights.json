@@ -1,15 +1,24 @@
 {
-  "schema_version": "strategy_weights.v1",
-  "weights": {
+  "applied_action_id": "38745352b23e96a0fa8a4881",
+  "previous_weights": {
     "alpha": 0.35,
-    "beta": 0.30,
-    "gamma": 0.15,
-    "omega": 0.10,
-    "delta": 0.05,
+    "beta": 0.3,
     "crypto": 0.03,
-    "forex": 0.03
+    "delta": 0.05,
+    "forex": 0.03,
+    "gamma": 0.15,
+    "omega": 0.1
   },
-  "applied_action_id": null,
-  "updated_ts_utc": "2026-04-03T11:30:00Z",
-  "notes": "Initial seed — mirrors DEFAULT_STRATEGY_WEIGHTS exactly. No behavior change."
+  "reason": "Phase 1 rebalance \u2014 forex is no-op stub with no execution path, activate futures lane, raise crypto to meaningful allocation",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-03T11:37:23Z",
+  "weights": {
+    "alpha": 0.27,
+    "alpha_futures": 0.15,
+    "beta": 0.22,
+    "crypto": 0.08,
+    "delta": 0.05,
+    "gamma": 0.13,
+    "omega": 0.1
+  }
 }

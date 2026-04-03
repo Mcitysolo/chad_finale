@@ -142,8 +142,11 @@ def test_risk_state_shape_is_consistent() -> None:
         assert isinstance(dynamic_caps.get("portfolio_risk_cap"), (int, float))
         strategy_caps = dynamic_caps.get("strategy_caps", {})
         assert isinstance(strategy_caps, dict)
-        for key in ("alpha", "beta", "gamma", "omega", "delta", "crypto", "forex"):
-            assert isinstance(strategy_caps.get(key), (int, float)), key
+        # Verify all present caps are numeric; strategy set is governed by
+        # config/strategy_weights.json and may change across rebalances.
+        assert len(strategy_caps) >= 1, "strategy_caps must not be empty"
+        for key, val in strategy_caps.items():
+            assert isinstance(val, (int, float)), f"{key} cap must be numeric"
 
     shadow = data.get("shadow", {})
     assert isinstance(shadow, dict)
