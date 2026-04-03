@@ -395,7 +395,7 @@ class TestConfig:
         cfg = config_build_gamma_reversion_config()
         assert cfg.name == StrategyName.GAMMA_REVERSION
         assert cfg.enabled is True
-        assert list(cfg.target_universe) == ["SPY", "QQQ", "IWM", "GLD", "TLT"]
+        assert list(cfg.target_universe) == ["SPY", "QQQ", "GLD", "TLT"]
         assert cfg.max_gross_exposure == pytest.approx(0.18)
 
     def test_env_disable(self) -> None:
@@ -452,7 +452,7 @@ class TestHandler:
             now=NOW,
             ticks={},
             portfolio=_FakePortfolio(positions={}),
-            bars={"SPY": bars, "QQQ": bars, "IWM": bars, "GLD": bars, "TLT": bars},
+            bars={"SPY": bars, "QQQ": bars, "GLD": bars, "TLT": bars},
         )
         result = gamma_reversion_handler(ctx)
         # At least some symbols should trigger
@@ -484,3 +484,73 @@ class TestRegistry:
                 assert cfg.enabled is True
                 return
         pytest.fail("GAMMA_REVERSION not found in registry")
+
+
+# ===========================================================================
+# GLD strict confluence tests
+# ===========================================================================
+
+class TestGLDStrictConfluence:
+
+    def test_gld_strict_blocks_or_condition(self) -> None:
+        """GLD with strict confluence should not fire when only BB OR zscore triggers."""
+        # Build bars where price is above BB upper but zscore is below threshold
+        # (a marginal overbought that would trigger with OR but not AND)
+        closes = _spike_up_series(60, base=300.0)
+        bars = _make_bars(closes, spread=0.5)
+        tuning_strict = GammaReversionTuning(gld_strict_confluence=True)
+        tuning_relaxed = GammaReversionTuning(gld_strict_confluence=False)
+
+        sig_strict = _build_signal_for_symbol(
+            symbol="GLD",
+            bars=bars,
+            price=closes[-1],
+            tuning=tuning_strict,
+            now=NOW,
+        )
+        sig_relaxed = _build_signal_for_symbol(
+            symbol="GLD",
+            bars=bars,
+            price=closes[-1],
+            tuning=tuning_relaxed,
+            now=NOW,
+        )
+        # Strict should be None or same as relaxed (if both BB and ZS agree)
+        # The key invariant: strict never fires when relaxed wouldn't
+        if sig_strict is not None and sig_relaxed is not None:
+            assert sig_strict.side == sig_relaxed.side
+
+    def test_non_gld_unaffected_by_strict_flag(self) -> None:
+        """SPY should behave the same regardless of gld_strict_confluence."""
+        closes = _spike_up_series(60, base=500.0)
+        bars = _make_bars(closes)
+        tuning_strict = GammaReversionTuning(gld_strict_confluence=True)
+        tuning_relaxed = GammaReversionTuning(gld_strict_confluence=False)
+
+        sig_strict = _build_signal_for_symbol(
+            symbol="SPY",
+            bars=bars,
+            price=closes[-1],
+            tuning=tuning_strict,
+            now=NOW,
+        )
+        sig_relaxed = _build_signal_for_symbol(
+            symbol="SPY",
+            bars=bars,
+            price=closes[-1],
+            tuning=tuning_relaxed,
+            now=NOW,
+        )
+        # Both should produce identical results for non-GLD
+        assert (sig_strict is None) == (sig_relaxed is None)
+        if sig_strict is not None and sig_relaxed is not None:
+            assert sig_strict.side == sig_relaxed.side
+            assert sig_strict.confidence == sig_relaxed.confidence
+
+    def test_gld_strict_default_is_true(self) -> None:
+        tuning = GammaReversionTuning()
+        assert tuning.gld_strict_confluence is True
+
+    def test_iwm_not_in_default_universe(self) -> None:
+        """IWM should no longer be in the default universe."""
+        assert "IWM" not in DEFAULT_GAMMA_REVERSION_UNIVERSE

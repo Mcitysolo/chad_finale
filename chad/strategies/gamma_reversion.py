@@ -11,7 +11,7 @@ Instruments
 -----------
 - SPY : S&P 500 ETF
 - QQQ : Nasdaq 100 ETF
-- IWM : Russell 2000 ETF
+- IWM : Russell 2000 ETF (removed: negative backtest Sharpe)
 - GLD : Gold ETF
 - TLT : 20+ Year Treasury ETF
 
@@ -97,6 +97,10 @@ class GammaReversionTuning:
     # Sizing
     base_size: float = 5.0
     max_size: float = 15.0
+
+    # GLD strict confluence: require 3/3 indicators for GLD
+    # (backtest showed 38% win rate with 2/3 confluence)
+    gld_strict_confluence: bool = True
 
 
 DEFAULT_TUNING = GammaReversionTuning()
@@ -362,12 +366,20 @@ def _build_signal_for_symbol(
     atr_v = atr_vals[idx]
     sma20 = bb_middle[idx]
 
+    # GLD strict confluence: require BOTH Bollinger AND Z-score (not OR)
+    strict = tuning.gld_strict_confluence and symbol.upper() == "GLD"
+
     # Check SHORT confluence (3/3 required)
     short_confluence = 0
     if rsi_v > tuning.rsi_overbought:
         short_confluence += 1
-    if price > bb_upper[idx] or zs_v > tuning.zscore_threshold:
-        short_confluence += 1
+    if strict:
+        # GLD strict: require both Bollinger AND Z-score
+        if price > bb_upper[idx] and zs_v > tuning.zscore_threshold:
+            short_confluence += 1
+    else:
+        if price > bb_upper[idx] or zs_v > tuning.zscore_threshold:
+            short_confluence += 1
     if roc_v > 0:
         short_confluence += 1
 
@@ -375,8 +387,13 @@ def _build_signal_for_symbol(
     long_confluence = 0
     if rsi_v < tuning.rsi_oversold:
         long_confluence += 1
-    if price < bb_lower[idx] or zs_v < -tuning.zscore_threshold:
-        long_confluence += 1
+    if strict:
+        # GLD strict: require both Bollinger AND Z-score
+        if price < bb_lower[idx] and zs_v < -tuning.zscore_threshold:
+            long_confluence += 1
+    else:
+        if price < bb_lower[idx] or zs_v < -tuning.zscore_threshold:
+            long_confluence += 1
     if roc_v < 0:
         long_confluence += 1
 
@@ -438,7 +455,7 @@ def build_gamma_reversion_config() -> StrategyConfig:
         return StrategyConfig(
             name=StrategyName.GAMMA_REVERSION,
             enabled=True,
-            target_universe=["SPY", "QQQ", "IWM", "GLD", "TLT"],
+            target_universe=["SPY", "QQQ", "GLD", "TLT"],
             max_gross_exposure=0.18,
             notes="ETF mean reversion engine (fallback config)",
         )
@@ -467,7 +484,7 @@ def build_gamma_reversion_signals(
     ticks_map = _get_mapping(ctx, "ticks")
 
     cfg = build_gamma_reversion_config()
-    universe = list(cfg.target_universe or ["SPY", "QQQ", "IWM", "GLD", "TLT"])
+    universe = list(cfg.target_universe or ["SPY", "QQQ", "GLD", "TLT"])
 
     signals: List[TradeSignal] = []
     for symbol in universe:

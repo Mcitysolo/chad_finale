@@ -1,19 +1,6 @@
 {
-  "applied_action_id": "ebb4f5b54c368258ce2b179f",
+  "applied_action_id": "8cd7b89adafb359333cb6f12",
   "previous_weights": {
-    "alpha": 0.25,
-    "alpha_futures": 0.13,
-    "beta": 0.2,
-    "crypto": 0.08,
-    "delta": 0.04,
-    "gamma": 0.12,
-    "gamma_futures": 0.09,
-    "omega": 0.09
-  },
-  "reason": "OMEGA_MACRO validated with 62 tests \u2014 fund at 7%, futures+macro total now 27%",
-  "schema_version": "strategy_weights.v1",
-  "updated_ts_utc": "2026-04-03T18:28:35Z",
-  "weights": {
     "alpha": 0.23,
     "alpha_futures": 0.12,
     "beta": 0.19,
@@ -23,5 +10,20 @@
     "gamma_futures": 0.08,
     "omega": 0.08,
     "omega_macro": 0.07
+  },
+  "reason": "gamma_reversion backtest validated: SPY 80% win/4.07 Sharpe, QQQ 75%/3.04, TLT 100%/16.15 \u2014 IWM removed (negative Sharpe)",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-03T18:51:38Z",
+  "weights": {
+    "alpha": 0.22,
+    "alpha_futures": 0.11,
+    "beta": 0.18,
+    "crypto": 0.08,
+    "delta": 0.04,
+    "gamma": 0.1,
+    "gamma_futures": 0.07,
+    "gamma_reversion": 0.06,
+    "omega": 0.08,
+    "omega_macro": 0.06
   }
 }

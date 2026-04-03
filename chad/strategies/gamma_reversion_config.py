@@ -28,9 +28,9 @@ from chad.types import StrategyConfig, StrategyName
 DEFAULT_GAMMA_REVERSION_UNIVERSE: Tuple[str, ...] = (
     "SPY",  # S&P 500 ETF
     "QQQ",  # Nasdaq 100 ETF
-    "IWM",  # Russell 2000 ETF
     "GLD",  # Gold ETF
     "TLT",  # 20+ Year Treasury ETF
+    # IWM removed: negative Sharpe (-1.06) in backtest
 )
 
 DEFAULT_ENABLED: bool = True
