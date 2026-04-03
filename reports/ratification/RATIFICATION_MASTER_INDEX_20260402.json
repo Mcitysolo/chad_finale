@@ -118,5 +118,26 @@
     "S3 backup upload not configured \u2014 off-site backup not active",
     "Lifecycle truth will remain PARTIAL until CHAD executes real orders through its own pipeline"
   ],
-  "rollback_command": "git checkout PRE_HARDENING_20260402"
+  "rollback_command": "git checkout PRE_HARDENING_20260402",
+  "live_promotion_checklist": {
+    "completed_ts_utc": "2026-04-03T03:08:51.985988Z",
+    "items": {
+      "os_reboot": "COMPLETE \u2014 kernel updated, all 8 services recovered cleanly",
+      "disk_cleanup": "COMPLETE \u2014 19.6GB freed, 45% disk usage, 7 days backups retained",
+      "ibkr_latency_fix": "COMPLETE \u2014 connect_ms/api_ms split, api_ms=0.47ms, env_label=normal",
+      "pnl_publisher": "COMPLETE \u2014 profit_lock side-writes pnl_state.json every 60s",
+      "config_snapshots": "COMPLETE \u2014 15 config files hashed, tamper detection active",
+      "change_canary": "COMPLETE \u2014 live composite hash comparison, canary_factor reduces on drift",
+      "chaos_drills": "COMPLETE \u2014 all 4 drills passed: feed stall, broker disconnect, restart safety, sensor outage",
+      "mes_position": "COMPLETE \u2014 positions_snapshot refreshed, reconciliation GREEN, auto-refresh every 2min"
+    },
+    "additional_tags": [
+      "IBKR_LATENCY_FIX_20260403",
+      "PNL_PUBLISHER_LIVE_20260403",
+      "CONFIG_SNAPSHOTS_LIVE_20260403",
+      "CHAOS_DRILLS_COMPLETE_20260403",
+      "MES_POSITION_RESOLVED_20260403"
+    ]
+  },
+  "status_as_of_20260403": "ALL_LIVE_PROMOTION_ITEMS_COMPLETE"
 }
