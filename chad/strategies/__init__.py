@@ -21,6 +21,8 @@ Strategies Covered
 - DELTA         – Execution intelligence / meta-signals
 - ALPHA_CRYPTO  – Intraday crypto
 - ALPHA_FOREX   – Intraday FX
+- ALPHA_FUTURES – Futures momentum
+- GAMMA_FUTURES – Futures mean-reversion
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ from .alpha_forex import build_alpha_forex_config, alpha_forex_handler, AlphaFor
 from chad.strategies.alpha_futures import build_alpha_futures_signals
 from .alpha_futures import alpha_futures_handler
 from .alpha_futures_config import build_alpha_futures_config
+from .gamma_futures import gamma_futures_handler
+from .gamma_futures_config import build_gamma_futures_config
 # ---------------------------------------------------------------------------
 # Protocols & Dataclasses
 # ---------------------------------------------------------------------------
@@ -133,6 +137,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.ALPHA_FUTURES,
             build_config=build_alpha_futures_config,
             handler=alpha_futures_handler,
+        ),
+        StrategyName.GAMMA_FUTURES: StrategyRegistration(
+            name=StrategyName.GAMMA_FUTURES,
+            build_config=build_gamma_futures_config,
+            handler=gamma_futures_handler,
         ),
     }
     return registrations
