@@ -1,0 +1,15 @@
+{
+  "schema_version": "strategy_weights.v1",
+  "weights": {
+    "alpha": 0.35,
+    "beta": 0.30,
+    "gamma": 0.15,
+    "omega": 0.10,
+    "delta": 0.05,
+    "crypto": 0.03,
+    "forex": 0.03
+  },
+  "applied_action_id": null,
+  "updated_ts_utc": "2026-04-03T11:30:00Z",
+  "notes": "Initial seed — mirrors DEFAULT_STRATEGY_WEIGHTS exactly. No behavior change."
+}

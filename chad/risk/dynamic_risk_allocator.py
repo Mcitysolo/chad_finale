@@ -40,6 +40,10 @@ DEFAULT_STRATEGY_WEIGHTS: Dict[str, float] = {
     "forex": 0.03,
 }
 
+# Governed config file path — written atomically by ActionApplier
+STRATEGY_WEIGHTS_CONFIG = "config/strategy_weights.json"
+STRATEGY_WEIGHTS_SCHEMA_VERSION = "strategy_weights.v1"
+
 
 # ---------------------------------------------------------------------------
 # Value objects
@@ -56,14 +60,100 @@ class StrategyAllocation:
     """
 
     weights: Dict[str, float]
+    source: str = "hardcoded_default"
 
     @classmethod
-    def from_env_or_default(cls) -> "StrategyAllocation":
+    def _load_from_config_file(cls, repo_root: Path) -> "StrategyAllocation | None":
         """
+        Attempt to load weights from config/strategy_weights.json.
+
+        Returns None on any failure (missing file, bad JSON, schema mismatch,
+        invalid weights). Callers fall through to the hardcoded default.
+        This is fail-open-to-next-tier, not fail-open-to-trading.
+        """
+        config_path = repo_root / STRATEGY_WEIGHTS_CONFIG
+        if not config_path.is_file():
+            return None
+
+        try:
+            raw = config_path.read_text(encoding="utf-8")
+            doc = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "StrategyAllocation: config file unreadable, skipping: %s",
+                exc,
+            )
+            return None
+
+        if not isinstance(doc, dict):
+            logger.warning("StrategyAllocation: config file is not a JSON object")
+            return None
+
+        schema = str(doc.get("schema_version") or "").strip()
+        if schema != STRATEGY_WEIGHTS_SCHEMA_VERSION:
+            logger.warning(
+                "StrategyAllocation: config file schema %r != expected %r, skipping",
+                schema,
+                STRATEGY_WEIGHTS_SCHEMA_VERSION,
+            )
+            return None
+
+        weights_raw = doc.get("weights")
+        if not isinstance(weights_raw, dict) or not weights_raw:
+            logger.warning("StrategyAllocation: config file ‘weights’ missing or empty")
+            return None
+
+        # Validate every entry is a non-negative float
+        weights: Dict[str, float] = {}
+        for key, val in weights_raw.items():
+            if not isinstance(key, str) or not key.strip():
+                logger.warning(
+                    "StrategyAllocation: config file has non-string or empty key"
+                )
+                return None
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "StrategyAllocation: config file weight %r is not a number", key
+                )
+                return None
+            if fval < 0.0:
+                logger.warning(
+                    "StrategyAllocation: config file weight %r is negative", key
+                )
+                return None
+            weights[key.strip().lower()] = fval
+
+        weight_sum = sum(weights.values())
+        if weight_sum <= 0.0:
+            logger.warning("StrategyAllocation: config file weights sum to zero")
+            return None
+
+        logger.info(
+            "StrategyAllocation: loaded %d weights from %s (sum=%.4f)",
+            len(weights),
+            config_path,
+            weight_sum,
+        )
+        return cls(weights=weights, source=f"config_file:{config_path}")
+
+    @classmethod
+    def from_env_or_default(
+        cls, repo_root: Path | None = None,
+    ) -> "StrategyAllocation":
+        """
+        Resolution order (first wins):
+
+        1. CHAD_STRATEGY_WEIGHTS env var   — operator override
+        2. config/strategy_weights.json    — governed source (ActionApplier)
+        3. DEFAULT_STRATEGY_WEIGHTS dict   — emergency fallback
+
         CHAD_STRATEGY_WEIGHTS env format:
 
-            CHAD_STRATEGY_WEIGHTS="alpha=0.35,beta=0.30,gamma=0.15,omega=0.10,delta=0.05,crypto=0.03,forex=0.03"
+            CHAD_STRATEGY_WEIGHTS="alpha=0.35,beta=0.30,gamma=0.15,..."
         """
+        # --- Tier 1: environment variable override ---
         env_val = os.getenv("CHAD_STRATEGY_WEIGHTS")
         if env_val:
             weights: Dict[str, float] = {}
@@ -79,10 +169,23 @@ class StrategyAllocation:
                 name, value = chunk.split("=", 1)
                 name = name.strip().lower()
                 weights[name] = float(value)
-            return cls(weights=weights)
+            return cls(weights=weights, source="env:CHAD_STRATEGY_WEIGHTS")
 
-        # Fallback to the canonical map we’ve been using.
-        return cls(weights=dict(DEFAULT_STRATEGY_WEIGHTS))
+        # --- Tier 2: governed config file ---
+        if repo_root is None:
+            # Infer repo root from this file’s location:
+            # chad/risk/dynamic_risk_allocator.py -> ../../
+            repo_root = Path(__file__).resolve().parent.parent.parent
+
+        config_alloc = cls._load_from_config_file(repo_root)
+        if config_alloc is not None:
+            return config_alloc
+
+        # --- Tier 3: hardcoded emergency fallback ---
+        logger.info(
+            "StrategyAllocation: using hardcoded DEFAULT_STRATEGY_WEIGHTS fallback"
+        )
+        return cls(weights=dict(DEFAULT_STRATEGY_WEIGHTS), source="hardcoded_default")
 
     def normalized(self) -> Dict[str, float]:
         """

@@ -117,6 +117,144 @@ def archive_unsupported_action(src: Path) -> Path:
     return _move_file(src, UNSUPPORTED_DIR)
 
 
+# ---------------------------------------------------------------------------
+# Supported action kind: weight_rebalance_config
+# ---------------------------------------------------------------------------
+
+STRATEGY_WEIGHTS_PATH = ROOT / "config" / "strategy_weights.json"
+STRATEGY_WEIGHTS_SCHEMA_VERSION = "strategy_weights.v1"
+
+# Validation constants
+_WEIGHT_SUM_TOLERANCE = 0.015  # allow 0.985..1.015 for float rounding
+_WEIGHT_KEY_PATTERN_RE = None  # lazily compiled
+
+
+def _weight_key_re():
+    """Compile and cache the weight key validation regex."""
+    global _WEIGHT_KEY_PATTERN_RE
+    if _WEIGHT_KEY_PATTERN_RE is None:
+        import re
+        _WEIGHT_KEY_PATTERN_RE = re.compile(r"^[a-z][a-z0-9_]{0,49}$")
+    return _WEIGHT_KEY_PATTERN_RE
+
+
+def validate_weight_payload(payload: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Validate a weight_rebalance_config payload and return clean weights.
+
+    Raises RuntimeError with a descriptive code on any validation failure.
+    This is fail-closed: any ambiguity or bad data rejects the action.
+    """
+    if not isinstance(payload, dict):
+        raise RuntimeError("weight_config:payload_not_dict")
+
+    weights_raw = payload.get("weights")
+    if not isinstance(weights_raw, dict) or not weights_raw:
+        raise RuntimeError("weight_config:weights_missing_or_empty")
+
+    key_re = _weight_key_re()
+    weights: Dict[str, float] = {}
+
+    for key, val in weights_raw.items():
+        if not isinstance(key, str):
+            raise RuntimeError(f"weight_config:key_not_string:{key!r}")
+
+        clean_key = key.strip().lower()
+        if not key_re.match(clean_key):
+            raise RuntimeError(
+                f"weight_config:invalid_key_format:{clean_key!r}"
+            )
+
+        try:
+            fval = float(val)
+        except (TypeError, ValueError):
+            raise RuntimeError(f"weight_config:value_not_number:{clean_key}={val!r}")
+
+        if fval < 0.0:
+            raise RuntimeError(f"weight_config:negative_weight:{clean_key}={fval}")
+        if fval > 1.0:
+            raise RuntimeError(f"weight_config:weight_exceeds_1:{clean_key}={fval}")
+
+        if clean_key in weights:
+            raise RuntimeError(f"weight_config:duplicate_key:{clean_key}")
+
+        weights[clean_key] = fval
+
+    weight_sum = sum(weights.values())
+    if abs(weight_sum - 1.0) > _WEIGHT_SUM_TOLERANCE:
+        raise RuntimeError(
+            f"weight_config:sum_out_of_range:{weight_sum:.6f}"
+        )
+
+    if weight_sum <= 0.0:
+        raise RuntimeError("weight_config:sum_is_zero")
+
+    return weights
+
+
+def apply_weight_rebalance_config(action: Dict[str, Any]) -> str:
+    """
+    Apply a weight_rebalance_config action.
+
+    Atomically writes validated weights to config/strategy_weights.json.
+    Returns the path to the updated config file.
+
+    Fail-closed: any validation failure raises RuntimeError, leaving the
+    existing config file untouched.
+    """
+    action_id = str(action.get("action_id") or "").strip()
+    if not action_id:
+        raise RuntimeError("weight_config:missing_action_id")
+
+    payload = action.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError("weight_config:payload_not_dict")
+
+    # Validate weights (raises on any failure)
+    weights = validate_weight_payload(payload)
+
+    # Read current config for backup reference in the new document
+    previous_weights: Optional[Dict[str, float]] = None
+    if STRATEGY_WEIGHTS_PATH.is_file():
+        try:
+            prev_doc = json.loads(
+                STRATEGY_WEIGHTS_PATH.read_text(encoding="utf-8")
+            )
+            if isinstance(prev_doc, dict) and isinstance(
+                prev_doc.get("weights"), dict
+            ):
+                previous_weights = prev_doc["weights"]
+        except Exception:
+            LOG.warning("weight_config: could not read previous config (non-fatal)")
+
+    # Build the new config document
+    new_doc: Dict[str, Any] = {
+        "schema_version": STRATEGY_WEIGHTS_SCHEMA_VERSION,
+        "weights": {k: weights[k] for k in sorted(weights)},
+        "applied_action_id": action_id,
+        "updated_ts_utc": utc_now(),
+        "reason": str(payload.get("reason") or ""),
+        "previous_weights": previous_weights,
+    }
+
+    # Atomic write
+    write_json_atomic(STRATEGY_WEIGHTS_PATH, new_doc)
+
+    LOG.info(
+        "weight_config: applied action %s — %d strategies, sum=%.4f",
+        action_id,
+        len(weights),
+        sum(weights.values()),
+    )
+
+    return str(STRATEGY_WEIGHTS_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Supported action kind: rebalance_execute
+# ---------------------------------------------------------------------------
+
+
 def apply_rebalance(action: Dict[str, Any]) -> str:
     action_id = str(action.get("action_id") or "").strip()
     if not action_id:
@@ -181,6 +319,17 @@ def apply_rebalance(action: Dict[str, Any]) -> str:
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Dispatch table — maps action kind strings to handler functions.
+# Each handler takes (action: Dict) and returns a receipt path string.
+# ---------------------------------------------------------------------------
+
+DISPATCH: Dict[str, Any] = {
+    "rebalance_execute": apply_rebalance,
+    "weight_rebalance_config": apply_weight_rebalance_config,
+}
+
+
 def main() -> int:
     state = load_state()
 
@@ -222,7 +371,8 @@ def main() -> int:
             expired_archived += 1
             continue
 
-        if kind != "rebalance_execute":
+        handler = DISPATCH.get(kind)
+        if handler is None:
             archive_unsupported_action(p)
             unsupported_archived += 1
             continue
@@ -238,7 +388,7 @@ def main() -> int:
                 LOG.exception("config snapshot failed (non-fatal)")
                 snap_path = None
 
-            receipt_path = apply_rebalance(action)
+            receipt_path = handler(action)
 
             archive_applied_action(p)
 
