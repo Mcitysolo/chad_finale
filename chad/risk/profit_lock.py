@@ -640,6 +640,25 @@ class ProfitLockEngine:
         tmp_path = out_path.with_name(out_path.name + ".tmp")
         # write to tmp file in thread to avoid blocking event loop
         await asyncio.to_thread(self._atomic_write_json, tmp_path, out_path, state)
+
+        # Side-write canonical pnl_state.json from the same computation
+        inputs = state.get("inputs", {})
+        pnl_state = {
+            "schema_version": "pnl_state.v1",
+            "ts_utc": state["ts_utc"],
+            "ttl_seconds": int(self.config.ttl_seconds),
+            "realized_pnl": float(inputs.get("realized_pnl", 0.0)),
+            "trade_count": int(inputs.get("trade_count", 0)),
+            "pnl_pct_of_equity": float(inputs.get("pnl_pct_of_equity", 0.0)),
+            "account_equity": inputs.get("account_equity"),
+            "equity_known": bool(inputs.get("equity_known", False)),
+            "pnl_sources": list(inputs.get("pnl_sources", [])),
+            "source": "profit_lock_engine",
+        }
+        pnl_path = out_path.parent / "pnl_state.json"
+        pnl_tmp = pnl_path.with_name(pnl_path.name + ".tmp")
+        await asyncio.to_thread(self._atomic_write_json, pnl_tmp, pnl_path, pnl_state)
+
         return state
 
     @staticmethod
