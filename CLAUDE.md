@@ -5,8 +5,9 @@
 - Canonical root: /home/ubuntu/chad_finale
 - Python binary: python3 (never python)
 - Virtual environment: /home/ubuntu/chad_finale/venv
-- Current trading posture: DRY_RUN / PAUSED — no live broker execution
+- Current trading posture: DRY_RUN / PAUSED — live promotion in progress
 - Account equity: ~$994k paper
+- Hardening status: P0-P2 complete, GAP-1 through GAP-25 complete
 
 ## Governance Rules — Non-Negotiable
 1. One change at a time. Baseline, change, verify, proceed.
@@ -24,53 +25,28 @@ python3 -m py_compile <changed_file>
 python3 -m pytest chad/tests/ -x -q 2>&1 | tail -20
 python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 
-## Priority Work Order
+## Live Promotion Checklist
 
-### P0 — Execute in strict order, one at a time
+### Completed Hardening (for reference)
+- P0-1 through P0-4: execution hardening — DONE
+- P1-1 through P1-3: observability and broker truth — DONE
+- P2-1 through P2-3: hygiene and test surface — DONE
+- GAP-1 through GAP-25: governance audit items — DONE
 
-P0-1: Remove reqContractDetails from CHAD hot paths
-- Target files (never touch venv):
-  chad/execution/ibkr_adapter.py line 646
-  chad/core/paper_shadow_runner.py line 695
-  chad/core/paper_position_closer.py line 186
-- Replacement: use explicit contract metadata from intent.meta
-  using contract_month and multiplier when present
-  use cached resolution otherwise
-  never perform live network lookup in the hot path
-- Success check: grep -rn "reqContractDetails" chad/ returns zero results
+### Pre-Live Operator Tasks
+1. OS reboot — pending kernel update requires restart
+2. Disk cleanup — prune backup archives to below 75% usage
+3. IB Gateway latency — investigate and resolve dangerous (>750ms) classification
+4. Verify all 82 tests pass after reboot
+5. Run full_cycle_preview.py --dry-run clean
+6. Confirm live_readiness.json flips to ready_for_live: true
+7. Review open paper positions (MES short) before mode switch
 
-P0-2: Enforce 10-second execution liveness contract
-- Target: chad/execution/ibkr_adapter.py and ibkr_executor.py
-- Add hard 10s timeout to every broker submission call
-- On timeout: log TIMEOUT classification, continue loop safely
-- Failure classes: TIMEOUT, BLOCKED, REJECTED, FAILED, UNKNOWN
-- Success check: every broker submit wrapped in asyncio.wait_for timeout=10.0
-
-P0-3: Enforce single IB() session discipline
-- Hot path target: chad/execution/ibkr_adapter.py line 509
-- Refactor to accept injected IB session, not create new IB()
-- Non-hot-path files such as ledger watcher and health check
-  may retain own sessions but must be documented as non-execution
-- Success check: grep -rn "IB()" chad/execution/ returns zero results
-
-P0-4: Fix paper_exec attribution flattening
-- Target: chad/execution/paper_exec_evidence_writer.py
-- primary_strategy must never fall back to paper_exec
-  when a real strategy name exists upstream in the intent or plan
-- Raise attribution error if no real strategy can be resolved
-  rather than silently writing paper_exec
-- Success check: paper_exec appears only as schema version constant
-  never as a fallback for primary_strategy
-
-### P1 — After all P0 items verified
-P1-1: Complete Profit Lock LiveGate wiring
-P1-2: Add uniform EXECUTION RESULT logs to all execution lanes
-P1-3: Complete loop-level broker truth rebuild
-
-### P2 — After all P1 items verified
-P2-1: Quarantine all .bak files from canonical paths
-P2-2: Fix price-cache timer cadence overlap
-P2-3: Repair pytest collection surface
+### Live Activation Sequence (requires explicit GO)
+1. Set trading posture from DRY_RUN to LIVE in config (Pending Action)
+2. Validate LiveGate accepts the posture change
+3. Monitor first 3 execution cycles with manual oversight
+4. Confirm broker truth reconciliation on first fill
 
 ## Key Files Reference
 - Hot path entry: chad/core/orchestrator.py
@@ -83,7 +59,8 @@ P2-3: Repair pytest collection surface
 
 ## Active Git Tags
 - STABILITY_FREEZE_20260307_GREEN — original stable baseline
-- PRE_HARDENING_20260402 — all work captured before P0 fixes
+- PRE_HARDENING_20260402 — snapshot before P0 hardening began
+- RATIFICATION_MASTER_20260402 — all hardening and GAP items complete
 
 ## Rollback Command
-git checkout PRE_HARDENING_20260402
+git checkout RATIFICATION_MASTER_20260402
