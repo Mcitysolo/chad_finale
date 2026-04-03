@@ -6,10 +6,11 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Runtime file freshness for portfolio snapshot (short on purpose)
 PORTFOLIO_SNAPSHOT_TTL_SECONDS = 300  # 5 minutes
+POSITIONS_SNAPSHOT_TTL_SECONDS = 300  # 5 minutes
 
 
 def _utc_now_iso() -> str:
@@ -150,6 +151,60 @@ class IBKRPortfolioCollector:
         _atomic_write_json(path, new_payload)
         return path
 
+    # ------------------------------------------------------------------ #
+    # positions snapshot                                                  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _default_positions_path() -> Path:
+        root = Path(__file__).resolve().parents[2]
+        return root / "runtime" / "positions_snapshot.json"
+
+    def collect_positions(self, positions_path: Optional[Path] = None) -> Path:
+        """
+        Query IBKR for all positions and write runtime/positions_snapshot.json.
+
+        This is the broker-authority source for reconciliation.
+        """
+        from ib_insync import IB  # type: ignore[import]
+
+        path = positions_path or self._default_positions_path()
+        ib = IB()
+        try:
+            ib.connect(
+                self._cfg.host, self._cfg.port,
+                clientId=self._cfg.client_id, readonly=True, timeout=10.0,
+            )
+            raw_positions = ib.positions()
+
+            pos_list: List[Dict[str, Any]] = []
+            for p in raw_positions:
+                c = p.contract
+                pos_list.append({
+                    "conId": int(c.conId),
+                    "symbol": str(c.symbol),
+                    "position": float(p.position),
+                    "avgCost": float(p.avgCost),
+                    "secType": str(c.secType),
+                    "currency": str(c.currency),
+                })
+
+            payload: Dict[str, Any] = {
+                "positions": pos_list,
+                "positions_count": len(pos_list),
+                "ts_utc": _utc_now_iso(),
+                "ttl_seconds": int(POSITIONS_SNAPSHOT_TTL_SECONDS),
+                "source": "ibkr_portfolio_collector_v2",
+            }
+
+            _atomic_write_json(path, payload)
+            return path
+        finally:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -201,14 +256,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     # collect
+    rc = 0
     try:
         snapshot_path = Path(args.snapshot_path).expanduser().resolve() if args.snapshot_path else None
         out_path = collector.update_snapshot(snapshot_path=snapshot_path)
-        print(f"[IBKR PORTFOLIO] Updated snapshot: {out_path}")
-        return 0
+        print(f"[IBKR PORTFOLIO] Updated equity snapshot: {out_path}")
     except Exception as exc:
-        print(f"[IBKR PORTFOLIO] Error: {exc}")
-        return 1
+        print(f"[IBKR PORTFOLIO] Equity snapshot error: {exc}")
+        rc = 1
+
+    try:
+        pos_path = collector.collect_positions()
+        print(f"[IBKR PORTFOLIO] Updated positions snapshot: {pos_path}")
+    except Exception as exc:
+        print(f"[IBKR PORTFOLIO] Positions snapshot error: {exc}")
+        rc = 1
+
+    return rc
 
 
 if __name__ == "__main__":  # pragma: no cover
