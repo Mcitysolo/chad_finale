@@ -166,7 +166,10 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 def _extract_ibkr_latency(runtime_dir: Path) -> Tuple[Optional[bool], Optional[float], str]:
     """
-    Returns: (ok, latency_ms, source_path)
+    Returns: (ok, classify_latency_ms, source_path)
+
+    Prefers api_ms (actual API round-trip) for classification when available,
+    falling back to latency_ms (which includes connect overhead).
     """
     p = runtime_dir / "ibkr_status.json"
     if not p.is_file():
@@ -174,7 +177,8 @@ def _extract_ibkr_latency(runtime_dir: Path) -> Tuple[Optional[bool], Optional[f
 
     obj = _read_json(p)
     ok = obj.get("ok")
-    latency = obj.get("latency_ms")
+    # Prefer api_ms for classification — it excludes connect overhead
+    latency = obj.get("api_ms") if obj.get("api_ms") is not None else obj.get("latency_ms")
     try:
         ok_b = bool(ok) if ok is not None else None
     except Exception:
@@ -226,8 +230,14 @@ def build_latency_state(*, runtime_dir: Path) -> Dict[str, Any]:
         dangerous_ms=_env_int("CHAD_LATENCY_DANGEROUS_MS", 750),
     )
 
-    ok, latency_ms, src = _extract_ibkr_latency(runtime_dir)
-    env_label = _classify_latency_env(latency_ms, ok=ok, th=th)
+    ok, classify_ms, src = _extract_ibkr_latency(runtime_dir)
+    env_label = _classify_latency_env(classify_ms, ok=ok, th=th)
+
+    # Read raw split metrics for observability
+    _ibkr_raw = _read_json(Path(src)) if src else {}
+    raw_connect_ms = _ibkr_raw.get("connect_ms")
+    raw_api_ms = _ibkr_raw.get("api_ms")
+    raw_latency_ms = _ibkr_raw.get("latency_ms")
 
     l1, l5, l15 = _safe_loadavg()
 
@@ -236,7 +246,10 @@ def build_latency_state(*, runtime_dir: Path) -> Dict[str, Any]:
         "broker": {
             "name": "IBKR",
             "ok": ok,
-            "latency_ms": latency_ms,
+            "latency_ms": raw_latency_ms,
+            "connect_ms": raw_connect_ms,
+            "api_ms": raw_api_ms,
+            "classified_on_ms": classify_ms,
             "source_path": src,
         },
         "system": {

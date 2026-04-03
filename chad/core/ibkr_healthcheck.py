@@ -56,6 +56,8 @@ class IBKRHealthStatus:
     port: int
     client_id: int
     latency_ms: Optional[float]
+    connect_ms: Optional[float]
+    api_ms: Optional[float]
     server_time_iso: Optional[str]
 
 
@@ -118,6 +120,8 @@ def _healthcheck(host: str, port: int, client_id: int, timeout_s: float, quiet_i
             port=port,
             client_id=client_id,
             latency_ms=None,
+            connect_ms=None,
+            api_ms=None,
             server_time_iso=None,
         )
 
@@ -137,51 +141,72 @@ def _healthcheck(host: str, port: int, client_id: int, timeout_s: float, quiet_i
             # ib.connect uses socket handshake + API negotiation
             ib.connect(host, port, clientId=client_id, timeout=float(timeout_s))
         except Exception as exc:
+            elapsed_connect = (time.perf_counter() - start) * 1000.0
             return IBKRHealthStatus(
                 ok=False,
                 error=f"connect_failed: {_fmt_exc(exc)}",
                 host=host,
                 port=port,
                 client_id=client_id,
-                latency_ms=(time.perf_counter() - start) * 1000.0,
+                latency_ms=elapsed_connect,
+                connect_ms=elapsed_connect,
+                api_ms=None,
                 server_time_iso=None,
             )
+
+        # Split timer: connect phase done, API phase begins
+        after_connect = time.perf_counter()
 
         try:
             # Prove API responsiveness
             server_time = ib.reqCurrentTime()
             if server_time is None:
+                now = time.perf_counter()
+                c_ms = (after_connect - start) * 1000.0
+                a_ms = (now - after_connect) * 1000.0
                 return IBKRHealthStatus(
                     ok=False,
                     error="reqCurrentTime_returned_none",
                     host=host,
                     port=port,
                     client_id=client_id,
-                    latency_ms=(time.perf_counter() - start) * 1000.0,
+                    latency_ms=c_ms + a_ms,
+                    connect_ms=c_ms,
+                    api_ms=a_ms,
                     server_time_iso=None,
                 )
 
             # server_time is a datetime
             server_time_iso = server_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")  # type: ignore[name-defined]
 
+            now = time.perf_counter()
+            c_ms = (after_connect - start) * 1000.0
+            a_ms = (now - after_connect) * 1000.0
             return IBKRHealthStatus(
                 ok=True,
                 error=None,
                 host=host,
                 port=port,
                 client_id=client_id,
-                latency_ms=(time.perf_counter() - start) * 1000.0,
+                latency_ms=c_ms + a_ms,
+                connect_ms=c_ms,
+                api_ms=a_ms,
                 server_time_iso=server_time_iso,
             )
 
         except Exception as exc:
+            now = time.perf_counter()
+            c_ms = (after_connect - start) * 1000.0
+            a_ms = (now - after_connect) * 1000.0
             return IBKRHealthStatus(
                 ok=False,
                 error=f"reqCurrentTime_failed: {_fmt_exc(exc)}",
                 host=host,
                 port=port,
                 client_id=client_id,
-                latency_ms=(time.perf_counter() - start) * 1000.0,
+                latency_ms=c_ms + a_ms,
+                connect_ms=c_ms,
+                api_ms=a_ms,
                 server_time_iso=None,
             )
 
@@ -200,6 +225,8 @@ def _as_payload(st: IBKRHealthStatus) -> Dict[str, Any]:
         "port": int(st.port),
         "client_id": int(st.client_id),
         "latency_ms": st.latency_ms,
+        "connect_ms": st.connect_ms,
+        "api_ms": st.api_ms,
         "server_time_iso": st.server_time_iso,
     }
 
