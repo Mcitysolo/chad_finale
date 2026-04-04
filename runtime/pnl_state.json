@@ -1,13 +1,12 @@
 {
-  "schema_version": "pnl_state.v1",
-  "ts_utc": "2026-04-02T18:08:06.346008+00:00",
-  "ttl_seconds": 300,
-  "realized_pnl": 0.0,
-  "trade_count": 0,
-  "pnl_pct_of_equity": 0.0,
-  "account_equity": 994429.42,
+  "account_equity": 998109.89,
   "equity_known": true,
+  "pnl_pct_of_equity": 0.0,
   "pnl_sources": [],
-  "source": "pnl_state_bootstrap",
-  "note": "Canonical pnl_state stub \u2014 will be replaced by live PnL publisher when real executions occur"
+  "realized_pnl": 0.0,
+  "schema_version": "pnl_state.v1",
+  "source": "profit_lock_engine",
+  "trade_count": 0,
+  "ts_utc": "2026-04-04T00:16:44Z",
+  "ttl_seconds": 60
 }
