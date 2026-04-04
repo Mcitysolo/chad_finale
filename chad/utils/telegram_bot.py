@@ -1158,6 +1158,13 @@ def cmd_ai_research(update: Update, context: CallbackContext) -> None:
         send_message(update, context, "<b>AI RESEARCH ERROR</b>\n\n" + escape_html(str(exc)))
 
 
+def cmd_advisory(update: Update, context: CallbackContext) -> None:
+    if not is_allowed(update):
+        return
+    text = " ".join(context.args) if context.args else ""
+    handle_advisory_chat(update, context, text)
+
+
 # =============================================================================
 # CHADGPT free-text advisory
 # =============================================================================
@@ -1350,6 +1357,7 @@ def build_updater() -> Updater:
     dp.add_handler(CommandHandler("portfolio_rebalance", cmd_portfolio_rebalance))
     dp.add_handler(CommandHandler("price", cmd_price))
     dp.add_handler(CommandHandler("ai_research", cmd_ai_research))
+    dp.add_handler(CommandHandler("advisory", cmd_advisory))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_free_text))
 
     return updater
