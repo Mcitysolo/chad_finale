@@ -328,25 +328,6 @@ def _get_vix() -> Optional[float]:
             if val is not None:
                 return _safe_float(val)
 
-    # 3. Try ib_insync direct query as last resort
-    try:
-        from ib_insync import IB, Index
-        ib = IB()
-        ib.connect("127.0.0.1", 4002, clientId=9099, timeout=5, readonly=True)
-        try:
-            contract = Index("VIX", "CBOE")
-            ib.qualifyContracts(contract)
-            ticker = ib.reqMktData(contract, snapshot=True)
-            ib.sleep(2)
-            if ticker.last and math.isfinite(ticker.last):
-                return float(ticker.last)
-            if ticker.close and math.isfinite(ticker.close):
-                return float(ticker.close)
-        finally:
-            ib.disconnect()
-    except Exception:
-        pass
-
     return None
 
 
@@ -615,17 +596,18 @@ class DailyCHADReport:
                 sections.append(f"  {label}: {status}")
         sections.append("")
 
-        # 7. MARKET TEMPERATURE
-        sections.append("═══ MARKET TEMPERATURE ═══")
-        sections.append("(The \"fear gauge\" tells us how nervous investors are)")
-        if vix is not None:
-            sections.append(f"  Fear gauge (VIX): {vix:.1f} — {vix_description(vix)}")
-        if spy_change is not None:
-            direction = "up" if spy_change >= 0 else "down"
-            sections.append(f"  Stock market was {direction} {abs(spy_change):.1f}% today")
-        if btc_price is not None:
-            sections.append(f"  Bitcoin: {_format_money(btc_price)}")
-        sections.append("")
+        # 7. MARKET TEMPERATURE — only show when we have data
+        if vix is not None or spy_change is not None or btc_price is not None:
+            sections.append("═══ MARKET TEMPERATURE ═══")
+            sections.append("(The \"fear gauge\" tells us how nervous investors are)")
+            if vix is not None:
+                sections.append(f"  Fear gauge (VIX): {vix:.1f} — {vix_description(vix)}")
+            if spy_change is not None:
+                direction = "up" if spy_change >= 0 else "down"
+                sections.append(f"  Stock market was {direction} {abs(spy_change):.1f}% today")
+            if btc_price is not None:
+                sections.append(f"  Bitcoin: {_format_money(btc_price)}")
+            sections.append("")
 
         # 8. CHAD STATUS
         sections.append("═══ CHAD STATUS ═══")
