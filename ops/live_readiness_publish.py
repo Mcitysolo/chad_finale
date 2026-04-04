@@ -149,14 +149,25 @@ def feed_ok() -> Tuple[bool, str]:
     try:
         f = read_json_dict(FEED_PATH)
         feeds = f.get("feeds") if isinstance(f.get("feeds"), dict) else {}
-        poly = feeds.get("polygon_stocks") if isinstance(feeds.get("polygon_stocks"), dict) else None
-        if not isinstance(poly, dict):
-            return False, "feed_missing_polygon_stocks"
-        fs = float(poly.get("freshness_seconds", 1e9))
+
+        # Prefer ibkr_stocks; fall back to polygon_stocks (legacy)
+        feed_entry = None
+        feed_label = "unknown"
+        for key in ("ibkr_stocks", "polygon_stocks"):
+            candidate = feeds.get(key)
+            if isinstance(candidate, dict):
+                feed_entry = candidate
+                feed_label = key
+                break
+
+        if feed_entry is None:
+            return False, "feed_missing_ibkr_stocks_and_polygon_stocks"
+
+        fs = float(feed_entry.get("freshness_seconds", 1e9))
         # If feed freshness is NaN/unparsable -> fail
         if not (fs == fs) or fs > 180:
-            return False, f"feed_stale:{fs}"
-        return True, f"feed_fresh:{fs}"
+            return False, f"feed_stale:{feed_label}:{fs}"
+        return True, f"feed_fresh:{feed_label}:{fs}"
     except Exception as exc:
         return False, f"feed_unreadable:{type(exc).__name__}"
 

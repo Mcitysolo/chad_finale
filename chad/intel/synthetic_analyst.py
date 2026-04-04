@@ -36,22 +36,7 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 
 def _load_polygon_api_key() -> str:
-    key = str(os.environ.get("POLYGON_API_KEY", "")).strip()
-    if key:
-        return key
-
-    env_path = Path("/etc/chad/polygon.env")
-    if env_path.is_file():
-        try:
-            for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() == "POLYGON_API_KEY" and v.strip():
-                    return v.strip().strip('"').strip("'")
-        except Exception:
-            return ""
+    """Legacy — kept for reference but no longer used."""
     return ""
 
 
@@ -158,53 +143,32 @@ def _holding_balance_label(position_value_usd: Optional[float], portfolio_value_
 
 
 def _headline_tone(symbol: str, limit: int = 5) -> Dict[str, Any]:
-    api_key = _load_polygon_api_key()
-    if not api_key:
-        return {
-            "label": "unknown",
-            "headlines_used": [],
-            "notes": ["polygon_api_key_missing"],
-        }
-
+    """Fetch headline tone via Alpaca News (replaces Polygon)."""
     try:
-        resp = requests.get(
-            "https://api.polygon.io/v2/reference/news",
-            params={
-                "ticker": symbol,
-                "limit": max(1, min(int(limit), 5)),
-                "order": "desc",
-                "sort": "published_utc",
-                "apiKey": api_key,
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
+        from chad.market_data.alpaca_news_provider import AlpacaNewsProvider
+
+        provider = AlpacaNewsProvider()
+        if not provider.configured:
             return {
                 "label": "unknown",
                 "headlines_used": [],
-                "notes": [f"polygon_http_{resp.status_code}"],
+                "notes": ["alpaca_api_key_missing"],
             }
 
-        payload = resp.json()
-        results = payload.get("results")
-        if not isinstance(results, list):
+        items = provider.get_headlines(symbols=[symbol], limit=max(1, min(int(limit), 5)))
+        if not items:
             return {
                 "label": "unknown",
                 "headlines_used": [],
-                "notes": ["polygon_results_missing"],
+                "notes": ["alpaca_no_results"],
             }
 
         used: List[Dict[str, Any]] = []
         direct = 0
         broad = 0
 
-        for item in results[: max(1, min(int(limit), 5))]:
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title") or "").strip()
-            published = str(item.get("published_utc") or "").strip()
-            tickers = item.get("tickers")
-            tickers_up = {str(t).strip().upper() for t in tickers} if isinstance(tickers, list) else set()
+        for item in items:
+            tickers_up = set(item.symbols)
 
             if symbol in tickers_up:
                 if len(tickers_up) <= 3:
@@ -212,14 +176,12 @@ def _headline_tone(symbol: str, limit: int = 5) -> Dict[str, Any]:
                 else:
                     broad += 1
 
-            if title:
-                used.append(
-                    {
-                        "title": title,
-                        "published_utc": published,
-                        "tickers": sorted(list(tickers_up))[:10],
-                    }
-                )
+            if item.headline:
+                used.append({
+                    "title": item.headline,
+                    "published_utc": item.published_utc,
+                    "tickers": sorted(list(tickers_up))[:10],
+                })
 
         if direct >= 2:
             label = "direct"

@@ -101,80 +101,33 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 
 def _load_live_fx_usdcad() -> Optional[Dict[str, Any]]:
-    import requests
-    from datetime import datetime, timedelta, timezone
-
-    api_key = str(os.environ.get("POLYGON_API_KEY", "")).strip()
-    if not api_key:
-        env_path = Path("/etc/chad/polygon.env")
-        if env_path.is_file():
-            try:
-                for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    if k.strip() == "POLYGON_API_KEY" and v.strip():
-                        api_key = v.strip().strip('"').strip("'")
-                        break
-            except Exception:
-                api_key = api_key
-
-    if not api_key:
-        return None
+    from datetime import datetime, timezone
 
     try:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=2)
-        url = (
-            f"https://api.polygon.io/v2/aggs/ticker/C:USDCAD/range/1/minute/"
-            f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-        )
-        resp = requests.get(
-            url,
-            params={
-                "adjusted": "true",
-                "sort": "desc",
-                "limit": 1,
-                "apiKey": api_key,
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return None
+        from ib_insync import IB
+        from chad.market_data.ibkr_price_provider import IBKRPriceProvider
 
-        payload = resp.json()
-        results = payload.get("results")
-        if not isinstance(results, list) or not results:
-            return None
-
-        row = results[0]
-        if not isinstance(row, dict):
-            return None
-
-        close_px = row.get("c")
-        ts_ms = row.get("t")
-        status = str(payload.get("status") or "").strip()
-
-        if not isinstance(close_px, (int, float)):
-            return None
-
-        ts_utc = None
-        if isinstance(ts_ms, (int, float)):
+        ib = IB()
+        ib.connect("127.0.0.1", 4002, clientId=9036, timeout=10)
+        try:
+            provider = IBKRPriceProvider(ib)
+            rate = provider.get_fx_rate("USDCAD")
+            if rate > 0:
+                return {
+                    "pair": "C:USDCAD",
+                    "rate": rate,
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "status": "OK",
+                    "source": "ibkr_fx",
+                }
+        finally:
             try:
-                ts_utc = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+                ib.disconnect()
             except Exception:
-                ts_utc = None
-
-        return {
-            "pair": "C:USDCAD",
-            "rate": float(close_px),
-            "ts_utc": ts_utc,
-            "status": status,
-            "source": "polygon_aggs_delayed",
-        }
+                pass
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _load_live_context(symbol: str) -> Dict[str, Any]:
@@ -275,90 +228,44 @@ def _load_live_context(symbol: str) -> Dict[str, Any]:
     }
 
 
-def _load_recent_polygon_headlines(symbol: str, limit: int = 3) -> List[Dict[str, Any]]:
-    import requests
-
+def _load_recent_headlines(symbol: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Fetch recent headlines via Alpaca News API (replaces Polygon)."""
     symbol = str(symbol or "").strip().upper()
     if not symbol:
         return []
 
-    api_key = str(os.environ.get("POLYGON_API_KEY", "")).strip()
-    if not api_key:
-        env_path = Path("/etc/chad/polygon.env")
-        if env_path.is_file():
-            try:
-                for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    if k.strip() == "POLYGON_API_KEY" and v.strip():
-                        api_key = v.strip().strip('"').strip("'")
-                        break
-            except Exception:
-                api_key = api_key
-
-    if not api_key:
-        return []
-
     try:
-        resp = requests.get(
-            "https://api.polygon.io/v2/reference/news",
-            params={
-                "ticker": symbol,
-                "limit": max(1, min(int(limit), 5)),
-                "order": "desc",
-                "sort": "published_utc",
-                "apiKey": api_key,
-            },
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return []
+        from chad.market_data.alpaca_news_provider import AlpacaNewsProvider
 
-        payload = resp.json()
-        results = payload.get("results")
-        if not isinstance(results, list):
-            return []
+        provider = AlpacaNewsProvider()
+        items = provider.get_headlines(symbols=[symbol], limit=max(1, min(int(limit), 5)))
 
         out: List[Dict[str, Any]] = []
         sym_low = symbol.lower()
 
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-
-            title = str(item.get("title") or "").strip()
-            desc = str(item.get("description") or "").strip()
-            published = str(item.get("published_utc") or "").strip()
-
-            hay = f"{title} {desc}".lower()
+        for item in items:
+            hay = f"{item.headline} {item.summary}".lower()
             relevance = 0
             if sym_low in hay:
                 relevance += 2
+            if symbol in item.symbols:
+                relevance += 3
 
-            tickers = item.get("tickers")
-            if isinstance(tickers, list):
-                tickers_up = {str(t).strip().upper() for t in tickers if str(t).strip()}
-                if symbol in tickers_up:
-                    relevance += 3
-
-            if not title:
-                continue
-
-            out.append(
-                {
-                    "title": title,
-                    "published_utc": published,
-                    "description_preview": desc[:160],
-                    "relevance": relevance,
-                }
-            )
+            out.append({
+                "title": item.headline,
+                "published_utc": item.published_utc,
+                "description_preview": item.summary[:160],
+                "relevance": relevance,
+            })
 
         out.sort(key=lambda x: (x.get("relevance", 0), x.get("published_utc", "")), reverse=True)
         return out[: max(1, min(int(limit), 3))]
     except Exception:
         return []
+
+
+# Legacy alias for backward compatibility
+_load_recent_polygon_headlines = _load_recent_headlines
 
 
 def get_coach_profile_from_request(request: "AdvisoryRequest") -> Dict[str, Any]:
@@ -649,7 +556,7 @@ class OpenAIAdvisoryClient:
 
         coaching_instructions = build_coaching_instructions(request)
         live_context = _load_live_context(request.symbol)
-        recent_headlines = _load_recent_polygon_headlines(request.symbol, limit=3)
+        recent_headlines = _load_recent_headlines(request.symbol, limit=3)
 
         return truncate_text(
             f"""
@@ -672,7 +579,7 @@ Coaching instructions:
 LIVE CONTEXT TO USE IN THE ANSWER:
 {safe_json_dumps(live_context)}
 
-RECENT POLYGON HEADLINES TO USE IF RELEVANT:
+RECENT HEADLINES TO USE IF RELEVANT:
 {safe_json_dumps(recent_headlines)}
 
 User request:

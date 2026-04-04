@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+chad/market_data/ibkr_historical_provider.py
+
+IBKR Historical Bar Provider for CHAD.
+
+Replaces Polygon daily bars backfill with direct IBKR reqHistoricalData.
+Writes to data/bars/1d/ and data/bars/1m/ in the same format as
+polygon_daily_bars_backfill.py for seamless consumer compatibility.
+
+Usage:
+    from ib_insync import IB
+    from chad.market_data.ibkr_historical_provider import IBKRHistoricalProvider
+
+    ib = IB()
+    ib.connect('127.0.0.1', 4002, clientId=9034)
+    provider = IBKRHistoricalProvider(ib)
+    bars = provider.fetch_daily_bars('SPY', days=400)
+    results = provider.backfill_universe(['SPY', 'QQQ', 'AAPL'])
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+LOGGER = logging.getLogger("chad.market_data.ibkr_historical_provider")
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BARS_DIR = REPO_ROOT / "data" / "bars"
+
+# IBKR pacing: max 60 requests per 10 minutes; we use 1 req per 0.5s
+PACING_DELAY_S = 0.5
+
+
+@dataclass(frozen=True)
+class Bar:
+    """Standard OHLCV bar."""
+    ts_utc: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    symbol: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ts_utc": self.ts_utc,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+        }
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+class IBKRHistoricalProvider:
+    """
+    Fetches historical OHLCV bars from IBKR and writes to data/bars/.
+
+    Output format matches polygon_daily_bars_backfill.py for consumer compatibility:
+    {
+        "symbol": "SPY",
+        "source": "ibkr",
+        "timeframe": "1d",
+        "ts_utc": "...",
+        "ttl_seconds": 86400,
+        "bars": [{...}, ...]
+    }
+    """
+
+    def __init__(
+        self,
+        ib: Any,
+        *,
+        bars_dir: Optional[Path] = None,
+    ) -> None:
+        self._ib = ib
+        self._bars_dir = bars_dir or BARS_DIR
+
+        # Request delayed data (free)
+        try:
+            self._ib.reqMarketDataType(3)
+        except Exception:
+            pass
+
+    def _make_contract(self, symbol: str, sec_type: str = "STK") -> Any:
+        from ib_insync import Stock, Future
+
+        sym = symbol.strip().upper()
+        if sec_type == "FUT":
+            exchange_map = {
+                "MES": "CME", "MNQ": "CME", "MCL": "NYMEX",
+                "MGC": "COMEX", "ZN": "CBOT", "ZB": "CBOT",
+                "M6E": "CME", "SIL": "COMEX",
+            }
+            exchange = exchange_map.get(sym, "CME")
+            contract = Future(symbol=sym, exchange=exchange, currency="USD")
+            try:
+                qualified = self._ib.qualifyContracts(contract)
+                if qualified:
+                    return qualified[0]
+            except Exception:
+                pass
+            return contract
+        return Stock(sym, "SMART", "USD")
+
+    def _duration_str(self, days: int) -> str:
+        """Convert days to IBKR duration string."""
+        if days <= 365:
+            return f"{days} D"
+        years = days // 365
+        return f"{years} Y"
+
+    def _parse_bars(self, ib_bars: Any, symbol: str) -> List[Bar]:
+        """Parse IBKR bar objects into Bar dataclasses."""
+        bars: List[Bar] = []
+        for b in ib_bars:
+            ts = str(getattr(b, "date", ""))
+            o = _safe_float(getattr(b, "open", 0))
+            h = _safe_float(getattr(b, "high", 0))
+            lo = _safe_float(getattr(b, "low", 0))
+            c = _safe_float(getattr(b, "close", 0))
+            v = _safe_float(getattr(b, "volume", 0))
+
+            # Validate OHLC integrity
+            if min(o, h, lo, c) <= 0 or h < lo:
+                continue
+
+            bars.append(Bar(
+                ts_utc=ts,
+                open=o, high=h, low=lo, close=c,
+                volume=max(v, 0.0),
+                symbol=symbol,
+            ))
+        return bars
+
+    def _write_bars_file(
+        self,
+        symbol: str,
+        bars: List[Bar],
+        timeframe: str,
+    ) -> Path:
+        """Write bars to data/bars/{timeframe}/{symbol}.json atomically."""
+        out_dir = self._bars_dir / timeframe
+        out_path = out_dir / f"{symbol}.json"
+
+        payload = {
+            "bars": [b.to_dict() for b in bars],
+            "symbol": symbol,
+            "source": "ibkr",
+            "timeframe": timeframe,
+            "ts_utc": _utc_now_iso(),
+            "ttl_seconds": 86400 if timeframe == "1d" else 3600,
+        }
+
+        _atomic_write_json(out_path, payload)
+        return out_path
+
+    def fetch_daily_bars(
+        self,
+        symbol: str,
+        days: int = 400,
+        sec_type: str = "STK",
+    ) -> List[Bar]:
+        """
+        Fetch daily OHLCV bars from IBKR.
+
+        Writes to data/bars/1d/{symbol}.json.
+        Returns list of Bar objects sorted ascending by timestamp.
+        """
+        sym = symbol.strip().upper()
+        contract = self._make_contract(sym, sec_type)
+
+        try:
+            self._ib.qualifyContracts(contract)
+        except Exception:
+            pass
+
+        ib_bars = self._ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=self._duration_str(days),
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+
+        bars = self._parse_bars(ib_bars, sym)
+        if bars:
+            self._write_bars_file(sym, bars, "1d")
+            LOGGER.info("ibkr_historical.daily_fetched symbol=%s bars=%d", sym, len(bars))
+
+        return bars
+
+    def fetch_minute_bars(
+        self,
+        symbol: str,
+        days: int = 5,
+        sec_type: str = "STK",
+    ) -> List[Bar]:
+        """
+        Fetch 1-minute OHLCV bars from IBKR.
+
+        Writes to data/bars/1m/{symbol}.json.
+        IBKR limits 1-min bars to ~5-7 days of history.
+        """
+        sym = symbol.strip().upper()
+        contract = self._make_contract(sym, sec_type)
+
+        try:
+            self._ib.qualifyContracts(contract)
+        except Exception:
+            pass
+
+        # IBKR max for 1-min bars is ~7 days
+        capped_days = min(days, 7)
+
+        ib_bars = self._ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=f"{capped_days} D",
+            barSizeSetting="1 min",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+
+        bars = self._parse_bars(ib_bars, sym)
+        if bars:
+            self._write_bars_file(sym, bars, "1m")
+            LOGGER.info("ibkr_historical.minute_fetched symbol=%s bars=%d", sym, len(bars))
+
+        return bars
+
+    def backfill_universe(
+        self,
+        symbols: List[str],
+        days: int = 400,
+        sec_type: str = "STK",
+        include_minute: bool = False,
+    ) -> Dict[str, int]:
+        """
+        Backfill daily bars for a list of symbols.
+
+        Returns dict of symbol -> bar count written.
+        Rate-limited to respect IBKR pacing (1 req per 0.5s).
+        """
+        results: Dict[str, int] = {}
+
+        for sym in symbols:
+            sym = sym.strip().upper()
+            try:
+                bars = self.fetch_daily_bars(sym, days=days, sec_type=sec_type)
+                results[sym] = len(bars)
+                LOGGER.info("ibkr_historical.backfill symbol=%s daily_bars=%d", sym, len(bars))
+            except Exception as exc:
+                LOGGER.warning("ibkr_historical.backfill_failed symbol=%s: %s", sym, exc)
+                results[sym] = 0
+
+            time.sleep(PACING_DELAY_S)
+
+            if include_minute:
+                try:
+                    self.fetch_minute_bars(sym, days=5, sec_type=sec_type)
+                except Exception as exc:
+                    LOGGER.warning("ibkr_historical.minute_backfill_failed symbol=%s: %s", sym, exc)
+                time.sleep(PACING_DELAY_S)
+
+        total = sum(results.values())
+        LOGGER.info("ibkr_historical.backfill_complete symbols=%d total_bars=%d", len(results), total)
+        return results

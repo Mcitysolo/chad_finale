@@ -285,40 +285,94 @@ class _PolygonClient:
 # ---------------------------------------------------------------------------
 
 
+class IBKRMarketDataService:
+    """
+    IBKR-native market data service implementing the same interface as
+    the legacy Polygon-based MarketDataService.
+
+    Uses IBKRPriceProvider for snapshots and IBKRHistoricalProvider for bars.
+    """
+
+    def __init__(self, ib: Optional[Any] = None) -> None:
+        _ensure_logging()
+        self.provider = "ibkr"
+        self._ib = ib
+        self._price_provider = None
+
+    def _get_price_provider(self) -> Any:
+        if self._price_provider is None:
+            from chad.market_data.ibkr_price_provider import IBKRPriceProvider
+            if self._ib is None:
+                raise MarketDataError("IBKRMarketDataService requires an IB connection")
+            self._price_provider = IBKRPriceProvider(self._ib)
+        return self._price_provider
+
+    def get_price_snapshot(self, symbol: str) -> PriceSnapshot:
+        symbol = symbol.upper().strip()
+        if not symbol:
+            raise MarketDataError("Symbol must be a non-empty string.")
+
+        provider = self._get_price_provider()
+        snap = provider.get_snapshot(symbol)
+
+        price = snap.last if snap.last > 0 else snap.close
+        return PriceSnapshot(
+            symbol=symbol,
+            asset_class="equity",
+            price=price,
+            change=None,
+            percent_change=None,
+            as_of=snap.ts_utc,
+            source="ibkr",
+        )
+
+    def get_bars(self, symbol: str, days: int = 400) -> list:
+        from chad.market_data.ibkr_historical_provider import IBKRHistoricalProvider
+        if self._ib is None:
+            raise MarketDataError("IBKRMarketDataService requires an IB connection")
+        hist = IBKRHistoricalProvider(self._ib)
+        return hist.fetch_daily_bars(symbol, days=days)
+
+
 class MarketDataService:
     """
     Unified market data access layer.
 
-    Currently supports:
-        - Provider: "polygon" (default)
+    Supports:
+        - Provider: "polygon" (legacy)
+        - Provider: "ibkr" (new default)
 
-    Future extensions:
-        - "ibkr"    for account-linked data
-        - "coinbase"/"kraken" for crypto
-        - caching backends (Redis, in-memory LRU)
-
-    This class is safe to instantiate frequently; provider clients are
-    relatively lightweight and use internal sessions.
+    Provider selection:
+        1) Explicit provider arg
+        2) CHAD_MARKET_DATA_PROVIDER env var
+        3) "ibkr" (default)
     """
 
-    def __init__(self, provider: Optional[str] = None) -> None:
+    def __init__(self, provider: Optional[str] = None, ib: Optional[Any] = None) -> None:
         _ensure_logging()
         self.provider = provider or os.environ.get(
-            "MARKET_DATA_DEFAULT_PROVIDER", "polygon"
+            "CHAD_MARKET_DATA_PROVIDER", "ibkr"
         ).lower()
 
-        if self.provider not in ("polygon",):
+        if self.provider not in ("polygon", "ibkr"):
             raise MarketDataError(
                 f"Unsupported market data provider {self.provider!r}. "
-                "Currently only 'polygon' is implemented."
+                "Supported: 'ibkr', 'polygon'."
             )
 
         self._polygon_client: Optional[_PolygonClient] = None
+        self._ibkr_service: Optional[IBKRMarketDataService] = None
+        self._ib = ib
 
     def _get_polygon_client(self) -> _PolygonClient:
         if self._polygon_client is None:
             self._polygon_client = _PolygonClient()
         return self._polygon_client
+
+    def _get_ibkr_service(self) -> IBKRMarketDataService:
+        if self._ibkr_service is None:
+            self._ibkr_service = IBKRMarketDataService(ib=self._ib)
+        return self._ibkr_service
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -327,8 +381,6 @@ class MarketDataService:
     def get_price_snapshot(self, symbol: str) -> PriceSnapshot:
         """
         Fetch a PriceSnapshot for a given symbol using the configured provider.
-
-        For now, this delegates to Polygon.
 
         Args:
             symbol: Ticker symbol, e.g. "AAPL", "SPY".
@@ -343,10 +395,11 @@ class MarketDataService:
         if not symbol:
             raise MarketDataError("Symbol must be a non-empty string.")
 
+        if self.provider == "ibkr":
+            return self._get_ibkr_service().get_price_snapshot(symbol)
         if self.provider == "polygon":
             return self._get_polygon_price_snapshot(symbol)
 
-        # Safety net: provider validation is done in __init__.
         raise MarketDataError(f"Provider {self.provider!r} is not implemented.")
 
     # ------------------------------------------------------------------ #
@@ -432,3 +485,23 @@ class MarketDataService:
         )
 
         return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def get_market_data_service(
+    provider: Optional[str] = None,
+    ib: Optional[Any] = None,
+) -> MarketDataService:
+    """
+    Factory: return a MarketDataService configured for the requested provider.
+
+    Provider resolution:
+        1) Explicit `provider` arg
+        2) CHAD_MARKET_DATA_PROVIDER env var
+        3) "ibkr" (default)
+    """
+    return MarketDataService(provider=provider, ib=ib)

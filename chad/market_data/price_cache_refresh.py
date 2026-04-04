@@ -217,16 +217,95 @@ def find_latest_feed(feed_dir: Path) -> Path:
     raise FileNotFoundError(f"No non-empty Polygon NDJSON feeds found under {feed_dir}")
 
 
+def _get_provider() -> str:
+    """Read CHAD_MARKET_DATA_PROVIDER env var. Default: ibkr."""
+    return os.environ.get("CHAD_MARKET_DATA_PROVIDER", "ibkr").strip().lower()
+
+
+def _load_universe() -> list:
+    """Load symbol universe from config/universe.json."""
+    universe_path = Path("/home/ubuntu/chad_finale/config/universe.json")
+    try:
+        obj = json.loads(universe_path.read_text(encoding="utf-8"))
+        syms = obj.get("symbols", [])
+        return [str(s).strip().upper() for s in syms if str(s).strip()]
+    except Exception:
+        return ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "NVDA", "BAC", "GLD", "SH", "IEMG", "VWO"]
+
+
+def _refresh_ibkr(runtime_dir: Path, ttl_seconds: int) -> int:
+    """Refresh price_cache.json using IBKR snapshots."""
+    from ib_insync import IB
+    from chad.market_data.ibkr_price_provider import IBKRPriceProvider
+
+    out_path = runtime_dir / "price_cache.json"
+    feed_state_path = runtime_dir / "feed_state.json"
+    symbols = _load_universe()
+
+    ib = IB()
+    try:
+        ib.connect("127.0.0.1", 4002, clientId=9035, timeout=15)
+        provider = IBKRPriceProvider(ib)
+        snapshots = provider.get_batch_snapshots(symbols)
+
+        prices: Dict[str, float] = {}
+        for sym, snap in snapshots.items():
+            px = snap.last if snap.last > 0 else snap.close
+            if px > 0:
+                prices[sym] = px
+
+        payload = {
+            "prices": dict(sorted(prices.items())),
+            "ts_utc": utc_now_iso(),
+            "ttl_seconds": int(ttl_seconds),
+        }
+        atomic_write_json(out_path, payload)
+
+        # Write feed_state.json with ibkr_stocks key
+        feed_state = {
+            "feeds": {
+                "ibkr_stocks": {
+                    "freshness_seconds": 0.0,
+                    "last_update_ts_utc": utc_now_iso(),
+                }
+            },
+            "ts_utc": utc_now_iso(),
+            "ttl_seconds": 180,
+        }
+        atomic_write_json(feed_state_path, feed_state)
+
+        print(f"[price_cache_refresh] IBKR wrote {out_path}")
+        print(f"  symbols_written={len(prices)}")
+        print(f"  spy_price={prices.get('SPY')}")
+        return 0
+
+    except Exception as exc:
+        print(f"[price_cache_refresh] IBKR error: {exc}")
+        return 1
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Refresh runtime/price_cache.json from Polygon NDJSON feed")
+    ap = argparse.ArgumentParser(description="Refresh runtime/price_cache.json")
     ap.add_argument("--feed-dir", default="/home/ubuntu/chad_finale/data/feeds")
     ap.add_argument("--runtime-dir", default="/home/ubuntu/chad_finale/runtime")
     ap.add_argument("--tail-lines", type=int, default=DEFAULT_TAIL_LINES)
     ap.add_argument("--ttl-seconds", type=int, default=DEFAULT_TTL_SECONDS)
+    ap.add_argument("--provider", default=None, help="Force provider: ibkr or polygon")
     args = ap.parse_args()
 
-    feed_dir = Path(args.feed_dir).resolve()
     runtime_dir = Path(args.runtime_dir).resolve()
+    provider = args.provider or _get_provider()
+
+    if provider == "ibkr":
+        return _refresh_ibkr(runtime_dir, args.ttl_seconds)
+
+    # Legacy Polygon path
+    feed_dir = Path(args.feed_dir).resolve()
     out_path = runtime_dir / "price_cache.json"
 
     feed = find_latest_feed(feed_dir)
