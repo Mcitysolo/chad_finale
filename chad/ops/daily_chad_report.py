@@ -453,6 +453,12 @@ class DailyCHADReport:
         self._trades_dir = trades_dir or (self._root / "data" / "trades")
         self._runtime_dir = self._root / "runtime"
 
+    async def send_to_telegram(self) -> bool:
+        """Generate the daily report and send it via Telegram."""
+        message = self.generate()
+        _send_telegram(message)
+        return True
+
     def generate(self) -> str:
         """Generate the full daily report as a single string."""
         now = _utc_now()
@@ -674,6 +680,12 @@ class MorningBrief:
 
     def __init__(self, repo_root: Optional[Path] = None):
         self._root = repo_root or REPO_ROOT
+
+    async def send_to_telegram(self) -> bool:
+        """Generate the morning brief and send it via Telegram."""
+        message = self.generate()
+        _send_telegram(message)
+        return True
 
     def generate(self) -> str:
         vix = _get_vix()
