@@ -14,7 +14,8 @@ Design goals:
   (LLMClient Protocol from advisory_engine.py).
 
 Tier routing:
-    TIER 1 — "routine":  claude-haiku-4-5-20251001  (fast, cheap)
+    TIER 0 — "routine":  OllamaClient (phi3:mini, local, free) if available
+    TIER 1 — "routine":  claude-haiku-4-5-20251001  (fast, cheap — fallback)
     TIER 2 — "standard": claude-haiku-4-5-20251001  (default for most advisory)
     TIER 3 — "complex":  claude-sonnet-4-6           (full portfolio analysis)
 
@@ -665,3 +666,150 @@ Provide a clear, practical advisory response. Be direct and risk-aware."""
     @property
     def config(self) -> ClaudeConfig:
         return self._config
+
+
+# ===================================================================== #
+# OllamaClient — local model tier for routine tasks
+# ===================================================================== #
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "phi3:mini")
+OLLAMA_TIMEOUT_SEC = 30.0
+
+_ollama_logger = logging.getLogger("chad.ollama")
+
+
+class OllamaClient:
+    """
+    Local Ollama model client for lightweight routine tasks.
+
+    Provides the same chat_json() interface as ClaudeClient for tier routing.
+    Falls back gracefully if Ollama is not running.
+    """
+
+    def __init__(
+        self,
+        base_url: str = OLLAMA_URL,
+        model: str = OLLAMA_MODEL,
+        timeout: float = OLLAMA_TIMEOUT_SEC,
+    ):
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._timeout = timeout
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if Ollama is running and has a model loaded."""
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                f"{OLLAMA_URL}/api/tags",
+                headers={"User-Agent": "chad-ollama/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = [m.get("name", "") for m in data.get("models", [])]
+                return any(OLLAMA_MODEL.split(":")[0] in m for m in models)
+        except Exception:
+            return False
+
+    def chat_json(
+        self,
+        prompt: str,
+        *,
+        task_type: str = "routine",
+        system: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Send a prompt to Ollama and parse JSON response.
+
+        Compatible with ClaudeClient.chat_json() interface.
+        """
+        import urllib.request
+
+        full_prompt = prompt
+        if system:
+            full_prompt = f"{system}\n\n{prompt}"
+
+        payload = json.dumps({
+            "model": self._model,
+            "prompt": full_prompt + "\n\nRespond ONLY with valid JSON, no extra text.",
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": 256},
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{self._base_url}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "chad-ollama/1.0"},
+        )
+
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+
+            text = str(raw.get("response", "")).strip()
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            _ollama_logger.info(
+                "ollama.ok model=%s elapsed_ms=%d len=%d",
+                self._model, elapsed_ms, len(text),
+            )
+
+            # Extract JSON from response (may have markdown wrapping)
+            return _extract_json(text)
+
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            _ollama_logger.warning("ollama.error model=%s elapsed_ms=%d err=%s", self._model, elapsed_ms, exc)
+            raise
+
+    def generate(self, prompt: str, *, max_tokens: int = 256) -> str:
+        """Raw text generation without JSON parsing."""
+        import urllib.request
+
+        payload = json.dumps({
+            "model": self._model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": max_tokens},
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{self._base_url}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "chad-ollama/1.0"},
+        )
+
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        return str(raw.get("response", "")).strip()
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    """Extract JSON from text that may contain markdown code fences."""
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting from code fences
+    import re
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # Try finding first { ... } block
+    brace_start = text.find("{")
+    brace_end = text.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        try:
+            return json.loads(text[brace_start:brace_end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    return {"raw_text": text}

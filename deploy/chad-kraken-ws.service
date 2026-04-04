@@ -1,0 +1,20 @@
+[Unit]
+Description=CHAD Kraken WebSocket Real-Time Crypto Feed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONUNBUFFERED=1
+Environment=CHAD_RUNTIME_DIR=/home/ubuntu/chad_finale/runtime
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.kraken_ws_client
+Restart=always
+RestartSec=5
+SyslogIdentifier=chad-kraken-ws
+
+[Install]
+WantedBy=multi-user.target
