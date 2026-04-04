@@ -572,6 +572,8 @@ Core job:
 - If data is incomplete, say what is missing
 - Do not mention internal function names or code
 - Do not expose secrets, env vars, stack traces, or file-system details unless relevant to trading logic
+- CRITICAL: Only discuss the symbol the user asked about ({request.symbol}). Do not mention, recommend, or analyze other tickers unless the user explicitly asked about them
+- Never invent stock symbols, prices, or positions not present in the provided runtime data and engine outputs
 
 Coaching instructions:
 {coaching_instructions}
@@ -857,7 +859,7 @@ class ClaudeAdvisoryClient:
             for name, result in engine_results.items()
         }
         return truncate_text(
-            f"Symbol: {request.symbol}\nQuestion: {request.user_question}\n\nEngine outputs:\n{safe_json_dumps(engine_payload)}",
+            f"Symbol: {request.symbol}\nQuestion: {request.user_question}\n\nIMPORTANT: Only discuss {request.symbol}. Do not mention other tickers not in the data below.\n\nEngine outputs:\n{safe_json_dumps(engine_payload)}",
             self._max_prompt_chars,
         )
 

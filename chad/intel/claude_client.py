@@ -626,7 +626,7 @@ Provide a clear, practical advisory response. Be direct and risk-aware."""
         try:
             text, input_tok, output_tok = self._call_claude(
                 prompt=prompt,
-                system="You are CHAD's market advisory explainer. Be clear, direct, balanced, and risk-aware. Keep responses under 600 characters.",
+                system="You are CHAD's market advisory explainer. Be clear, direct, balanced, and risk-aware. Keep responses under 600 characters. CRITICAL: Only discuss symbols the user explicitly asked about. Never mention, recommend, or analyze tickers not present in the user request or engine outputs. Never invent stock symbols, prices, or positions not in the provided data.",
                 task_type="complex",
                 max_tokens=1024,
                 temperature=0.2,
