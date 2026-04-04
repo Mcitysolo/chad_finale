@@ -307,15 +307,46 @@ def _load_price_cache() -> Dict[str, Any]:
 
 
 def _get_vix() -> Optional[float]:
+    # 1. Try price_cache.json (top-level and nested under "prices")
     cache = _load_price_cache()
-    for key in ("VIX", "^VIX", "CBOE:VIX"):
-        val = cache.get(key)
-        if val is not None:
-            return _safe_float(val)
-        if isinstance(val, dict):
-            p = val.get("price") or val.get("last") or val.get("close")
-            if p is not None:
-                return _safe_float(p)
+    for source in (cache, cache.get("prices", {})):
+        for key in ("VIX", "^VIX", "CBOE:VIX"):
+            val = source.get(key)
+            if val is not None:
+                if isinstance(val, (int, float)):
+                    return _safe_float(val)
+                if isinstance(val, dict):
+                    p = val.get("price") or val.get("last") or val.get("close")
+                    if p is not None:
+                        return _safe_float(p)
+
+    # 2. Try ibkr_status.json
+    ibkr = _read_json(RUNTIME_DIR / "ibkr_status.json")
+    if ibkr:
+        for key in ("VIX", "vix"):
+            val = ibkr.get(key)
+            if val is not None:
+                return _safe_float(val)
+
+    # 3. Try ib_insync direct query as last resort
+    try:
+        from ib_insync import IB, Index
+        ib = IB()
+        ib.connect("127.0.0.1", 4002, clientId=9099, timeout=5, readonly=True)
+        try:
+            contract = Index("VIX", "CBOE")
+            ib.qualifyContracts(contract)
+            ticker = ib.reqMktData(contract, snapshot=True)
+            ib.sleep(2)
+            if ticker.last and math.isfinite(ticker.last):
+                return float(ticker.last)
+            if ticker.close and math.isfinite(ticker.close):
+                return float(ticker.close)
+        finally:
+            ib.disconnect()
+    except Exception:
+        pass
+
     return None
 
 
@@ -400,6 +431,35 @@ def _generate_chads_take(
             )
 
 
+def _generate_quiet_day_take() -> str:
+    """Generate CHAD's take for weekends / no-trade days."""
+    try:
+        from chad.intel.claude_client import ClaudeClient
+
+        client = ClaudeClient.load()
+        prompt = (
+            "CHAD had a quiet day — markets were closed. Write 2 sentences telling the owner "
+            "their system is ready for Monday and what to expect. Friendly, plain English, "
+            "no jargon. Sign off warmly."
+        )
+        text, _, _ = client._call_claude(
+            prompt=prompt,
+            system=(
+                "You are CHAD, a friendly trading assistant. The owner knows nothing about "
+                "trading. Use simple language, be warm and encouraging. Keep it to 2 sentences."
+            ),
+            task_type="routine",
+            max_tokens=150,
+            temperature=0.7,
+        )
+        return text.strip()
+    except Exception:
+        return (
+            "Quiet day — markets were closed and the system took a well-deserved rest. "
+            "Everything is loaded up and ready to go when Monday rolls around."
+        )
+
+
 # ---------------------------------------------------------------------------
 # DailyCHADReport
 # ---------------------------------------------------------------------------
@@ -450,9 +510,20 @@ class DailyCHADReport:
         # Week PnL
         week_pnl = sum(t.pnl for t in week_trades)
 
-        # Win rate over all available trades
-        all_recent = week_trades if week_trades else today_trades
-        overall_win_rate = (sum(1 for t in all_recent if t.pnl > 0) / len(all_recent) * 100) if all_recent else 0.0
+        # Win rate — prefer SCR state, fall back to trade history
+        overall_win_rate = 0.0
+        scr_data = _read_json(self._runtime_dir / "scr_state.json")
+        if scr_data:
+            scr_wr = scr_data.get("win_rate")
+            if scr_wr is None:
+                stats = scr_data.get("stats")
+                if isinstance(stats, dict):
+                    scr_wr = stats.get("win_rate")
+            if scr_wr is not None:
+                overall_win_rate = _safe_float(scr_wr) * 100  # stored as 0-1 fraction
+        if overall_win_rate == 0.0:
+            all_recent = week_trades if week_trades else today_trades
+            overall_win_rate = (sum(1 for t in all_recent if t.pnl > 0) / len(all_recent) * 100) if all_recent else 0.0
 
         sections: List[str] = []
 
@@ -513,32 +584,35 @@ class DailyCHADReport:
 
         # 6. WHAT'S WORKING
         sections.append("═══ WHAT'S WORKING ═══")
-        all_strategies = [
-            "alpha", "beta", "gamma", "gamma_reversion",
-            "alpha_futures", "gamma_futures",
-            "omega", "omega_macro", "omega_vol",
-            "alpha_options", "crypto", "alpha_crypto", "delta",
-        ]
-        seen = set()
-        for strat in all_strategies:
-            # Dedupe crypto/alpha_crypto
-            label = translate_strategy(strat)
-            if label in seen:
-                continue
-            seen.add(label)
+        if total_trades == 0:
+            sections.append("All 12 strategies are loaded and ready for Monday.")
+        else:
+            all_strategies = [
+                "alpha", "beta", "gamma", "gamma_reversion",
+                "alpha_futures", "gamma_futures",
+                "omega", "omega_macro", "omega_vol",
+                "alpha_options", "crypto", "alpha_crypto", "delta",
+            ]
+            seen = set()
+            for strat in all_strategies:
+                # Dedupe crypto/alpha_crypto
+                label = translate_strategy(strat)
+                if label in seen:
+                    continue
+                seen.add(label)
 
-            pnl = strategy_pnl.get(strat, 0.0)
-            count = strategy_trades.get(strat, 0)
-            if count > 0:
-                if pnl > 0:
-                    status = f"✅ Made {_format_money(pnl)}"
-                elif pnl < 0:
-                    status = f"🔴 Lost {_format_money(abs(pnl))}"
+                pnl = strategy_pnl.get(strat, 0.0)
+                count = strategy_trades.get(strat, 0)
+                if count > 0:
+                    if pnl > 0:
+                        status = f"✅ Made {_format_money(pnl)}"
+                    elif pnl < 0:
+                        status = f"🔴 Lost {_format_money(abs(pnl))}"
+                    else:
+                        status = "⏸ Broke even"
                 else:
-                    status = "⏸ Broke even"
-            else:
-                status = "😴 No trades today"
-            sections.append(f"  {label}: {status}")
+                    status = "😴 No trades today"
+                sections.append(f"  {label}: {status}")
         sections.append("")
 
         # 7. MARKET TEMPERATURE
@@ -546,8 +620,6 @@ class DailyCHADReport:
         sections.append("(The \"fear gauge\" tells us how nervous investors are)")
         if vix is not None:
             sections.append(f"  Fear gauge (VIX): {vix:.1f} — {vix_description(vix)}")
-        else:
-            sections.append("  Fear gauge (VIX): data not available right now")
         if spy_change is not None:
             direction = "up" if spy_change >= 0 else "down"
             sections.append(f"  Stock market was {direction} {abs(spy_change):.1f}% today")
@@ -561,7 +633,8 @@ class DailyCHADReport:
         sections.append("  Mode: Practice mode (not using real money yet)")
         if overall_win_rate > 0:
             above_below = "above" if overall_win_rate >= 55 else "below"
-            sections.append(f"  Win rate: {overall_win_rate:.0f}% — {above_below} our 55% target")
+            emoji = " 🎯" if overall_win_rate >= 55 else ""
+            sections.append(f"  Win rate: {overall_win_rate:.0f}% — {above_below} our 55% target{emoji}")
         else:
             sections.append("  Win rate: not enough data yet")
         if not ready:
@@ -587,9 +660,9 @@ class DailyCHADReport:
             sections.append("  Change this week: $0")
         sections.append("")
 
-        # CHAD's Take (AI-generated, best-effort)
+        # CHAD's Take (AI-generated, best-effort — always present)
+        sections.append("═══ CHAD'S TAKE ═══")
         if total_trades > 0:
-            sections.append("═══ CHAD'S TAKE ═══")
             take = _generate_chads_take(
                 total_pnl=total_pnl,
                 total_trades=total_trades,
@@ -598,8 +671,10 @@ class DailyCHADReport:
                 vix=vix,
                 strategy_results=strategy_pnl,
             )
-            sections.append(take)
-            sections.append("")
+        else:
+            take = _generate_quiet_day_take()
+        sections.append(take)
+        sections.append("")
 
         # 10. SIGN OFF
         sections.append("See you tomorrow. Reply anytime if you have questions — just type naturally.")

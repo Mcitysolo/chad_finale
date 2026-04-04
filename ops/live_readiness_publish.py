@@ -307,6 +307,13 @@ def main() -> int:
     }
     atomic_write_json(POINTER_PATH, pointer)
 
+    # Publish to Redis state bus (non-blocking, fail-soft)
+    try:
+        from chad.core.state_bus import get_publisher
+        get_publisher().publish_live_readiness(pointer)
+    except Exception:
+        pass
+
     print(json.dumps({"ok": True, "ready_for_live": bool(ready), "report_path": str(report_path), "pointer_path": str(POINTER_PATH), "ts_utc": ts}, sort_keys=True))
     return 0
 

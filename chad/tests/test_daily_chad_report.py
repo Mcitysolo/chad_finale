@@ -271,6 +271,11 @@ class TestDailyCHADReport:
         assert "CHAD's End of Day" in msg
         assert "Quiet day" in msg or "no trades" in msg.lower()
         assert "Practice mode" in msg
+        # Fix 1: quiet days show condensed strategy line, not full breakdown
+        assert "All 12 strategies are loaded and ready for Monday." in msg
+        assert "😴 No trades today" not in msg
+        # Fix 4: CHAD's Take always present
+        assert "CHAD'S TAKE" in msg
 
     def test_winning_day(self, tmp_path):
         trades_dir = tmp_path / "trades"
@@ -352,6 +357,52 @@ class TestDailyCHADReport:
         msg = report.generate()
         assert "See you tomorrow" in msg
         assert "CHAD 🤝" in msg
+
+    def test_win_rate_from_scr(self, tmp_path):
+        """Fix 3: Win rate should be read from scr_state.json."""
+        trades_dir = tmp_path / "trades"
+        trades_dir.mkdir()
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        (runtime / "pnl_state.json").write_text(json.dumps({"account_equity": 998000}))
+        (runtime / "live_readiness.json").write_text(json.dumps({"ready_for_live": False}))
+        (runtime / "scr_state.json").write_text(json.dumps({
+            "stats": {"win_rate": 0.58},
+        }))
+
+        report = DailyCHADReport(repo_root=tmp_path, trades_dir=trades_dir)
+        msg = report.generate()
+        assert "Win rate: 58%" in msg
+        assert "above our 55% target" in msg
+        assert "🎯" in msg
+
+    def test_vix_omitted_when_unavailable(self, tmp_path):
+        """Fix 2: VIX line should be omitted, not show 'data not available'."""
+        trades_dir = tmp_path / "trades"
+        trades_dir.mkdir()
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        (runtime / "pnl_state.json").write_text(json.dumps({"account_equity": 998000}))
+        (runtime / "live_readiness.json").write_text(json.dumps({"ready_for_live": False}))
+
+        report = DailyCHADReport(repo_root=tmp_path, trades_dir=trades_dir)
+        msg = report.generate()
+        assert "data not available" not in msg
+
+    def test_chads_take_present_on_quiet_day(self, tmp_path):
+        """Fix 4: CHAD's Take should always appear, even on quiet days."""
+        trades_dir = tmp_path / "trades"
+        trades_dir.mkdir()
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        (runtime / "pnl_state.json").write_text(json.dumps({"account_equity": 998000}))
+        (runtime / "live_readiness.json").write_text(json.dumps({"ready_for_live": False}))
+
+        report = DailyCHADReport(repo_root=tmp_path, trades_dir=trades_dir)
+        msg = report.generate()
+        assert "CHAD'S TAKE" in msg
+        # Fallback text should mention quiet/rest/Monday
+        assert "quiet" in msg.lower() or "rest" in msg.lower() or "monday" in msg.lower()
 
     def test_practice_mode_label(self, tmp_path):
         trades_dir = tmp_path / "trades"

@@ -82,6 +82,10 @@ position_sync = BrokerPositionSync(ib)
 LOOP_INTERVAL_SECONDS = 60
 _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
 
+# Redis stop signal flag — set by state bus subscriber
+_redis_stop_flag = False
+_redis_stop_reason = ""
+
 
 def _write_route_decision(detail: Dict[str, Any]) -> None:
     """Write strategy_detail bridge file for orchestrator DecisionTrace pickup."""
@@ -456,7 +460,28 @@ def run_once(logger: logging.Logger) -> None:
         logger.info("All intents skipped by signal/position guard.")
 
 
+def _init_redis_stop_subscriber(logger: logging.Logger) -> None:
+    """Subscribe to Redis stop signal for immediate propagation."""
+    global _redis_stop_flag, _redis_stop_reason
+    try:
+        from chad.core.state_bus import get_subscriber
+
+        def _on_stop(data: dict) -> None:
+            global _redis_stop_flag, _redis_stop_reason
+            _redis_stop_flag = True
+            _redis_stop_reason = str(data.get("reason", "redis_stop_signal"))
+            logger.warning(
+                "STOP_SIGNAL_RECEIVED via Redis: %s", _redis_stop_reason,
+            )
+
+        get_subscriber().on_stop(_on_stop)
+        logger.info("Redis stop signal subscriber active")
+    except Exception as exc:
+        logger.info("Redis stop subscriber not available (non-fatal): %s", exc)
+
+
 def run_loop() -> None:
+    global _redis_stop_flag, _redis_stop_reason
     logger = logging.getLogger("chad.live_loop")
 
     if not logger.handlers:
@@ -469,7 +494,19 @@ def run_loop() -> None:
     logger.setLevel(logging.INFO)
     logger.info("Starting CHAD live loop")
 
+    # Subscribe to Redis stop signal for <100ms propagation
+    _init_redis_stop_subscriber(logger)
+
     while True:
+        # Check Redis stop flag before each cycle
+        if _redis_stop_flag:
+            logger.warning(
+                "STOP_SIGNAL_ACTIVE via Redis, skipping cycle: %s",
+                _redis_stop_reason,
+            )
+            time.sleep(LOOP_INTERVAL_SECONDS)
+            continue
+
         try:
             run_once(logger)
         except Exception as exc:

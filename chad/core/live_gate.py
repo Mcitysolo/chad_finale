@@ -1085,7 +1085,16 @@ def evaluate_live_gate() -> LiveGateDecision:
         reasons.append("LIVE denied by final allow flags (ibkr_enabled/ibkr_dry_run/operator flags).")
 
     ctx = LiveGateContext(exec_cfg, mode_state, shadow, operator, stop_state, profit_lock, live_readiness, execution_quality, recon, lifecycle, mutation, canary)
-    return LiveGateDecision(ctx, mode, reasons, allow_exits_only, allow_ibkr_live, allow_ibkr_paper)
+    decision = LiveGateDecision(ctx, mode, reasons, allow_exits_only, allow_ibkr_live, allow_ibkr_paper)
+
+    # Publish to Redis state bus (non-blocking, fail-soft)
+    try:
+        from chad.core.state_bus import get_publisher
+        get_publisher().publish_live_gate(decision.to_dict())
+    except Exception:
+        pass
+
+    return decision
 
 
 # ----------------------------

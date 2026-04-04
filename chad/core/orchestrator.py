@@ -650,6 +650,13 @@ class Orchestrator:
         out_path = self._settings.dynamic_caps_path
         _atomic_write_json(out_path, payload, indent=2)
 
+        # Publish to Redis state bus (non-blocking, fail-soft)
+        try:
+            from chad.core.state_bus import get_publisher
+            get_publisher().publish_dynamic_caps(payload)
+        except Exception:
+            pass
+
         caps_hash = _sha256_json(payload)
 
         total_equity = float(_finite_float(payload.get("total_equity"), 0.0))
@@ -803,6 +810,13 @@ class Orchestrator:
         # Write state file
         _atomic_write_json(FAST_LOOP_STATE_PATH, state)
 
+        # Publish fast loop heartbeat to Redis (non-blocking, fail-soft)
+        try:
+            from chad.core.state_bus import get_publisher
+            get_publisher().publish_fast_loop(state)
+        except Exception:
+            pass
+
         return state
 
     async def _run_fast_loop(self) -> None:
@@ -836,6 +850,12 @@ class Orchestrator:
                             "ibkr_bars_ok": state.get("ibkr_bars_ok"),
                         },
                     )
+                    # Write Redis health state (best-effort, ~every 7 min)
+                    try:
+                        from chad.core.state_bus import write_redis_state_json
+                        write_redis_state_json()
+                    except Exception:
+                        pass
             except Exception as exc:  # noqa: BLE001
                 self._log.warning(
                     "orchestrator.fast_loop_error",

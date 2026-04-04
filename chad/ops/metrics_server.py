@@ -441,12 +441,30 @@ def _render_prometheus(metrics: Iterable[MetricLine]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _redis_lines() -> List[MetricLine]:
+    """Redis state bus health metrics (best-effort)."""
+    out: List[MetricLine] = []
+    try:
+        from chad.core.state_bus import get_state_bus
+        bus = get_state_bus()
+        connected = bus.is_connected()
+        out.append(MetricLine("chad_redis_connected", {}, 1.0 if connected else 0.0))
+        out.append(MetricLine("chad_redis_ping_ms", {}, _finite_or_zero(bus.ping_ms())))
+        out.append(MetricLine("chad_redis_memory_used_mb", {}, _finite_or_zero(bus.memory_used_mb())))
+        out.append(MetricLine("chad_redis_messages_published", {}, float(bus.messages_published)))
+        out.append(MetricLine("chad_redis_subscriber_count", {}, float(bus.subscriber_count)))
+    except Exception:
+        out.append(MetricLine("chad_redis_connected", {}, 0.0))
+    return out
+
+
 def collect_metrics(*, days_back: int, max_trades: int) -> List[MetricLine]:
     out: List[MetricLine] = []
     out.extend(_paper_rollup_metrics(None, days_back=days_back, max_trades=max_trades))
     trades_raw = load_recent_paper_trades(days_back=days_back, max_trades=max_trades, trades_dir=None)
     out.extend(_paper_strategy_lines(trades_raw))
     out.extend(_scr_lines())
+    out.extend(_redis_lines())
     return out
 
 
