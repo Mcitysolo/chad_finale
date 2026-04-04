@@ -143,9 +143,12 @@ class IBKRPriceProvider:
             exchange = exchange_map.get(sym, "CME")
             contract = Future(symbol=sym, exchange=exchange, currency="USD")
             try:
-                qualified = self._ib.qualifyContracts(contract)
-                if qualified:
-                    return qualified[0]
+                # Resolve front-month: reqContractDetails returns all expiries,
+                # pick the nearest one to get an unambiguous contract.
+                details = self._ib.reqContractDetails(contract)
+                if details:
+                    front = min(details, key=lambda d: d.contract.lastTradeDateOrContractMonth)
+                    return front.contract
             except Exception:
                 pass
             return contract

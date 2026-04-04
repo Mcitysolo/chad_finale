@@ -11,5 +11,9 @@
     "NVDA",
     "GLD",
     "SH"
+  ],
+  "futures": [
+    {"symbol": "MES", "exchange": "CME"},
+    {"symbol": "MCL", "exchange": "NYMEX"}
   ]
 }

@@ -223,7 +223,7 @@ def _get_provider() -> str:
 
 
 def _load_universe() -> list:
-    """Load symbol universe from config/universe.json."""
+    """Load equity/ETF symbol universe from config/universe.json."""
     universe_path = Path("/home/ubuntu/chad_finale/config/universe.json")
     try:
         obj = json.loads(universe_path.read_text(encoding="utf-8"))
@@ -233,26 +233,49 @@ def _load_universe() -> list:
         return ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "NVDA", "BAC", "GLD", "SH", "IEMG", "VWO"]
 
 
+def _load_futures_universe() -> list:
+    """Load futures symbols from config/universe.json 'futures' key."""
+    universe_path = Path("/home/ubuntu/chad_finale/config/universe.json")
+    try:
+        obj = json.loads(universe_path.read_text(encoding="utf-8"))
+        futures = obj.get("futures", [])
+        return [str(f["symbol"]).strip().upper() for f in futures if isinstance(f, dict) and f.get("symbol")]
+    except Exception:
+        return []
+
+
 def _refresh_ibkr(runtime_dir: Path, ttl_seconds: int) -> int:
-    """Refresh price_cache.json using IBKR snapshots."""
+    """Refresh price_cache.json using IBKR snapshots (equities + futures)."""
     from ib_insync import IB
     from chad.market_data.ibkr_price_provider import IBKRPriceProvider
 
     out_path = runtime_dir / "price_cache.json"
     feed_state_path = runtime_dir / "feed_state.json"
-    symbols = _load_universe()
+    equity_symbols = _load_universe()
+    futures_symbols = _load_futures_universe()
 
     ib = IB()
     try:
         ib.connect("127.0.0.1", 4002, clientId=9035, timeout=15)
+        ib.reqMarketDataType(4)  # delayed-frozen for weekend/off-hours
         provider = IBKRPriceProvider(ib)
-        snapshots = provider.get_batch_snapshots(symbols)
 
         prices: Dict[str, float] = {}
+
+        # Equities/ETFs
+        snapshots = provider.get_batch_snapshots(equity_symbols, sec_type="STK")
         for sym, snap in snapshots.items():
             px = snap.last if snap.last > 0 else snap.close
             if px > 0:
                 prices[sym] = px
+
+        # Futures
+        if futures_symbols:
+            fut_snapshots = provider.get_batch_snapshots(futures_symbols, sec_type="FUT")
+            for sym, snap in fut_snapshots.items():
+                px = snap.last if snap.last > 0 else snap.close
+                if px > 0:
+                    prices[sym] = px
 
         payload = {
             "prices": dict(sorted(prices.items())),
@@ -277,6 +300,7 @@ def _refresh_ibkr(runtime_dir: Path, ttl_seconds: int) -> int:
         print(f"[price_cache_refresh] IBKR wrote {out_path}")
         print(f"  symbols_written={len(prices)}")
         print(f"  spy_price={prices.get('SPY')}")
+        print(f"  futures={[s for s in futures_symbols if s in prices]}")
         return 0
 
     except Exception as exc:
