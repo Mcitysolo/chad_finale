@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from chad.intel.gpt_client import GPTClient, GPTClientError
+from chad.intel.gpt_client import GPTClient, GPTClientError, get_ai_client
 from chad.intel.schemas import (
     ResearchScenario,
     ResearchRequestInput,
@@ -103,7 +103,10 @@ def run_research_scenario(
         GPTClientError, GPTAPIError, GPTConfigError, ValueError
     """
     if client is None:
-        client = GPTClient()  # loads config from /etc/chad/openai.env
+        try:
+            client = get_ai_client()
+        except Exception:
+            client = GPTClient()
 
     symbol = symbol.upper().strip()
     if not symbol:

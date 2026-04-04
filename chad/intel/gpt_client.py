@@ -618,6 +618,39 @@ class GPTClient:
 # ---------------------------------------------------------------------------
 
 
+def get_ai_client():
+    """
+    Factory function: return the best available AI client.
+
+    Returns ClaudeClient if ANTHROPIC_API_KEY is available,
+    falls back to GPTClient if only OPENAI_API_KEY is available.
+    Raises ConfigurationError if neither key is available.
+    """
+    # Try Claude first
+    try:
+        from chad.intel.claude_client import ClaudeClient, ClaudeConfigError, _load_claude_env_file
+        _load_claude_env_file()
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if api_key:
+            return ClaudeClient.load()
+    except Exception:
+        pass
+
+    # Fall back to OpenAI
+    try:
+        _load_openai_env_file(OPENAI_ENV_PATH)
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if api_key:
+            return GPTClient()
+    except Exception:
+        pass
+
+    from chad.intel.claude_client import ConfigurationError
+    raise ConfigurationError(
+        "No AI provider available: neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set"
+    )
+
+
 def test_connection() -> Dict[str, Any]:
     """
     Lightweight connectivity + configuration test for GPTClient.

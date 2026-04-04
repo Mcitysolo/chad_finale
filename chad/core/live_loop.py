@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -221,6 +222,76 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
         )
 
 
+_INTELLIGENCE_CACHE_PATH = Path("/home/ubuntu/chad_finale/runtime/strategy_intelligence_cache.json")
+_INTELLIGENCE_CACHE_MAX_AGE_SEC = 300  # 5 minutes
+_MIN_CONFIDENCE_THRESHOLD = 0.20
+
+
+def _apply_intelligence_bias(intents: list, logger: logging.Logger) -> list:
+    """
+    Apply strategy intelligence confidence bias to intents.
+
+    Reads cached bias from runtime/strategy_intelligence_cache.json.
+    If cache is fresh (< 5 min) and symbol has a bias entry, adjusts confidence.
+    Suppresses signals where adjusted confidence falls below threshold.
+
+    Fail-open: if cache is missing, stale, or unreadable, all intents pass through.
+    """
+    try:
+        if not _INTELLIGENCE_CACHE_PATH.exists():
+            return intents
+
+        cache_data = json.loads(_INTELLIGENCE_CACHE_PATH.read_text(encoding="utf-8"))
+        confidence_cache = cache_data.get("confidence", {})
+        if not confidence_cache:
+            return intents
+    except Exception:
+        return intents
+
+    from datetime import datetime, timezone
+
+    surviving = []
+    for intent in intents:
+        symbol = str(getattr(intent, "symbol", "") or "")
+        strategy = str(getattr(intent, "strategy", "") or "")
+
+        # Look up cache entry
+        cache_key = f"{symbol}|{strategy}"
+        entry = confidence_cache.get(cache_key)
+
+        if not isinstance(entry, dict):
+            surviving.append(intent)
+            continue
+
+        # Check freshness
+        ts_str = entry.get("ts_utc", "")
+        try:
+            cached_time = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - cached_time).total_seconds()
+            if age > _INTELLIGENCE_CACHE_MAX_AGE_SEC:
+                surviving.append(intent)
+                continue
+        except Exception:
+            surviving.append(intent)
+            continue
+
+        adjustment = float(entry.get("adjustment", 0.0))
+        base_confidence = float(getattr(intent, "confidence", 0.5) or 0.5)
+        adjusted = base_confidence + adjustment
+
+        if adjusted < _MIN_CONFIDENCE_THRESHOLD:
+            logger.info(
+                "SUPPRESSED_BY_INTELLIGENCE %s %s base=%.3f adj=%.3f threshold=%.3f reason=%s",
+                symbol, strategy, base_confidence, adjusted,
+                _MIN_CONFIDENCE_THRESHOLD, entry.get("reason", ""),
+            )
+            continue
+
+        surviving.append(intent)
+
+    return surviving
+
+
 def run_once(logger: logging.Logger) -> None:
     """
     Execute one CHAD live cycle.
@@ -304,6 +375,12 @@ def run_once(logger: logging.Logger) -> None:
     if not intents:
         logger.info("No executable intents.")
         return
+
+    # ------------------------------------------------------------------
+    # Phase 9: Optional strategy intelligence confidence bias
+    # ------------------------------------------------------------------
+    if os.environ.get("CHAD_STRATEGY_INTELLIGENCE_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        intents = _apply_intelligence_bias(intents, logger)
 
     logger.info("Executing %d intents", len(intents))
 

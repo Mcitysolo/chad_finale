@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from chad.intel.gpt_client import GPTClient
+from chad.intel.gpt_client import GPTClient, get_ai_client
 from chad.intel.schemas import LessonsLearned, LessonItem
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +244,10 @@ def run_lessons_job(
         GPTClientError, ValueError on schema failures.
     """
     if client is None:
-        client = GPTClient()
+        try:
+            client = get_ai_client()
+        except Exception:
+            client = GPTClient()
 
     trades, date_range = _collect_recent_losing_trades(
         days_back=days_back,

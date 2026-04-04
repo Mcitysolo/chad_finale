@@ -781,6 +781,123 @@ Why this matters
         return "\n".join(lines).strip()
 
 
+class ClaudeAdvisoryClient:
+    """
+    Claude-based LLMClient implementation for advisory synthesis.
+
+    Uses ClaudeClient with task_type routing:
+    - "complex" for full advisory synthesis
+    - "standard" for quick Telegram responses
+    """
+
+    def __init__(
+        self,
+        *,
+        task_type: str = "complex",
+        max_prompt_chars: int = 120_000,
+    ) -> None:
+        self._task_type = task_type
+        self._max_prompt_chars = int(max_prompt_chars)
+        self._client = None
+        self._model = "claude-sonnet-4-6"
+
+        try:
+            from chad.intel.claude_client import ClaudeClient
+            self._client = ClaudeClient.load()
+            self._model = ClaudeClient.model_for_tier(task_type)
+        except Exception:
+            pass
+
+    def synthesize(
+        self,
+        request: AdvisoryRequest,
+        runtime_state: Dict[str, Any],
+        engine_results: Dict[str, EngineResult],
+    ) -> Tuple[bool, str, Optional[str], str]:
+        prompt = self._build_prompt(request, runtime_state, engine_results)
+        prompt_preview = truncate_text(prompt, 6000)
+
+        if self._client is None:
+            return False, self._fallback_text(request, runtime_state, engine_results, "claude_client_unavailable"), self._model, prompt_preview
+
+        try:
+            engine_payload = {
+                name: {
+                    "ok": result.ok,
+                    "function_name": result.function_name,
+                    "duration_ms": result.duration_ms,
+                    "data": result.data,
+                }
+                for name, result in engine_results.items()
+            }
+            coaching = build_coaching_instructions(request)
+
+            text = self._client.synthesize(
+                engine_outputs=engine_payload,
+                user_request=request,
+                runtime_context=runtime_state,
+                coaching_profile=coaching,
+            )
+
+            if text and not text.startswith("CHAD advisory synthesis unavailable"):
+                return True, text.strip(), self._model, prompt_preview
+
+            return False, self._fallback_text(request, runtime_state, engine_results, "claude_empty_response"), self._model, prompt_preview
+        except Exception as exc:
+            return False, self._fallback_text(request, runtime_state, engine_results, f"claude_error:{type(exc).__name__}:{exc}"), self._model, prompt_preview
+
+    def _build_prompt(
+        self,
+        request: AdvisoryRequest,
+        runtime_state: Dict[str, Any],
+        engine_results: Dict[str, EngineResult],
+    ) -> str:
+        engine_payload = {
+            name: {"ok": result.ok, "data": result.data}
+            for name, result in engine_results.items()
+        }
+        return truncate_text(
+            f"Symbol: {request.symbol}\nQuestion: {request.user_question}\n\nEngine outputs:\n{safe_json_dumps(engine_payload)}",
+            self._max_prompt_chars,
+        )
+
+    def _fallback_text(
+        self,
+        request: AdvisoryRequest,
+        runtime_state: Dict[str, Any],
+        engine_results: Dict[str, EngineResult],
+        reason: str,
+    ) -> str:
+        lines: List[str] = []
+        lines.append(f"CHAD advisory fallback triggered: {reason}")
+        lines.append("")
+        lines.append(f"Question: {request.user_question}")
+        lines.append(f"Symbol: {request.symbol}")
+        lines.append("")
+        lines.append("Brain status")
+        for name, result in engine_results.items():
+            status = "OK" if result.ok else "ERROR"
+            lines.append(f"- {name}: {status}")
+        lines.append("")
+        lines.append("Claude synthesis was unavailable, so this is a local fallback summary.")
+        return "\n".join(lines).strip()
+
+
+def _build_default_llm_client() -> "LLMClient":
+    """Build the best available LLM client: Claude preferred, OpenAI fallback."""
+    try:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            from chad.intel.claude_client import _load_claude_env_file
+            _load_claude_env_file()
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if api_key:
+            return ClaudeAdvisoryClient()
+    except Exception:
+        pass
+    return OpenAIAdvisoryClient()
+
+
 # ---------------------------------------------------------------------
 # Engine resolver / runner
 # ---------------------------------------------------------------------
@@ -1122,6 +1239,24 @@ DEFAULT_ENGINE_SPECS: Tuple[EngineSpec, ...] = (
         candidate_functions=("build_synthetic_analyst",),
         timeout_seconds=8.0,
     ),
+    EngineSpec(
+        name="strategy_intelligence",
+        module_name="chad.intel.strategy_intelligence_engine",
+        candidate_functions=("run_strategy_intelligence",),
+        timeout_seconds=10.0,
+    ),
+    EngineSpec(
+        name="regime_classifier",
+        module_name="chad.intel.strategy_intelligence_engine",
+        candidate_functions=("run_regime_classifier",),
+        timeout_seconds=8.0,
+    ),
+    EngineSpec(
+        name="cross_strategy_correlation",
+        module_name="chad.intel.strategy_intelligence_engine",
+        candidate_functions=("run_cross_strategy_correlation",),
+        timeout_seconds=8.0,
+    ),
 )
 
 
@@ -1139,7 +1274,7 @@ class AdvisoryService:
     ) -> None:
         self._runtime_provider = runtime_provider or RuntimeStateProvider()
         self._engine_runner = engine_runner or EngineRunner(DEFAULT_ENGINE_SPECS)
-        self._llm_client = llm_client or OpenAIAdvisoryClient()
+        self._llm_client = llm_client or _build_default_llm_client()
 
     def run(self, request: AdvisoryRequest) -> AdvisoryResult:
         ts = utc_now_iso()

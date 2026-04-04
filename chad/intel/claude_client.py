@@ -1,0 +1,667 @@
+from __future__ import annotations
+
+"""
+CHAD Phase 9 — Claude AI Client (Global Intelligence Layer)
+
+Unified client for Anthropic Claude API with three-tier model routing,
+rate limiting, usage logging, retry with backoff, and OpenAI fallback.
+
+Design goals:
+- NEVER execute trades or touch broker / risk state directly.
+- Only produce advisory, structured outputs for higher-level modules.
+- Enforce strict timeouts, rate limits, and logging for auditability.
+- Implements both chat_json() (GPTClient-compatible) and synthesize()
+  (LLMClient Protocol from advisory_engine.py).
+
+Tier routing:
+    TIER 1 — "routine":  claude-haiku-4-5-20251001  (fast, cheap)
+    TIER 2 — "standard": claude-haiku-4-5-20251001  (default for most advisory)
+    TIER 3 — "complex":  claude-sonnet-4-6           (full portfolio analysis)
+
+Config loading:
+    Primary source: /etc/chad/claude.env (simple KEY=VALUE lines).
+    Secondary: process environment (os.environ).
+
+Expected environment variables (after normalisation):
+    ANTHROPIC_API_KEY  (required)
+"""
+
+import json
+import logging
+import os
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CLAUDE_ENV_PATH = "/etc/chad/claude.env"
+LOG_DIR_DEFAULT = "/home/ubuntu/chad_finale/logs/claude"
+USAGE_FILE = "/home/ubuntu/chad_finale/runtime/claude_usage.json"
+
+TIER_MODELS = {
+    "routine": "claude-haiku-4-5-20251001",
+    "standard": "claude-haiku-4-5-20251001",
+    "complex": "claude-sonnet-4-6",
+}
+
+DEFAULT_REQUEST_TIMEOUT_SEC = 15.0
+DEFAULT_MAX_REQUESTS_PER_MIN = 10
+DEFAULT_DAILY_TOKEN_CAP = 100_000
+MAX_RETRIES = 2
+RETRYABLE_STATUS_CODES = {429, 529, 500, 502, 503, 504}
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class ClaudeClientError(Exception):
+    """Base error type for Claude client failures."""
+
+
+class ClaudeConfigError(ClaudeClientError):
+    """Raised when required configuration is missing or invalid."""
+
+
+class ClaudeRateLimitError(ClaudeClientError):
+    """Raised when local rate limits would be exceeded."""
+
+
+class ClaudeAPIError(ClaudeClientError):
+    """Raised when the Claude API returns an error or invalid response."""
+
+
+class ConfigurationError(ClaudeClientError):
+    """Raised when no AI provider is available."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClaudeConfig:
+    api_key: str
+    request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC
+    max_requests_per_min: int = DEFAULT_MAX_REQUESTS_PER_MIN
+    daily_token_cap: int = DEFAULT_DAILY_TOKEN_CAP
+
+
+@dataclass
+class _RateLimiterState:
+    minute_window_start: float = 0.0
+    minute_requests: int = 0
+    day_window_start: float = 0.0
+    day_tokens_used: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_claude_env_file(path: str = CLAUDE_ENV_PATH) -> None:
+    """Best-effort loader for .env-style file into os.environ."""
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if key not in os.environ and value:
+                    os.environ[key] = value
+    except Exception:
+        pass
+
+
+def _get_logger() -> logging.Logger:
+    """Create or return a logger for Claude client operations."""
+    logger = logging.getLogger("chad.claude_client")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+
+    log_dir = Path(LOG_DIR_DEFAULT)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "claude_client.log"
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.propagate = True
+    logger.info("Claude client logging initialised at %s", log_path)
+    return logger
+
+
+def _approximate_tokens(*texts: str) -> int:
+    """Rough token estimator: ~4 chars per token. For local rate limiting only."""
+    total_chars = sum(len(t) for t in texts if t)
+    return max(1, total_chars // 4)
+
+
+def _write_usage_log(entry: Dict[str, Any]) -> None:
+    """Append a usage entry to runtime/claude_usage.json."""
+    usage_path = Path(USAGE_FILE)
+    usage_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if usage_path.exists():
+            data = json.loads(usage_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {"entries": []}
+        else:
+            data = {"entries": []}
+
+        entries = data.get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+
+        entries.append(entry)
+
+        # Keep last 1000 entries
+        if len(entries) > 1000:
+            entries = entries[-1000:]
+
+        data["entries"] = entries
+        data["last_updated_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        tmp = usage_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        tmp.replace(usage_path)
+    except Exception:
+        pass
+
+
+def _write_call_log(
+    *,
+    model: str,
+    task_type: str,
+    input_tokens: int,
+    output_tokens: int,
+    duration_ms: int,
+    success: bool,
+    error: Optional[str] = None,
+) -> None:
+    """Write per-call log to logs/claude/ directory."""
+    log_dir = Path(LOG_DIR_DEFAULT)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(timezone.utc)
+    date_str = ts.strftime("%Y%m%d")
+    log_path = log_dir / f"calls_{date_str}.ndjson"
+
+    entry = {
+        "ts_utc": ts.isoformat().replace("+00:00", "Z"),
+        "model": model,
+        "task_type": task_type,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "duration_ms": duration_ms,
+        "success": success,
+    }
+    if error:
+        entry["error"] = error
+
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+
+    # Also update usage tracking
+    _write_usage_log(entry)
+
+
+# ---------------------------------------------------------------------------
+# Claude Client
+# ---------------------------------------------------------------------------
+
+
+class ClaudeClient:
+    """
+    Production-grade Claude API client for CHAD.
+
+    - Three-tier model routing based on task complexity.
+    - Rate limiting (10 req/min, 100K tokens/day).
+    - 15s timeout per call.
+    - 2 retries with exponential backoff on 529/overload.
+    - Fallback to OpenAI if Claude unavailable.
+    - Full usage logging.
+    """
+
+    def __init__(
+        self,
+        config: Optional[ClaudeConfig] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._config = config or self._load_config_from_env()
+        self._logger = logger or _get_logger()
+        self._client = self._build_anthropic_client()
+
+        now = time.monotonic()
+        self._rate_state = _RateLimiterState(
+            minute_window_start=now,
+            minute_requests=0,
+            day_window_start=now,
+            day_tokens_used=0,
+        )
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def load(cls) -> "ClaudeClient":
+        """Factory classmethod: load key from /etc/chad/claude.env or environment."""
+        return cls()
+
+    @classmethod
+    def load_key(cls) -> str:
+        """Read ANTHROPIC_API_KEY from /etc/chad/claude.env or environment."""
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            _load_claude_env_file()
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not key:
+            raise ClaudeConfigError("ANTHROPIC_API_KEY is not set or empty")
+        return key
+
+    @staticmethod
+    def _load_config_from_env() -> ClaudeConfig:
+        """Load Claude configuration from environment variables."""
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            _load_claude_env_file()
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not api_key:
+            raise ClaudeConfigError("ANTHROPIC_API_KEY is not set or empty")
+
+        return ClaudeConfig(api_key=api_key)
+
+    def _build_anthropic_client(self) -> Any:
+        """Build the anthropic.Anthropic client instance."""
+        try:
+            import anthropic
+            return anthropic.Anthropic(
+                api_key=self._config.api_key,
+                timeout=self._config.request_timeout_sec,
+            )
+        except Exception as exc:
+            self._logger.warning("Failed to build Anthropic client: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Tier routing
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def model_for_tier(task_type: str) -> str:
+        """Return model ID for a given task type tier."""
+        return TIER_MODELS.get(task_type, TIER_MODELS["standard"])
+
+    # ------------------------------------------------------------------ #
+    # Rate limiting
+    # ------------------------------------------------------------------ #
+
+    def _enforce_rate_limits(self, *, estimated_tokens: int) -> None:
+        """Enforce per-minute and per-day limits. Raises ClaudeRateLimitError."""
+        now = time.monotonic()
+        state = self._rate_state
+
+        minute_elapsed = now - state.minute_window_start
+        if minute_elapsed >= 60.0:
+            state.minute_window_start = now
+            state.minute_requests = 0
+
+        day_elapsed = now - state.day_window_start
+        if day_elapsed >= 24 * 3600.0:
+            state.day_window_start = now
+            state.day_tokens_used = 0
+
+        if state.minute_requests + 1 > self._config.max_requests_per_min:
+            raise ClaudeRateLimitError(
+                f"Local Claude rate limit exceeded: {self._config.max_requests_per_min} requests per minute"
+            )
+
+        if state.day_tokens_used + estimated_tokens > self._config.daily_token_cap:
+            raise ClaudeRateLimitError(
+                f"Local Claude daily token cap exceeded: {self._config.daily_token_cap} tokens"
+            )
+
+        state.minute_requests += 1
+        state.day_tokens_used += estimated_tokens
+
+    def _update_token_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Update daily token usage from API response."""
+        total = input_tokens + output_tokens
+        if total > 0:
+            self._rate_state.day_tokens_used += total
+
+    # ------------------------------------------------------------------ #
+    # Core API call
+    # ------------------------------------------------------------------ #
+
+    def _call_claude(
+        self,
+        *,
+        prompt: str,
+        system: Optional[str] = None,
+        task_type: str = "standard",
+        max_tokens: int = 2048,
+        temperature: float = 0.1,
+    ) -> Tuple[str, int, int]:
+        """
+        Make a single Claude API call with retries.
+
+        Returns: (response_text, input_tokens, output_tokens)
+        Raises: ClaudeAPIError on failure after retries.
+        """
+        if self._client is None:
+            raise ClaudeAPIError("Anthropic client not initialised")
+
+        model = self.model_for_tier(task_type)
+        messages = [{"role": "user", "content": prompt}]
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages,
+        }
+        if system:
+            kwargs["system"] = system
+
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, MAX_RETRIES + 2):  # 1 initial + MAX_RETRIES
+            try:
+                response = self._client.messages.create(**kwargs)
+
+                text_parts = []
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text_parts.append(block.text)
+
+                text = "\n".join(text_parts).strip()
+                input_tok = getattr(response.usage, "input_tokens", 0)
+                output_tok = getattr(response.usage, "output_tokens", 0)
+
+                return text, input_tok, output_tok
+
+            except Exception as exc:
+                last_error = exc
+                exc_str = str(exc).lower()
+
+                # Check if retryable
+                is_retryable = any(
+                    frag in exc_str
+                    for frag in ["529", "overload", "rate_limit", "timeout", "500", "502", "503", "504"]
+                )
+
+                if not is_retryable or attempt > MAX_RETRIES:
+                    break
+
+                backoff = min(2 ** attempt, 8) + 0.1 * attempt
+                self._logger.warning(
+                    "Retryable Claude API error (attempt %d/%d): %s; backing off %.2fs",
+                    attempt, MAX_RETRIES + 1, exc, backoff,
+                )
+                time.sleep(backoff)
+
+        raise ClaudeAPIError(f"Claude API failed after {MAX_RETRIES + 1} attempts: {last_error}") from last_error
+
+    # ------------------------------------------------------------------ #
+    # OpenAI fallback
+    # ------------------------------------------------------------------ #
+
+    def _try_openai_fallback(
+        self,
+        *,
+        prompt: str,
+        system: Optional[str] = None,
+    ) -> Optional[str]:
+        """Attempt to call OpenAI as fallback if key is available."""
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            return None
+
+        try:
+            from chad.intel.gpt_client import GPTClient
+            client = GPTClient()
+            result = client.chat_json(
+                system_prompt=system or "You are a helpful financial analyst. Respond in JSON.",
+                user_prompt=prompt,
+                temperature=0.1,
+                max_output_tokens=1024,
+            )
+            return json.dumps(result)
+        except Exception as exc:
+            self._logger.warning("OpenAI fallback also failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Public API: chat_json
+    # ------------------------------------------------------------------ #
+
+    def chat_json(
+        self,
+        prompt: Optional[str] = None,
+        *,
+        system: Optional[str] = None,
+        task_type: str = "standard",
+        schema: Optional[Dict[str, Any]] = None,
+        # GPTClient-compatible kwargs for drop-in replacement
+        system_prompt: Optional[str] = None,
+        user_prompt: Optional[str] = None,
+        temperature: float = 0.1,
+        max_output_tokens: int = 2048,
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Call Claude with a prompt and expect a JSON object response.
+
+        Compatible with both ClaudeClient and GPTClient call signatures:
+        - ClaudeClient style: chat_json(prompt, system=..., task_type=...)
+        - GPTClient style: chat_json(system_prompt=..., user_prompt=..., extra_context=...)
+
+        Returns: Parsed JSON dict.
+        Raises: ClaudeRateLimitError, ClaudeAPIError, ClaudeClientError.
+        """
+        # Normalize GPTClient-compatible kwargs
+        if prompt is None and user_prompt is not None:
+            prompt = user_prompt
+        if system is None and system_prompt is not None:
+            system = system_prompt
+
+        if not prompt or not prompt.strip():
+            raise ClaudeClientError("prompt must not be empty")
+
+        # Build system prompt with JSON instruction
+        sys_parts = []
+        if system:
+            sys_parts.append(system)
+        sys_parts.append("Respond with a single valid JSON object. No markdown fences, no commentary outside the JSON.")
+        if schema:
+            sys_parts.append(f"Expected JSON schema:\n{json.dumps(schema, indent=2)}")
+        full_system = "\n\n".join(sys_parts)
+
+        estimated_tokens = _approximate_tokens(prompt, full_system)
+
+        with self._lock:
+            self._enforce_rate_limits(estimated_tokens=estimated_tokens)
+
+        model = self.model_for_tier(task_type)
+        t0 = time.monotonic()
+        input_tok = 0
+        output_tok = 0
+
+        try:
+            text, input_tok, output_tok = self._call_claude(
+                prompt=prompt,
+                system=full_system,
+                task_type=task_type,
+            )
+        except ClaudeAPIError:
+            # Try OpenAI fallback
+            fallback = self._try_openai_fallback(prompt=prompt, system=full_system)
+            if fallback is not None:
+                text = fallback
+                model = "openai_fallback"
+                self._logger.info("Used OpenAI fallback for chat_json")
+            else:
+                # Return structured fallback
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                _write_call_log(
+                    model=model, task_type=task_type,
+                    input_tokens=0, output_tokens=0,
+                    duration_ms=elapsed_ms, success=False,
+                    error="all_providers_unavailable",
+                )
+                return {
+                    "error": "all_ai_providers_unavailable",
+                    "fallback": True,
+                    "message": "Claude and OpenAI both unavailable. Manual analysis required.",
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+        with self._lock:
+            self._update_token_usage(input_tok, output_tok)
+
+        _write_call_log(
+            model=model, task_type=task_type,
+            input_tokens=input_tok, output_tokens=output_tok,
+            duration_ms=elapsed_ms, success=True,
+        )
+
+        self._logger.info(
+            "chat_json completed in %dms (model=%s, task_type=%s, in=%d, out=%d)",
+            elapsed_ms, model, task_type, input_tok, output_tok,
+        )
+
+        # Parse JSON from response
+        try:
+            # Strip markdown fences if present
+            clean = text.strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                # Remove first and last fence lines
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                clean = "\n".join(lines).strip()
+
+            parsed = json.loads(clean)
+            if not isinstance(parsed, dict):
+                raise ValueError("Top-level JSON is not an object")
+            return parsed
+        except Exception as exc:
+            self._logger.error(
+                "Failed to parse JSON from Claude response: %s; raw=%r",
+                exc, text[:512],
+            )
+            raise ClaudeAPIError("Failed to parse Claude JSON response") from exc
+
+    # ------------------------------------------------------------------ #
+    # Public API: synthesize (LLMClient Protocol)
+    # ------------------------------------------------------------------ #
+
+    def synthesize(
+        self,
+        engine_outputs: Dict[str, Any],
+        user_request: Any,
+        runtime_context: Dict[str, Any],
+        coaching_profile: str,
+    ) -> str:
+        """
+        Synthesize engine outputs into a user-facing advisory text.
+
+        Matches the LLMClient Protocol signature from advisory_engine.py.
+        This is the raw synthesis method — ClaudeAdvisoryClient wraps this
+        with the full advisory_engine protocol.
+        """
+        prompt = f"""You are CHAD's advisory synthesis layer.
+
+Coaching instructions:
+{coaching_profile}
+
+User request:
+{json.dumps({"symbol": getattr(user_request, "symbol", str(user_request)), "question": getattr(user_request, "user_question", str(user_request))}, default=str)}
+
+Runtime context:
+{json.dumps(runtime_context, indent=2, default=str)[:8000]}
+
+Engine outputs:
+{json.dumps(engine_outputs, indent=2, default=str)[:16000]}
+
+Provide a clear, practical advisory response. Be direct and risk-aware."""
+
+        estimated_tokens = _approximate_tokens(prompt)
+
+        with self._lock:
+            self._enforce_rate_limits(estimated_tokens=estimated_tokens)
+
+        t0 = time.monotonic()
+        try:
+            text, input_tok, output_tok = self._call_claude(
+                prompt=prompt,
+                system="You are CHAD's market advisory explainer. Be clear, direct, balanced, and risk-aware. Keep responses under 600 characters.",
+                task_type="complex",
+                max_tokens=1024,
+                temperature=0.2,
+            )
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+            with self._lock:
+                self._update_token_usage(input_tok, output_tok)
+
+            _write_call_log(
+                model=self.model_for_tier("complex"),
+                task_type="synthesize",
+                input_tokens=input_tok, output_tokens=output_tok,
+                duration_ms=elapsed_ms, success=True,
+            )
+
+            return text
+
+        except Exception as exc:
+            self._logger.warning("Claude synthesize failed: %s", exc)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            _write_call_log(
+                model=self.model_for_tier("complex"),
+                task_type="synthesize",
+                input_tokens=0, output_tokens=0,
+                duration_ms=elapsed_ms, success=False,
+                error=str(exc),
+            )
+            return f"CHAD advisory synthesis unavailable: {type(exc).__name__}"
+
+    # ------------------------------------------------------------------ #
+    # Properties
+    # ------------------------------------------------------------------ #
+
+    @property
+    def config(self) -> ClaudeConfig:
+        return self._config
