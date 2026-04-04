@@ -229,15 +229,15 @@ def _load_live_context(symbol: str) -> Dict[str, Any]:
 
 
 def _load_recent_headlines(symbol: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Fetch recent headlines via Alpaca News API (replaces Polygon)."""
+    """Fetch recent headlines via Yahoo Finance (replaces Alpaca)."""
     symbol = str(symbol or "").strip().upper()
     if not symbol:
         return []
 
     try:
-        from chad.market_data.alpaca_news_provider import AlpacaNewsProvider
+        from chad.market_data.yahoo_news_provider import YahooNewsProvider
 
-        provider = AlpacaNewsProvider()
+        provider = YahooNewsProvider()
         items = provider.get_headlines(symbols=[symbol], limit=max(1, min(int(limit), 5)))
 
         out: List[Dict[str, Any]] = []

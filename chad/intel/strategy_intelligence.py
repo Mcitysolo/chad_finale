@@ -207,10 +207,10 @@ class StrategyIntelligence:
         }
 
     def _load_news_headlines(self, symbols: Optional[List[str]] = None) -> List[Dict[str, str]]:
-        """Load recent Alpaca news headlines."""
+        """Load recent Yahoo Finance news headlines."""
         try:
-            from chad.market_data.alpaca_news_provider import AlpacaNewsProvider
-            provider = AlpacaNewsProvider()
+            from chad.market_data.yahoo_news_provider import YahooNewsProvider
+            provider = YahooNewsProvider()
             items = provider.get_headlines(symbols=symbols or [], limit=5)
             return [
                 {"headline": item.headline, "published_utc": item.published_utc}

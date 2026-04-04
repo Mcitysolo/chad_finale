@@ -143,24 +143,18 @@ def _holding_balance_label(position_value_usd: Optional[float], portfolio_value_
 
 
 def _headline_tone(symbol: str, limit: int = 5) -> Dict[str, Any]:
-    """Fetch headline tone via Alpaca News (replaces Polygon)."""
+    """Fetch headline tone via Yahoo Finance (replaces Alpaca)."""
     try:
-        from chad.market_data.alpaca_news_provider import AlpacaNewsProvider
+        from chad.market_data.yahoo_news_provider import YahooNewsProvider
 
-        provider = AlpacaNewsProvider()
-        if not provider.configured:
-            return {
-                "label": "unknown",
-                "headlines_used": [],
-                "notes": ["alpaca_api_key_missing"],
-            }
+        provider = YahooNewsProvider()
 
         items = provider.get_headlines(symbols=[symbol], limit=max(1, min(int(limit), 5)))
         if not items:
             return {
                 "label": "unknown",
                 "headlines_used": [],
-                "notes": ["alpaca_no_results"],
+                "notes": ["yahoo_no_results"],
             }
 
         used: List[Dict[str, Any]] = []

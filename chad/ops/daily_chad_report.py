@@ -613,6 +613,17 @@ class DailyCHADReport:
                 sections.append(f"  Stock market was {direction} {abs(spy_change):.1f}% today")
             if btc_price is not None:
                 sections.append(f"  Bitcoin: {_format_money(btc_price)}")
+            # News headlines (Yahoo Finance — no API key needed)
+            try:
+                from chad.market_data.yahoo_news_provider import YahooNewsProvider
+                _news = YahooNewsProvider().get_market_headlines(limit=3)
+                if _news:
+                    sections.append("")
+                    sections.append("  \U0001f4f0 In the news today:")
+                    for _h in _news:
+                        sections.append(f"    \u2022 {_h.headline[:100]}")
+            except Exception:
+                pass
             sections.append("")
 
         # 8. CHAD STATUS
