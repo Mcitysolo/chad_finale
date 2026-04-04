@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-CHAD GPT Client (Phase 10 – Global Intelligence Layer)
+CHAD AI Client (Phase 10 – Global Intelligence Layer)
 
 This module provides a safe, rate-limited wrapper around the OpenAI Chat
 Completions API for CHAD's "Global Intelligence Layer".

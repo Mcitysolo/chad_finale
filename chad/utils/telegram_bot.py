@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-CHAD Telegram Bot — Production-Grade Read-Only Coach + CHADGPT Layer
+CHAD Telegram Bot — Production-Grade Read-Only Coach + CHAD Intelligence Layer
 
 What this bot does
 ------------------
@@ -761,7 +761,7 @@ def fmt_portfolio_rebalance(payload: Dict[str, Any]) -> str:
 def render_advisory_answer(result: Dict[str, Any]) -> str:
     analysis = str(result.get("analysis_text") or "").strip()
 
-    lines = ["<b>CHADGPT</b>", ""]
+    lines = ["<b>CHAD</b>", ""]
     if analysis:
         lines.append(escape_html(analysis))
     else:
@@ -1020,7 +1020,7 @@ def cmd_help(update: Update, context: CallbackContext) -> None:
         /price AAPL
         /ai_research AAPL what is the macro risk?
 
-        <b>Freeform CHADGPT</b>
+        <b>CHAD Free-Text Advisory</b>
         Ask:
         should i buy aapl right now?
         what do you think about nvda over 3 months
@@ -1166,13 +1166,13 @@ def cmd_advisory(update: Update, context: CallbackContext) -> None:
 
 
 # =============================================================================
-# CHADGPT free-text advisory
+# CHAD free-text advisory
 # =============================================================================
 
 def handle_advisory_chat(update: Update, context: CallbackContext, text: str) -> None:
     question = (text or "").strip()
     if not question:
-        send_message(update, context, "<b>CHADGPT</b>\n\nPlease send a real question.")
+        send_message(update, context, "<b>CHAD</b>\n\nPlease send a real question or ask me anything about your portfolio.")
         return
 
     question = question[:ADVISORY_MAX_QUESTION_CHARS]
@@ -1241,7 +1241,7 @@ def handle_advisory_chat(update: Update, context: CallbackContext, text: str) ->
 
     except Exception as exc:
         LOGGER.exception("telegram_advisory_failed symbol=%s question=%r err=%s", symbol, question, exc)
-        send_message(update, context, "<b>CHADGPT ERROR</b>\n\n" + escape_html(str(exc)))
+        send_message(update, context, "<b>CHAD ERROR</b>\n\n" + escape_html(str(exc)))
 
 
 # =============================================================================
