@@ -13,7 +13,35 @@
     "SH"
   ],
   "futures": [
-    {"symbol": "MES", "exchange": "CME"},
-    {"symbol": "MCL", "exchange": "NYMEX"}
+    {
+      "symbol": "MES",
+      "exchange": "CME",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "MCL",
+      "exchange": "NYMEX",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "MNQ",
+      "exchange": "CME",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "MGC",
+      "exchange": "COMEX",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "ZN",
+      "exchange": "CBOT",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "ZB",
+      "exchange": "CBOT",
+      "sec_type": "FUT"
+    }
   ]
 }
