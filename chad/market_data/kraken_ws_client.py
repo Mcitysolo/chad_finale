@@ -292,6 +292,7 @@ class KrakenWSClient:
                     ticks_snapshot = {sym: asdict(tick) for sym, tick in self._ticks.items()}
 
                 payload = {
+                    "connected": self._connected,
                     "prices": dict(sorted(prices.items())),
                     "ticks": ticks_snapshot,
                     "ts_utc": now,
