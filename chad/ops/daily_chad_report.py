@@ -698,13 +698,66 @@ class MorningBrief:
         _send_telegram(message)
         return True
 
+    def _scan_opportunities(self) -> Optional[str]:
+        """
+        Scan overnight data for opportunities worth watching.
+
+        Reads price_cache, trends_state, and kraken_prices, then asks
+        Claude Haiku for 2-3 concise observations. Fails silently.
+        """
+        try:
+            runtime = self._root / "runtime"
+            price_cache = _read_json(runtime / "price_cache.json") or {}
+            trends_state = _read_json(runtime / "trends_state.json") or {}
+            kraken_prices = _read_json(runtime / "kraken_prices.json") or {}
+
+            # Build context snapshot
+            context_parts = []
+            if price_cache:
+                context_parts.append(f"Price cache (overnight): {json.dumps(price_cache, default=str)[:2000]}")
+            trends_signals = trends_state.get("signals", {})
+            if trends_signals:
+                context_parts.append(f"Google Trends signals: {json.dumps(trends_signals, default=str)[:1000]}")
+            if kraken_prices:
+                context_parts.append(f"Crypto prices (Kraken): {json.dumps(kraken_prices, default=str)[:1000]}")
+
+            if not context_parts:
+                return None
+
+            from chad.intel.claude_client import ClaudeClient
+            client = ClaudeClient.load()
+
+            prompt = (
+                "You are CHAD. Based on this overnight data, identify 2-3 instruments "
+                "worth watching today and why. Be specific and direct. Plain English. "
+                "No jargon. Each point max 1 sentence.\n\n"
+                + "\n\n".join(context_parts)
+            )
+
+            text, _, _ = client._call_claude(
+                prompt=prompt,
+                system=(
+                    "You are CHAD, a trading system's intelligence layer. "
+                    "Return 2-3 bullet points, each starting with the instrument symbol. "
+                    "Be specific about price levels and percentages. No markdown. "
+                    "Format: SYMBOL: observation"
+                ),
+                task_type="routine",
+                max_tokens=250,
+                temperature=0.3,
+            )
+            return text.strip() if text.strip() else None
+        except Exception as exc:
+            logging.getLogger("chad.morning_brief").debug("Opportunity scan failed: %s", exc)
+            return None
+
     def generate(self) -> str:
         vix = _get_vix()
         spy_price = _get_price("SPY")
         btc_price = _get_price("BTC-USD")
 
         lines: List[str] = []
-        lines.append("☀️ Good morning! Markets open in 30 minutes.")
+        lines.append("\u2600\ufe0f Good morning! Markets open in 30 minutes.")
         lines.append("")
         lines.append("Here's what I'm watching today:")
 
@@ -712,14 +765,14 @@ class MorningBrief:
             spy_change = _get_spy_change()
             if spy_change is not None:
                 direction = "up" if spy_change >= 0 else "down"
-                lines.append(f"- Stock market (SPY): {_format_money(spy_price)} — {direction} overnight")
+                lines.append(f"- Stock market (SPY): {_format_money(spy_price)} \u2014 {direction} overnight")
             else:
                 lines.append(f"- Stock market (SPY): {_format_money(spy_price)}")
         else:
             lines.append("- Stock market (SPY): waiting for data")
 
         if vix is not None:
-            lines.append(f"- Fear gauge (VIX): {vix:.1f} — {vix_description(vix)}")
+            lines.append(f"- Fear gauge (VIX): {vix:.1f} \u2014 {vix_description(vix)}")
         else:
             lines.append("- Fear gauge (VIX): waiting for data")
 
@@ -728,9 +781,22 @@ class MorningBrief:
         else:
             lines.append("- Bitcoin: waiting for data")
 
+        # Opportunity scan — AI-generated watchlist
+        opps = self._scan_opportunities()
+        if opps:
+            lines.append("")
+            lines.append("\U0001f440 Worth watching today:")
+            for line in opps.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    # Normalize to bullet format
+                    if not stripped.startswith("\u2022"):
+                        stripped = f"\u2022 {stripped}"
+                    lines.append(f"  {stripped}")
+
         lines.append("")
         lines.append("I'm ready to trade. I'll send you a full report at the end of the day.")
-        lines.append("— CHAD 🤝")
+        lines.append("\u2014 CHAD \U0001f91d")
 
         return "\n".join(lines)
 

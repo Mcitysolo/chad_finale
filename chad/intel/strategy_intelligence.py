@@ -206,6 +206,49 @@ class StrategyIntelligence:
             "execution_quality": exec_quality,
         }
 
+    def _get_trends_adjustment(self, symbol: str, strategy_name: str) -> float:
+        """
+        Get confidence adjustment from Google Trends data.
+
+        HIGH interest (ratio > 1.5):
+          +0.05 for momentum strategies (alpha, gamma)
+          -0.05 for reversion strategies (gamma_reversion)
+        LOW interest (ratio < 0.5):
+          -0.05 for momentum strategies
+          +0.05 for reversion strategies
+        Returns 0.0 on any error or NEUTRAL signal.
+        """
+        try:
+            trends_state = _read_json(self._runtime_dir / "trends_state.json")
+            signals = trends_state.get("signals", {})
+            sig = signals.get(symbol)
+            if not sig or not isinstance(sig, dict):
+                return 0.0
+
+            signal = sig.get("signal", "NEUTRAL")
+            if signal == "NEUTRAL":
+                return 0.0
+
+            momentum_strategies = {"alpha", "gamma", "alpha_futures", "gamma_futures"}
+            reversion_strategies = {"gamma_reversion"}
+
+            strat = strategy_name.lower()
+
+            if signal == "HIGH":
+                if strat in momentum_strategies:
+                    return 0.05
+                if strat in reversion_strategies:
+                    return -0.05
+            elif signal == "LOW":
+                if strat in momentum_strategies:
+                    return -0.05
+                if strat in reversion_strategies:
+                    return 0.05
+
+            return 0.0
+        except Exception:
+            return 0.0
+
     def _load_news_headlines(self, symbols: Optional[List[str]] = None) -> List[Dict[str, str]]:
         """Load recent Yahoo Finance news headlines."""
         try:
@@ -299,9 +342,13 @@ Rules:
         if elapsed > MAX_CALL_TIMEOUT_SEC:
             LOG.warning("Confidence bias took %.1fs (>%.1fs limit)", elapsed, MAX_CALL_TIMEOUT_SEC)
 
-        # Parse and clamp
-        adjustment = _clamp(float(result.get("adjustment", 0.0)), CONFIDENCE_BIAS_MIN, CONFIDENCE_BIAS_MAX)
+        # Parse and clamp — include Google Trends adjustment
+        base_adj = float(result.get("adjustment", 0.0))
+        trends_adj = self._get_trends_adjustment(symbol, strategy_name)
+        adjustment = _clamp(base_adj + trends_adj, CONFIDENCE_BIAS_MIN, CONFIDENCE_BIAS_MAX)
         reason = str(result.get("reason", ""))[:200]
+        if trends_adj != 0.0:
+            reason = f"{reason} [trends:{'+' if trends_adj > 0 else ''}{trends_adj:.2f}]"
         macro_risk = str(result.get("macro_risk", "unknown"))
         regime = str(result.get("regime", "neutral"))
 
