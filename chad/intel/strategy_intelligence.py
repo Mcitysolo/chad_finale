@@ -249,6 +249,82 @@ class StrategyIntelligence:
         except Exception:
             return 0.0
 
+    def _get_reddit_adjustment(self, symbol: str, strategy_name: str) -> float:
+        """
+        Get confidence adjustment from Reddit sentiment data.
+
+        HYPE (>50 mentions, positive):
+          +0.05 for momentum strategies (crowded trade may continue)
+          -0.08 for reversion strategies (crowded = risky to fade)
+        BEARISH with high mentions:
+          -0.05 for momentum (negative pressure)
+          +0.03 for reversion (oversold sentiment precedes bounces)
+        Returns 0.0 on any error or NEUTRAL/low-mention signals.
+        """
+        try:
+            state = _read_json(self._runtime_dir / "reddit_sentiment.json")
+            signals = state.get("signals", {})
+            sig = signals.get(symbol)
+            if not sig or not isinstance(sig, dict):
+                return 0.0
+
+            signal = sig.get("signal", "NEUTRAL")
+            if signal == "NEUTRAL":
+                return 0.0
+
+            momentum_strategies = {"alpha", "gamma", "alpha_futures", "gamma_futures"}
+            reversion_strategies = {"gamma_reversion"}
+            strat = strategy_name.lower()
+
+            if signal == "HYPE":
+                if strat in momentum_strategies:
+                    return 0.05
+                if strat in reversion_strategies:
+                    return -0.08
+            elif signal == "BEARISH":
+                mentions = sig.get("mention_count", 0)
+                if mentions >= 10:  # meaningful volume of discussion
+                    if strat in momentum_strategies:
+                        return -0.05
+                    if strat in reversion_strategies:
+                        return 0.03
+
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def _get_short_interest_adjustment(self, symbol: str, strategy_name: str) -> float:
+        """
+        Get confidence adjustment from short interest data.
+
+        EXTREME short interest + price uptrend (squeeze):
+          +0.08 for momentum strategies (ride the squeeze)
+        HIGH short interest + price downtrend:
+          +0.04 for momentum (shorts pushing price lower)
+        Returns 0.0 on any error or LOW/MODERATE signals.
+        """
+        try:
+            state = _read_json(self._runtime_dir / "short_interest.json")
+            signals = state.get("signals", {})
+            sig = signals.get(symbol)
+            if not sig or not isinstance(sig, dict):
+                return 0.0
+
+            signal = sig.get("signal", "LOW")
+            squeeze = sig.get("squeeze_risk", False)
+
+            momentum_strategies = {"alpha", "gamma", "alpha_futures", "gamma_futures"}
+            strat = strategy_name.lower()
+
+            if signal == "EXTREME" and squeeze and strat in momentum_strategies:
+                return 0.08
+            if signal == "HIGH" and not squeeze and strat in momentum_strategies:
+                return 0.04
+
+            return 0.0
+        except Exception:
+            return 0.0
+
     def _load_news_headlines(self, symbols: Optional[List[str]] = None) -> List[Dict[str, str]]:
         """Load recent Yahoo Finance news headlines."""
         try:
@@ -342,13 +418,23 @@ Rules:
         if elapsed > MAX_CALL_TIMEOUT_SEC:
             LOG.warning("Confidence bias took %.1fs (>%.1fs limit)", elapsed, MAX_CALL_TIMEOUT_SEC)
 
-        # Parse and clamp — include Google Trends adjustment
+        # Parse and clamp — include alternative data adjustments
         base_adj = float(result.get("adjustment", 0.0))
         trends_adj = self._get_trends_adjustment(symbol, strategy_name)
-        adjustment = _clamp(base_adj + trends_adj, CONFIDENCE_BIAS_MIN, CONFIDENCE_BIAS_MAX)
+        reddit_adj = self._get_reddit_adjustment(symbol, strategy_name)
+        short_adj = self._get_short_interest_adjustment(symbol, strategy_name)
+        adjustment = _clamp(base_adj + trends_adj + reddit_adj + short_adj,
+                            CONFIDENCE_BIAS_MIN, CONFIDENCE_BIAS_MAX)
         reason = str(result.get("reason", ""))[:200]
+        adj_tags = []
         if trends_adj != 0.0:
-            reason = f"{reason} [trends:{'+' if trends_adj > 0 else ''}{trends_adj:.2f}]"
+            adj_tags.append(f"trends:{'+' if trends_adj > 0 else ''}{trends_adj:.2f}")
+        if reddit_adj != 0.0:
+            adj_tags.append(f"reddit:{'+' if reddit_adj > 0 else ''}{reddit_adj:.2f}")
+        if short_adj != 0.0:
+            adj_tags.append(f"short:{'+' if short_adj > 0 else ''}{short_adj:.2f}")
+        if adj_tags:
+            reason = f"{reason} [{','.join(adj_tags)}]"
         macro_risk = str(result.get("macro_risk", "unknown"))
         regime = str(result.get("regime", "neutral"))
 

@@ -624,6 +624,48 @@ class DailyCHADReport:
                         sections.append(f"    \u2022 {_h.headline[:100]}")
             except Exception:
                 pass
+            # Market signals (Reddit sentiment + short interest — best-effort)
+            _market_signal_lines: List[str] = []
+            try:
+                _reddit = _read_json(RUNTIME_DIR / "reddit_sentiment.json")
+                _reddit_sigs = _reddit.get("signals", {})
+                _notable_reddit = [
+                    (sym, s) for sym, s in _reddit_sigs.items()
+                    if isinstance(s, dict) and s.get("signal") in ("HYPE", "BULLISH", "BEARISH")
+                ]
+                if _notable_reddit:
+                    _top_reddit = sorted(_notable_reddit,
+                                         key=lambda x: x[1].get("mention_count", 0),
+                                         reverse=True)[:2]
+                    _sent_parts = []
+                    for _sym, _s in _top_reddit:
+                        _label = _s.get("signal", "NEUTRAL")
+                        _mc = _s.get("mention_count", 0)
+                        _sent_parts.append(f"{_sym} {_label.lower()} ({_mc} mentions)")
+                    if _sent_parts:
+                        _market_signal_lines.append(f"  \u2022 Sentiment: {', '.join(_sent_parts)}")
+            except Exception:
+                pass
+            try:
+                _short = _read_json(RUNTIME_DIR / "short_interest.json")
+                _short_sigs = _short.get("signals", {})
+                _squeeze_watch = [
+                    (sym, s) for sym, s in _short_sigs.items()
+                    if isinstance(s, dict) and (s.get("squeeze_risk") or s.get("signal") == "EXTREME")
+                ]
+                if _squeeze_watch:
+                    _sq_parts = []
+                    for _sym, _s in _squeeze_watch[:2]:
+                        _pct = _s.get("short_float_pct", 0)
+                        _sq_parts.append(f"{_sym} {_pct:.0%} short float")
+                    if _sq_parts:
+                        _market_signal_lines.append(f"  \u2022 Short squeeze watch: {', '.join(_sq_parts)}")
+            except Exception:
+                pass
+            if _market_signal_lines:
+                sections.append("")
+                sections.append("  \U0001f4e1 Market signals:")
+                sections.extend(_market_signal_lines)
             sections.append("")
 
         # 8. CHAD STATUS
@@ -711,6 +753,9 @@ class MorningBrief:
             trends_state = _read_json(runtime / "trends_state.json") or {}
             kraken_prices = _read_json(runtime / "kraken_prices.json") or {}
 
+            reddit_sentiment = _read_json(runtime / "reddit_sentiment.json") or {}
+            short_interest = _read_json(runtime / "short_interest.json") or {}
+
             # Build context snapshot
             context_parts = []
             if price_cache:
@@ -720,6 +765,12 @@ class MorningBrief:
                 context_parts.append(f"Google Trends signals: {json.dumps(trends_signals, default=str)[:1000]}")
             if kraken_prices:
                 context_parts.append(f"Crypto prices (Kraken): {json.dumps(kraken_prices, default=str)[:1000]}")
+            reddit_signals = reddit_sentiment.get("signals", {})
+            if reddit_signals:
+                context_parts.append(f"Reddit sentiment: {json.dumps(reddit_signals, default=str)[:1000]}")
+            short_signals = short_interest.get("signals", {})
+            if short_signals:
+                context_parts.append(f"Short interest: {json.dumps(short_signals, default=str)[:1000]}")
 
             if not context_parts:
                 return None
