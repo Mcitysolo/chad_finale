@@ -27,6 +27,7 @@ Strategies Covered
 - GAMMA_REVERSION  – ETF mean reversion
 - ALPHA_OPTIONS    – Vertical spread options
 - OMEGA_VOL       – Volatility regime alpha
+- DELTA_PAIRS     – Market-neutral pairs trading
 """
 
 from __future__ import annotations
@@ -57,6 +58,8 @@ from .alpha_options import alpha_options_handler
 from .alpha_options_config import build_alpha_options_config
 from .omega_vol import omega_vol_handler
 from .omega_vol_config import build_omega_vol_config
+from .delta_pairs import delta_pairs_handler
+from .delta_pairs_config import build_delta_pairs_config
 # ---------------------------------------------------------------------------
 # Protocols & Dataclasses
 # ---------------------------------------------------------------------------
@@ -174,6 +177,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.OMEGA_VOL,
             build_config=build_omega_vol_config,
             handler=omega_vol_handler,
+        ),
+        StrategyName.DELTA_PAIRS: StrategyRegistration(
+            name=StrategyName.DELTA_PAIRS,
+            build_config=build_delta_pairs_config,
+            handler=delta_pairs_handler,
         ),
     }
     return registrations
