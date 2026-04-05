@@ -1,22 +1,6 @@
 {
-  "applied_action_id": "db36b40eabbf4cfd7c6035d4",
+  "applied_action_id": "1604eab75e04f68a800d66b1",
   "previous_weights": {
-    "alpha": 0.21,
-    "alpha_futures": 0.1,
-    "alpha_options": 0.08,
-    "beta": 0.17,
-    "crypto": 0.08,
-    "delta": 0.04,
-    "gamma": 0.09,
-    "gamma_futures": 0.06,
-    "gamma_reversion": 0.05,
-    "omega": 0.07,
-    "omega_macro": 0.05
-  },
-  "reason": "OMEGA_VOL validated \u2014 5-regime vol classifier, SVXY short vol + UVXY long vol, strict decay controls",
-  "schema_version": "strategy_weights.v1",
-  "updated_ts_utc": "2026-04-03T19:47:27Z",
-  "weights": {
     "alpha": 0.2,
     "alpha_futures": 0.09,
     "alpha_options": 0.08,
@@ -29,5 +13,23 @@
     "omega": 0.07,
     "omega_macro": 0.05,
     "omega_vol": 0.06
+  },
+  "reason": "DELTA_PAIRS validated \u2014 3 correlated pairs (corr 0.94-0.99), zscore entry/exit logic, 584 tests passing. Trimmed alpha 19->16%, beta 27->25%, crypto 5->4% to fund.",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-05T02:47:04Z",
+  "weights": {
+    "alpha": 0.16,
+    "alpha_futures": 0.09,
+    "alpha_options": 0.07,
+    "beta": 0.25,
+    "crypto": 0.04,
+    "delta": 0.03,
+    "delta_pairs": 0.05,
+    "gamma": 0.07,
+    "gamma_futures": 0.05,
+    "gamma_reversion": 0.04,
+    "omega": 0.06,
+    "omega_macro": 0.04,
+    "omega_vol": 0.05
   }
 }

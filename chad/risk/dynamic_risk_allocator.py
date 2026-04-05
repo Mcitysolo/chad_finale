@@ -387,7 +387,7 @@ ALPHA_STRATEGIES = frozenset({
 })
 BETA_STRATEGIES = frozenset({"beta"})
 ADAPTIVE_STRATEGIES = frozenset({
-    "omega", "omega_macro", "omega_vol", "delta", "crypto",
+    "omega", "omega_macro", "omega_vol", "delta", "delta_pairs", "crypto",
 })
 
 ALPHA_TARGET = 0.50
