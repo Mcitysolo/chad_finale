@@ -305,7 +305,7 @@ class DynamicRiskAllocator:
 
         norm = self.strategy_allocation.normalized()
         portfolio_risk_cap = total_equity * self.daily_risk_fraction
-        # Keep payload summary consistent with compute_caps()
+        # --- PROFIT LOCK INTEGRATION (SYSTEM-LEVEL CONTROL) ---
         try:
             import json
             from pathlib import Path
@@ -325,30 +325,7 @@ class DynamicRiskAllocator:
                     portfolio_risk_cap = 0.0
 
         except Exception:
-            pass        # --- PROFIT LOCK INTEGRATION (SYSTEM-LEVEL CONTROL) ---
-        try:
-            import json
-            from pathlib import Path
-
-            profit_lock_path = Path(__file__).resolve().parents[2] / "runtime" / "profit_lock_state.json"
-
-            if profit_lock_path.is_file():
-                with profit_lock_path.open("r", encoding="utf-8") as f:
-                    pl = json.load(f)
-
-                sizing_factor = float(pl.get("sizing_factor", 1.0))
-                stop_new_entries = bool(pl.get("stop_new_entries", False))
-
-                # Apply scaling
-                portfolio_risk_cap *= max(0.0, min(1.0, sizing_factor))
-
-                # Hard stop overrides everything
-                if stop_new_entries:
-                    portfolio_risk_cap = 0.0
-
-        except Exception:
-            # Fail-safe: never break allocator
-            pass
+            pass  # Fail-safe: never break allocator
 
         caps: Dict[str, float] = {}
         for name, frac in norm.items():
@@ -398,6 +375,106 @@ class DynamicRiskAllocator:
             "strategy_caps": caps,
             "strategies": per_strategy,
         }
+
+
+# ---------------------------------------------------------------------------
+# 50/30/20 Chassis Enforcement
+# ---------------------------------------------------------------------------
+
+ALPHA_STRATEGIES = frozenset({
+    "alpha", "alpha_futures", "alpha_options",
+    "gamma", "gamma_futures", "gamma_reversion",
+})
+BETA_STRATEGIES = frozenset({"beta"})
+ADAPTIVE_STRATEGIES = frozenset({
+    "omega", "omega_macro", "omega_vol", "delta", "crypto",
+})
+
+ALPHA_TARGET = 0.50
+BETA_TARGET = 0.30
+ADAPTIVE_TARGET = 0.20
+CHASSIS_TOLERANCE = 0.05  # allow 5% drift before hard clamp
+
+
+def _chassis_enabled() -> bool:
+    raw = os.environ.get("CHAD_CHASSIS_ENFORCEMENT", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def enforce_chassis(weights: Dict[str, float]) -> Dict[str, float]:
+    """
+    Enforce the 50/30/20 sleeve allocation:
+      - ALPHA sleeve (50%): alpha, alpha_futures, alpha_options, gamma, gamma_futures, gamma_reversion
+      - BETA sleeve (30%): beta — structural savings sleeve, protected
+      - ADAPTIVE sleeve (20%): omega, omega_macro, omega_vol, delta, crypto
+
+    Only fires when sleeve drift exceeds CHASSIS_TOLERANCE.
+    Preserves intra-sleeve proportions. Returns weights summing to ~1.0.
+    Disabled via CHAD_CHASSIS_ENFORCEMENT=0.
+    """
+    if not _chassis_enabled():
+        return dict(weights)
+
+    result = dict(weights)
+    total = sum(result.values())
+    if total <= 0.0:
+        return result
+
+    # Normalize to 1.0 for sleeve math
+    for k in result:
+        result[k] /= total
+
+    alpha_total = sum(result.get(s, 0.0) for s in ALPHA_STRATEGIES)
+    beta_total = sum(result.get(s, 0.0) for s in BETA_STRATEGIES)
+    adaptive_total = sum(result.get(s, 0.0) for s in ADAPTIVE_STRATEGIES)
+
+    needs_enforcement = (
+        abs(alpha_total - ALPHA_TARGET) > CHASSIS_TOLERANCE
+        or abs(beta_total - BETA_TARGET) > CHASSIS_TOLERANCE
+        or abs(adaptive_total - ADAPTIVE_TARGET) > CHASSIS_TOLERANCE
+    )
+
+    if not needs_enforcement:
+        return result
+
+    logger.info(
+        "chassis_enforcement: BEFORE alpha=%.3f beta=%.3f adaptive=%.3f",
+        alpha_total, beta_total, adaptive_total,
+    )
+
+    # Scale each sleeve to its target, preserving intra-sleeve proportions
+    def _scale_sleeve(strategies: frozenset, target: float, current: float) -> None:
+        if current > 0.0:
+            scale = target / current
+            for s in strategies:
+                if s in result:
+                    result[s] *= scale
+        elif target > 0.0:
+            # Sleeve has zero weight but should have some — distribute equally
+            members = [s for s in strategies if s in result]
+            if members:
+                each = target / len(members)
+                for s in members:
+                    result[s] = each
+
+    _scale_sleeve(ALPHA_STRATEGIES, ALPHA_TARGET, alpha_total)
+    _scale_sleeve(BETA_STRATEGIES, BETA_TARGET, beta_total)
+    _scale_sleeve(ADAPTIVE_STRATEGIES, ADAPTIVE_TARGET, adaptive_total)
+
+    # Any unknown strategies (not in any sleeve) get zeroed
+    known = ALPHA_STRATEGIES | BETA_STRATEGIES | ADAPTIVE_STRATEGIES
+    for k in list(result.keys()):
+        if k not in known:
+            result[k] = 0.0
+
+    logger.info(
+        "chassis_enforcement: AFTER alpha=%.3f beta=%.3f adaptive=%.3f",
+        sum(result.get(s, 0.0) for s in ALPHA_STRATEGIES),
+        sum(result.get(s, 0.0) for s in BETA_STRATEGIES),
+        sum(result.get(s, 0.0) for s in ADAPTIVE_STRATEGIES),
+    )
+
+    return result
 
 
 # ---------------------------------------------------------------------------

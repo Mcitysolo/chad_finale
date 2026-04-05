@@ -60,6 +60,7 @@ from chad.risk.dynamic_risk_allocator import (
     PortfolioSnapshot,
     StrategyAllocation,
     default_output_path as default_dynamic_caps_path,
+    enforce_chassis,
 )
 
 # Phase 11 (Savage)
@@ -596,6 +597,8 @@ class Orchestrator:
                     adjusted_clean[k] = 0.0
                 else:
                     adjusted_clean[k] = max(0.0, float(adjusted.get(k, bw)))
+            # 50/30/20 chassis enforcement (after overlays, before cap build)
+            adjusted_clean = enforce_chassis(adjusted_clean)
             allocation = StrategyAllocation(weights=adjusted_clean)
 
             self._log.info("orchestrator.allocation_overlay_applied", extra={"mode": mode})
@@ -604,7 +607,7 @@ class Orchestrator:
                 "orchestrator.allocation_overlay_failed_fallback_to_base",
                 extra={"mode": mode, "error": str(exc)},
             )
-            allocation = base
+            allocation = StrategyAllocation(weights=enforce_chassis(base.weights))
 
         daily_fraction = float(self._settings.daily_risk_pct) / 100.0
         daily_fraction = max(0.0, min(1.0, float(_finite_float(daily_fraction, 0.0))))
