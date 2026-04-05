@@ -14,7 +14,7 @@ Signal Flow
 3. If bearish with high confidence: bear put spread on SPY.
 4. Use chain_provider for available strikes/expiries (from cache).
 5. Use strike_selector to construct SpreadSpec.
-6. Emit TWO TradeSignals per spread (one per leg), linked by spread_id.
+6. Emit ONE BAG (combo) TradeSignal per spread — atomic execution.
 
 Instruments
 -----------
@@ -336,9 +336,10 @@ def _build_spread_signals(
     source_info: Dict[str, Any],
 ) -> List[TradeSignal]:
     """
-    Build two TradeSignals (one per leg) from a SpreadSpec.
+    Build ONE BAG (combo) TradeSignal from a SpreadSpec.
 
-    Both legs share a spread_id UUID linking them as a single position.
+    Direction is encoded in the legs — the signal is always BUY the spread.
+    Execution adapter resolves both legs atomically via IBKR combo order.
     """
     if spread.max_loss_per_contract <= 0:
         return []
@@ -351,10 +352,18 @@ def _build_spread_signals(
 
     spread_id = str(uuid.uuid4())
 
-    signals: List[TradeSignal] = []
+    # Determine per-leg rights for meta
+    if spread.spread_type == "BULL_CALL":
+        long_right = "C"
+        short_right = "C"
+    elif spread.spread_type == "BEAR_PUT":
+        long_right = "P"
+        short_right = "P"
+    else:
+        long_right = spread.right
+        short_right = spread.right
 
-    # Long leg (BUY)
-    signals.append(TradeSignal(
+    signal = TradeSignal(
         strategy=StrategyName.ALPHA_OPTIONS,
         symbol=spread.symbol,
         side=SignalSide.BUY,
@@ -366,48 +375,22 @@ def _build_spread_signals(
             "engine": "alpha_options.v1",
             "spread_id": spread_id,
             "spread_type": spread.spread_type,
-            "leg_role": "LONG",
             "expiry": spread.expiry,
-            "strike": spread.long_strike,
-            "right": spread.right,
+            "long_strike": spread.long_strike,
+            "short_strike": spread.short_strike,
+            "long_right": long_right,
+            "short_right": short_right,
             "dte": spread.dte,
             "max_loss_per_contract": spread.max_loss_per_contract,
             "net_debit_estimate": spread.net_debit_estimate,
             "contracts": contracts,
             "required_asset_class": "options",
-            "sec_type": "OPT",
+            "sec_type": "BAG",
             **source_info,
         },
-    ))
+    )
 
-    # Short leg (SELL)
-    signals.append(TradeSignal(
-        strategy=StrategyName.ALPHA_OPTIONS,
-        symbol=spread.symbol,
-        side=SignalSide.SELL,
-        size=float(contracts),
-        confidence=float(confidence),
-        asset_class=AssetClass.OPTIONS,
-        created_at=now,
-        meta={
-            "engine": "alpha_options.v1",
-            "spread_id": spread_id,
-            "spread_type": spread.spread_type,
-            "leg_role": "SHORT",
-            "expiry": spread.expiry,
-            "strike": spread.short_strike,
-            "right": spread.right,
-            "dte": spread.dte,
-            "max_loss_per_contract": spread.max_loss_per_contract,
-            "net_debit_estimate": spread.net_debit_estimate,
-            "contracts": contracts,
-            "required_asset_class": "options",
-            "sec_type": "OPT",
-            **source_info,
-        },
-    ))
-
-    return signals
+    return [signal]
 
 
 # ---------------------------------------------------------------------------

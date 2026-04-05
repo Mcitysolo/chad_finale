@@ -176,7 +176,7 @@ class IbkrConfig:
     default_stock_currency: str = "USD"
     default_forex_exchange: str = "IDEALPRO"
     default_forex_quantity_step: str = "0.0001"
-    default_whole_unit_sec_types: Tuple[str, ...] = ("STK", "FUT", "OPT")
+    default_whole_unit_sec_types: Tuple[str, ...] = ("STK", "FUT", "OPT", "BAG")
 
     primary_exchange_by_symbol: Mapping[str, str] = field(
         default_factory=lambda: {
@@ -610,6 +610,8 @@ class _ContractResolver:
             resolved = self._resolve_future(ib, intent)
         elif sec_type == "OPT":
             resolved = self._resolve_option(ib, intent)
+        elif sec_type == "BAG":
+            resolved = self._resolve_combo(ib, intent)
         else:
             raise ContractResolutionError(f"Unsupported sec_type: {intent.sec_type!r}")
 
@@ -779,6 +781,139 @@ class _ContractResolver:
             "resolution": "qualified" if ib is not None else "unqualified",
         }
         return _ResolvedContract(contract=contract, summary=summary)
+
+    def _resolve_combo(self, ib: Optional[IBLike], intent: NormalizedIntent) -> _ResolvedContract:
+        """
+        Resolve a BAG (combo) contract for vertical spreads.
+
+        Builds an IBKR combo contract with two legs (long + short) from
+        intent metadata. Qualifies individual leg contracts to obtain conIds
+        when an IB session is available.
+
+        Required meta fields:
+          - expiry: str (YYYYMMDD)
+          - long_strike: float
+          - short_strike: float
+          - long_right: str ("C" or "P")
+          - short_right: str ("C" or "P")
+        """
+        _Contract, _Future, _Forex, _Order, _Stock = _lazy_import_contract_classes()
+        Option = _lazy_import_option_class()
+
+        meta = dict(intent.meta)
+        expiry = _safe_str(meta.get("expiry"))
+        if not expiry:
+            raise ContractResolutionError(
+                f"BAG contract for {intent.symbol} requires 'expiry' in intent.meta"
+            )
+
+        long_strike = meta.get("long_strike")
+        short_strike = meta.get("short_strike")
+        if long_strike is None or short_strike is None:
+            raise ContractResolutionError(
+                f"BAG contract for {intent.symbol} requires 'long_strike' and 'short_strike' in intent.meta"
+            )
+        try:
+            long_strike = float(long_strike)
+            short_strike = float(short_strike)
+        except (TypeError, ValueError):
+            raise ContractResolutionError(
+                f"BAG contract for {intent.symbol}: invalid strike values"
+            )
+
+        long_right = _safe_upper(_safe_str(meta.get("long_right")))
+        short_right = _safe_upper(_safe_str(meta.get("short_right")))
+        if long_right not in ("C", "P") or short_right not in ("C", "P"):
+            raise ContractResolutionError(
+                f"BAG contract for {intent.symbol} requires 'long_right' and 'short_right' (C or P)"
+            )
+
+        exchange = _safe_str(meta.get("exchange")) or intent.exchange or "SMART"
+        currency = intent.currency or "USD"
+
+        # Build individual leg contracts for qualification
+        long_opt = Option(
+            symbol=intent.symbol,
+            lastTradeDateOrContractMonth=expiry,
+            strike=long_strike,
+            right=long_right,
+            exchange=exchange,
+            currency=currency,
+        )
+        short_opt = Option(
+            symbol=intent.symbol,
+            lastTradeDateOrContractMonth=expiry,
+            strike=short_strike,
+            right=short_right,
+            exchange=exchange,
+            currency=currency,
+        )
+
+        # Qualify legs to obtain conIds when IB session is available
+        long_con_id = 0
+        short_con_id = 0
+        if ib is not None:
+            try:
+                qualified = ib.qualifyContracts(long_opt, short_opt)
+                if qualified and len(qualified) >= 2:
+                    long_opt = qualified[0]
+                    short_opt = qualified[1]
+                long_con_id = getattr(long_opt, "conId", 0) or 0
+                short_con_id = getattr(short_opt, "conId", 0) or 0
+            except Exception as exc:
+                LOGGER.warning(
+                    "ibkr_adapter.combo_qualify_failed",
+                    extra={
+                        "symbol": intent.symbol,
+                        "expiry": expiry,
+                        "long_strike": long_strike,
+                        "short_strike": short_strike,
+                        "error": str(exc),
+                    },
+                )
+
+        # Build BAG contract
+        try:
+            from ib_insync import ComboLeg  # type: ignore[import]
+        except ImportError as exc:  # pragma: no cover
+            raise ConnectionError("ib_insync is not installed") from exc
+
+        bag = _Contract()
+        bag.symbol = intent.symbol
+        bag.secType = "BAG"
+        bag.currency = currency
+        bag.exchange = exchange
+
+        long_leg = ComboLeg()
+        long_leg.conId = long_con_id
+        long_leg.ratio = 1
+        long_leg.action = "BUY"
+        long_leg.exchange = exchange
+
+        short_leg = ComboLeg()
+        short_leg.conId = short_con_id
+        short_leg.ratio = 1
+        short_leg.action = "SELL"
+        short_leg.exchange = exchange
+
+        bag.comboLegs = [long_leg, short_leg]
+
+        summary = {
+            "symbol": intent.symbol,
+            "sec_type": "BAG",
+            "spread_type": meta.get("spread_type", "UNKNOWN"),
+            "expiry": expiry,
+            "long_strike": long_strike,
+            "short_strike": short_strike,
+            "long_right": long_right,
+            "short_right": short_right,
+            "exchange": exchange,
+            "currency": currency,
+            "long_conId": long_con_id,
+            "short_conId": short_con_id,
+            "resolution": "qualified" if ib is not None else "unqualified",
+        }
+        return _ResolvedContract(contract=bag, summary=summary)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1178,12 @@ class IbkrAdapter:
             exchange = _safe_upper(meta.get("exchange"), self._config.default_forex_exchange)
             currency = quote
             meta = {**meta, "base_currency": base, "quote_currency": quote}
+        elif asset_class == "options":
+            sec_type = _safe_upper(meta.get("sec_type"), "OPT")
+            exchange = _safe_upper(meta.get("exchange"), "SMART")
+            currency = _safe_upper(meta.get("currency"), "USD")
+            if meta.get("net_debit_estimate") is not None:
+                meta = {**meta, "limit_price": meta["net_debit_estimate"]}
         else:
             raise ValidationError(f"Unsupported asset_class for IBKR adapter: {asset_class!r}")
 

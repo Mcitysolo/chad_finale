@@ -7,13 +7,14 @@ Covers:
 - Strike selection (bull call, bear put, edge cases)
 - DTE calculation
 - SpreadSpec generation
-- Signal generation (two legs per spread, linked by spread_id)
+- BAG combo signal generation (one signal per spread)
 - Confidence gating
 - Sizing validation
 - Config and env overrides
 - Handler contract
 - Registry integration
-- OPT lane in types
+- Options routing in ibkr_adapter
+- _resolve_combo with mocked IB session
 """
 
 from __future__ import annotations
@@ -255,12 +256,13 @@ class TestStrikeSelector:
 
 
 # ===========================================================================
-# Signal generation tests
+# BAG signal generation tests
 # ===========================================================================
 
 class TestSignalGeneration:
 
-    def test_spread_signals_come_in_pairs(self) -> None:
+    def test_spread_emits_one_bag_signal(self) -> None:
+        """Phase 6b: one BAG signal per spread instead of two leg signals."""
         chain = _make_chain(price=650.0)
         spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
         assert spread is not None
@@ -273,34 +275,72 @@ class TestSignalGeneration:
             now=NOW,
             source_info={"source_strategy": "alpha"},
         )
-        assert len(signals) == 2
+        assert len(signals) == 1
 
-    def test_legs_share_spread_id(self) -> None:
-        chain = _make_chain(price=650.0)
-        spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
-        signals = _build_spread_signals(
-            spread=spread,
-            confidence=0.75,
-            equity=500_000.0,
-            tuning=AlphaOptionsTuning(),
-            now=NOW,
-            source_info={},
-        )
-        assert signals[0].meta["spread_id"] == signals[1].meta["spread_id"]
-
-    def test_long_leg_is_buy(self) -> None:
+    def test_bag_signal_side_is_buy(self) -> None:
+        """BAG signal is always BUY — direction encoded in legs."""
         chain = _make_chain(price=650.0)
         spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
         signals = _build_spread_signals(
             spread=spread, confidence=0.75, equity=500_000.0,
             tuning=AlphaOptionsTuning(), now=NOW, source_info={},
         )
-        long_leg = [s for s in signals if s.meta["leg_role"] == "LONG"]
-        short_leg = [s for s in signals if s.meta["leg_role"] == "SHORT"]
-        assert len(long_leg) == 1
-        assert len(short_leg) == 1
-        assert long_leg[0].side == SignalSide.BUY
-        assert short_leg[0].side == SignalSide.SELL
+        assert signals[0].side == SignalSide.BUY
+
+    def test_bag_meta_fields_present(self) -> None:
+        """All required BAG meta fields must be present."""
+        chain = _make_chain(price=650.0)
+        spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
+        signals = _build_spread_signals(
+            spread=spread, confidence=0.75, equity=500_000.0,
+            tuning=AlphaOptionsTuning(), now=NOW, source_info={},
+        )
+        meta = signals[0].meta
+        required_fields = [
+            "spread_type", "expiry", "long_strike", "short_strike",
+            "long_right", "short_right", "net_debit_estimate",
+            "max_loss_per_contract", "spread_id", "sec_type",
+        ]
+        for f in required_fields:
+            assert f in meta, f"Missing meta field: {f}"
+        assert meta["sec_type"] == "BAG"
+        assert meta["spread_type"] in ("BULL_CALL", "BEAR_PUT")
+
+    def test_bag_limit_price_is_net_debit(self) -> None:
+        """limit_price (net_debit_estimate) is set in meta for BAG signal."""
+        chain = _make_chain(price=650.0)
+        spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
+        signals = _build_spread_signals(
+            spread=spread, confidence=0.75, equity=500_000.0,
+            tuning=AlphaOptionsTuning(), now=NOW, source_info={},
+        )
+        meta = signals[0].meta
+        assert meta["net_debit_estimate"] == spread.net_debit_estimate
+        assert meta["net_debit_estimate"] > 0
+
+    def test_bag_bull_call_rights(self) -> None:
+        """Bull call spread should have C/C for long/short rights."""
+        chain = _make_chain(price=650.0)
+        spread = select_vertical_spread(chain, 650.0, "bullish")
+        signals = _build_spread_signals(
+            spread=spread, confidence=0.75, equity=500_000.0,
+            tuning=AlphaOptionsTuning(), now=NOW, source_info={},
+        )
+        if signals:
+            assert signals[0].meta["long_right"] == "C"
+            assert signals[0].meta["short_right"] == "C"
+
+    def test_bag_bear_put_rights(self) -> None:
+        """Bear put spread should have P/P for long/short rights."""
+        chain = _make_chain(price=650.0)
+        spread = select_vertical_spread(chain, 650.0, "bearish")
+        signals = _build_spread_signals(
+            spread=spread, confidence=0.75, equity=500_000.0,
+            tuning=AlphaOptionsTuning(), now=NOW, source_info={},
+        )
+        if signals:
+            assert signals[0].meta["long_right"] == "P"
+            assert signals[0].meta["short_right"] == "P"
 
     def test_signals_have_options_metadata(self) -> None:
         chain = _make_chain(price=650.0)
@@ -313,8 +353,6 @@ class TestSignalGeneration:
             assert sig.strategy == StrategyName.ALPHA_OPTIONS
             assert sig.asset_class == AssetClass.OPTIONS
             assert "expiry" in sig.meta
-            assert "strike" in sig.meta
-            assert "right" in sig.meta
             assert sig.meta["engine"] == "alpha_options.v1"
 
     def test_sizing_respects_risk_budget(self) -> None:
@@ -472,3 +510,212 @@ class TestRegistry:
                 assert cfg.name == StrategyName.ALPHA_OPTIONS
                 return
         pytest.fail("ALPHA_OPTIONS not found in registry")
+
+
+# ===========================================================================
+# Options routing gap fix test
+# ===========================================================================
+
+class TestOptionsRouting:
+
+    def test_options_asset_class_routes_in_adapter(self) -> None:
+        """Verify that asset_class='options' is handled in _intent_from_routed_signal."""
+        from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+
+        config = IbkrConfig(dry_run=True, validate_contracts_in_dry_run=False)
+        adapter = IbkrAdapter(config=config)
+
+        @dataclass
+        class _FakeRouted:
+            symbol: str = "SPY"
+            side: str = "BUY"
+            net_size: float = 1.0
+            asset_class: str = "options"
+            source_strategies: tuple = ("alpha_options",)
+            created_at: Any = None
+            meta: dict = None
+
+            def __post_init__(self):
+                if self.meta is None:
+                    self.meta = {
+                        "sec_type": "BAG",
+                        "expiry": "20260516",
+                        "long_strike": 655.0,
+                        "short_strike": 660.0,
+                        "long_right": "C",
+                        "short_right": "C",
+                        "net_debit_estimate": 2.50,
+                    }
+
+        routed = _FakeRouted()
+        intent = adapter._intent_from_routed_signal(routed)
+        assert intent.sec_type == "BAG"
+        assert intent.asset_class == "options"
+        assert intent.exchange == "SMART"
+        assert intent.currency == "USD"
+
+    def test_options_routing_sets_limit_price_from_net_debit(self) -> None:
+        """Verify net_debit_estimate flows through to meta.limit_price."""
+        from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+
+        config = IbkrConfig(dry_run=True, validate_contracts_in_dry_run=False)
+        adapter = IbkrAdapter(config=config)
+
+        @dataclass
+        class _FakeRouted:
+            symbol: str = "SPY"
+            side: str = "BUY"
+            net_size: float = 1.0
+            asset_class: str = "options"
+            source_strategies: tuple = ("alpha_options",)
+            created_at: Any = None
+            meta: dict = None
+
+            def __post_init__(self):
+                if self.meta is None:
+                    self.meta = {
+                        "sec_type": "BAG",
+                        "net_debit_estimate": 3.25,
+                    }
+
+        routed = _FakeRouted()
+        intent = adapter._intent_from_routed_signal(routed)
+        assert intent.meta["limit_price"] == 3.25
+
+
+# ===========================================================================
+# _resolve_combo tests with mocked IB
+# ===========================================================================
+
+class TestResolveCombo:
+
+    def test_resolve_combo_builds_bag_contract(self) -> None:
+        """_resolve_combo should produce a BAG contract with two combo legs."""
+        from chad.execution.ibkr_adapter import IbkrConfig, _ContractResolver, NormalizedIntent
+        from datetime import datetime, timezone
+
+        config = IbkrConfig(dry_run=True)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+
+        intent = NormalizedIntent(
+            strategy="alpha_options",
+            symbol="SPY",
+            sec_type="BAG",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            order_type="LMT",
+            quantity=2.0,
+            notional_estimate=0.0,
+            asset_class="options",
+            source_strategies=("alpha_options",),
+            created_at=datetime.now(timezone.utc),
+            meta={
+                "expiry": "20260516",
+                "long_strike": 655.0,
+                "short_strike": 660.0,
+                "long_right": "C",
+                "short_right": "C",
+                "spread_type": "BULL_CALL",
+            },
+        )
+
+        # Mock IB session
+        mock_ib = mock.MagicMock()
+        # qualifyContracts returns the same objects with conId set
+        def fake_qualify(*contracts):
+            for i, c in enumerate(contracts):
+                c.conId = 100 + i
+            return list(contracts)
+        mock_ib.qualifyContracts.side_effect = fake_qualify
+
+        resolved = resolver.resolve(mock_ib, intent)
+        contract = resolved.contract
+
+        assert contract.secType == "BAG"
+        assert contract.symbol == "SPY"
+        assert len(contract.comboLegs) == 2
+
+        long_leg = contract.comboLegs[0]
+        short_leg = contract.comboLegs[1]
+        assert long_leg.action == "BUY"
+        assert short_leg.action == "SELL"
+        assert long_leg.conId == 100
+        assert short_leg.conId == 101
+        assert long_leg.ratio == 1
+        assert short_leg.ratio == 1
+
+    def test_resolve_combo_without_ib_session(self) -> None:
+        """_resolve_combo should work with ib=None (dry run, conIds=0)."""
+        from chad.execution.ibkr_adapter import IbkrConfig, _ContractResolver, NormalizedIntent
+        from datetime import datetime, timezone
+
+        config = IbkrConfig(dry_run=True)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+
+        intent = NormalizedIntent(
+            strategy="alpha_options",
+            symbol="SPY",
+            sec_type="BAG",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            order_type="LMT",
+            quantity=1.0,
+            notional_estimate=0.0,
+            asset_class="options",
+            source_strategies=("alpha_options",),
+            created_at=datetime.now(timezone.utc),
+            meta={
+                "expiry": "20260516",
+                "long_strike": 655.0,
+                "short_strike": 660.0,
+                "long_right": "C",
+                "short_right": "C",
+                "spread_type": "BULL_CALL",
+            },
+        )
+
+        resolved = resolver.resolve(None, intent)
+        assert resolved.summary["sec_type"] == "BAG"
+        assert resolved.summary["resolution"] == "unqualified"
+        assert resolved.summary["long_conId"] == 0
+        assert resolved.summary["short_conId"] == 0
+
+    def test_resolve_combo_missing_expiry_raises(self) -> None:
+        """Missing expiry should raise ContractResolutionError."""
+        from chad.execution.ibkr_adapter import IbkrConfig, _ContractResolver, NormalizedIntent, ContractResolutionError
+        from datetime import datetime, timezone
+
+        config = IbkrConfig(dry_run=True)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+
+        intent = NormalizedIntent(
+            strategy="alpha_options",
+            symbol="SPY",
+            sec_type="BAG",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            order_type="LMT",
+            quantity=1.0,
+            notional_estimate=0.0,
+            asset_class="options",
+            source_strategies=("alpha_options",),
+            created_at=datetime.now(timezone.utc),
+            meta={
+                "long_strike": 655.0,
+                "short_strike": 660.0,
+                "long_right": "C",
+                "short_right": "C",
+            },
+        )
+
+        with pytest.raises(ContractResolutionError, match="expiry"):
+            resolver.resolve(None, intent)
+
+    def test_bag_in_whole_unit_sec_types(self) -> None:
+        """BAG must be in default_whole_unit_sec_types for integer quantity enforcement."""
+        from chad.execution.ibkr_adapter import IbkrConfig
+        config = IbkrConfig()
+        assert "BAG" in config.default_whole_unit_sec_types
