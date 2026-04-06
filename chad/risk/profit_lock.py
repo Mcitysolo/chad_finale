@@ -346,20 +346,21 @@ class NdjsonPnlProvider(PnlProvider):
 
     async def get_realized_pnl(self, repo_root: Path, days: int = 0) -> Tuple[float, int, List[str]]:
         trades_dir = repo_root / "data" / "trades"
-        if not trades_dir.exists():
-            logger.debug("NdjsonPnlProvider: trades directory %s does not exist", trades_dir)
-            return 0.0, 0, []
+        fills_dir = repo_root / "data" / "fills"
         # compute date strings to search
         day_strings = []
         today = _utc_now().date()
         for offset in range(days + 1):
             dt = today - timedelta(days=offset)
             day_strings.append(dt.strftime("%Y%m%d"))
-        # gather files
+        # gather files from both data/trades/ and data/fills/
         files: List[Path] = []
-        for ds in day_strings:
-            pattern = f"*{ds}*.ndjson"
-            files.extend(sorted(trades_dir.glob(pattern)))
+        for scan_dir in (trades_dir, fills_dir):
+            if not scan_dir.exists():
+                continue
+            for ds in day_strings:
+                pattern = f"*{ds}*.ndjson"
+                files.extend(sorted(scan_dir.glob(pattern)))
         if not files:
             return 0.0, 0, []
         # process files concurrently
@@ -396,7 +397,7 @@ class NdjsonPnlProvider(PnlProvider):
                             file_used = True
             else:
                 # fallback synchronous reader
-                async def read_sync() -> None:
+                def read_sync() -> None:
                     nonlocal pnl_sum, trade_count, file_used
                     for raw in path.open("r", encoding="utf-8"):
                         rec = self._parse_line(raw)
@@ -439,6 +440,8 @@ class NdjsonPnlProvider(PnlProvider):
             for key in self.preview_keys:
                 if container.get(key) is True:
                     return True
+            if container.get("pnl_untrusted") is True:
+                return True
             status = str(container.get("status") or container.get("trade_status") or "").strip().lower()
             if status in {"preview_only", "paper_only", "what_if"}:
                 return True
@@ -486,6 +489,11 @@ class NdjsonPnlProvider(PnlProvider):
                 pnl = search_container(nested)
                 if pnl is not None:
                     return pnl
+        # fill records from data/fills/ have fill_price but no explicit pnl —
+        # count them as executed trades with zero realised pnl (entry, not exit)
+        fp_container = payload if isinstance(payload, Mapping) else record
+        if "fill_price" in fp_container and _safe_float(fp_container.get("fill_price"), default=0.0) > 0.0:
+            return 0.0
         return None
 
 
