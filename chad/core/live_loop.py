@@ -73,12 +73,19 @@ from chad.core.live_execution_router import (
 from chad.core.ibkr_execution_runner import _build_plan_and_intents
 from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
+from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+from chad.execution.paper_exec_evidence_writer import (
+    PaperExecEvidence,
+    StrategyAttributionError,
+    write_paper_exec_evidence,
+)
 from ib_insync import IB
 
 ib = IB()
 ib.connect("127.0.0.1", 4002, clientId=99)
 
 position_sync = BrokerPositionSync(ib)
+_paper_adapter = IbkrAdapter(config=IbkrConfig(dry_run=True))
 LOOP_INTERVAL_SECONDS = 60
 _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
 
@@ -455,6 +462,44 @@ def run_once(logger: logging.Logger) -> None:
                 getattr(intent, "quantity", None),
             )
             mark_position_open(intent)
+
+        # --- Submit to IBKR adapter and record paper evidence ---
+        try:
+            submitted = _paper_adapter.submit_strategy_trade_intents([intent])
+            for order in submitted:
+                logger.info(
+                    "SUBMITTED %s %s %s qty=%s status=%s dry_run=%s",
+                    order.symbol, order.side, order.sec_type,
+                    order.quantity, order.status, order.dry_run,
+                )
+                try:
+                    ev = PaperExecEvidence(
+                        symbol=order.symbol,
+                        side=order.side,
+                        quantity=order.quantity,
+                        fill_price=0.0,
+                        strategy=getattr(intent, "strategy", "") or "",
+                        source_strategies=[getattr(intent, "strategy", "") or ""],
+                        broker="ibkr_paper",
+                        status=order.status,
+                        asset_class=order.asset_class,
+                        is_live=False,
+                        fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
+                    )
+                    paths = write_paper_exec_evidence(ev)
+                    logger.info("EVIDENCE_WRITTEN fills=%s", paths.get("fills_path", ""))
+                except StrategyAttributionError as attr_err:
+                    logger.warning("Evidence attribution failed (non-fatal): %s", attr_err)
+                except Exception as ev_err:
+                    logger.warning("Evidence write failed (non-fatal): %s", ev_err)
+        except Exception as submit_err:
+            logger.error(
+                "SUBMIT_FAILED %s %s qty=%s: %s",
+                getattr(intent, "symbol", None),
+                getattr(intent, "side", None),
+                getattr(intent, "quantity", None),
+                submit_err,
+            )
 
     if emitted == 0:
         logger.info("All intents skipped by signal/position guard.")
