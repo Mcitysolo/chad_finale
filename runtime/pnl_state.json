@@ -7,6 +7,6 @@
   "schema_version": "pnl_state.v1",
   "source": "profit_lock_engine",
   "trade_count": 0,
-  "ts_utc": "2026-04-06T19:27:24Z",
+  "ts_utc": "2026-04-06T19:40:20Z",
   "ttl_seconds": 60
 }

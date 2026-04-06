@@ -55,7 +55,7 @@ from chad.types import AssetClass, SignalSide, StrategyName
 # Helpers
 # ---------------------------------------------------------------------------
 
-NOW = datetime(2026, 4, 3, 14, 30, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 # Future expiry ~30 days out
 EXPIRY_30D = (NOW + timedelta(days=30)).strftime("%Y%m%d")
