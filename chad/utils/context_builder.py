@@ -125,6 +125,9 @@ class MarketContext:
     ticks: Dict[str, Mapping[str, float]]
     bars: Dict[str, List[Mapping[str, float]]]
     prices: Dict[str, float]
+    now: Optional[datetime] = None
+    portfolio: Optional[object] = None
+    legend: Optional[object] = None
 
 
 @dataclass
@@ -379,19 +382,27 @@ class ContextBuilder:
 
         current_total_notional = sum(current_symbol_notional.values())
 
-        # Build context
-        context = MarketContext(
-            ticks=ticks,
-            bars=bars,
-            prices=prices,
+        # Load portfolio equity from dynamic_caps.json (authoritative source)
+        total_equity = self._load_equity_from_dynamic_caps()
+
+        # Wrap ticks as attribute-accessible objects for strategy compatibility
+        # (strategies access tick.price, not tick["price"])
+        wrapped_ticks = self._wrap_ticks(ticks)
+
+        # Build portfolio object with required fields for strategy handlers
+        portfolio = self._build_portfolio_for_context(
+            total_equity=total_equity,
+            positions=current_positions or {},
         )
 
-        # Construct portfolio snapshot using runtime type introspection
-        portfolio = self._construct_portfolio_snapshot(
-            positions=current_positions,
-            cash=current_cash,
-            total_equity=current_total_notional + current_cash,
+        # Build context
+        context = MarketContext(
+            ticks=wrapped_ticks,
+            bars=bars,
+            prices=prices,
             now=self.now,
+            portfolio=portfolio,
+            legend=None,
         )
 
         # Evidence for auditability
@@ -468,3 +479,69 @@ class ContextBuilder:
             return PortfolioSnapshot(
                 timestamp=now, positions=positions, cash=float(cash)
             )  # type: ignore
+
+    _DYNAMIC_CAPS_PATH = Path("/home/ubuntu/chad_finale/runtime/dynamic_caps.json")
+
+    def _load_equity_from_dynamic_caps(self) -> float:
+        """
+        Read total_equity from runtime/dynamic_caps.json.
+
+        This is the authoritative equity source maintained by the dynamic
+        risk allocator.  Returns 0.0 on any failure (caller should treat
+        as missing, not as zero equity).
+        """
+        try:
+            if not self._DYNAMIC_CAPS_PATH.is_file():
+                self.logger.warning("dynamic_caps.json not found — equity unknown")
+                return 0.0
+            data = json.loads(self._DYNAMIC_CAPS_PATH.read_text(encoding="utf-8"))
+            equity = float(data.get("total_equity", 0.0))
+            if equity > 0:
+                return equity
+            self.logger.warning("dynamic_caps.json total_equity is %s", equity)
+            return 0.0
+        except Exception as exc:
+            self.logger.warning("Failed to read dynamic_caps.json: %s", exc)
+            return 0.0
+
+    @staticmethod
+    def _wrap_ticks(
+        ticks: Dict[str, Mapping[str, float]],
+    ) -> Dict[str, object]:
+        """
+        Wrap tick dicts as SimpleNamespace objects so that strategy
+        handlers can access tick.price (attribute access) instead of
+        tick["price"] (dict access).
+        """
+        from types import SimpleNamespace
+
+        wrapped: Dict[str, object] = {}
+        for symbol, tick_data in ticks.items():
+            wrapped[symbol] = SimpleNamespace(**dict(tick_data))
+        return wrapped
+
+    def _build_portfolio_for_context(
+        self,
+        *,
+        total_equity: float,
+        positions: Mapping[str, object],
+    ) -> object:
+        """
+        Build a portfolio object compatible with strategy handler expectations.
+
+        Strategies access:
+          - portfolio.cash
+          - portfolio.positions
+          - portfolio.extra["equity"], portfolio.extra["equity_peak"]
+        """
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            timestamp=self.now,
+            cash=total_equity,
+            positions=dict(positions),
+            total_equity=total_equity,
+            equity=total_equity,
+            net_liq=total_equity,
+            extra={"equity": total_equity, "equity_peak": total_equity},
+        )

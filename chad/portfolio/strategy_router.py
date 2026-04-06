@@ -46,8 +46,17 @@ PREFERRED_ORDER: Sequence[str] = (
     "alpha_futures",
     "alpha",
     "alpha_crypto",
+    "alpha_forex",
+    "alpha_options",
     "gamma",
+    "gamma_futures",
+    "gamma_reversion",
     "beta",
+    "omega",
+    "omega_macro",
+    "omega_vol",
+    "delta",
+    "delta_pairs",
 )
 
 

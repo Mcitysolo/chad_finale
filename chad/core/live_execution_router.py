@@ -29,39 +29,32 @@ from chad.portfolio.strategy_router import (
 )
 
 
-def _safe_import(name: str, fn: str):
-    try:
-        module = __import__(name, fromlist=[fn])
-        return getattr(module, fn)
-    except Exception:
-        return None
-
-
-def _run_handler(handler, ctx):
+def _run_handler(name: str, handler, ctx, logger: logging.Logger) -> List:
+    """Run a strategy handler, logging any exception at WARNING level."""
     try:
         if handler is None:
             return []
         return handler(ctx) or []
-    except Exception:
+    except Exception as exc:
+        logger.warning("Strategy handler %s raised %s: %s", name, type(exc).__name__, exc)
         return []
 
 
 def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], Dict[str, float]]:
-    """Shared signal-building logic for both routing modes."""
+    """
+    Shared signal-building logic for both routing modes.
+
+    Loads all registered strategies from the canonical registry and
+    evaluates each handler against the current market context.
+    """
     ctx = ContextBuilder().build().context
 
-    handlers = {
-        "alpha_futures": _safe_import("chad.strategies.alpha_futures", "alpha_futures_handler"),
-        "alpha": _safe_import("chad.strategies", "alpha_handler"),
-        "alpha_crypto": _safe_import("chad.strategies", "alpha_crypto_handler"),
-        "gamma": _safe_import("chad.strategies", "gamma_handler"),
-        "beta": _safe_import("chad.strategies", "beta_handler"),
-    }
+    from chad.strategies import iter_strategy_registrations
 
-    available_signals: Dict[str, List] = {
-        name: _run_handler(handler, ctx)
-        for name, handler in handlers.items()
-    }
+    available_signals: Dict[str, List] = {}
+    for reg in iter_strategy_registrations():
+        name = reg.name.value  # StrategyName enum → string
+        available_signals[name] = _run_handler(name, reg.handler, ctx, logger)
 
     weights = load_allocation_weights()
     return available_signals, weights
