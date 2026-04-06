@@ -333,24 +333,58 @@ def _get_vix() -> Optional[float]:
 
 def _get_price(symbol: str) -> Optional[float]:
     cache = _load_price_cache()
-    val = cache.get(symbol)
+    for source in (cache, cache.get("prices", {})):
+        val = source.get(symbol)
+        if val is not None:
+            if isinstance(val, (int, float)):
+                return _safe_float(val)
+            if isinstance(val, dict):
+                p = val.get("price") or val.get("last") or val.get("close")
+                if p is not None:
+                    return _safe_float(p)
+    return None
+
+
+def _get_spy_from_bars() -> Optional[float]:
+    """Fallback: read most recent close from daily bar history."""
+    bar_file = REPO_ROOT / "data" / "bars" / "1d" / "SPY.json"
+    data = _read_json(bar_file)
+    if not data:
+        return None
+    bars = data.get("bars")
+    if not isinstance(bars, list) or not bars:
+        return None
+    last_bar = bars[-1]
+    close = last_bar.get("close")
+    return _safe_float(close) if close is not None else None
+
+
+def _get_btc_from_kraken() -> Optional[float]:
+    """Read BTC-USD price from runtime/kraken_prices.json."""
+    data = _read_json(RUNTIME_DIR / "kraken_prices.json")
+    if not data:
+        return None
+    prices = data.get("prices", {})
+    val = prices.get("BTC-USD")
     if val is not None:
-        if isinstance(val, (int, float)):
-            return _safe_float(val)
-        if isinstance(val, dict):
-            p = val.get("price") or val.get("last") or val.get("close")
-            if p is not None:
-                return _safe_float(p)
+        return _safe_float(val)
+    ticks = data.get("ticks", {})
+    tick = ticks.get("BTC-USD")
+    if isinstance(tick, dict):
+        p = tick.get("last") or tick.get("price")
+        if p is not None:
+            return _safe_float(p)
     return None
 
 
 def _get_spy_change() -> Optional[float]:
     cache = _load_price_cache()
-    val = cache.get("SPY")
-    if isinstance(val, dict):
-        chg = val.get("change_pct") or val.get("pct_change")
-        if chg is not None:
-            return _safe_float(chg)
+    for source in (cache, cache.get("prices", {})):
+        val = source.get("SPY")
+        if isinstance(val, dict):
+            chg = val.get("change_pct") or val.get("pct_change")
+            if chg is not None:
+                return _safe_float(chg)
     return None
 
 
@@ -485,7 +519,7 @@ class DailyCHADReport:
         # Market data
         vix = _get_vix()
         spy_change = _get_spy_change()
-        btc_price = _get_price("BTC-USD")
+        btc_price = _get_price("BTC-USD") or _get_btc_from_kraken()
 
         # Account state
         pnl_state = _read_json(self._runtime_dir / "pnl_state.json") or {}
@@ -764,7 +798,21 @@ class MorningBrief:
             if trends_signals:
                 context_parts.append(f"Google Trends signals: {json.dumps(trends_signals, default=str)[:1000]}")
             if kraken_prices:
-                context_parts.append(f"Crypto prices (Kraken): {json.dumps(kraken_prices, default=str)[:1000]}")
+                # Convert crypto volume to USD for clearer labeling
+                kraken_display = {}
+                kp = kraken_prices.get("prices", {})
+                kt = kraken_prices.get("ticks", {})
+                for sym in ("BTC-USD", "ETH-USD", "SOL-USD"):
+                    price = kp.get(sym)
+                    tick = kt.get(sym, {})
+                    if price:
+                        vol_base = tick.get("volume_24h", 0)
+                        kraken_display[sym] = {
+                            "price": price,
+                            "volume_24h_usd": round(vol_base * price, 0) if vol_base else None,
+                        }
+                if kraken_display:
+                    context_parts.append(f"Crypto prices (Kraken, volume is in USD): {json.dumps(kraken_display, default=str)[:1000]}")
             reddit_signals = reddit_sentiment.get("signals", {})
             if reddit_signals:
                 context_parts.append(f"Reddit sentiment: {json.dumps(reddit_signals, default=str)[:1000]}")
@@ -781,7 +829,8 @@ class MorningBrief:
             prompt = (
                 "You are CHAD. Based on this overnight data, identify 2-3 instruments "
                 "worth watching today and why. Be specific and direct. Plain English. "
-                "No jargon. Each point max 1 sentence.\n\n"
+                "No jargon. Each point max 1 sentence. "
+                "For crypto (BTC, ETH, SOL), volume is in USD — label it as USD, not contracts.\n\n"
                 + "\n\n".join(context_parts)
             )
 
@@ -804,8 +853,8 @@ class MorningBrief:
 
     def generate(self) -> str:
         vix = _get_vix()
-        spy_price = _get_price("SPY")
-        btc_price = _get_price("BTC-USD")
+        spy_price = _get_price("SPY") or _get_spy_from_bars()
+        btc_price = _get_price("BTC-USD") or _get_btc_from_kraken()
 
         lines: List[str] = []
         lines.append("\u2600\ufe0f Good morning! Markets open in 30 minutes.")
@@ -819,18 +868,12 @@ class MorningBrief:
                 lines.append(f"- Stock market (SPY): {_format_money(spy_price)} \u2014 {direction} overnight")
             else:
                 lines.append(f"- Stock market (SPY): {_format_money(spy_price)}")
-        else:
-            lines.append("- Stock market (SPY): waiting for data")
 
         if vix is not None:
             lines.append(f"- Fear gauge (VIX): {vix:.1f} \u2014 {vix_description(vix)}")
-        else:
-            lines.append("- Fear gauge (VIX): waiting for data")
 
         if btc_price is not None:
             lines.append(f"- Bitcoin: {_format_money(btc_price)}")
-        else:
-            lines.append("- Bitcoin: waiting for data")
 
         # Opportunity scan — AI-generated watchlist
         opps = self._scan_opportunities()

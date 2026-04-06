@@ -440,6 +440,6 @@ class TestMorningBrief:
         runtime.mkdir()
         brief = MorningBrief(repo_root=tmp_path)
         msg = brief.generate()
-        assert "Stock market (SPY)" in msg
-        assert "Fear gauge (VIX)" in msg
-        assert "Bitcoin" in msg
+        assert "Good morning" in msg
+        # VIX line is omitted when data is unavailable (no "waiting for data")
+        assert "waiting for data" not in msg
