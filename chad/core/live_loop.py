@@ -473,11 +473,23 @@ def run_once(logger: logging.Logger) -> None:
                     order.quantity, order.status, order.dry_run,
                 )
                 try:
+                    # Inject real fill price from price cache
+                    _fill_price = 0.0
+                    try:
+                        _pc_path = Path("/home/ubuntu/chad_finale/runtime/price_cache.json")
+                        _pc = json.loads(_pc_path.read_text(encoding="utf-8"))
+                        _prices = _pc.get("prices", {})
+                        _fill_price = float(_prices.get(order.symbol, 0.0))
+                        if _fill_price == 0.0:
+                            logger.warning("PRICE_CACHE_MISS symbol=%s — fill_price defaulting to 0.0", order.symbol)
+                    except Exception as pc_err:
+                        logger.warning("PRICE_CACHE_READ_FAILED: %s — fill_price defaulting to 0.0", pc_err)
+
                     ev = PaperExecEvidence(
                         symbol=order.symbol,
                         side=order.side,
                         quantity=order.quantity,
-                        fill_price=0.0,
+                        fill_price=_fill_price,
                         strategy=getattr(intent, "strategy", "") or "",
                         source_strategies=[getattr(intent, "strategy", "") or ""],
                         broker="ibkr_paper",
