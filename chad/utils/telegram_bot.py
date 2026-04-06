@@ -830,16 +830,53 @@ def extract_symbol_for_advisory(text: str) -> str:
     ]
 
     stopwords = {
+        # pronouns / determiners / prepositions / conjunctions
         "I", "A", "AN", "THE", "DO", "IS", "IT", "TO", "FOR", "AND", "OR",
         "YOU", "ME", "WE", "US", "NOW", "RIGHT", "WHAT", "WHEN", "WHY", "HOW",
         "WITH", "THIS", "THAT", "THESE", "THOSE", "SHOULD", "WOULD", "COULD",
         "ABOUT", "OVER", "UNDER", "FROM", "INTO", "ONTO", "THEN", "THAN",
+        "AM", "MY", "IN", "OF", "ON", "AT", "BY", "IF", "NO", "SO", "UP",
+        "AS", "BE", "HE",
+        # common verbs / verb forms
+        "DID", "ARE", "WAS", "HAS", "HAD", "CAN", "GET", "GOT", "LET", "MAY",
+        "SAY", "SEE", "SET", "SAW", "RAN", "USE", "TRY", "PUT", "RUN", "SAT",
+        "SIT", "HIT", "CUT", "WON", "MET", "LED", "LAY", "PAY", "BET",
+        "SEEN", "BEEN", "MADE", "MAKE", "TAKE", "TOOK", "GIVE", "GAVE",
+        "COME", "CAME", "KNOW", "KNEW", "WILL", "WENT", "JUST", "ALSO",
+        "SAID", "LOOK", "TELL", "FEEL", "TOLD", "KEPT", "LEFT", "DONE",
+        "DOES", "GOES", "GONE", "GETS", "PUTS", "PUTS", "RUNS", "LETS",
+        "SENT", "SOLD", "PAID", "READ", "DREW", "GREW", "FELL", "HUNG",
+        # common adjectives / adverbs
+        "NOT", "ALL", "NEW", "OLD", "BIG", "FEW", "FAR", "LOW", "HIGH",
+        "TOO", "TOP", "TWO", "ONE", "OWN", "GOOD", "BEST", "SOME", "MOST",
+        "VERY", "EVEN", "REAL", "SAFE", "FREE", "FULL", "FAST", "HARD",
+        "EASY", "SURE", "LATE", "LAST", "PAST", "NEXT", "EACH", "MANY",
+        "LESS", "MORE", "ONLY", "SAME", "SUCH", "BOTH", "ELSE", "EVER",
+        "NEAR", "WIDE", "DEEP", "TINY", "HUGE", "FLAT", "WARM", "COLD",
+        # common nouns / general words
+        "HIM", "HIS", "HER", "SHE", "ITS", "WAY", "WHO", "YES", "YET",
+        "BUT", "OUT", "BACK", "WELL", "OVER", "WHEN", "THEM", "THEY",
+        "HAVE", "BEEN", "MUCH", "TIME", "LONG", "DOWN", "DAYS", "WEEK",
+        "YEAR", "SHOW", "MEAN", "TURN", "MOVE", "PLAN", "LOSS", "GAIN",
+        "CASH", "FUND", "DEBT", "DEAL", "WANT", "NEED", "CALL", "WORK",
+        "PLAY", "STOP", "LIFE", "HOME", "NAME", "PART", "LINE", "SIDE",
+        "HEAD", "HAND", "ROOM", "FACT", "IDEA", "KIND", "SORT", "HALF",
+        "MIND", "EYES", "BODY", "FACE", "AREA", "CITY", "DATA", "RATE",
+        "ROLE", "RULE", "SIZE", "TEAM", "TERM", "TEST", "TYPE", "UNIT",
+        "VIEW", "WORD", "FORM", "LEFT",
+        # CHAD / finance domain words (not tickers)
         "RISK", "PERF", "LIVE", "GATE", "CHAD", "PRICE", "READY", "BLOCK",
-        "HELP", "NOTE", "TERM", "SHORT", "LONG", "MONTH", "MONTHS", "WEEK",
-        "WEEKS", "YEAR", "YEARS", "PORTFOLIO", "TARGETS", "REBALANCE",
+        "HELP", "NOTE", "SHORT", "LONG", "MONTH", "MONTHS", "WEEKS",
+        "YEARS", "PORTFOLIO", "TARGETS", "REBALANCE",
         "BALANCED", "CAUTIOUS", "CONFIDENT", "STATUS", "HEALTH",
-        "MUCH", "HAVE", "HOLD", "HOLDING", "HOLDINGS", "OWN", "POSITIONS",
-        "POSITION", "AM", "MY", "SHOW"
+        "HOLD", "HOLDING", "HOLDINGS", "POSITIONS", "POSITION",
+        "BRIEF", "DAILY", "TRADE", "HEDGE", "ALPHA", "GAMMA", "DELTA",
+        "THETA", "SIGMA", "ENTRY", "EXIT", "FILLS", "ORDER", "LIMIT",
+        "AUDIT", "CHECK", "CYCLE", "RANGE", "TREND", "BREAK", "RALLY",
+        "CRASH", "RECAP", "TODAY", "NIGHT", "AFTER", "CLOSE", "ABOVE",
+        "BELOW", "SINCE", "UNTIL", "STILL", "THINK", "GOING", "WHERE",
+        "WHICH", "THEIR", "THERE", "OTHER", "EVERY", "BEING", "NEVER",
+        "THOSE", "FIRST", "THREE", "MIGHT",
     }
 
     for pattern in explicit_patterns:
