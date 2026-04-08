@@ -240,6 +240,208 @@ def _append_ndjson_locked(path: Path, line_obj: Dict[str, Any]) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Live trace enrichment helpers (best-effort, fail-soft)
+#
+# These replace the previous reads of runtime/full_execution_cycle_last.json and
+# runtime/decision_trace_heartbeat.json, both of which had been frozen since
+# 2026-04-03 when their writer processes (full_execution_cycle.py oneshot and
+# decision_trace_heartbeat.py timer) stopped running. The orchestrator now
+# composes a fresh gate snapshot every cycle from authoritative sources:
+#   - HTTP /live-gate            (live evaluation, source of truth for permissions)
+#   - runtime/scr_state.json     (chad-scr-sync writes from /shadow)
+#   - runtime/live_readiness.json (chad-live-readiness oneshot)
+#   - runtime/fast_loop_state.json (orchestrator fast loop)
+#   - runtime/last_route_decision.json (chad-live-loop)
+# and writes a fresh runtime/decision_trace_heartbeat.json so downstream readers
+# (operator surface, daily reports) see live data.
+# -----------------------------------------------------------------------------
+
+LIVE_GATE_URL_DEFAULT = "http://127.0.0.1:9618/live-gate"
+DECISION_TRACE_HEARTBEAT_PATH: Path = RUNTIME_DIR / "decision_trace_heartbeat.json"
+
+
+def _fetch_live_gate_snapshot(
+    url: Optional[str] = None,
+    timeout_s: float = 2.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fail-soft HTTP fetch of /live-gate. Returns the parsed JSON dict on success
+    or None on any error (network, timeout, parse, non-dict). Stdlib only.
+    """
+    import urllib.request
+
+    target = url or os.environ.get("LIVE_GATE_URL") or LIVE_GATE_URL_DEFAULT
+    try:
+        with urllib.request.urlopen(target, timeout=float(timeout_s)) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _compose_gate_results(
+    live_gate: Optional[Dict[str, Any]],
+    scr_state: Optional[Dict[str, Any]],
+    live_readiness: Optional[Dict[str, Any]],
+    fast_loop: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Build trace `gate_results` from fresh runtime sources. Prefers live HTTP
+    /live-gate, falls back to file state if the endpoint is unreachable.
+    """
+    out: Dict[str, Any] = {}
+
+    if isinstance(live_gate, dict):
+        for key in (
+            "allow_exits_only",
+            "allow_ibkr_live",
+            "allow_ibkr_paper",
+            "execution",
+            "mode",
+            "operator_mode",
+            "operator_reason",
+            "reasons",
+            "shadow",
+        ):
+            if key in live_gate:
+                out[key] = live_gate[key]
+
+    # If /live-gate fetch failed or returned no shadow, splice in scr_state file.
+    if "shadow" not in out and isinstance(scr_state, dict):
+        out["shadow"] = {
+            "state": scr_state.get("state"),
+            "sizing_factor": scr_state.get("sizing_factor"),
+            "paper_only": scr_state.get("paper_only"),
+            "reasons": list(scr_state.get("reasons") or [])[:10],
+            "stats": scr_state.get("stats") or {},
+            "ts_utc": scr_state.get("ts_utc"),
+        }
+
+    if isinstance(live_readiness, dict):
+        out["live_readiness"] = {
+            "ready_for_live": bool(live_readiness.get("ready_for_live", False)),
+            "ts_utc": live_readiness.get("ts_utc"),
+        }
+
+    if isinstance(fast_loop, dict):
+        out["fast_loop"] = {
+            "status": fast_loop.get("status"),
+            "broker_ok": fast_loop.get("broker_ok"),
+            "price_ok": fast_loop.get("price_ok"),
+            "ibkr_bars_ok": fast_loop.get("ibkr_bars_ok"),
+            "profit_lock_active": fast_loop.get("profit_lock_active"),
+            "ts_utc": fast_loop.get("ts_utc"),
+        }
+
+    return out
+
+
+def _resolve_execution_mode(live_gate: Optional[Dict[str, Any]]) -> str:
+    """
+    Pull current execution mode from the live-gate response, falling back to
+    env vars and finally 'unknown'. Never raises.
+    """
+    if isinstance(live_gate, dict):
+        ex = live_gate.get("execution")
+        if isinstance(ex, dict):
+            m = ex.get("exec_mode")
+            if isinstance(m, str) and m.strip():
+                return m.strip()
+        md = live_gate.get("mode")
+        if isinstance(md, dict):
+            cm = md.get("chad_mode")
+            if isinstance(cm, str) and cm.strip():
+                return cm.strip()
+    env_m = os.environ.get("CHAD_EXECUTION_MODE")
+    return env_m.strip() if env_m and env_m.strip() else "unknown"
+
+
+def _count_fills_today(repo_root: Path) -> Dict[str, Any]:
+    """
+    Best-effort line-count of today's executed fills from
+    data/fills/FILLS_YYYYMMDD.ndjson. Returns a small summary dict; never raises.
+    """
+    try:
+        ymd = time.strftime("%Y%m%d", time.gmtime())
+        path = repo_root / "data" / "fills" / f"FILLS_{ymd}.ndjson"
+        if not path.is_file():
+            return {"fills_today": 0, "exists": False, "path": str(path)}
+        n = 0
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+        return {"fills_today": int(n), "exists": True, "path": str(path)}
+    except Exception:
+        return {"fills_today": 0, "exists": False}
+
+
+def _write_decision_trace_heartbeat(
+    *,
+    ts_utc: str,
+    live_gate: Optional[Dict[str, Any]],
+    scr_state: Optional[Dict[str, Any]],
+    live_readiness: Optional[Dict[str, Any]],
+    fast_loop: Optional[Dict[str, Any]],
+    executions_today: Dict[str, Any],
+    out_path: Path = DECISION_TRACE_HEARTBEAT_PATH,
+) -> None:
+    """
+    Atomically write a fresh runtime/decision_trace_heartbeat.json composed
+    from current live state. Replaces the dead chad/core/decision_trace_heartbeat.py
+    timer-driven oneshot.
+    """
+    payload: Dict[str, Any] = {
+        "ts_utc": str(ts_utc),
+        "ok": bool(live_gate is not None),
+        "source": "orchestrator",
+        "live_gate": live_gate if isinstance(live_gate, dict) else None,
+        "mode": (live_gate.get("mode") if isinstance(live_gate, dict) else None),
+        "allow_ibkr_paper": (
+            live_gate.get("allow_ibkr_paper") if isinstance(live_gate, dict) else None
+        ),
+        "allow_ibkr_live": (
+            live_gate.get("allow_ibkr_live") if isinstance(live_gate, dict) else None
+        ),
+        "scr_state": (
+            {
+                "state": scr_state.get("state"),
+                "sizing_factor": scr_state.get("sizing_factor"),
+                "paper_only": scr_state.get("paper_only"),
+                "ts_utc": scr_state.get("ts_utc"),
+                "stats": scr_state.get("stats") or {},
+            }
+            if isinstance(scr_state, dict)
+            else None
+        ),
+        "live_readiness": (
+            {
+                "ready_for_live": bool(live_readiness.get("ready_for_live", False)),
+                "ts_utc": live_readiness.get("ts_utc"),
+            }
+            if isinstance(live_readiness, dict)
+            else None
+        ),
+        "fast_loop": (
+            {
+                "status": fast_loop.get("status"),
+                "broker_ok": fast_loop.get("broker_ok"),
+                "price_ok": fast_loop.get("price_ok"),
+                "ts_utc": fast_loop.get("ts_utc"),
+            }
+            if isinstance(fast_loop, dict)
+            else None
+        ),
+        "executions_today": executions_today,
+        # Orchestrator does not own order submission (chad-live-loop does);
+        # this list is intentionally empty for trace contract compatibility.
+        "submitted_orders": [],
+    }
+    _atomic_write_json(out_path, payload, indent=2)
+
+
+# -----------------------------------------------------------------------------
 # Settings / results
 # -----------------------------------------------------------------------------
 
@@ -644,10 +846,19 @@ class Orchestrator:
         snapshot, used_fallback = self._load_portfolio_snapshot()
         allocator, allocator_mode = self._build_allocator()
 
-        # Domain 2: read execution state and gate for trace enrichment (best-effort)
-        _full_cycle = _safe_json_load(RUNTIME_DIR / "full_execution_cycle_last.json")
-        _heartbeat = _safe_json_load(RUNTIME_DIR / "decision_trace_heartbeat.json")
+        # Domain 2: gather fresh runtime state for trace enrichment (best-effort).
+        # Replaces the previous reads of full_execution_cycle_last.json and
+        # decision_trace_heartbeat.json which had been stale since their writers
+        # stopped running. None of these calls can break the publish path.
+        _live_gate = _fetch_live_gate_snapshot()
+        _scr_state = _safe_json_load(RUNTIME_DIR / "scr_state.json")
+        _live_readiness = _safe_json_load(RUNTIME_DIR / "live_readiness.json")
+        _fast_loop = _safe_json_load(RUNTIME_DIR / "fast_loop_state.json")
         _route_decision = _safe_json_load(RUNTIME_DIR / "last_route_decision.json")
+        _gate_results = _compose_gate_results(_live_gate, _scr_state, _live_readiness, _fast_loop)
+        _exec_mode = _resolve_execution_mode(_live_gate)
+        _executions_today = _count_fills_today(self._repo_root)
+
         payload = allocator.build_payload(snapshot=snapshot)
 
         out_path = self._settings.dynamic_caps_path
@@ -666,6 +877,22 @@ class Orchestrator:
         daily_risk_fraction = float(_finite_float(payload.get("daily_risk_fraction"), 0.0))
         portfolio_risk_cap = float(_finite_float(payload.get("portfolio_risk_cap"), 0.0))
 
+        # Best-effort: write a fresh runtime/decision_trace_heartbeat.json so
+        # operator surface and downstream readers see live state instead of the
+        # frozen snapshot left behind by the dead heartbeat oneshot. MUST NOT
+        # break orchestrator publishing.
+        try:
+            _write_decision_trace_heartbeat(
+                ts_utc=ts_utc,
+                live_gate=_live_gate,
+                scr_state=_scr_state,
+                live_readiness=_live_readiness,
+                fast_loop=_fast_loop,
+                executions_today=_executions_today,
+            )
+        except Exception:
+            pass
+
         # DecisionTrace (best-effort, cannot fail publish)
         try:
             self._trace.record_cycle(
@@ -678,9 +905,12 @@ class Orchestrator:
                 dynamic_caps_path=str(out_path),
                 dynamic_caps_hash=caps_hash,
                 dynamic_caps=payload,
-                execution_mode=(_full_cycle or {}).get("summary", {}).get("execution_mode", "unknown"),
-                gate_results=(_heartbeat or {}).get("live_gate", {}),
-                submitted_orders=(_full_cycle or {}).get("orders", []),
+                execution_mode=_exec_mode,
+                gate_results=_gate_results,
+                # Orchestrator no longer owns order submission; chad-live-loop
+                # is the execution path. Submission counts surface via the
+                # decision_trace_heartbeat.json executions_today block instead.
+                submitted_orders=[],
                 strategy_detail=_route_decision if isinstance(_route_decision, dict) else None,
             )
         except Exception:
