@@ -37,12 +37,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path("/home/ubuntu/chad_finale")
 DATA_TRADES = REPO_ROOT / "data" / "trades"
+DATA_FILLS = REPO_ROOT / "data" / "fills"
 RUNTIME_DIR = REPO_ROOT / "runtime"
 PNL_STATE_PATH = RUNTIME_DIR / "pnl_state.json"
 LIVE_READINESS_PATH = RUNTIME_DIR / "live_readiness.json"
 REPORTS_DIR = REPO_ROOT / "reports" / "ops"
 
 TRADE_FILE_GLOB = "trade_history_*.ndjson"
+FILLS_FILE_TEMPLATE = "FILLS_{ymd}.ndjson"
 
 # ---------------------------------------------------------------------------
 # Instrument translations — plain English
@@ -294,6 +296,124 @@ def load_week_trades(trades_dir: Optional[Path] = None) -> List[TradeRow]:
 
 
 # ---------------------------------------------------------------------------
+# Intent loading from data/fills/ (open-intent records, no closed PnL yet)
+#
+# Live loop fills are written to data/fills/FILLS_YYYYMMDD.ndjson by
+# chad/execution/paper_exec_evidence_writer.py. They represent submitted/
+# executed paper-trade intents but do not contain closed PnL (positions
+# have not been matched/closed). Use these to surface "what we did today"
+# in the daily report; PnL still requires the closed-trade ledger or a
+# future trade closer.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class IntentRow:
+    strategy: str
+    symbol: str
+    side: str
+    quantity: float
+    fill_price: float
+    ts_utc: Optional[str]
+
+
+def _normalize_strategy_field(value: Any) -> str:
+    """Strategy may arrive as a string or a list (e.g. source_strategies)."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        for v in value:
+            if v:
+                return str(v).strip().lower()
+        return ""
+    return str(value).strip().lower()
+
+
+def _extract_intent(obj: Dict[str, Any]) -> Optional[IntentRow]:
+    """
+    Extract a single fill record into an IntentRow. Skips obvious non-trades
+    (live records, rejected fills, missing symbol). Mirrors the defensive
+    style of _extract_row.
+    """
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        payload = obj
+
+    if payload.get("is_live") is True:
+        return None
+    if payload.get("reject") is True:
+        return None
+
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    if not symbol:
+        return None
+
+    strategy = _normalize_strategy_field(payload.get("strategy"))
+    if not strategy:
+        strategy = _normalize_strategy_field(payload.get("source_strategies"))
+    if not strategy:
+        strategy = "unknown"
+
+    side = str(payload.get("side") or "").strip().lower() or "unknown"
+
+    try:
+        qty = float(payload.get("quantity") or 0.0)
+        if not math.isfinite(qty):
+            qty = 0.0
+    except (TypeError, ValueError):
+        qty = 0.0
+
+    try:
+        price = float(payload.get("fill_price") or 0.0)
+        if not math.isfinite(price):
+            price = 0.0
+    except (TypeError, ValueError):
+        price = 0.0
+
+    ts = obj.get("timestamp_utc") or payload.get("fill_time_utc") or payload.get("entry_time_utc")
+    return IntentRow(
+        strategy=strategy,
+        symbol=symbol,
+        side=side,
+        quantity=qty,
+        fill_price=price,
+        ts_utc=str(ts) if ts else None,
+    )
+
+
+def load_today_intents(fills_dir: Optional[Path] = None) -> List[IntentRow]:
+    """
+    Load today's executed paper-trade intents from
+    data/fills/FILLS_YYYYMMDD.ndjson. Returns an empty list when the file
+    is missing or unreadable. Never raises.
+    """
+    root = fills_dir or DATA_FILLS
+    today = _today_yyyymmdd()
+    ledger = root / FILLS_FILE_TEMPLATE.format(ymd=today)
+
+    if not ledger.exists():
+        return []
+
+    rows: List[IntentRow] = []
+    try:
+        for line in ledger.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            row = _extract_intent(obj)
+            if row is not None:
+                rows.append(row)
+    except Exception:
+        pass
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Market data helpers (best-effort, from runtime cache)
 # ---------------------------------------------------------------------------
 
@@ -482,9 +602,15 @@ def _generate_quiet_day_take() -> str:
 class DailyCHADReport:
     """Generate a plain-English daily report for non-traders."""
 
-    def __init__(self, repo_root: Optional[Path] = None, trades_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        repo_root: Optional[Path] = None,
+        trades_dir: Optional[Path] = None,
+        fills_dir: Optional[Path] = None,
+    ):
         self._root = repo_root or REPO_ROOT
         self._trades_dir = trades_dir or (self._root / "data" / "trades")
+        self._fills_dir = fills_dir or (self._root / "data" / "fills")
         self._runtime_dir = self._root / "runtime"
 
     async def send_to_telegram(self) -> bool:
@@ -498,6 +624,7 @@ class DailyCHADReport:
         now = _utc_now()
         today_trades = load_today_trades(self._trades_dir)
         week_trades = load_week_trades(self._trades_dir)
+        today_intents = load_today_intents(self._fills_dir)
 
         total_pnl = sum(t.pnl for t in today_trades)
         total_trades = len(today_trades)
@@ -557,12 +684,22 @@ class DailyCHADReport:
         # 2. DID WE MAKE MONEY?
         sections.append("═══ DID WE MAKE MONEY? ═══")
         if total_trades == 0:
-            sections.append("Quiet day — no trades today ⚪")
-            day_of_week = now.weekday()
-            if day_of_week >= 5:
-                sections.append("Markets are closed on weekends — we'll be back Monday!")
+            if today_intents:
+                # Submitted trades exist but nothing has closed yet — be honest
+                # about $0 closed P&L without claiming "no trades today".
+                sections.append("$0 in closed profit/loss today ⚪")
+                sections.append(
+                    "We submitted trades today but no positions have closed yet — "
+                    "open positions don't count as profit or loss until they're closed out. "
+                    "See WHAT DID WE DO TODAY below."
+                )
             else:
-                sections.append("No clear signals today, so we sat on the sidelines. Sometimes the smartest move is no move at all.")
+                sections.append("Quiet day — no trades today ⚪")
+                day_of_week = now.weekday()
+                if day_of_week >= 5:
+                    sections.append("Markets are closed on weekends — we'll be back Monday!")
+                else:
+                    sections.append("No clear signals today, so we sat on the sidelines. Sometimes the smartest move is no move at all.")
         elif total_pnl > 0:
             sections.append(f"Yes — we made {_format_money(total_pnl)} on paper today 🟢")
             sections.append(f"That's like finding {_format_money(total_pnl)} in your pocket. Not real money yet, but the approach is working.")
@@ -574,7 +711,7 @@ class DailyCHADReport:
             sections.append("We traded but came out flat. Think of it as a tie game.")
         sections.append("")
 
-        # 3. WHAT DID WE DO?
+        # 3. WHAT DID WE DO?  (closed-trade P&L view; rare under live-loop today)
         if total_trades > 0:
             sections.append("═══ WHAT DID WE DO? ═══")
             sections.append(f"{total_trades} trades today. {wins} were winners, {losses} were losers.")
@@ -582,6 +719,33 @@ class DailyCHADReport:
                 record = f"{wins}-{losses}"
                 quality = "a winning" if wins > losses else ("a tough" if losses > wins else "an even")
                 sections.append(f"That's like going {record} — {quality} day.")
+            sections.append("")
+
+        # 3b. WHAT DID WE DO TODAY  (live-loop submitted intents from data/fills/)
+        if today_intents:
+            n_intents = len(today_intents)
+            uniq_symbols = sorted({r.symbol for r in today_intents})
+            strat_counts: Dict[str, int] = {}
+            for r in today_intents:
+                strat_counts[r.strategy] = strat_counts.get(r.strategy, 0) + 1
+            top_strategy, top_count = max(strat_counts.items(), key=lambda kv: kv[1])
+
+            display_symbols = uniq_symbols[:8]
+            sym_text = ", ".join(display_symbols)
+            if len(uniq_symbols) > 8:
+                sym_text += f" (+{len(uniq_symbols) - 8} more)"
+
+            trade_word = "trade" if n_intents == 1 else "trades"
+            top_word = "trade" if top_count == 1 else "trades"
+
+            sections.append("═══ WHAT DID WE DO TODAY ═══")
+            sections.append(f"We submitted {n_intents} {trade_word} across {sym_text} today.")
+            sections.append(
+                f"Most active: {translate_strategy(top_strategy)} with {top_count} {top_word}."
+            )
+            sections.append(
+                "Note: These are practice trades — real profit/loss shows once positions close."
+            )
             sections.append("")
 
         # 4. BEST MOVE TODAY

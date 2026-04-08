@@ -14,11 +14,13 @@ import pytest
 
 from chad.ops.daily_chad_report import (
     DailyCHADReport,
+    IntentRow,
     MorningBrief,
     TradeRow,
     translate_instrument,
     translate_strategy,
     vix_description,
+    load_today_intents,
     load_today_trades,
     _format_money,
 )
@@ -228,6 +230,85 @@ class TestTradeLoading:
 
 
 # ---------------------------------------------------------------------------
+# Intent loading from data/fills/ (live-loop submitted intents, no PnL)
+# ---------------------------------------------------------------------------
+
+class TestIntentLoading:
+    def _write_fills(self, fills_dir: Path, ymd: str, fills: list):
+        fills_dir.mkdir(parents=True, exist_ok=True)
+        ledger = fills_dir / f"FILLS_{ymd}.ndjson"
+        lines = []
+        for i, payload in enumerate(fills):
+            rec = {
+                "payload": payload,
+                "timestamp_utc": f"2026-04-08T00:00:0{i}Z",
+                "record_hash": f"h{i}",
+                "sequence_id": i,
+            }
+            lines.append(json.dumps(rec))
+        ledger.write_text("\n".join(lines), encoding="utf-8")
+
+    def test_loads_intents_from_paper_fills(self, tmp_path):
+        from chad.ops.daily_chad_report import _today_yyyymmdd
+        today = _today_yyyymmdd()
+        self._write_fills(tmp_path, today, [
+            {"strategy": "alpha_futures", "symbol": "MES", "side": "SELL",
+             "quantity": 1.0, "fill_price": 6663.5, "is_live": False, "status": "dry_run"},
+            {"strategy": "alpha_futures", "symbol": "MNQ", "side": "SELL",
+             "quantity": 1.0, "fill_price": 24371.0, "is_live": False, "status": "dry_run"},
+        ])
+        rows = load_today_intents(tmp_path)
+        assert len(rows) == 2
+        assert rows[0].symbol == "MES"
+        assert rows[0].strategy == "alpha_futures"
+        assert rows[0].side == "sell"
+        assert rows[0].quantity == 1.0
+        assert rows[0].fill_price == 6663.5
+
+    def test_skips_live_fills(self, tmp_path):
+        from chad.ops.daily_chad_report import _today_yyyymmdd
+        today = _today_yyyymmdd()
+        self._write_fills(tmp_path, today, [
+            {"strategy": "alpha", "symbol": "SPY", "side": "BUY",
+             "quantity": 1.0, "fill_price": 500.0, "is_live": True},
+            {"strategy": "alpha", "symbol": "QQQ", "side": "BUY",
+             "quantity": 1.0, "fill_price": 400.0, "is_live": False},
+        ])
+        rows = load_today_intents(tmp_path)
+        assert len(rows) == 1
+        assert rows[0].symbol == "QQQ"
+
+    def test_skips_rejected_fills(self, tmp_path):
+        from chad.ops.daily_chad_report import _today_yyyymmdd
+        today = _today_yyyymmdd()
+        self._write_fills(tmp_path, today, [
+            {"strategy": "alpha", "symbol": "SPY", "side": "BUY",
+             "quantity": 1.0, "fill_price": 500.0, "reject": True},
+            {"strategy": "alpha", "symbol": "QQQ", "side": "BUY",
+             "quantity": 1.0, "fill_price": 400.0},
+        ])
+        rows = load_today_intents(tmp_path)
+        assert len(rows) == 1
+        assert rows[0].symbol == "QQQ"
+
+    def test_strategy_list_field(self, tmp_path):
+        """source_strategies as a list should resolve to the first entry."""
+        from chad.ops.daily_chad_report import _today_yyyymmdd
+        today = _today_yyyymmdd()
+        self._write_fills(tmp_path, today, [
+            {"strategy": None, "source_strategies": ["alpha_futures"],
+             "symbol": "MCL", "side": "BUY", "quantity": 2.0, "fill_price": 110.3},
+        ])
+        rows = load_today_intents(tmp_path)
+        assert len(rows) == 1
+        assert rows[0].strategy == "alpha_futures"
+
+    def test_empty_dir(self, tmp_path):
+        rows = load_today_intents(tmp_path)
+        assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
 
@@ -403,6 +484,91 @@ class TestDailyCHADReport:
         assert "CHAD'S TAKE" in msg
         # Fallback text should mention quiet/rest/Monday
         assert "quiet" in msg.lower() or "rest" in msg.lower() or "monday" in msg.lower()
+
+    def _make_report_with_intents(self, tmp_path, intents):
+        """Build a DailyCHADReport with no closed trades but submitted intents in data/fills/."""
+        from chad.ops.daily_chad_report import _today_yyyymmdd
+        today = _today_yyyymmdd()
+
+        trades_dir = tmp_path / "trades"
+        trades_dir.mkdir()
+        fills_dir = tmp_path / "fills"
+        fills_dir.mkdir()
+
+        ledger = fills_dir / f"FILLS_{today}.ndjson"
+        lines = []
+        for i, payload in enumerate(intents):
+            rec = {
+                "payload": payload,
+                "timestamp_utc": f"2026-04-08T00:00:0{i}Z",
+                "record_hash": f"h{i}",
+                "sequence_id": i,
+            }
+            lines.append(json.dumps(rec))
+        ledger.write_text("\n".join(lines), encoding="utf-8")
+
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        (runtime / "pnl_state.json").write_text(json.dumps({"account_equity": 998000}))
+        (runtime / "live_readiness.json").write_text(json.dumps({"ready_for_live": False}))
+
+        report = DailyCHADReport(repo_root=tmp_path, trades_dir=trades_dir, fills_dir=fills_dir)
+        return report.generate()
+
+    def test_intents_section_present_when_fills_exist(self, tmp_path):
+        msg = self._make_report_with_intents(tmp_path, [
+            {"strategy": "alpha_futures", "symbol": "MES", "side": "SELL",
+             "quantity": 1.0, "fill_price": 6663.5, "is_live": False, "status": "dry_run"},
+            {"strategy": "alpha_futures", "symbol": "MNQ", "side": "SELL",
+             "quantity": 1.0, "fill_price": 24371.0, "is_live": False, "status": "dry_run"},
+            {"strategy": "alpha_futures", "symbol": "MCL", "side": "BUY",
+             "quantity": 2.0, "fill_price": 110.3, "is_live": False, "status": "dry_run"},
+        ])
+        assert "WHAT DID WE DO TODAY" in msg
+        assert "We submitted 3 trades" in msg
+        # Symbols listed
+        assert "MES" in msg and "MNQ" in msg and "MCL" in msg
+        # Top strategy translated to plain English
+        assert "Futures momentum" in msg
+        assert "with 3 trades" in msg
+        # Disclaimer present
+        assert "practice trades" in msg.lower()
+        assert "positions close" in msg
+
+    def test_intents_section_replaces_quiet_day_message(self, tmp_path):
+        """When fills exist but no closed trades, DID WE MAKE MONEY should not say 'Quiet day'."""
+        msg = self._make_report_with_intents(tmp_path, [
+            {"strategy": "alpha_futures", "symbol": "MES", "side": "SELL",
+             "quantity": 1.0, "fill_price": 6663.5, "is_live": False},
+        ])
+        assert "$0 in closed profit/loss" in msg
+        assert "open positions don't count" in msg
+        assert "Quiet day — no trades today" not in msg
+
+    def test_quiet_day_message_kept_when_no_fills(self, tmp_path):
+        """When neither closed trades nor fills exist, the original 'Quiet day' message stays."""
+        trades_dir = tmp_path / "trades"
+        trades_dir.mkdir()
+        fills_dir = tmp_path / "fills"
+        fills_dir.mkdir()
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        (runtime / "pnl_state.json").write_text(json.dumps({"account_equity": 998000}))
+        (runtime / "live_readiness.json").write_text(json.dumps({"ready_for_live": False}))
+
+        report = DailyCHADReport(repo_root=tmp_path, trades_dir=trades_dir, fills_dir=fills_dir)
+        msg = report.generate()
+        assert "Quiet day" in msg
+        assert "WHAT DID WE DO TODAY" not in msg
+
+    def test_intents_section_singular_grammar(self, tmp_path):
+        """Single fill should use singular 'trade'."""
+        msg = self._make_report_with_intents(tmp_path, [
+            {"strategy": "alpha_futures", "symbol": "MES", "side": "SELL",
+             "quantity": 1.0, "fill_price": 6663.5, "is_live": False},
+        ])
+        assert "We submitted 1 trade across" in msg
+        assert "with 1 trade." in msg
 
     def test_practice_mode_label(self, tmp_path):
         trades_dir = tmp_path / "trades"
