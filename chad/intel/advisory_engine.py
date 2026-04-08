@@ -1173,10 +1173,15 @@ class RuntimeStateProvider:
             "feed_state": self._runtime_dir / "feed_state.json",
         }
 
-        out = {
-            name: read_json_dict(path)
-            for name, path in files.items()
-        }
+        out: Dict[str, Any] = {}
+
+        # Synthesized human-readable system status FIRST so the LLM leads with the
+        # real reason CHAD is or isn't acting, not vague "not confident enough" framing.
+        scr = read_json_dict(self._runtime_dir / "scr_state.json")
+        out["system_status"] = _build_system_status(scr)
+
+        for name, path in files.items():
+            out[name] = read_json_dict(path)
 
         # Try local API-derived snapshot only if present in runtime or if a local mirror exists.
         # This keeps the module file-safe and network-optional.
@@ -1184,6 +1189,55 @@ class RuntimeStateProvider:
         out["live_gate"] = read_json_dict(live_gate_path)
 
         return normalize_to_primitive(out)
+
+
+def _build_system_status(scr: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a top-of-context summary the LLM can lead with. SCR.state == PAUSED does
+    NOT mean "not confident" — it means SCR's own performance gates blocked promotion.
+    Surface the actual reasons so the advisory text reflects ground truth.
+    """
+    stats = scr.get("stats") or {}
+    win_rate = stats.get("win_rate", scr.get("win_rate"))
+    sharpe = stats.get("sharpe_like", scr.get("sharpe_like"))
+    max_dd = stats.get("max_drawdown", scr.get("max_drawdown"))
+    state = scr.get("state") or "unknown"
+    reasons = list(scr.get("reasons") or [])[:3]
+
+    plain: str
+    if state == "PAUSED":
+        bits = []
+        if isinstance(win_rate, (int, float)):
+            bits.append(f"win rate {win_rate*100:.1f}%")
+        if isinstance(sharpe, (int, float)):
+            bits.append(f"sharpe-like {sharpe:.2f}")
+        if isinstance(max_dd, (int, float)):
+            bits.append(f"max drawdown {max_dd:.0f}")
+        metric_phrase = ", ".join(bits) if bits else "below cautious thresholds"
+        plain = (
+            f"SCR is PAUSED because recent paper performance ({metric_phrase}) "
+            f"failed CONFIDENT and CAUTIOUS promotion gates. This is a performance "
+            f"block, not a low-confidence signal — the system stops acting until "
+            f"the rolling window recovers."
+        )
+    elif state == "CONFIDENT":
+        plain = "SCR is CONFIDENT — performance gates passed; sizing is at full strength."
+    elif state == "CAUTIOUS":
+        plain = "SCR is CAUTIOUS — partial sizing; some promotion gates not yet met."
+    elif state == "WARMUP":
+        plain = "SCR is in WARMUP — not enough trade history yet to evaluate."
+    else:
+        plain = f"SCR state: {state}."
+
+    return {
+        "scr_state": state,
+        "scr_win_rate": win_rate,
+        "scr_sharpe": sharpe,
+        "scr_max_drawdown": max_dd,
+        "scr_reasons": reasons,
+        "trading_posture": "DRY_RUN — paper account only, no real money at risk",
+        "why_paused_plain_english": plain,
+    }
 
 
 # ---------------------------------------------------------------------
