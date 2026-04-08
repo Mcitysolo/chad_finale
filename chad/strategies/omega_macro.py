@@ -13,16 +13,15 @@ Instruments
 - ZN  : 10-Year Treasury Note (CBOT)  — interest rate / duration exposure
 - ZB  : 30-Year Treasury Bond (CBOT)  — long-duration rate exposure
 - M6E : Micro Euro FX (CME)           — USD strength / global risk proxy
-- SIL : Micro Silver (COMEX)          — industrial metal / inflation proxy
 
 Signal Logic
 ------------
 Regime-driven directional positioning. Each instrument has a defined
 side per regime:
 
-    RISK_OFF:     ZN BUY, ZB BUY, M6E SELL, SIL SELL
-    RISK_ON:      ZN SELL, ZB SELL, M6E BUY, SIL BUY
-    STAGFLATION:  ZN BUY, ZB BUY, M6E SELL, SIL BUY
+    RISK_OFF:     ZN BUY, ZB BUY, M6E SELL
+    RISK_ON:      ZN SELL, ZB SELL, M6E BUY
+    STAGFLATION:  ZN BUY, ZB BUY, M6E SELL
     NEUTRAL:      No signals (flat)
 
 Sizing
@@ -99,14 +98,6 @@ OMEGA_MACRO_SPECS: Dict[str, FuturesInstrumentSpec] = {
         min_tick=0.0001,
         max_contracts=3,
     ),
-    "SIL": FuturesInstrumentSpec(
-        symbol="SIL",
-        family="SI",
-        exchange="COMEX",
-        point_value=1000.0,
-        min_tick=0.001,
-        max_contracts=2,
-    ),
 }
 
 
@@ -159,19 +150,16 @@ REGIME_SIGNAL_MAP: Dict[MacroRegime, Dict[str, SignalSide]] = {
         "ZN": SignalSide.BUY,     # Flight to safety, bonds rally
         "ZB": SignalSide.BUY,     # Long duration rally
         "M6E": SignalSide.SELL,   # USD strength, euro weakness
-        "SIL": SignalSide.SELL,   # Industrial demand falls
     },
     MacroRegime.RISK_ON: {
         "ZN": SignalSide.SELL,    # Yields rise, bonds fall
         "ZB": SignalSide.SELL,    # Duration sells off
-        "M6E": SignalSide.BUY,   # Risk appetite, euro strengthens
-        "SIL": SignalSide.BUY,   # Industrial demand, growth
+        "M6E": SignalSide.BUY,    # Risk appetite, euro strengthens
     },
     MacroRegime.STAGFLATION: {
         "ZN": SignalSide.BUY,     # Rate uncertainty, flight to quality
         "ZB": SignalSide.BUY,     # Convexity hedge
         "M6E": SignalSide.SELL,   # USD safe haven
-        "SIL": SignalSide.BUY,   # Commodity inflation hedge
     },
     MacroRegime.NEUTRAL: {},       # No signals — stay flat
 }
@@ -190,7 +178,7 @@ def build_omega_macro_config() -> StrategyConfig:
         return StrategyConfig(
             name=StrategyName.OMEGA_MACRO,
             enabled=True,
-            target_universe=["ZN", "ZB", "M6E", "SIL"],
+            target_universe=["ZN", "ZB", "M6E"],
             max_gross_exposure=0.18,
             notes="Macro regime futures engine (fallback config)",
         )
@@ -442,15 +430,13 @@ def build_omega_macro_signals(
     bars_by_symbol = _extract_bars(ctx, all_symbols)
     equity = _extract_equity(ctx, StrategyTuning(equity_fallback=tuning.equity_fallback))
 
-    # Compute trend signals from bond and commodity bars
+    # Compute trend signals from bond bars (commodity trend deprecated with SIL removal)
     zn_bars = bars_by_symbol.get("ZN", [])
-    sil_bars = bars_by_symbol.get("SIL", [])
 
     zn_closes = [_to_float(b.get("close"), 0.0) for b in zn_bars if _to_float(b.get("close"), 0.0) > 0]
-    sil_closes = [_to_float(b.get("close"), 0.0) for b in sil_bars if _to_float(b.get("close"), 0.0) > 0]
 
     bond_trend = _ema_slope(zn_closes, tuning.ema_slope_period)
-    commodity_trend = _ema_slope(sil_closes, tuning.ema_slope_period)
+    commodity_trend = None
 
     # Classify regime
     regime = classify_macro_regime(vix, drawdown_pct, bond_trend, commodity_trend)

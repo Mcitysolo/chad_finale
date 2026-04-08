@@ -35,9 +35,44 @@ LOGGER = logging.getLogger("chad.market_data.ibkr_historical_provider")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BARS_DIR = REPO_ROOT / "data" / "bars"
+UNIVERSE_PATH = REPO_ROOT / "config" / "universe.json"
 
 # IBKR pacing: max 60 requests per 10 minutes; we use 1 req per 0.5s
 PACING_DELAY_S = 0.5
+
+
+_FUTURES_SPEC_CACHE: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _load_futures_specs() -> Dict[str, Dict[str, str]]:
+    """
+    Load precise futures contract specs from config/universe.json.
+
+    Returns dict keyed by symbol with exchange/currency/tradingClass fields.
+    Cached after first load.
+    """
+    global _FUTURES_SPEC_CACHE
+    if _FUTURES_SPEC_CACHE is not None:
+        return _FUTURES_SPEC_CACHE
+    specs: Dict[str, Dict[str, str]] = {}
+    try:
+        if UNIVERSE_PATH.is_file():
+            obj = json.loads(UNIVERSE_PATH.read_text(encoding="utf-8"))
+            for entry in obj.get("futures", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                sym = str(entry.get("symbol", "")).strip().upper()
+                if not sym:
+                    continue
+                specs[sym] = {
+                    "exchange": str(entry.get("exchange", "")).strip(),
+                    "currency": str(entry.get("currency", "USD")).strip() or "USD",
+                    "tradingClass": str(entry.get("tradingClass", "")).strip(),
+                }
+    except Exception as exc:
+        LOGGER.warning("ibkr_historical_provider.universe_load_failed: %s", exc)
+    _FUTURES_SPEC_CACHE = specs
+    return specs
 
 
 @dataclass(frozen=True)
@@ -120,13 +155,22 @@ class IBKRHistoricalProvider:
 
         sym = symbol.strip().upper()
         if sec_type == "FUT":
-            exchange_map = {
-                "MES": "CME", "MNQ": "CME", "MCL": "NYMEX",
-                "MGC": "COMEX", "ZN": "CBOT", "ZB": "CBOT",
-                "M6E": "CME", "SIL": "COMEX",
-            }
-            exchange = exchange_map.get(sym, "CME")
-            contract = Future(symbol=sym, exchange=exchange, currency="USD")
+            # Resolve full spec from config/universe.json. tradingClass is
+            # required to disambiguate micros from full-size contracts on the
+            # same root (e.g. MES vs ES on CME) — without it bar fetches can
+            # return wrong-contract data or fail outright.
+            specs = _load_futures_specs()
+            spec = specs.get(sym, {})
+            exchange = spec.get("exchange") or "CME"
+            currency = spec.get("currency") or "USD"
+            trading_class = spec.get("tradingClass") or sym
+
+            contract = Future(
+                symbol=sym,
+                exchange=exchange,
+                currency=currency,
+                tradingClass=trading_class,
+            )
             try:
                 qualified = self._ib.qualifyContracts(contract)
                 if qualified:

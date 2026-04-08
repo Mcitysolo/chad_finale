@@ -206,21 +206,21 @@ class TestSignalDirections:
         assert directions["ZN"] == SignalSide.BUY
         assert directions["ZB"] == SignalSide.BUY
         assert directions["M6E"] == SignalSide.SELL
-        assert directions["SIL"] == SignalSide.SELL
+        assert "SIL" not in directions
 
     def test_risk_on_directions(self) -> None:
         directions = REGIME_SIGNAL_MAP[MacroRegime.RISK_ON]
         assert directions["ZN"] == SignalSide.SELL
         assert directions["ZB"] == SignalSide.SELL
         assert directions["M6E"] == SignalSide.BUY
-        assert directions["SIL"] == SignalSide.BUY
+        assert "SIL" not in directions
 
     def test_stagflation_directions(self) -> None:
         directions = REGIME_SIGNAL_MAP[MacroRegime.STAGFLATION]
         assert directions["ZN"] == SignalSide.BUY
         assert directions["ZB"] == SignalSide.BUY
         assert directions["M6E"] == SignalSide.SELL
-        assert directions["SIL"] == SignalSide.BUY
+        assert "SIL" not in directions
 
     def test_neutral_no_signals(self) -> None:
         directions = REGIME_SIGNAL_MAP[MacroRegime.NEUTRAL]
@@ -520,15 +520,13 @@ class TestBuildSignals:
         # Need generous notional cap or use M6E (price ~1.08, pv 12500 -> $13.5k)
         closes_bond = _steady_series(n=50, base=110.0, step=0.1)
         closes_m6e = _steady_series(n=50, base=1.08, step=0.001)
-        closes_sil = _steady_series(n=50, base=25.0, step=0.05)
         bars_bond = _make_bars(closes_bond, spread=0.5, volume=50_000.0)
         bars_m6e = _make_bars(closes_m6e, spread=0.005, volume=50_000.0)
-        bars_sil = _make_bars(closes_sil, spread=0.2, volume=50_000.0)
-        prices = {"ZN": 110.0, "ZB": 120.0, "M6E": 1.08, "SIL": 25.0}
+        prices = {"ZN": 110.0, "ZB": 120.0, "M6E": 1.08}
         ctx = _build_ctx(
             vix=30.0,
             equity=1_000_000.0,
-            bars={"ZN": bars_bond, "ZB": bars_bond, "M6E": bars_m6e, "SIL": bars_sil},
+            bars={"ZN": bars_bond, "ZB": bars_bond, "M6E": bars_m6e},
             prices=prices,
         )
         signals = build_omega_macro_signals(ctx)
@@ -587,7 +585,7 @@ class TestConfig:
         cfg = config_build_omega_macro_config()
         assert cfg.name == StrategyName.OMEGA_MACRO
         assert cfg.enabled is True
-        assert list(cfg.target_universe) == ["ZN", "ZB", "M6E", "SIL"]
+        assert list(cfg.target_universe) == ["ZN", "ZB", "M6E"]
         assert cfg.max_gross_exposure == pytest.approx(0.18)
 
     def test_env_disable(self) -> None:
@@ -674,8 +672,8 @@ class TestRegistry:
 class TestInstrumentSpecs:
     """Validate OMEGA_MACRO instrument specifications."""
 
-    def test_all_four_instruments_defined(self) -> None:
-        assert set(OMEGA_MACRO_SPECS.keys()) == {"ZN", "ZB", "M6E", "SIL"}
+    def test_all_instruments_defined(self) -> None:
+        assert set(OMEGA_MACRO_SPECS.keys()) == {"ZN", "ZB", "M6E"}
 
     def test_zn_spec(self) -> None:
         spec = OMEGA_MACRO_SPECS["ZN"]
@@ -697,10 +695,3 @@ class TestInstrumentSpecs:
         assert spec.point_value == 12500.0
         assert spec.min_tick == pytest.approx(0.0001)
         assert spec.max_contracts == 3
-
-    def test_sil_spec(self) -> None:
-        spec = OMEGA_MACRO_SPECS["SIL"]
-        assert spec.exchange == "COMEX"
-        assert spec.point_value == 1000.0
-        assert spec.min_tick == pytest.approx(0.001)
-        assert spec.max_contracts == 2

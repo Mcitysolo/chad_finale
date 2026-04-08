@@ -30,7 +30,6 @@ DEFAULT_OMEGA_MACRO_UNIVERSE: Tuple[str, ...] = (
     "ZN",   # 10-Year Treasury Note
     "ZB",   # 30-Year Treasury Bond
     "M6E",  # Micro Euro FX
-    "SIL",  # Micro Silver
 )
 
 DEFAULT_ENABLED: bool = True
@@ -181,7 +180,7 @@ def _load_env_overrides() -> OmegaMacroConfigSpec:
     Environment contract
     --------------------
     CHAD_OMEGA_MACRO_ENABLED=true|false
-    CHAD_OMEGA_MACRO_UNIVERSE=ZN,ZB,M6E,SIL
+    CHAD_OMEGA_MACRO_UNIVERSE=ZN,ZB,M6E
     CHAD_OMEGA_MACRO_MAX_GROSS_EXPOSURE=0.18
     CHAD_OMEGA_MACRO_NOTES=Macro regime futures engine
     """

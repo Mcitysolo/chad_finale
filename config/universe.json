@@ -20,31 +20,50 @@
     {
       "symbol": "MES",
       "exchange": "CME",
-      "sec_type": "FUT"
-    },
-    {
-      "symbol": "MCL",
-      "exchange": "NYMEX",
+      "currency": "USD",
+      "tradingClass": "MES",
       "sec_type": "FUT"
     },
     {
       "symbol": "MNQ",
       "exchange": "CME",
+      "currency": "USD",
+      "tradingClass": "MNQ",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "MCL",
+      "exchange": "NYMEX",
+      "currency": "USD",
+      "tradingClass": "MCL",
       "sec_type": "FUT"
     },
     {
       "symbol": "MGC",
       "exchange": "COMEX",
+      "currency": "USD",
+      "tradingClass": "MGC",
       "sec_type": "FUT"
     },
     {
       "symbol": "ZN",
       "exchange": "CBOT",
+      "currency": "USD",
+      "tradingClass": "ZN",
       "sec_type": "FUT"
     },
     {
       "symbol": "ZB",
       "exchange": "CBOT",
+      "currency": "USD",
+      "tradingClass": "ZB",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "M6E",
+      "exchange": "CME",
+      "currency": "USD",
+      "tradingClass": "M6E",
       "sec_type": "FUT"
     }
   ]
