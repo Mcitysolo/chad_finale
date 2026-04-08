@@ -1237,6 +1237,18 @@ def _build_system_status(scr: Dict[str, Any]) -> Dict[str, Any]:
         "scr_reasons": reasons,
         "trading_posture": "DRY_RUN — paper account only, no real money at risk",
         "why_paused_plain_english": plain,
+        "self_referential_keywords": [
+            "our", "we", "us", "chad", "system",
+            "win rate", "target", "performance",
+            "confident", "cautious", "paused",
+            "will we", "are we", "can we",
+        ],
+        "interpretation_note": (
+            "When the user asks about 'our' performance, 'our' target, 'we', "
+            "'us', or 'the system', they are asking about CHAD's own trading "
+            "metrics — not about external stocks or tickers. Answer using "
+            "scr_state / scr_win_rate / scr_sharpe / scr_reasons above."
+        ),
     }
 
 
