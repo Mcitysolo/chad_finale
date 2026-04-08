@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Trade Closer (FIFO match fills -> closed_trade.v1 records)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.execution.trade_closer

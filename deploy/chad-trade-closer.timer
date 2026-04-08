@@ -1,0 +1,12 @@
+[Unit]
+Description=Timer: CHAD Trade Closer every 60 seconds
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=60
+AccuracySec=10s
+Persistent=true
+Unit=chad-trade-closer.service
+
+[Install]
+WantedBy=timers.target
