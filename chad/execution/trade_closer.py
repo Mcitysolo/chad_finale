@@ -82,6 +82,7 @@ class ClosedTrade:
     schema: str = "closed_trade.v1"
 
     def to_payload(self) -> Dict[str, Any]:
+        notional = self.entry_price * self.quantity * self.contract_multiplier
         return {
             "schema_version": self.schema,
             "strategy": self.strategy,
@@ -95,6 +96,7 @@ class ClosedTrade:
             "exit_price": self.exit_price,
             "quantity": self.quantity,
             "contract_multiplier": self.contract_multiplier,
+            "notional": notional,
             "fill_ids": list(self.fill_ids),
             "broker": "paper_exec",
             "account_id": "PAPER_EXEC",

@@ -318,6 +318,12 @@ def _parse_ledger(
 
         pnl = _safe_float(payload.get("pnl"), default=float("nan"))
         notional = _safe_float(payload.get("notional"), default=float("nan"))
+        if not math.isfinite(notional):
+            entry_price = _safe_float(payload.get("entry_price"), default=float("nan"))
+            qty = _safe_float(payload.get("quantity"), default=float("nan"))
+            mult = _safe_float(payload.get("contract_multiplier"), default=1.0)
+            if math.isfinite(entry_price) and math.isfinite(qty):
+                notional = entry_price * qty * mult
         if not (math.isfinite(pnl) and math.isfinite(notional)):
             counters["excluded_nonfinite"] += 1
             continue
