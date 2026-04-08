@@ -100,6 +100,18 @@ Canonical list of futures symbols to be included in every context build.
 May be customised via the ``CHAD_FUTURES_SYMBOLS`` environment variable.
 """
 
+CRYPTO_SYMBOLS: Tuple[str, ...] = ("BTC-USD", "ETH-USD", "SOL-USD")
+"""
+Canonical list of crypto symbols sourced from runtime/kraken_prices.json.
+Crypto trades 24/7 and is wired in via _merge_kraken_prices().
+"""
+
+KRAKEN_PRICES_PATH = os.getenv(
+    "CHAD_KRAKEN_PRICES_PATH",
+    os.path.join(os.getcwd(), "runtime", "kraken_prices.json"),
+)
+KRAKEN_MAX_AGE_SECONDS = 300
+
 
 @dataclass
 class MarketContext:
@@ -356,6 +368,10 @@ class ContextBuilder:
         for s in self.futures_symbols:
             if s not in universe:
                 universe.append(s)
+        # Then crypto symbols (24/7 — sourced from runtime/kraken_prices.json)
+        for s in CRYPTO_SYMBOLS:
+            if s not in universe:
+                universe.append(s)
 
         # Asynchronously load bars and ticks
         bars = await self.bars_provider.load_bars(universe)
@@ -372,6 +388,9 @@ class ContextBuilder:
                     price = series[-1].get("close")
                     if price is not None:
                         prices[symbol] = float(price)
+
+        # Merge Kraken crypto spot prices (24/7 feed) — fail-closed if stale/missing
+        kraken_evidence = self._merge_kraken_prices(prices)
 
         # Compute notionals
         current_symbol_notional: Dict[str, float] = {}
@@ -410,6 +429,7 @@ class ContextBuilder:
             "requested_symbols": universe,
             "bars_found": {s: len(bars.get(s, [])) for s in universe},
             "ticks_found": {s: (s in ticks) for s in universe},
+            "kraken_merge": kraken_evidence,
         }
 
         return ContextResult(
@@ -440,6 +460,89 @@ class ContextBuilder:
     # ------------------------------------------------------------------
     # Helper functions
     # ------------------------------------------------------------------
+
+    def _merge_kraken_prices(self, prices: Dict[str, float]) -> Dict[str, object]:
+        """
+        Merge Kraken crypto spot prices into the supplied prices dict in-place.
+
+        Reads ``runtime/kraken_prices.json``, validates freshness against
+        ``KRAKEN_MAX_AGE_SECONDS``, and merges the canonical
+        :data:`CRYPTO_SYMBOLS` into ``prices``.
+
+        Fail-closed: any missing file, malformed JSON, stale feed, or unparseable
+        timestamp results in *no* mutation to ``prices`` and an evidence record
+        explaining why. Never raises.
+        """
+        evidence: Dict[str, object] = {
+            "merged": False,
+            "merged_symbols": [],
+            "reason": None,
+            "feed_age_seconds": None,
+            "feed_ts_utc": None,
+        }
+        try:
+            path = Path(KRAKEN_PRICES_PATH)
+            if not path.is_file():
+                evidence["reason"] = "file_missing"
+                self.logger.warning("Kraken prices file missing at %s", path)
+                return evidence
+            with path.open("r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as exc:
+            evidence["reason"] = f"read_error: {type(exc).__name__}"
+            self.logger.warning("Failed to read kraken_prices.json: %s", exc)
+            return evidence
+
+        ts_raw = doc.get("ts_utc")
+        if not isinstance(ts_raw, str):
+            evidence["reason"] = "missing_ts_utc"
+            self.logger.warning("kraken_prices.json missing ts_utc")
+            return evidence
+        try:
+            # tolerate trailing 'Z'
+            ts_clean = ts_raw[:-1] if ts_raw.endswith("Z") else ts_raw
+            feed_ts = datetime.fromisoformat(ts_clean).replace(tzinfo=timezone.utc)
+        except ValueError:
+            evidence["reason"] = "bad_ts_format"
+            self.logger.warning("kraken_prices.json bad ts_utc: %s", ts_raw)
+            return evidence
+
+        age_seconds = (datetime.now(timezone.utc) - feed_ts).total_seconds()
+        evidence["feed_ts_utc"] = ts_raw
+        evidence["feed_age_seconds"] = age_seconds
+        if age_seconds > KRAKEN_MAX_AGE_SECONDS:
+            evidence["reason"] = "stale"
+            self.logger.warning(
+                "kraken_prices.json stale: age=%.1fs > %ds",
+                age_seconds, KRAKEN_MAX_AGE_SECONDS,
+            )
+            return evidence
+
+        kraken_prices = doc.get("prices")
+        if not isinstance(kraken_prices, dict):
+            evidence["reason"] = "missing_prices"
+            self.logger.warning("kraken_prices.json missing prices map")
+            return evidence
+
+        merged: List[str] = []
+        for sym in CRYPTO_SYMBOLS:
+            v = kraken_prices.get(sym)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv <= 0.0 or fv != fv:  # reject zero/NaN
+                continue
+            prices[sym] = fv
+            merged.append(sym)
+
+        evidence["merged"] = bool(merged)
+        evidence["merged_symbols"] = merged
+        if not merged:
+            evidence["reason"] = "no_valid_symbols"
+        return evidence
 
     def _construct_portfolio_snapshot(
         self,
