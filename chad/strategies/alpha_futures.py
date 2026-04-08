@@ -10,11 +10,15 @@ with dynamic sizing based on ATR and capital-allocation weights.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 import math
 import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
+
+_TRADE_CLOSER_STATE_PATH = "/home/ubuntu/chad_finale/runtime/trade_closer_state.json"
 
 # ---------------------------------------------------------------------------
 # Configuration fallback (for robustness if config module missing)
@@ -60,6 +64,10 @@ class StrategyTuning:
     confidence_trend_weight: float = 20.0
     allow_long: bool = True
     allow_short: bool = True
+    # Exit rules — checked before entry logic when a position is open
+    stop_loss_atr_multiple: float = 2.0
+    trend_exit_on_ema_slow: bool = True
+    time_stop_bars: int = 20
 
 # Default spec definitions
 DEFAULT_SPECS: Dict[str, FuturesInstrumentSpec] = {
@@ -251,6 +259,147 @@ def _compute_contract_size(
 
 # ---------------------------------------------------------------------------
 # Signal generator
+def _load_alpha_futures_open_positions() -> Dict[str, Dict[str, Any]]:
+    """
+    Read open alpha_futures positions out of runtime/trade_closer_state.json.
+
+    Returns: { symbol: {side, quantity, avg_entry_price, earliest_ts} }
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        with open(_TRADE_CLOSER_STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return out
+    for entry in (data.get("queues") or []):
+        if str(entry.get("strategy", "")).strip().lower() != "alpha_futures":
+            continue
+        symbol = str(entry.get("symbol", "")).strip().upper()
+        lots = [
+            lot for lot in (entry.get("lots") or [])
+            if _to_float(lot.get("quantity"), 0.0) > 0
+        ]
+        if not symbol or not lots:
+            continue
+        head_side = str(lots[0].get("side", "")).strip().upper()
+        total_qty = sum(_to_float(lot.get("quantity"), 0.0) for lot in lots)
+        if total_qty <= 0:
+            continue
+        notional = sum(
+            _to_float(lot.get("quantity"), 0.0) * _to_float(lot.get("fill_price"), 0.0)
+            for lot in lots
+        )
+        avg_px = notional / total_qty if total_qty > 0 else 0.0
+        earliest: Optional[str] = None
+        for lot in lots:
+            ts = lot.get("ts_utc")
+            if ts and (earliest is None or str(ts) < str(earliest)):
+                earliest = str(ts)
+        out[symbol] = {
+            "side": head_side,
+            "quantity": total_qty,
+            "avg_entry_price": avg_px,
+            "earliest_ts": earliest,
+        }
+    return out
+
+
+def _evaluate_exit_signal(
+    *,
+    symbol: str,
+    spec: FuturesInstrumentSpec,
+    price: float,
+    ema_slow: float,
+    atr_val: float,
+    open_position: Mapping[str, Any],
+    tuning: StrategyTuning,
+) -> Optional[TradeSignal]:
+    """
+    If the open position satisfies any exit condition, return a closing
+    TradeSignal (opposite side, sized to flatten). Otherwise return None.
+
+    Order of checks:
+      1. ATR stop loss (adverse move > stop_loss_atr_multiple * ATR)
+      2. Trend exit vs ema_slow
+      3. Time stop (held > time_stop_bars minutes ≈ bars on a 1m loop)
+    """
+    pos_side = str(open_position.get("side", "")).upper()
+    pos_qty = _to_float(open_position.get("quantity"), 0.0)
+    avg_entry = _to_float(open_position.get("avg_entry_price"), 0.0)
+    if pos_side not in ("BUY", "SELL") or pos_qty <= 0:
+        return None
+
+    exit_side: Optional[SignalSide] = None
+    exit_reason: Optional[str] = None
+
+    # 1. ATR stop loss
+    if avg_entry > 0 and atr_val > 0 and tuning.stop_loss_atr_multiple > 0:
+        if pos_side == "BUY":
+            adverse = avg_entry - price
+            if adverse > tuning.stop_loss_atr_multiple * atr_val:
+                exit_side = SignalSide.SELL
+                exit_reason = "stop_loss_atr"
+        else:  # SELL
+            adverse = price - avg_entry
+            if adverse > tuning.stop_loss_atr_multiple * atr_val:
+                exit_side = SignalSide.BUY
+                exit_reason = "stop_loss_atr"
+
+    # 2. Trend exit vs ema_slow
+    if exit_side is None and tuning.trend_exit_on_ema_slow and ema_slow > 0:
+        if pos_side == "BUY" and price < ema_slow:
+            exit_side = SignalSide.SELL
+            exit_reason = "trend_exit_ema_slow"
+        elif pos_side == "SELL" and price > ema_slow:
+            exit_side = SignalSide.BUY
+            exit_reason = "trend_exit_ema_slow"
+
+    # 3. Time stop
+    if exit_side is None and tuning.time_stop_bars > 0:
+        earliest_ts = open_position.get("earliest_ts")
+        if isinstance(earliest_ts, str) and earliest_ts:
+            try:
+                ts_clean = earliest_ts.replace("Z", "+00:00")
+                entry_dt = datetime.fromisoformat(ts_clean)
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                age_min = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60.0
+                if age_min >= float(tuning.time_stop_bars):
+                    exit_side = SignalSide.SELL if pos_side == "BUY" else SignalSide.BUY
+                    exit_reason = "time_stop"
+            except Exception:
+                pass
+
+    if exit_side is None:
+        return None
+
+    return TradeSignal(
+        strategy=StrategyName.ALPHA_FUTURES,
+        symbol=symbol,
+        side=exit_side,
+        size=float(pos_qty),
+        confidence=1.0,
+        asset_class=AssetClass.FUTURES,
+        meta={
+            "engine": "alpha_futures.v4",
+            "family": spec.family,
+            "contract_symbol": symbol,
+            "exchange": spec.exchange,
+            "point_value": spec.point_value,
+            "min_tick": spec.min_tick,
+            "exit_reason": exit_reason,
+            "open_side": pos_side,
+            "avg_entry_price": round(avg_entry, 6),
+            "atr": round(atr_val, 6),
+            "ema_slow": round(ema_slow, 6),
+            "estimated_notional": round(price * spec.point_value * pos_qty, 6),
+            "spread_bps": 0.0,
+            "required_asset_class": "futures",
+            "is_exit": True,
+        },
+    )
+
+
 def _build_signal_for_symbol(
     *,
     symbol: str,
@@ -259,6 +408,7 @@ def _build_signal_for_symbol(
     spec: FuturesInstrumentSpec,
     tuning: StrategyTuning,
     equity: float,
+    open_position: Optional[Mapping[str, Any]] = None,
 ) -> Optional[TradeSignal]:
     """Generate a TradeSignal for the given symbol, or None if conditions fail."""
     if len(bars) < tuning.min_bars or price <= 0:
@@ -272,6 +422,23 @@ def _build_signal_for_symbol(
     atr_val = _atr(bars, tuning.atr_len)
     if atr_val <= 0:
         return None
+
+    # ---- Exit logic (position-aware) — runs before entry signals ----
+    if open_position:
+        exit_signal = _evaluate_exit_signal(
+            symbol=symbol,
+            spec=spec,
+            price=price,
+            ema_slow=ema_slow,
+            atr_val=atr_val,
+            open_position=open_position,
+            tuning=tuning,
+        )
+        if exit_signal is not None:
+            return exit_signal
+        # Position open and no exit triggered → suppress re-entry on this symbol.
+        return None
+
     highest_high = _highest_high(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     lowest_low = _lowest_low(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     latest_bar = bars[-1]
@@ -352,6 +519,17 @@ def build_alpha_futures_signals(
     prices = _extract_prices(ctx)
     bars_by_symbol = _extract_bars(ctx, DEFAULT_SPECS.keys())
     equity = _extract_equity(ctx, tuning)
+    # Position-aware: prefer ctx.paper_positions if provided, otherwise read
+    # the trade_closer ledger directly so the strategy can emit exit signals.
+    ctx_positions = getattr(ctx, "paper_positions", None)
+    if isinstance(ctx_positions, Mapping):
+        open_positions: Dict[str, Dict[str, Any]] = {
+            str(k).strip().upper(): dict(v)
+            for k, v in ctx_positions.items()
+            if isinstance(v, Mapping)
+        }
+    else:
+        open_positions = _load_alpha_futures_open_positions()
     signals: List[TradeSignal] = []
     for symbol, spec in DEFAULT_SPECS.items():
         signal = _build_signal_for_symbol(
@@ -361,6 +539,7 @@ def build_alpha_futures_signals(
             spec=spec,
             tuning=tuning,
             equity=equity,
+            open_position=open_positions.get(symbol),
         )
         if signal is not None:
             signals.append(signal)

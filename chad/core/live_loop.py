@@ -140,6 +140,105 @@ def _attach_strategy_to_intent(intent: object, routed_signal_map: Dict[Tuple[str
             return
 
 
+def _is_paper_mode() -> bool:
+    """Detect paper / dry_run posture from env (mirrors live_gate._load_execution_config)."""
+    raw = (
+        os.environ.get("CHAD_EXECUTION_MODE")
+        or os.environ.get("CHAD_EXEC_MODE")
+        or os.environ.get("CHAD_MODE")
+        or "dry_run"
+    ).strip().lower()
+    return raw in ("dry_run", "paper")
+
+
+_TRADE_CLOSER_STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/trade_closer_state.json")
+
+
+def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
+    """
+    Paper-mode reconciliation. Reads runtime/trade_closer_state.json and
+    rewrites paper-strategy entries in position_guard.json so the doom loop
+    cannot wipe simulated positions every cycle.
+
+    Rules:
+    - For each (strategy, symbol) with a non-empty FIFO queue → guard entry
+      open=True with side from the head lot, quantity = sum of lot sizes.
+    - For each existing guard entry that is NOT a broker_sync entry and is
+      NOT present in the trade_closer queues → mark closed
+      (closed_by="paper_ledger_rebuild").
+    - broker_sync|* entries (real broker truth from prior live runs) are
+      left untouched.
+
+    The IB Gateway is NOT queried in paper mode.
+    """
+    from datetime import datetime, timezone
+    from chad.core.position_guard import _load_state, _save_state
+
+    queues_by_key: Dict[Tuple[str, str], list] = {}
+    if _TRADE_CLOSER_STATE_PATH.is_file():
+        try:
+            data = json.loads(_TRADE_CLOSER_STATE_PATH.read_text(encoding="utf-8"))
+            for entry in data.get("queues", []) or []:
+                strategy = str(entry.get("strategy", "")).strip()
+                symbol = str(entry.get("symbol", "")).strip().upper()
+                lots = [
+                    lot for lot in (entry.get("lots") or [])
+                    if float(lot.get("quantity", 0) or 0) > 0
+                ]
+                if strategy and symbol and lots:
+                    queues_by_key[(strategy, symbol)] = lots
+        except Exception as exc:
+            logger.warning("PAPER_GUARD_RECONCILE: failed to read trade_closer_state: %s", exc)
+            return
+
+    guard_state = _load_state()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    open_count = 0
+    closed_count = 0
+
+    for (strategy, symbol), lots in queues_by_key.items():
+        head = lots[0]
+        side = str(head.get("side", "")).strip().upper()
+        total_qty = sum(float(lot.get("quantity", 0) or 0) for lot in lots)
+        key = f"{strategy}|{symbol}"
+        guard_state[key] = {
+            "open": True,
+            "updated_at_utc": now_iso,
+            "strategy": strategy,
+            "symbol": symbol,
+            "side": side,
+            "quantity": total_qty,
+            "last_state": "OPEN",
+            "source": "paper_ledger_rebuild",
+        }
+        open_count += 1
+
+    for key, entry in list(guard_state.items()):
+        strategy = str(entry.get("strategy", ""))
+        symbol = str(entry.get("symbol", "")).upper()
+        if strategy == "broker_sync":
+            continue
+        if (strategy, symbol) in queues_by_key:
+            continue
+        if entry.get("open"):
+            entry["open"] = False
+            entry["updated_at_utc"] = now_iso
+            entry["closed_by"] = "paper_ledger_rebuild"
+            closed_count += 1
+
+    _save_state(guard_state)
+    logger.info(
+        "PAPER_GUARD_RECONCILE: rebuilt from trade_closer_state, %d positions open, %d newly closed",
+        open_count,
+        closed_count,
+        extra={
+            "paper_open": open_count,
+            "paper_closed": closed_count,
+            "source": "trade_closer_state",
+        },
+    )
+
+
 def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     """
     Reconcile position_guard.json against actual broker positions.
@@ -319,11 +418,17 @@ def run_once(logger: logging.Logger) -> None:
     check so that stale local state does not suppress valid signals or
     allow phantom positions.
     """
-    # P1-3: Rebuild position guard from broker truth before any signal evaluation
+    # P1-3: Rebuild position guard before any signal evaluation. In paper /
+    # dry_run mode reconcile against the local trade_closer ledger so the
+    # simulated positions survive across cycles; only query IB Gateway when
+    # actually live.
     try:
-        _rebuild_guard_from_broker(logger)
+        if _is_paper_mode():
+            _rebuild_guard_from_paper_ledger(logger)
+        else:
+            _rebuild_guard_from_broker(logger)
     except Exception as exc:
-        logger.warning("Broker truth rebuild failed (non-fatal): %s", exc)
+        logger.warning("Guard rebuild failed (non-fatal): %s", exc)
 
     strategy_detail: Dict[str, Any] = {
         "available_strategies": {},
