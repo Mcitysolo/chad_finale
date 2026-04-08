@@ -758,6 +758,23 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         logger.exception("Failed to compute or write profit lock state: %s", exc)
         return 1
+    # Refresh stop_state.json TTL — preserve existing operator intent.
+    # Stop file is the highest-authority kill switch; we never override its
+    # value here, only re-stamp the TTL so it does not go stale between
+    # explicit operator changes.
+    try:
+        from chad.core.stop_state import STOP_PATH, write_stop_state
+        if STOP_PATH.is_file():
+            raw = json.loads(STOP_PATH.read_text(encoding="utf-8"))
+            existing_stop = bool(raw.get("stop", False))
+            existing_reason = str(raw.get("reason") or "unspecified")
+            write_stop_state(
+                stop=existing_stop,
+                reason=f"ttl_refresh:{existing_reason}",
+            )
+    except Exception as exc:
+        logger.warning("stop_state TTL refresh skipped: %s", exc)
+
     # Print summary for shell usage
     decision = state.get("mode", "")
     sizing = state.get("sizing_factor", 1.0)

@@ -507,22 +507,95 @@ def build_default_strategy_limits() -> Dict[StrategyName, StrategyRiskLimits]:
         max_trade_notional=50_000.0,
         allow_short=True,
     )
-    # Gamma / Omega / AlphaCrypto / AlphaForex / Delta are not yet wired on
-    # this instance; keep them disabled at the policy layer until their
-    # full strategies are restored.
+    # Gamma: equity swing — re-enabled 2026-04-08 (built, tested, funded).
     limits[StrategyName.GAMMA] = StrategyRiskLimits(
-        enabled=False,
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=False,
     )
+
+    # Gamma Futures: micro-futures mean reversion — mirror alpha_futures caps.
+    limits[StrategyName.GAMMA_FUTURES] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=50_000.0,
+        allow_short=True,
+    )
+
+    # Gamma Reversion: ETF mean reversion — mirror gamma (equity) caps.
+    limits[StrategyName.GAMMA_REVERSION] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=False,
+    )
+
+    # Omega: crash-hedge defensive sleeve — re-enabled 2026-04-08.
     limits[StrategyName.OMEGA] = StrategyRiskLimits(
-        enabled=False,
+        enabled=True,
+        max_symbol_notional=40_000.0,
+        max_total_notional=120_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=False,
     )
+
+    # Omega Macro: macro-futures sleeve — mirror alpha_futures caps.
+    limits[StrategyName.OMEGA_MACRO] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=50_000.0,
+        allow_short=True,
+    )
+
+    # Omega Vol: volatility regime sleeve — mirror omega (defensive) caps.
+    limits[StrategyName.OMEGA_VOL] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=40_000.0,
+        max_total_notional=120_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=False,
+    )
+
+    # Alpha Options: SPY verticals — mirror gamma equity caps with smaller
+    # per-trade notional (options sized smaller than underlying).
+    limits[StrategyName.ALPHA_OPTIONS] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=5_000.0,
+        allow_short=False,
+    )
+
+    # Alpha Crypto: crypto momentum — re-enabled 2026-04-08.
     limits[StrategyName.ALPHA_CRYPTO] = StrategyRiskLimits(
-        enabled=False,
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=False,
     )
+
+    # Delta: execution intelligence sleeve — re-enabled 2026-04-08.
+    limits[StrategyName.DELTA] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=40_000.0,
+        max_total_notional=120_000.0,
+        max_trade_notional=7_500.0,
+        allow_short=False,
+    )
+
+    # Alpha Forex: removed from rotation (0% weight) — kept disabled.
     limits[StrategyName.ALPHA_FOREX] = StrategyRiskLimits(
         enabled=False,
     )
-    limits[StrategyName.DELTA] = StrategyRiskLimits(
+
+    # Delta Pairs: not yet built — kept disabled.
+    limits[StrategyName.DELTA_PAIRS] = StrategyRiskLimits(
         enabled=False,
     )
 

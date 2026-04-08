@@ -383,10 +383,13 @@ def _build_plan_and_intents(logger: logging.Logger) -> tuple[Any, Any, list[Any]
     intents = build_ibkr_intents_from_plan(plan)
     intents_list = list(intents or [])
 
+    _meta = getattr(pipeline_result, "meta", {}) or {}
+    _passed = int(_meta.get("passed_signals", 0) or 0)
     logger.info(
-        "Pipeline built raw=%d evaluated=%d routed=%d plan_orders=%d ibkr_intents=%d",
+        "Pipeline built raw=%d policy_records=%d passed=%d routed=%d plan=%d intents=%d",
         len(getattr(pipeline_result, "raw_signals", []) or []),
         len(getattr(pipeline_result, "evaluated_signals", []) or []),
+        _passed,
         len(getattr(pipeline_result, "routed_signals", []) or []),
         len(getattr(plan, "orders", []) or []),
         len(intents_list),
