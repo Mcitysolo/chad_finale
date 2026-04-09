@@ -899,6 +899,27 @@ class DailyCHADReport:
             sections.append("  Change this week: $0")
         sections.append("")
 
+        # 9b. YOUR REAL KRAKEN CRYPTO ACCOUNT
+        # Read the snapshot the orchestrator refreshes every 5 minutes.
+        kraken_snap = _read_json(RUNTIME_DIR / "kraken_balances.json") or {}
+        if isinstance(kraken_snap, dict) and kraken_snap.get("ok"):
+            sections.append("═══ YOUR REAL KRAKEN ACCOUNT ═══")
+            sections.append("(This is real money on Kraken — read-only snapshot)")
+            usd_eq = float(kraken_snap.get("usd_equivalent") or 0.0)
+            if usd_eq > 0:
+                sections.append(f"  Total value (USD eq): {_format_money(usd_eq)}")
+            balances = kraken_snap.get("balances") or {}
+            if isinstance(balances, dict):
+                for asset, qty in sorted(balances.items()):
+                    try:
+                        sections.append(f"  {asset}: {float(qty):.6f}")
+                    except (TypeError, ValueError):
+                        continue
+            ts = kraken_snap.get("ts_utc")
+            if ts:
+                sections.append(f"  Snapshot taken: {ts}")
+            sections.append("")
+
         # CHAD's Take (AI-generated, best-effort — always present)
         sections.append("═══ CHAD'S TAKE ═══")
         if total_trades > 0:

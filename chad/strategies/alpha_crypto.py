@@ -66,6 +66,40 @@ from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, Tra
 
 CRYPTO_UNIVERSE_DEFAULT: List[str] = ["BTC-USD", "ETH-USD", "SOL-USD"]
 
+# CAD-quoted alternates used when USD buying power is insufficient and
+# the live Kraken balance shows ZCAD on hand. Sized in CAD against the
+# ZCAD line of runtime/kraken_balances.json by the orchestrator's risk
+# layer; the strategy itself emits these on the same logic as the USD
+# pair so the wiring stays simple.
+CRYPTO_UNIVERSE_CAD: List[str] = ["BTC-CAD", "ETH-CAD"]
+
+
+def _kraken_cad_balance_present() -> bool:
+    """
+    Read-only check: does the latest kraken balance snapshot show a
+    non-trivial CAD line? The snapshot is refreshed by
+    KrakenBalanceProvider on the orchestrator's cycle. We never block on
+    a fetch from the strategy boundary — strategies must remain pure.
+
+    Returns False on any I/O error so the CAD lane stays opt-in.
+    """
+    try:
+        from chad.market_data.kraken_balance_provider import (
+            DEFAULT_SNAPSHOT_PATH,
+            load_latest_snapshot,
+        )
+        snap = load_latest_snapshot(DEFAULT_SNAPSHOT_PATH)
+        if not snap:
+            return False
+        balances = snap.get("balances") or {}
+        cad = balances.get("CAD")
+        try:
+            return float(cad) > 1.0
+        except (TypeError, ValueError):
+            return False
+    except Exception:
+        return False
+
 
 # -------------------------
 # Helpers (pure, safe)
@@ -367,6 +401,11 @@ class AlphaCryptoParams:
     enabled: bool = True
     universe: Optional[List[str]] = None
 
+    # CAD-quoted fallback universe — included automatically when the live
+    # Kraken balance snapshot shows a non-zero CAD line and USD is empty.
+    enable_cad_pairs: bool = True
+    cad_universe: Optional[List[str]] = None
+
     # Liquidity
     min_liquidity_usd: float = 750_000.0
 
@@ -398,13 +437,25 @@ class AlphaCryptoParams:
     vol_spike_atr_pct: float = 0.120
 
     def actual_universe(self) -> List[str]:
+        base: List[str]
         if self.universe is None:
-            return list(CRYPTO_UNIVERSE_DEFAULT)
-        try:
-            u = [str(x) for x in self.universe if x]
-            return u if u else list(CRYPTO_UNIVERSE_DEFAULT)
-        except Exception:
-            return list(CRYPTO_UNIVERSE_DEFAULT)
+            base = list(CRYPTO_UNIVERSE_DEFAULT)
+        else:
+            try:
+                u = [str(x) for x in self.universe if x]
+                base = u if u else list(CRYPTO_UNIVERSE_DEFAULT)
+            except Exception:
+                base = list(CRYPTO_UNIVERSE_DEFAULT)
+        if self.enable_cad_pairs and _kraken_cad_balance_present():
+            cad = (
+                list(self.cad_universe)
+                if self.cad_universe is not None
+                else list(CRYPTO_UNIVERSE_CAD)
+            )
+            for sym in cad:
+                if sym not in base:
+                    base.append(sym)
+        return base
 
 
 # -------------------------

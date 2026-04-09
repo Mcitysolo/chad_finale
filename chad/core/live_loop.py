@@ -97,6 +97,45 @@ _redis_stop_reason = ""
 from chad.core.kraken_execution import execute_kraken_intents as _execute_kraken_intents
 
 
+_KRAKEN_BALANCE_PROVIDER = None  # lazy singleton
+
+
+def _refresh_kraken_balance_snapshot(logger: logging.Logger) -> None:
+    """
+    Refresh runtime/kraken_balances.json on a 5-minute interval.
+
+    Reads the current price cache to value crypto + fiat balances in USD.
+    The provider's own throttle keeps actual API calls capped at one per
+    DEFAULT_REFRESH_INTERVAL_SECONDS regardless of how often this is invoked.
+    """
+    global _KRAKEN_BALANCE_PROVIDER
+    if _KRAKEN_BALANCE_PROVIDER is None:
+        from chad.market_data.kraken_balance_provider import KrakenBalanceProvider
+        _KRAKEN_BALANCE_PROVIDER = KrakenBalanceProvider()
+
+    prices: Dict[str, float] = {}
+    try:
+        pc_path = Path("/home/ubuntu/chad_finale/runtime/price_cache.json")
+        if pc_path.is_file():
+            pc = json.loads(pc_path.read_text(encoding="utf-8"))
+            raw_prices = pc.get("prices", {}) if isinstance(pc, dict) else {}
+            if isinstance(raw_prices, dict):
+                for k, v in raw_prices.items():
+                    try:
+                        prices[str(k)] = float(v)
+                    except (TypeError, ValueError):
+                        continue
+    except Exception:
+        prices = {}
+
+    snap = _KRAKEN_BALANCE_PROVIDER.maybe_refresh_snapshot(prices)
+    if snap is not None:
+        logger.info(
+            "KRAKEN_BALANCE_SNAPSHOT ok=%s usd_eq=%.2f assets=%s",
+            snap.ok, snap.usd_equivalent, list(snap.balances.keys()),
+        )
+
+
 def _write_route_decision(detail: Dict[str, Any]) -> None:
     """Write strategy_detail bridge file for orchestrator DecisionTrace pickup."""
     try:
@@ -490,6 +529,14 @@ def run_once(logger: logging.Logger) -> None:
             return
 
     _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
+
+    # Throttled (5-min) refresh of runtime/kraken_balances.json so the
+    # advisory engine, daily report, and alpha_crypto's CAD lane all see
+    # the live Kraken account state. Non-fatal on any error.
+    try:
+        _refresh_kraken_balance_snapshot(logger)
+    except Exception as bex:  # noqa: BLE001
+        logger.warning("Kraken balance snapshot refresh failed (non-fatal): %s", bex)
 
     # ------------------------------------------------------------------
     # Kraken (CRYPTO) execution lane — gated by LiveGate.kraken_enabled

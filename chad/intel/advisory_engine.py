@@ -214,6 +214,21 @@ def _load_live_context(symbol: str) -> Dict[str, Any]:
     else:
         position_balance_label = "held_unknown_size"
 
+    # Live Kraken account snapshot (refreshed by live_loop every 5 min).
+    # Surfaced so the advisory LLM can answer "what's in the crypto account"
+    # and so the daily report can show real Kraken balances and USD eq.
+    kraken_account: Optional[Dict[str, Any]] = None
+    try:
+        kraken_snap = read_json_dict(runtime / "kraken_balances.json")
+        if isinstance(kraken_snap, dict) and kraken_snap.get("ok"):
+            kraken_account = {
+                "ts_utc": kraken_snap.get("ts_utc"),
+                "balances": kraken_snap.get("balances") or {},
+                "usd_equivalent": float(kraken_snap.get("usd_equivalent") or 0.0),
+            }
+    except Exception:
+        kraken_account = None
+
     return {
         "symbol": symbol,
         "price_usd": price_usd,
@@ -225,6 +240,7 @@ def _load_live_context(symbol: str) -> Dict[str, Any]:
         "position_value_usd": position_value_usd,
         "position_weight_pct": position_weight_pct,
         "position_balance_label": position_balance_label,
+        "kraken_account": kraken_account,
     }
 
 

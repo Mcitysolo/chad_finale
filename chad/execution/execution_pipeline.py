@@ -632,10 +632,13 @@ _KRAKEN_MIN_VOLUMES: Dict[str, Decimal] = {
     "XBT/USD": Decimal("0.0001"),
     "ETH/USD": Decimal("0.001"),
     "SOL/USD": Decimal("0.05"),
+    "XBT/CAD": Decimal("0.0001"),
+    "ETH/CAD": Decimal("0.001"),
 }
 
 # CHAD canonical symbol -> Kraken pair
 _KRAKEN_SYMBOL_MAP: Dict[str, str] = {
+    # USD-quoted
     "BTC-USD": "XBT/USD",
     "BTCUSD": "XBT/USD",
     "XBT-USD": "XBT/USD",
@@ -644,6 +647,14 @@ _KRAKEN_SYMBOL_MAP: Dict[str, str] = {
     "ETHUSD": "ETH/USD",
     "SOL-USD": "SOL/USD",
     "SOLUSD": "SOL/USD",
+    # CAD-quoted alternates (used when USD buying power is empty and the
+    # Kraken account holds ZCAD)
+    "BTC-CAD": "XBT/CAD",
+    "BTCCAD": "XBT/CAD",
+    "XBT-CAD": "XBT/CAD",
+    "XBTCAD": "XBT/CAD",
+    "ETH-CAD": "ETH/CAD",
+    "ETHCAD": "ETH/CAD",
 }
 
 
