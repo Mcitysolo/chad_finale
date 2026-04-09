@@ -576,6 +576,28 @@ def run_once(logger: logging.Logger) -> None:
     for intent in intents:
         _attach_strategy_to_intent(intent, routed_signal_map)
 
+        # --- SCR gate (P3-1: hard-block on PAUSED before any state mutation) ---
+        try:
+            _scr_path = Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
+            _scr_raw = json.loads(_scr_path.read_text(encoding="utf-8"))
+            _scr_state_val = str(_scr_raw.get("state", "")).upper()
+            _scr_sizing = float(_scr_raw.get("sizing_factor", 0.0) or 0.0)
+            _scr_reasons = list(_scr_raw.get("reasons") or [])[:3]
+            if _scr_state_val == "PAUSED":
+                logger.warning(
+                    "SCR_HARD_BLOCK state=PAUSED sizing_factor=%.3f symbol=%s side=%s qty=%s strategy=%s reasons=%s",
+                    _scr_sizing,
+                    getattr(intent, "symbol", None),
+                    getattr(intent, "side", None),
+                    getattr(intent, "quantity", None),
+                    getattr(intent, "strategy", None),
+                    _scr_reasons,
+                )
+                continue
+        except Exception as _scr_err:
+            logger.warning("SCR_GATE_READ_FAILED (fail-open): %s", _scr_err)
+        # --- end SCR gate ---
+
         class _IntentSignalAdapter:
             def __init__(self, obj: object) -> None:
                 self.strategy = getattr(obj, "strategy", None)
