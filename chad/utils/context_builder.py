@@ -74,6 +74,19 @@ except Exception:
         positions: Mapping[str, Position]
         cash: float
 
+# Legend consensus loader — wired into MarketContext.legend so that
+# legend-aware strategies (alpha, beta, delta) can resolve their universe
+# and weights from data/legend_top_stocks.json instead of falling through to
+# unconditional silence. Import is fail-soft so a missing legend file does
+# not break context construction; load_legend() raises LegendLoaderError
+# which is handled at the call site.
+try:
+    from chad.utils.legend_loader import load_legend, LegendLoaderError  # type: ignore
+except Exception:  # pragma: no cover - defensive fallback
+    load_legend = None  # type: ignore[assignment]
+    class LegendLoaderError(Exception):  # type: ignore[no-redef]
+        pass
+
 __all__ = [
     "MarketContext",
     "ContextResult",
@@ -414,6 +427,24 @@ class ContextBuilder:
             positions=current_positions or {},
         )
 
+        # Load legend consensus (top-stocks weights). Beta short-circuits to
+        # an empty signal list when ctx.legend is None; alpha and delta also
+        # consult ctx.legend.weights for universe selection. Hardcoding None
+        # here was the root cause of the equity-strategy "no_signal" pandemic.
+        # Fail-closed to None on any loader error so context construction
+        # remains robust if the legend file is missing or malformed.
+        legend_consensus = None
+        legend_load_error: Optional[str] = None
+        if load_legend is not None:
+            try:
+                legend_consensus = load_legend()
+            except LegendLoaderError as exc:
+                legend_load_error = str(exc)
+                self.logger.warning("legend_load_failed: %s", exc)
+            except Exception as exc:  # pragma: no cover - defensive
+                legend_load_error = f"unexpected:{exc}"
+                self.logger.warning("legend_load_unexpected_error: %s", exc)
+
         # Build context
         context = MarketContext(
             ticks=wrapped_ticks,
@@ -421,7 +452,7 @@ class ContextBuilder:
             prices=prices,
             now=self.now,
             portfolio=portfolio,
-            legend=None,
+            legend=legend_consensus,
         )
 
         # Evidence for auditability
@@ -430,6 +461,11 @@ class ContextBuilder:
             "bars_found": {s: len(bars.get(s, [])) for s in universe},
             "ticks_found": {s: (s in ticks) for s in universe},
             "kraken_merge": kraken_evidence,
+            "legend_loaded": legend_consensus is not None,
+            "legend_symbols_count": (
+                len(legend_consensus.weights) if legend_consensus is not None else 0
+            ),
+            "legend_load_error": legend_load_error,
         }
 
         return ContextResult(
