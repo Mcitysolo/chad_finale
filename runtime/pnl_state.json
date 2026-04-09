@@ -1,15 +1,15 @@
 {
   "account_equity": 998109.89,
   "equity_known": true,
-  "pnl_pct_of_equity": -0.74954172,
+  "pnl_pct_of_equity": 0.00631193,
   "pnl_sources": [
-    "/home/ubuntu/chad_finale/data/trades/trade_history_20260408.ndjson",
-    "/home/ubuntu/chad_finale/data/fills/FILLS_20260408.ndjson"
+    "/home/ubuntu/chad_finale/data/trades/trade_history_20260409.ndjson",
+    "/home/ubuntu/chad_finale/data/fills/FILLS_20260409.ndjson"
   ],
-  "realized_pnl": -7481.25,
+  "realized_pnl": 63.0,
   "schema_version": "pnl_state.v1",
   "source": "profit_lock_engine",
-  "trade_count": 343,
-  "ts_utc": "2026-04-08T11:53:04Z",
+  "trade_count": 11,
+  "ts_utc": "2026-04-09T00:37:41Z",
   "ttl_seconds": 60
 }

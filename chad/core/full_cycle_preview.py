@@ -744,7 +744,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run deterministic alpha_futures smoke test using synthetic bars",
     )
+    p.add_argument(
+        "--show-kraken-intents",
+        action="store_true",
+        help="Run the live pipeline once and print the Kraken (CRYPTO) intents it would emit (read-only).",
+    )
     return p
+
+
+def _show_kraken_intents() -> int:
+    """
+    Read-only dump of the Kraken intents the live pipeline would currently
+    produce. Does NOT execute anything against Kraken — purely shows what
+    intents the asset-class router + intent builder generate from current
+    routed signals + price cache.
+    """
+    import logging as _logging
+    logger = _logging.getLogger("chad.full_cycle_preview.kraken")
+    if not logger.handlers:
+        _h = _logging.StreamHandler()
+        _h.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logger.addHandler(_h)
+    logger.setLevel(_logging.INFO)
+
+    try:
+        from chad.core.ibkr_execution_runner import _build_plan_and_intents
+    except Exception as exc:
+        print(f"[KRAKEN-INTENTS] import_failed: {type(exc).__name__}: {exc}")
+        return 1
+
+    try:
+        _ctx, _plan, ibkr_intents, kraken_intents = _build_plan_and_intents(logger)
+    except Exception as exc:
+        print(f"[KRAKEN-INTENTS] pipeline_failed: {type(exc).__name__}: {exc}")
+        return 1
+
+    print(f"[KRAKEN-INTENTS] ibkr_intents={len(ibkr_intents)} kraken_intents={len(kraken_intents)}")
+    for i, intent in enumerate(kraken_intents):
+        print(
+            f"  [{i}] strategy={getattr(intent, 'strategy', None)} "
+            f"pair={getattr(intent, 'pair', None)} "
+            f"side={getattr(intent, 'side', None)} "
+            f"ordertype={getattr(intent, 'ordertype', None)} "
+            f"volume={getattr(intent, 'volume', None)} "
+            f"notional={getattr(intent, 'notional_estimate', None)}"
+        )
+    if not kraken_intents:
+        print("  (no kraken intents emitted this cycle)")
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -754,6 +801,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     args = build_arg_parser().parse_args(argv)
+
+    if getattr(args, "show_kraken_intents", False):
+        return _show_kraken_intents()
 
     cfg = PreviewAppConfig(
         full_cycle_path=Path(args.artifact_path),

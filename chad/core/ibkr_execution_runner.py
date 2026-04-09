@@ -61,7 +61,12 @@ from chad.analytics.shadow_confidence_router import evaluate_confidence
 from chad.analytics.trade_stats_engine import load_and_compute
 from chad.core.live_gate import evaluate_live_gate
 from chad.engine import StrategyEngine
-from chad.execution.execution_pipeline import build_execution_plan, build_ibkr_intents_from_plan
+from chad.execution.execution_pipeline import (
+    build_execution_plan,
+    build_ibkr_intents_from_plan,
+    split_signals_by_asset_class,
+    build_kraken_intents_from_routed_signals,
+)
 from chad.strategies import register_core_strategies
 from chad.utils.context_builder import ContextBuilder
 from chad.utils.pipeline import DecisionPipeline, PipelineConfig
@@ -354,10 +359,45 @@ def _build_pipeline(engine: StrategyEngine) -> DecisionPipeline:
     )
 
 
-def _build_plan_and_intents(logger: logging.Logger) -> tuple[Any, Any, list[Any]]:
+def _load_crypto_dynamic_cap() -> Optional[float]:
     """
-    Build context -> pipeline_result -> execution plan -> IBKR intents
+    Load the per-strategy crypto cap from runtime/dynamic_caps.json. Returns None
+    if the file is missing/unreadable. Tries 'alpha_crypto' first (canonical CHAD
+    strategy name), then 'crypto' as fallback.
+    """
+    try:
+        path = Path("/home/ubuntu/chad_finale/runtime/dynamic_caps.json")
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        sc = data.get("strategy_caps", {}) or {}
+        for key in ("alpha_crypto", "crypto"):
+            v = sc.get(key)
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                v = v.get("cap_usd") or v.get("notional_cap") or v.get("max_notional")
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _build_plan_and_intents(logger: logging.Logger) -> tuple[Any, Any, list[Any], list[Any]]:
+    """
+    Build context -> pipeline_result -> execution plan -> IBKR + Kraken intents
     using the canonical CHAD flow already validated elsewhere in this repo.
+
+    Returns: (ctx, plan, ibkr_intents, kraken_intents)
+
+    Asset-class router: routed signals are split before plan building.
+    - CRYPTO -> kraken intents (built via build_kraken_intents_from_routed_signals)
+    - Everything else -> IBKR intents (existing path, unchanged)
     """
     result = ContextBuilder().build()
     ctx = result.context
@@ -375,27 +415,38 @@ def _build_plan_and_intents(logger: logging.Logger) -> tuple[Any, Any, list[Any]
         current_total_notional=current_total_notional,
     )
 
+    routed_signals = list(getattr(pipeline_result, "routed_signals", []) or [])
+    ibkr_signals, kraken_signals = split_signals_by_asset_class(routed_signals)
+
     plan = build_execution_plan(
-        routed_signals=pipeline_result.routed_signals,
+        routed_signals=ibkr_signals,
         prices=prices,
     )
 
     intents = build_ibkr_intents_from_plan(plan)
     intents_list = list(intents or [])
 
+    crypto_cap = _load_crypto_dynamic_cap()
+    kraken_intents = build_kraken_intents_from_routed_signals(
+        kraken_signals,
+        prices=prices,
+        dynamic_cap_for_crypto=crypto_cap,
+    )
+
     _meta = getattr(pipeline_result, "meta", {}) or {}
     _passed = int(_meta.get("passed_signals", 0) or 0)
     logger.info(
-        "Pipeline built raw=%d policy_records=%d passed=%d routed=%d plan=%d intents=%d",
+        "Pipeline built raw=%d policy_records=%d passed=%d routed=%d plan=%d intents=%d kraken_intents=%d",
         len(getattr(pipeline_result, "raw_signals", []) or []),
         len(getattr(pipeline_result, "evaluated_signals", []) or []),
         _passed,
-        len(getattr(pipeline_result, "routed_signals", []) or []),
+        len(routed_signals),
         len(getattr(plan, "orders", []) or []),
         len(intents_list),
+        len(kraken_intents),
     )
 
-    return ctx, plan, intents_list
+    return ctx, plan, intents_list, kraken_intents
 
 
 def _route_intents(logger: logging.Logger, intents: Sequence[Any], shadow: ShadowSnapshot) -> tuple[list[Any], dict[str, Any]]:
@@ -719,7 +770,7 @@ def run_ibkr_execution(cfg: RunnerConfig) -> RunnerSummary:
         )
 
     try:
-        _, _, intents = _build_plan_and_intents(logger)
+        _, _, intents, _kraken_intents = _build_plan_and_intents(logger)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to build intents from pipeline: %s", exc)
         return RunnerSummary(

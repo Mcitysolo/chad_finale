@@ -594,6 +594,173 @@ def summarize_execution_plan(plan: ExecutionPlan) -> Dict[str, object]:
     }
 
 
+# ============================================================================
+# Asset-class router (IBKR vs Kraken)
+# ============================================================================
+
+
+def split_signals_by_asset_class(
+    routed_signals: Iterable[RoutedSignal],
+) -> Tuple[List[RoutedSignal], List[RoutedSignal]]:
+    """
+    Split a stream of RoutedSignal into (ibkr_signals, kraken_signals).
+
+    - CRYPTO asset class -> kraken_signals
+    - Everything else (or missing/unknown) -> ibkr_signals
+
+    The existing IBKR pipeline is unchanged; only CRYPTO signals are
+    diverted off the IBKR path. Order is preserved within each bucket.
+    """
+    ibkr_signals: List[RoutedSignal] = []
+    kraken_signals: List[RoutedSignal] = []
+    for rs in routed_signals:
+        ac = getattr(rs, "asset_class", None)
+        if ac == AssetClass.CRYPTO:
+            kraken_signals.append(rs)
+        else:
+            ibkr_signals.append(rs)
+    return ibkr_signals, kraken_signals
+
+
+# ============================================================================
+# Kraken intent builder
+# ============================================================================
+
+# Kraken-side minimum order sizes (base currency). Conservative defaults that
+# satisfy Kraken's published minima as of 2026.
+_KRAKEN_MIN_VOLUMES: Dict[str, Decimal] = {
+    "XBT/USD": Decimal("0.0001"),
+    "ETH/USD": Decimal("0.001"),
+    "SOL/USD": Decimal("0.05"),
+}
+
+# CHAD canonical symbol -> Kraken pair
+_KRAKEN_SYMBOL_MAP: Dict[str, str] = {
+    "BTC-USD": "XBT/USD",
+    "BTCUSD": "XBT/USD",
+    "XBT-USD": "XBT/USD",
+    "XBTUSD": "XBT/USD",
+    "ETH-USD": "ETH/USD",
+    "ETHUSD": "ETH/USD",
+    "SOL-USD": "SOL/USD",
+    "SOLUSD": "SOL/USD",
+}
+
+
+def normalize_kraken_pair(symbol: str) -> Optional[str]:
+    """
+    Map a CHAD canonical crypto symbol (e.g. BTC-USD) to a Kraken pair
+    (e.g. XBT/USD). Returns None for unsupported symbols.
+    """
+    if not symbol:
+        return None
+    key = _normalize_symbol(symbol)
+    return _KRAKEN_SYMBOL_MAP.get(key)
+
+
+def _build_kraken_intent_from_routed_signal(
+    signal: RoutedSignal,
+    current_price: float,
+    *,
+    dynamic_cap_for_crypto: Optional[float] = None,
+):
+    """
+    Convert a RoutedSignal (CRYPTO asset class) into a KrakenStrategyTradeIntent.
+
+    - symbol normalization: BTC-USD -> XBT/USD, ETH-USD -> ETH/USD, SOL-USD -> SOL/USD
+    - volume = capped_notional / current_price (base currency quantity)
+    - ordertype = "market"
+    - notional_estimate = min(signal.notional, dynamic_cap_for_crypto)
+    - validates volume against per-pair Kraken minimum
+
+    Returns None on any rejection (unsupported symbol, bad price, below min size).
+    """
+    # Local import: keep execution_pipeline import-light when Kraken stack
+    # is not present in some test contexts.
+    from chad.execution.kraken_executor import StrategyTradeIntent as KrakenStrategyTradeIntent
+
+    symbol = _normalize_symbol(getattr(signal, "symbol", ""))
+    pair = normalize_kraken_pair(symbol)
+    if pair is None:
+        return None
+
+    price_dec = _to_decimal(current_price)
+    if price_dec is None or price_dec <= 0:
+        return None
+
+    side_attr = getattr(signal, "side", None)
+    if side_attr not in (SignalSide.BUY, SignalSide.SELL):
+        return None
+    side = "buy" if side_attr is SignalSide.BUY else "sell"
+
+    raw_notional = _to_decimal(getattr(signal, "notional", None), default=Decimal("0"))
+    if raw_notional is None or raw_notional <= 0:
+        size_dec = _to_decimal(getattr(signal, "net_size", None), default=Decimal("0"))
+        if size_dec is None or size_dec <= 0:
+            return None
+        raw_notional = size_dec * price_dec
+
+    capped_notional = raw_notional
+    if dynamic_cap_for_crypto is not None:
+        cap_dec = _to_decimal(dynamic_cap_for_crypto)
+        if cap_dec is not None and cap_dec > 0 and cap_dec < capped_notional:
+            capped_notional = cap_dec
+
+    if capped_notional <= 0:
+        return None
+
+    volume_dec = capped_notional / price_dec
+    min_vol = _KRAKEN_MIN_VOLUMES.get(pair, Decimal("0.0001"))
+    if volume_dec < min_vol:
+        return None
+
+    strategies = tuple(getattr(signal, "source_strategies", ()) or ())
+    if strategies and isinstance(strategies[0], StrategyName):
+        primary_strategy_name = strategies[0].value
+    elif strategies:
+        primary_strategy_name = str(strategies[0])
+    else:
+        primary_strategy_name = "alpha_crypto"
+
+    return KrakenStrategyTradeIntent(
+        strategy=primary_strategy_name,
+        pair=pair,
+        side=side,
+        ordertype="market",
+        volume=float(volume_dec),
+        notional_estimate=float(capped_notional),
+        price=None,
+    )
+
+
+def build_kraken_intents_from_routed_signals(
+    routed_signals: Iterable[RoutedSignal],
+    prices: Mapping[str, float],
+    *,
+    dynamic_cap_for_crypto: Optional[float] = None,
+) -> List[object]:
+    """
+    Build KrakenStrategyTradeIntent objects for the CRYPTO subset of routed_signals.
+
+    Prices are looked up by the original CHAD canonical symbol (e.g. BTC-USD).
+    Signals that fail any validation step are silently dropped (fail-closed).
+    """
+    out: List[object] = []
+    for rs in routed_signals:
+        if getattr(rs, "asset_class", None) != AssetClass.CRYPTO:
+            continue
+        symbol = _normalize_symbol(getattr(rs, "symbol", ""))
+        price = prices.get(symbol)
+        if price is None:
+            continue
+        intent = _build_kraken_intent_from_routed_signal(
+            rs, float(price), dynamic_cap_for_crypto=dynamic_cap_for_crypto
+        )
+        if intent is not None:
+            out.append(intent)
+    return out
+
+
 __all__ = [
     "PlannedOrder",
     "ExecutionPlan",
@@ -604,4 +771,8 @@ __all__ = [
     "build_ibkr_intents_from_plan",
     "resolve_ibkr_instrument_spec",
     "summarize_execution_plan",
+    "split_signals_by_asset_class",
+    "normalize_kraken_pair",
+    "build_kraken_intents_from_routed_signals",
+    "_build_kraken_intent_from_routed_signal",
 ]

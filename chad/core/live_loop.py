@@ -94,6 +94,9 @@ _redis_stop_flag = False
 _redis_stop_reason = ""
 
 
+from chad.core.kraken_execution import execute_kraken_intents as _execute_kraken_intents
+
+
 def _write_route_decision(detail: Dict[str, Any]) -> None:
     """Write strategy_detail bridge file for orchestrator DecisionTrace pickup."""
     try:
@@ -486,10 +489,23 @@ def run_once(logger: logging.Logger) -> None:
             )
             return
 
-    _ctx, _plan, intents = _build_plan_and_intents(logger)
+    _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
+
+    # ------------------------------------------------------------------
+    # Kraken (CRYPTO) execution lane — gated by LiveGate.kraken_enabled
+    # and CHAD_KRAKEN_MODE in {live, paper_kraken}.
+    # paper_kraken routes through KrakenExecutor with validate_only=True
+    # so fills are simulated against real Kraken prices/spec without
+    # placing real orders.
+    # ------------------------------------------------------------------
+    if kraken_intents:
+        try:
+            _execute_kraken_intents(logger, kraken_intents)
+        except Exception as kex:  # noqa: BLE001
+            logger.warning("Kraken execution lane failed (non-fatal): %s", kex)
 
     if not intents:
-        logger.info("No executable intents.")
+        logger.info("No executable IBKR intents.")
         return
 
     # ------------------------------------------------------------------
