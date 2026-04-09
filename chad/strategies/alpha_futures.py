@@ -12,9 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import os
+import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
 
@@ -266,11 +270,29 @@ def _load_alpha_futures_open_positions() -> Dict[str, Dict[str, Any]]:
     Returns: { symbol: {side, quantity, avg_entry_price, earliest_ts} }
     """
     out: Dict[str, Dict[str, Any]] = {}
-    try:
-        with open(_TRADE_CLOSER_STATE_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        return out
+    data: Optional[Mapping[str, Any]] = None
+    last_err: Optional[Exception] = None
+    # Atomic read with retry — protects against concurrent writer races where
+    # the trade_closer state file may be partially written or briefly absent.
+    for _attempt in range(3):
+        try:
+            with open(_TRADE_CLOSER_STATE_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.05)
+    if data is None:
+        logger.warning(
+            "ALPHA_FUTURES_POSITION_LOAD_FAILED fail_closed symbol_guard_active: %s",
+            last_err,
+        )
+        # Fail CLOSED — if we cannot read position state, assume positions exist
+        # for ALL symbols to prevent stacking on state-read failure.
+        return {
+            sym: {"side": "UNKNOWN", "quantity": 1, "fail_closed": True}
+            for sym in DEFAULT_SPECS.keys()
+        }
     for entry in (data.get("queues") or []):
         if str(entry.get("strategy", "")).strip().lower() != "alpha_futures":
             continue
@@ -438,6 +460,22 @@ def _build_signal_for_symbol(
             return exit_signal
         # Position open and no exit triggered → suppress re-entry on this symbol.
         return None
+
+    # ---- Overnight illiquidity gate (entry-only) ----
+    # MCL and MGC have thin overnight liquidity and have produced poor fills
+    # outside of regular trading hours. Block new entries when current UTC time
+    # is outside the 13:30–20:00 UTC window. Exits are unaffected (handled above).
+    # MES and MNQ are intentionally exempt — they have shown edge overnight.
+    if symbol in ("MCL", "MGC"):
+        _now_utc = datetime.now(timezone.utc)
+        _minutes_of_day = _now_utc.hour * 60 + _now_utc.minute
+        # Active RTH window: 13:30 (810) inclusive → 20:00 (1200) exclusive
+        if _minutes_of_day < 810 or _minutes_of_day >= 1200:
+            logger.info(
+                "OVERNIGHT_GATE_SKIP symbol=%s hour=%d minute=%d",
+                symbol, _now_utc.hour, _now_utc.minute,
+            )
+            return None
 
     highest_high = _highest_high(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     lowest_low = _lowest_low(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
