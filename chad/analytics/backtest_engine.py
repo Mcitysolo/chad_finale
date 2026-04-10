@@ -500,7 +500,7 @@ def load_bars(symbol: str, bars_dir: Optional[Path] = None) -> List[BacktestBar]
             ts = _parse_bar_ts(str(ts_raw))
         except (KeyError, ValueError, TypeError):
             continue
-        if min(o, h, l, c) <= 0 or h < l:
+        if min(o, h, l, c) <= 0 or h < l or v <= 0:
             continue
         bars.append(BacktestBar(ts_utc=ts, open=o, high=h, low=l, close=c, volume=max(v, 0), symbol=symbol.upper()))
 

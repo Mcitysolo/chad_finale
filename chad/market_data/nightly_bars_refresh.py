@@ -195,7 +195,7 @@ def _run_ibkr(
 
         # Equities via backfill_universe
         try:
-            counts = provider.backfill_universe(equities, days=400, sec_type="STK")
+            counts = provider.backfill_universe(equities, days=400, sec_type="STK", include_minute=True)
             for sym in equities:
                 if sym in counts and counts[sym] > 0:
                     _log(sym, f"wrote {counts[sym]} bars, source=ibkr")
@@ -223,6 +223,12 @@ def _run_ibkr(
             except Exception as e:
                 _log(sym, f"FAILED {e}")
                 results[sym] = False
+            # 1-minute bars (additive, never affects exit code)
+            try:
+                provider.fetch_minute_bars(sym, days=5, sec_type="FUT")
+                _log(sym, "1m bars fetched")
+            except Exception as exc:
+                _log(sym, f"1m FAILED {exc!r}")
     finally:
         ib.disconnect()
 

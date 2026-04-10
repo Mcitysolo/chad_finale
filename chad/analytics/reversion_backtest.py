@@ -70,7 +70,7 @@ def load_bars(symbol: str) -> List[Dict[str, Any]]:
             v = float(b.get("volume", 0))
         except (TypeError, ValueError):
             continue
-        if min(o, h, l, c) <= 0 or h < l:
+        if min(o, h, l, c) <= 0 or h < l or v <= 0:
             continue
         bars.append({
             "ts_utc": str(b.get("ts_utc", "")),

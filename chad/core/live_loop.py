@@ -96,6 +96,12 @@ _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decisio
 _redis_stop_flag = False
 _redis_stop_reason = ""
 
+# Redis dynamic_caps — advisory cache for reducing JSON poll lag
+_redis_dynamic_caps: Optional[Dict] = None
+
+# Redis live_gate — last received timestamp for latency monitoring
+_redis_live_gate_ts: Optional[str] = None
+
 
 from chad.core.kraken_execution import execute_kraken_intents as _execute_kraken_intents
 
@@ -774,6 +780,45 @@ def _init_redis_stop_subscriber(logger: logging.Logger) -> None:
         logger.info("Redis stop subscriber not available (non-fatal): %s", exc)
 
 
+def _init_redis_dynamic_caps_subscriber(logger: logging.Logger) -> None:
+    """Subscribe to Redis dynamic_caps for real-time cap updates."""
+    global _redis_dynamic_caps
+    try:
+        from chad.core.state_bus import get_subscriber
+
+        def _on_dynamic_caps(data: dict) -> None:
+            global _redis_dynamic_caps
+            _redis_dynamic_caps = data
+            logger.debug(
+                "DYNAMIC_CAPS_RECEIVED via Redis: %d keys",
+                len(data) if isinstance(data, dict) else 0,
+            )
+
+        get_subscriber().on_dynamic_caps(_on_dynamic_caps)
+        logger.info("Redis dynamic_caps subscriber active")
+    except Exception as exc:
+        logger.info("Redis dynamic_caps subscriber not available (non-fatal): %s", exc)
+
+
+def _init_redis_live_gate_subscriber(logger: logging.Logger) -> None:
+    """Subscribe to Redis live_gate for observability."""
+    global _redis_live_gate_ts
+    try:
+        from chad.core.state_bus import get_subscriber
+
+        def _on_live_gate(data: dict) -> None:
+            global _redis_live_gate_ts
+            _redis_live_gate_ts = data.get("ts_utc") or data.get("timestamp", "")
+            logger.debug(
+                "LIVE_GATE_RECEIVED via Redis: ts=%s", _redis_live_gate_ts,
+            )
+
+        get_subscriber().on_live_gate(_on_live_gate)
+        logger.info("Redis live_gate subscriber active")
+    except Exception as exc:
+        logger.info("Redis live_gate subscriber not available (non-fatal): %s", exc)
+
+
 def run_loop() -> None:
     global _redis_stop_flag, _redis_stop_reason
     logger = logging.getLogger("chad.live_loop")
@@ -790,6 +835,10 @@ def run_loop() -> None:
 
     # Subscribe to Redis stop signal for <100ms propagation
     _init_redis_stop_subscriber(logger)
+    # Subscribe to Redis dynamic_caps for real-time cap updates
+    _init_redis_dynamic_caps_subscriber(logger)
+    # Subscribe to Redis live_gate for observability
+    _init_redis_live_gate_subscriber(logger)
 
     while True:
         # Check Redis stop flag before each cycle
