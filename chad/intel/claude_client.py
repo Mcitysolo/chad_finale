@@ -53,7 +53,20 @@ TIER_MODELS = {
 
 DEFAULT_REQUEST_TIMEOUT_SEC = 15.0
 DEFAULT_MAX_REQUESTS_PER_MIN = 10
-DEFAULT_DAILY_TOKEN_CAP = 100_000
+DEFAULT_DAILY_TOKEN_CAP: int = int(
+    os.environ.get("CHAD_ADVISORY_TOKEN_CAP", "100000")
+)
+DEFAULT_DAILY_DOLLAR_CAP: float = float(
+    os.environ.get("CHAD_ADVISORY_DAILY_DOLLAR_CAP", "5.0")
+)
+
+_MODEL_COST_PER_1K_TOKENS: dict = {
+    "claude-haiku-4-5-20251001": 0.001,
+    "claude-sonnet-4-6": 0.003,
+    "claude-opus-4-6": 0.015,
+}
+_DEFAULT_COST_PER_1K = 0.003  # conservative default
+
 MAX_RETRIES = 2
 RETRYABLE_STATUS_CODES = {429, 529, 500, 502, 503, 504}
 
@@ -101,6 +114,7 @@ class _RateLimiterState:
     minute_requests: int = 0
     day_window_start: float = 0.0
     day_tokens_used: int = 0
+    day_dollars_used: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +224,16 @@ def _write_call_log(
     date_str = ts.strftime("%Y%m%d")
     log_path = log_dir / f"calls_{date_str}.ndjson"
 
+    cost_per_1k = _MODEL_COST_PER_1K_TOKENS.get(model, _DEFAULT_COST_PER_1K)
+    estimated_cost = (input_tokens + output_tokens) / 1000.0 * cost_per_1k
+
     entry = {
         "ts_utc": ts.isoformat().replace("+00:00", "Z"),
         "model": model,
         "task_type": task_type,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "estimated_cost_usd": round(estimated_cost, 6),
         "duration_ms": duration_ms,
         "success": success,
     }
@@ -337,6 +355,7 @@ class ClaudeClient:
         if day_elapsed >= 24 * 3600.0:
             state.day_window_start = now
             state.day_tokens_used = 0
+            state.day_dollars_used = 0.0
 
         if state.minute_requests + 1 > self._config.max_requests_per_min:
             raise ClaudeRateLimitError(
@@ -351,11 +370,19 @@ class ClaudeClient:
         state.minute_requests += 1
         state.day_tokens_used += estimated_tokens
 
-    def _update_token_usage(self, input_tokens: int, output_tokens: int) -> None:
-        """Update daily token usage from API response."""
+    def _update_token_usage(self, input_tokens: int, output_tokens: int, model: str = "") -> None:
+        """Update daily token and dollar usage from API response."""
         total = input_tokens + output_tokens
         if total > 0:
             self._rate_state.day_tokens_used += total
+            cost_per_1k = _MODEL_COST_PER_1K_TOKENS.get(model, _DEFAULT_COST_PER_1K)
+            cost = total / 1000.0 * cost_per_1k
+            self._rate_state.day_dollars_used += cost
+            if self._rate_state.day_dollars_used >= DEFAULT_DAILY_DOLLAR_CAP:
+                raise ClaudeRateLimitError(
+                    f"Daily dollar cap ${DEFAULT_DAILY_DOLLAR_CAP:.2f} exceeded "
+                    f"(used ${self._rate_state.day_dollars_used:.3f})"
+                )
 
     # ------------------------------------------------------------------ #
     # Core API call
@@ -547,7 +574,7 @@ class ClaudeClient:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         with self._lock:
-            self._update_token_usage(input_tok, output_tok)
+            self._update_token_usage(input_tok, output_tok, model=model)
 
         _write_call_log(
             model=model, task_type=task_type,
@@ -636,7 +663,7 @@ Provide a clear, practical advisory response. Be direct and risk-aware."""
             elapsed_ms = int((time.monotonic() - t0) * 1000)
 
             with self._lock:
-                self._update_token_usage(input_tok, output_tok)
+                self._update_token_usage(input_tok, output_tok, model=self.model_for_tier("complex"))
 
             _write_call_log(
                 model=self.model_for_tier("complex"),

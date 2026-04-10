@@ -1025,21 +1025,22 @@ class MorningBrief:
                 "No jargon. Each point max 1 sentence. "
                 "For crypto (BTC, ETH, SOL), volume is in USD — label it as USD, not contracts.\n\n"
                 + "\n\n".join(context_parts)
+                + "\n\nReturn a JSON object: {\"text\": \"your bullet points here\"}"
             )
 
-            text, _, _ = client._call_claude(
-                prompt=prompt,
+            result = client.chat_json(
+                prompt,
                 system=(
                     "You are CHAD, a trading system's intelligence layer. "
                     "Return 2-3 bullet points, each starting with the instrument symbol. "
                     "Be specific about price levels and percentages. No markdown. "
-                    "Format: SYMBOL: observation"
+                    "Format: SYMBOL: observation. "
+                    "Wrap your response in a JSON object with a single key 'text'."
                 ),
                 task_type="routine",
-                max_tokens=250,
-                temperature=0.3,
             )
-            return text.strip() if text.strip() else None
+            text = str(result.get("text", "") or result.get("observations", "") or "").strip()
+            return text if text else None
         except Exception as exc:
             logging.getLogger("chad.morning_brief").debug("Opportunity scan failed: %s", exc)
             return None
@@ -1067,6 +1068,47 @@ class MorningBrief:
 
         if btc_price is not None:
             lines.append(f"- Bitcoin: {_format_money(btc_price)}")
+
+        # Portfolio equity
+        try:
+            caps_path = self._root / "runtime" / "dynamic_caps.json"
+            if caps_path.exists():
+                caps = json.loads(caps_path.read_text(encoding="utf-8"))
+                equity = caps.get("total_equity")
+                if isinstance(equity, (int, float)) and equity > 0:
+                    lines.append(f"- Portfolio equity: {_format_money(equity)}")
+        except Exception:
+            pass
+
+        # Open positions count
+        try:
+            pg_path = self._root / "runtime" / "positions_snapshot.json"
+            if pg_path.exists():
+                snap = json.loads(pg_path.read_text(encoding="utf-8"))
+                positions = snap.get("positions", [])
+                if isinstance(positions, list):
+                    open_count = sum(
+                        1 for p in positions
+                        if isinstance(p, dict) and abs(_safe_float(p.get("position", 0))) > 0
+                    )
+                    if open_count > 0:
+                        lines.append(f"- Open positions: {open_count}")
+        except Exception:
+            pass
+
+        # Risk posture
+        try:
+            scr_path = self._root / "runtime" / "scr_state.json"
+            if scr_path.exists():
+                scr = json.loads(scr_path.read_text(encoding="utf-8"))
+                scr_state = scr.get("state", "UNKNOWN")
+                sizing = scr.get("sizing_factor")
+                if isinstance(sizing, (int, float)):
+                    lines.append(f"- Risk posture: {scr_state} (sizing={sizing:.2f})")
+                else:
+                    lines.append(f"- Risk posture: {scr_state}")
+        except Exception:
+            pass
 
         # Opportunity scan — AI-generated watchlist
         opps = self._scan_opportunities()

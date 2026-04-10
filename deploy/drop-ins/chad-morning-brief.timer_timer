@@ -1,0 +1,10 @@
+[Unit]
+Description=CHAD Morning Brief Timer — Mon-Fri 9:00 AM ET (13:00 UTC)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 13:00:00 UTC
+Persistent=true
+Unit=chad-morning-brief.service
+
+[Install]
+WantedBy=timers.target

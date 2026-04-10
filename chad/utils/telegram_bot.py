@@ -75,6 +75,32 @@ from chad.intel.advisory_engine import run_full_advisory
 
 
 # =============================================================================
+# Known symbol universe (for advisory validation)
+# =============================================================================
+
+_UNIVERSE_PATH = Path(os.environ.get("CHAD_ROOT", Path(__file__).resolve().parents[2])).resolve() / "config" / "universe.json"
+
+
+def _load_known_symbols() -> frozenset:
+    try:
+        obj = json.loads(_UNIVERSE_PATH.read_text(encoding="utf-8"))
+        syms = set(obj.get("symbols", []))
+        for f in obj.get("futures", []):
+            if isinstance(f, dict):
+                syms.add(f["symbol"])
+        # Add crypto
+        syms.update({"BTC-USD", "ETH-USD", "SOL-USD", "VIX"})
+        # Add common valid query targets
+        syms.update({"SPY", "QQQ", "GLD", "TLT", "IWM", "VXX"})
+        return frozenset(s.upper() for s in syms if s)
+    except Exception:
+        return frozenset()
+
+
+_KNOWN_SYMBOLS: frozenset = _load_known_symbols()
+
+
+# =============================================================================
 # Paths / constants
 # =============================================================================
 
@@ -1221,6 +1247,13 @@ def handle_advisory_chat(update: Update, context: CallbackContext, text: str) ->
 
     symbol = extract_symbol_for_advisory(question)
     horizon = infer_horizon(question)
+
+    if symbol and _KNOWN_SYMBOLS and symbol not in _KNOWN_SYMBOLS:
+        LOGGER.warning(
+            "advisory_symbol_not_in_universe symbol=%s known_count=%d",
+            symbol, len(_KNOWN_SYMBOLS),
+        )
+        question = f"[Note: {symbol} is not in CHAD's active trading universe] {question}"
 
     LOGGER.info(
         "telegram_advisory_start symbol=%s horizon=%s question=%r",
