@@ -66,6 +66,10 @@ from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, Tra
 
 CRYPTO_UNIVERSE_DEFAULT: List[str] = ["BTC-USD", "ETH-USD", "SOL-USD"]
 
+# Symbols known to be highly liquid globally — bypass the fail-closed
+# dollar_volume gate when ctx.dollar_volume is unavailable.
+_KNOWN_LIQUID: frozenset = frozenset({"BTC-USD", "ETH-USD", "SOL-USD"})
+
 # CAD-quoted alternates used when USD buying power is insufficient and
 # the live Kraken balance shows ZCAD on hand. Sized in CAD against the
 # ZCAD line of runtime/kraken_balances.json by the orchestrator's risk
@@ -704,11 +708,12 @@ def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List:
         # -------------------------
 
         # Liquidity gate: requires dv_map presence for entries (fail-closed)
+        # Known-liquid symbols bypass the gate when dollar_volume is missing.
         dv = dv_map.get(symbol)
-        if dv is None:
+        if dv is None and symbol not in _KNOWN_LIQUID:
             blocked_by.append("LIQUIDITY_UNKNOWN")
             reasons.append("ctx missing dollar volume metrics; entries blocked (fail-closed)")
-        else:
+        elif dv is not None:
             diagnostics["dollar_volume"] = float(dv)
             if dv < params.min_liquidity_usd:
                 blocked_by.append("LIQUIDITY")

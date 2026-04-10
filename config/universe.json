@@ -65,6 +65,13 @@
       "currency": "USD",
       "tradingClass": "M6E",
       "sec_type": "FUT"
+    },
+    {
+      "symbol": "SIL",
+      "exchange": "COMEX",
+      "currency": "USD",
+      "tradingClass": "SIL",
+      "sec_type": "FUT"
     }
   ]
 }

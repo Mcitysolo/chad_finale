@@ -85,7 +85,10 @@ ib = IB()
 ib.connect("127.0.0.1", 4002, clientId=99)
 
 position_sync = BrokerPositionSync(ib)
-_paper_adapter = IbkrAdapter(config=IbkrConfig(dry_run=True))
+_paper_adapter = IbkrAdapter(config=IbkrConfig(
+    dry_run=(os.environ.get("CHAD_EXECUTION_MODE", "dry_run").strip().lower()
+             not in ("paper",)),
+))
 LOOP_INTERVAL_SECONDS = 60
 _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
 
@@ -584,19 +587,63 @@ def run_once(logger: logging.Logger) -> None:
             _scr_sizing = float(_scr_raw.get("sizing_factor", 0.0) or 0.0)
             _scr_reasons = list(_scr_raw.get("reasons") or [])[:3]
             if _scr_state_val == "PAUSED":
-                logger.warning(
-                    "SCR_HARD_BLOCK state=PAUSED sizing_factor=%.3f symbol=%s side=%s qty=%s strategy=%s reasons=%s",
-                    _scr_sizing,
-                    getattr(intent, "symbol", None),
-                    getattr(intent, "side", None),
-                    getattr(intent, "quantity", None),
-                    getattr(intent, "strategy", None),
-                    _scr_reasons,
-                )
-                continue
+                # P3-3: EXIT bypass — flip intents close existing positions and
+                # must always pass through regardless of SCR state.
+                # A flip signal reverses an open position — it is a closing trade.
+                _is_exit_intent = is_flip_signal(intent)
+                if _is_exit_intent:
+                    logger.info(
+                        "SCR_EXIT_BYPASS state=PAUSED symbol=%s side=%s qty=%s strategy=%s — exit allowed",
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "quantity", None),
+                        getattr(intent, "strategy", None),
+                    )
+                else:
+                    logger.warning(
+                        "SCR_HARD_BLOCK state=PAUSED sizing_factor=%.3f symbol=%s side=%s qty=%s strategy=%s reasons=%s",
+                        _scr_sizing,
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "quantity", None),
+                        getattr(intent, "strategy", None),
+                        _scr_reasons,
+                    )
+                    continue
         except Exception as _scr_err:
             logger.warning("SCR_GATE_READ_FAILED (fail-open): %s", _scr_err)
         # --- end SCR gate ---
+
+        # P3-2: CAUTIOUS scaling — apply sizing_factor to quantity when SCR
+        # is CAUTIOUS. Respects minimum quantity per market type.
+        # Futures: minimum 1 contract (no fractional). Equities: minimum 1 share.
+        try:
+            if _scr_state_val == "CAUTIOUS" and _scr_sizing > 0.0:
+                _raw_qty = float(getattr(intent, "quantity", 0.0) or 0.0)
+                _sec_type = str(getattr(intent, "sec_type", "") or "").upper()
+                _scaled_qty: float
+                if _sec_type == "FUT":
+                    # Futures: round to nearest whole contract, minimum 1
+                    _scaled_qty = max(1.0, round(_raw_qty * _scr_sizing))
+                else:
+                    # Equities and other: floor to whole shares, minimum 1
+                    import math as _math
+                    _scaled_qty = max(1.0, float(_math.floor(_raw_qty * _scr_sizing)))
+                if _scaled_qty != _raw_qty:
+                    logger.info(
+                        "SCR_CAUTIOUS_SCALE symbol=%s raw_qty=%.2f sizing_factor=%.3f scaled_qty=%.2f",
+                        getattr(intent, "symbol", None),
+                        _raw_qty,
+                        _scr_sizing,
+                        _scaled_qty,
+                    )
+                    try:
+                        object.__setattr__(intent, "quantity", _scaled_qty)
+                    except (AttributeError, TypeError):
+                        intent.quantity = _scaled_qty
+        except Exception as _p3_err:
+            logger.warning("SCR_CAUTIOUS_SCALE_FAILED (skipped): %s", _p3_err)
+        # --- end P3-2 ---
 
         class _IntentSignalAdapter:
             def __init__(self, obj: object) -> None:

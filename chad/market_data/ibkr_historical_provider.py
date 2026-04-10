@@ -27,7 +27,7 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -150,21 +150,121 @@ class IBKRHistoricalProvider:
         except Exception:
             pass
 
+    # ---------------------------------------------------------------------------
+    # Deterministic front-month expiry table
+    # ---------------------------------------------------------------------------
+    # Each entry is a list of YYYYMM strings covering the next ~18 months,
+    # ordered ascending. Resolver picks the first entry >= today + 5 days.
+    # Update annually or when roll schedule changes.
+    # Source: confirmed from live IBKR contract data 2026-04-10.
+    _EXPIRY_SCHEDULE: dict = {
+        "MES":  ["202606", "202609", "202612", "202703", "202706"],
+        "MNQ":  ["202606", "202609", "202612", "202703", "202706"],
+        "MCL":  ["202605", "202606", "202607", "202608", "202609", "202610", "202611", "202612"],
+        "MGC":  ["202604", "202606", "202608", "202610", "202612", "202702", "202704"],
+        "ZN":   ["202606", "202609", "202612", "202703"],
+        "ZB":   ["202606", "202609", "202612", "202703"],
+        "M6E":  ["202606", "202609", "202612", "202703"],
+        "SIL":  ["202605", "202606", "202607", "202608", "202609", "202610", "202611", "202612"],
+    }
+
+    # Per-symbol contract specs for explicit futures resolution.
+    # ibkr_symbol: the root symbol IBKR uses (may differ from logical name, e.g. SIL->SI)
+    # multiplier: contract size as string
+    # exchange: primary exchange
+    # currency: always USD
+    _FUTURES_CONTRACT_SPECS: dict = {
+        "MES":  {"ibkr_symbol": "MES", "multiplier": "5",     "exchange": "CME",   "currency": "USD"},
+        "MNQ":  {"ibkr_symbol": "MNQ", "multiplier": "2",     "exchange": "CME",   "currency": "USD"},
+        "MCL":  {"ibkr_symbol": "MCL", "multiplier": "100",   "exchange": "NYMEX", "currency": "USD", "local_symbol": "MCLK6"},
+        "MGC":  {"ibkr_symbol": "MGC", "multiplier": "10",    "exchange": "COMEX", "currency": "USD"},
+        "ZN":   {"ibkr_symbol": "ZN",  "multiplier": "1000",  "exchange": "CBOT",  "currency": "USD"},
+        "ZB":   {"ibkr_symbol": "ZB",  "multiplier": "1000",  "exchange": "CBOT",  "currency": "USD"},
+        "M6E":  {"ibkr_symbol": "M6E", "multiplier": "12500", "exchange": "CME",   "currency": "USD"},
+        "SIL":  {"ibkr_symbol": "SI",  "multiplier": "1000",  "exchange": "COMEX", "currency": "USD"},
+    }
+
+    @staticmethod
+    def _resolve_front_month(symbol: str) -> Optional[str]:
+        """
+        Return the nearest active front-month expiry string (YYYYMM) for
+        the given symbol from the deterministic expiry schedule.
+
+        Selects the first expiry that is at least 5 days from today.
+        Returns None if no valid expiry is found (caller must handle).
+        """
+        schedule = IBKRHistoricalProvider._EXPIRY_SCHEDULE.get(symbol)
+        if not schedule:
+            return None
+        today = datetime.now(timezone.utc)
+        cutoff = today + timedelta(days=5)
+        cutoff_str = cutoff.strftime("%Y%m")
+        # Also require day-of-month check for same-month cutoffs
+        cutoff_day = cutoff.day
+        for expiry in schedule:
+            if expiry > cutoff_str:
+                return expiry
+            if expiry == cutoff_str:
+                # Same month — only valid if expiry month has remaining days
+                # Conservative: skip same month if we are past the 20th
+                if cutoff_day <= 20:
+                    return expiry
+        return schedule[-1]  # fallback to last known expiry
+
     def _make_contract(self, symbol: str, sec_type: str = "STK") -> Any:
         from ib_insync import Stock, Future
 
         sym = symbol.strip().upper()
-        if sec_type == "FUT":
-            # Resolve full spec from config/universe.json. tradingClass is
-            # required to disambiguate micros from full-size contracts on the
-            # same root (e.g. MES vs ES on CME) — without it bar fetches can
-            # return wrong-contract data or fail outright.
-            specs = _load_futures_specs()
-            spec = specs.get(sym, {})
-            exchange = spec.get("exchange") or "CME"
-            currency = spec.get("currency") or "USD"
-            trading_class = spec.get("tradingClass") or sym
 
+        if sec_type == "FUT":
+            spec = IBKRHistoricalProvider._FUTURES_CONTRACT_SPECS.get(sym)
+            if spec:
+                local_sym = spec.get("local_symbol")
+                if local_sym:
+                    contract = Future(
+                        symbol=spec["ibkr_symbol"],
+                        localSymbol=local_sym,
+                        exchange=spec["exchange"],
+                        currency=spec["currency"],
+                        multiplier=spec["multiplier"],
+                    )
+                    LOGGER.info(
+                        "ibkr_historical.contract_resolved symbol=%s local_symbol=%s multiplier=%s",
+                        sym, local_sym, spec["multiplier"],
+                    )
+                    return contract
+
+                expiry = IBKRHistoricalProvider._resolve_front_month(sym)
+                if not expiry:
+                    LOGGER.warning(
+                        "ibkr_historical.no_expiry_found symbol=%s", sym
+                    )
+                    return Future(
+                        symbol=spec["ibkr_symbol"],
+                        exchange=spec["exchange"],
+                        currency=spec["currency"],
+                        tradingClass=sym,
+                    )
+                contract = Future(
+                    symbol=spec["ibkr_symbol"],
+                    lastTradeDateOrContractMonth=expiry,
+                    exchange=spec["exchange"],
+                    currency=spec["currency"],
+                    multiplier=spec["multiplier"],
+                    tradingClass=sym,
+                )
+                LOGGER.info(
+                    "ibkr_historical.contract_resolved symbol=%s expiry=%s multiplier=%s",
+                    sym, expiry, spec["multiplier"],
+                )
+                return contract
+
+            # Fallback for futures not in the spec table: use universe.json specs
+            specs = _load_futures_specs()
+            spec_fallback = specs.get(sym, {})
+            exchange = spec_fallback.get("exchange") or "CME"
+            currency = spec_fallback.get("currency") or "USD"
+            trading_class = spec_fallback.get("tradingClass") or sym
             contract = Future(
                 symbol=sym,
                 exchange=exchange,
@@ -175,9 +275,12 @@ class IBKRHistoricalProvider:
                 qualified = self._ib.qualifyContracts(contract)
                 if qualified:
                     return qualified[0]
-            except Exception:
-                pass
+            except Exception as _qe:
+                LOGGER.warning(
+                    "ibkr_historical.qualify_failed symbol=%s err=%s", sym, _qe
+                )
             return contract
+
         return Stock(sym, "SMART", "USD")
 
     def _duration_str(self, days: int) -> str:

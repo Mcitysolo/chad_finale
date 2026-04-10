@@ -324,9 +324,78 @@ def apply_rebalance(action: Dict[str, Any]) -> str:
 # Each handler takes (action: Dict) and returns a receipt path string.
 # ---------------------------------------------------------------------------
 
+def apply_execution_mode_change(action: Dict[str, Any]) -> str:
+    """
+    Apply an execution_mode_change action.
+
+    Writes a systemd drop-in file that overrides CHAD_EXECUTION_MODE for
+    chad-live-loop.service, then reloads systemd and restarts the service.
+
+    Supported modes: dry_run, paper
+    Live mode is explicitly blocked — requires a separate manual promotion.
+
+    Returns the path to the written drop-in file.
+    """
+    action_id = str(action.get("action_id") or "").strip()
+    if not action_id:
+        raise RuntimeError("execution_mode_change:missing_action_id")
+
+    payload = action.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError("execution_mode_change:payload_not_dict")
+
+    target_mode = str(payload.get("execution_mode") or "").strip().lower()
+    if target_mode not in ("dry_run", "paper"):
+        raise RuntimeError(
+            f"execution_mode_change:unsupported_mode:{target_mode} "
+            f"(only dry_run and paper are allowed via ActionApplier)"
+        )
+
+    dropin_dir = Path("/etc/systemd/system/chad-live-loop.service.d")
+    dropin_path = dropin_dir / "20-execution-mode.conf"
+
+    dropin_content = (
+        "[Service]\n"
+        f"Environment=CHAD_EXECUTION_MODE={target_mode}\n"
+    )
+
+    try:
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        tmp = dropin_path.with_suffix(".conf.tmp")
+        tmp.write_text(dropin_content, encoding="utf-8")
+        os.replace(tmp, dropin_path)
+        LOG.info(
+            "execution_mode_change: wrote drop-in %s mode=%s action=%s",
+            dropin_path, target_mode, action_id,
+        )
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"execution_mode_change:permission_denied writing {dropin_path}: {exc}"
+        ) from exc
+
+    # Reload systemd and restart the live loop
+    # Commands: systemctl daemon-reload, systemctl restart chad-live-loop.service
+    for cmd in [
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "restart", "chad-live-loop.service"],
+    ]:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"execution_mode_change:systemctl_failed:{' '.join(cmd)}:"
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        LOG.info("execution_mode_change: %s OK", " ".join(cmd))
+
+    return str(dropin_path)
+
+
 DISPATCH: Dict[str, Any] = {
     "rebalance_execute": apply_rebalance,
     "weight_rebalance_config": apply_weight_rebalance_config,
+    "execution_mode_change": apply_execution_mode_change,
 }
 
 

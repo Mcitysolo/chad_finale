@@ -194,7 +194,7 @@ def build_alpha_signals(
 ) -> List[TradeSignal]:
     p = params or build_alpha_params()
 
-    raw_prices = prices or {}
+    raw_prices = prices or getattr(ctx, "prices", None) or {}
     universe: Sequence[str] = []
 
     if p.use_legend_filter and ctx.legend and getattr(ctx.legend, "weights", None):

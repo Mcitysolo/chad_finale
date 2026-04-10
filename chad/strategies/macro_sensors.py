@@ -97,6 +97,20 @@ def _vix_value(ctx: Any) -> Optional[float]:
                     v = _safe_float(raw[key])
                     if v > 0:
                         return v
+
+    # Fallback: check ctx.prices for VIX scalar
+    try:
+        prices = getattr(ctx, "prices", None) or {}
+        if isinstance(prices, dict):
+            for key in ("VIX", "^VIX", "vix"):
+                val = prices.get(key)
+                if val is not None:
+                    v = float(val)
+                    if 0 < v < 200:
+                        return v
+    except Exception:
+        pass
+
     return None
 
 
