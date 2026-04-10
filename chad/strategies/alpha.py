@@ -128,7 +128,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 def _asset_class_for_symbol(sym: str) -> AssetClass:
     if sym in {"SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "LQD", "VWO", "IEMG"}:
         return AssetClass.ETF
-    return AssetClass.STOCK
+    return AssetClass.EQUITY
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +160,16 @@ def _true_range(highs, lows, closes):
 def _atr(highs, lows, closes, period):
     tr = _true_range(highs, lows, closes)
     return _ema(tr, period)
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    if x != x:
+        return lo
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +249,8 @@ def build_alpha_signals(
             regime = "uptrend"
         elif px < es and ef < es:
             regime = "downtrend"
+        elif px > es and ef < es:
+            regime = "recovery"
         elif ef_es_spread < 0.001:
             regime = "chop"
         else:
@@ -250,6 +262,8 @@ def build_alpha_signals(
 
         # Momentum gate: only applies to trending regimes
         if regime == "uptrend" and momentum < p.momentum_atr:
+            blocked = True
+        elif regime == "recovery" and momentum < p.momentum_atr * 0.5:
             blocked = True
         elif regime == "downtrend" and momentum > -p.momentum_atr:
             blocked = True
@@ -299,6 +313,9 @@ def build_alpha_signals(
         if regime == "uptrend":
             side = SignalSide.BUY
             reason = "trend_momentum"
+        elif regime == "recovery":
+            side = SignalSide.BUY
+            reason = "recovery_long"
         elif regime == "downtrend":
             side = SignalSide.SELL
             reason = "trend_short"
