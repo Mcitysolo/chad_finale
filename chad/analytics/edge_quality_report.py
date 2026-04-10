@@ -155,17 +155,18 @@ def summarize(rows: List[TradeRow], scr: Dict[str, Any]) -> Dict[str, Any]:
     # SCR fields: keep it simple and stable
     scr_summary: Dict[str, Any] = {}
     if scr:
+        stats = scr.get("stats") or {}
         scr_summary = {
             "scr_state": scr.get("state"),
             "paper_only": scr.get("paper_only"),
             "sizing_factor": scr.get("sizing_factor"),
             "reasons": scr.get("reasons"),
-            "total_trades": scr.get("total_trades"),
-            "effective_trades": scr.get("effective_trades"),
-            "win_rate": scr.get("win_rate"),
-            "sharpe_like": scr.get("sharpe_like"),
-            "max_drawdown": scr.get("max_drawdown"),
-            "total_pnl": scr.get("total_pnl"),
+            "total_trades": stats.get("total_trades", scr.get("total_trades")),
+            "effective_trades": stats.get("effective_trades", scr.get("effective_trades")),
+            "win_rate": stats.get("win_rate", scr.get("win_rate")),
+            "sharpe_like": stats.get("sharpe_like", scr.get("sharpe_like")),
+            "max_drawdown": stats.get("max_drawdown", scr.get("max_drawdown")),
+            "total_pnl": stats.get("total_pnl", scr.get("total_pnl")),
         }
 
     return {

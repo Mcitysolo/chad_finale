@@ -259,7 +259,7 @@ def _build_mode_snapshot() -> ModeSnapshot:
 
 
 def _build_shadow_snapshot() -> ShadowSnapshot:
-    stats_raw = load_and_compute(max_trades=2000, days_back=30, include_paper=True, include_live=True)
+    stats_raw = load_and_compute(max_trades=5000, days_back=60, include_paper=True, include_live=True)
     shadow_state: ShadowState = evaluate_confidence(stats_raw)
 
     stats_model = ShadowStats(
