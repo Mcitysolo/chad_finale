@@ -233,13 +233,25 @@ def build_alpha_signals(
         if atr_pct < p.min_atr_pct or atr_pct > p.max_atr_pct:
             blocked = True
 
-        if not (ef > es and px > ef):
+        # Regime detection: uptrend / downtrend / chop
+        ef_es_spread = abs(ef - es) / px if px else 0.0
+        if ef > es and px > ef:
+            regime = "uptrend"
+        elif px < es and ef < es:
+            regime = "downtrend"
+        elif ef_es_spread < 0.001:
+            regime = "chop"
+        else:
+            regime = None
             blocked = True
 
         if range_atr > p.anti_chase_range_atr:
             blocked = True
 
-        if momentum < p.momentum_atr:
+        # Momentum gate: only applies to trending regimes
+        if regime == "uptrend" and momentum < p.momentum_atr:
+            blocked = True
+        elif regime == "downtrend" and momentum > -p.momentum_atr:
             blocked = True
 
         state = _STATE.get(sym)
@@ -280,20 +292,30 @@ def build_alpha_signals(
         if blocked:
             continue
 
-        size = min(p.max_size, p.base_size * (1.0 + momentum))
+        size = min(p.max_size, p.base_size * (1.0 + abs(momentum)))
         if abs(size - pos) < p.min_delta_size:
             continue
+
+        if regime == "uptrend":
+            side = SignalSide.BUY
+            reason = "trend_momentum"
+        elif regime == "downtrend":
+            side = SignalSide.SELL
+            reason = "trend_short"
+        else:  # chop — fade the deviation from mid
+            side = SignalSide.SELL if px > (ef + es) / 2 else SignalSide.BUY
+            reason = "chop_reversion"
 
         signals.append(
             TradeSignal(
                 strategy=StrategyName.ALPHA,
                 symbol=sym,
-                side=SignalSide.BUY,
+                side=side,
                 size=float(size),
-                confidence=_clamp(0.5 + momentum, 0.0, 0.95),
+                confidence=_clamp(0.5 + abs(momentum), 0.0, 0.95),
                 asset_class=_asset_class_for_symbol(sym),
                 created_at=now,
-                meta={"reason": "trend_momentum"},
+                meta={"reason": reason, "regime": regime},
             )
         )
 

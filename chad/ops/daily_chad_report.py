@@ -533,7 +533,7 @@ def _generate_chads_take(
 
         prompt = (
             f"Today's results: {'made' if total_pnl >= 0 else 'lost'} {_format_money(abs(total_pnl))} total. "
-            f"{total_trades} trades, {wins} winners, {losses} losers. "
+            f"{total_trades} trades, {wins} winners, {losses} losers, {max(0, total_trades - wins - losses)} scratches. "
             f"VIX (fear gauge): {vix if vix else 'unknown'}. "
             f"Strategy results: {strat_summary}. "
             f"Write 2-3 sentences summarizing today for someone who knows nothing about trading. "
@@ -714,11 +714,19 @@ class DailyCHADReport:
         # 3. WHAT DID WE DO?  (closed-trade P&L view; rare under live-loop today)
         if total_trades > 0:
             sections.append("═══ WHAT DID WE DO? ═══")
-            sections.append(f"{total_trades} trades today. {wins} were winners, {losses} were losers.")
+            scratches = max(0, total_trades - wins - losses)
+            sections.append(f"{total_trades} trades today. {wins} wins, {losses} losses, {scratches} scratches (flat).")
             if wins + losses > 0:
                 record = f"{wins}-{losses}"
-                quality = "a winning" if wins > losses else ("a tough" if losses > wins else "an even")
-                sections.append(f"That's like going {record} — {quality} day.")
+                if total_pnl > 0:
+                    quality = "a winning" if wins > losses else "a grinding"
+                    sections.append(f"That's like going {record} — {quality} day.")
+                elif total_pnl < 0 and wins > losses:
+                    sections.append(f"Record of {record}: we had more wins than losses, but the losses were bigger — net red.")
+                elif total_pnl < 0:
+                    sections.append(f"Record of {record} — a tough day.")
+                else:
+                    sections.append(f"Record of {record} — an even day.")
             sections.append("")
 
         # 3b. WHAT DID WE DO TODAY  (live-loop submitted intents from data/fills/)

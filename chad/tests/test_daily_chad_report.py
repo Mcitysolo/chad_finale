@@ -370,7 +370,7 @@ class TestDailyCHADReport:
         assert "🟢" in msg
         assert "WHAT DID WE DO" in msg
         assert "3 trades" in msg
-        assert "2 were winners" in msg
+        assert "2 wins" in msg and "1 losses" in msg and "scratches" in msg
         assert "BEST MOVE" in msg
         assert "CHAD 🤝" in msg
 

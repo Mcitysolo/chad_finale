@@ -60,7 +60,7 @@ class BetaParams:
     max_symbols: int = 10
 
     # WEALTH MODE throttles (critical)
-    max_signals_per_day: int = 5          # hard cap: total Beta signals/day
+    max_signals_per_day: int = 20         # hard cap: total Beta signals/day
     once_per_day_per_symbol: bool = True  # hard gate
 
     # Churn controls
