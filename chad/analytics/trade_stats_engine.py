@@ -122,6 +122,47 @@ def _is_untrusted(tags: Sequence[str], extra: Dict[str, Any]) -> bool:
 def _is_warmup_sim(tags: Sequence[str]) -> bool:
     # Synthetic warmup trades must never influence SCR confidence gating.
     return any(str(t).strip().lower() == "warmup_sim" for t in (tags or []))
+
+
+# Strategy names recognised by the tag-based attribution recovery below.
+# Priority order: more specific names first so e.g. "delta_pairs" wins over
+# the prefix "delta" if both happen to appear in the same tag list.
+_KNOWN_STRATEGY_NAMES_PRIORITY: Tuple[str, ...] = (
+    "alpha_futures", "gamma_futures", "alpha_options",
+    "alpha_crypto", "alpha_forex", "gamma_reversion",
+    "omega_macro", "omega_vol", "delta_pairs",
+    "alpha", "beta", "gamma", "omega", "delta",
+)
+
+
+def _recover_strategy_from_tags(strategy: str, tags: Sequence[str]) -> str:
+    """
+    Tag-based strategy attribution recovery for legacy "paper_exec" rows.
+
+    Historical fills written before the P0-4 evidence-writer hardening were
+    bucketed under the literal label "paper_exec" in the ``strategy`` field
+    even though their tag list still carried the real strategy name (e.g.
+    ``["paper", "filled", "paper_exec", "etf", "delta"]``). This helper is
+    a *read-side* recovery: it inspects the tag list and substitutes the
+    first matching known strategy name. The on-disk evidence file is never
+    mutated, preserving the hash chain.
+
+    Behaviour:
+      - If ``strategy`` is anything other than literal "paper_exec",
+        the original value is returned unchanged.
+      - If ``strategy`` is "paper_exec" and a known strategy name appears
+        in ``tags`` (case-insensitive), the first match in priority order
+        is returned.
+      - If no match is found, the original "paper_exec" label is preserved
+        so downstream filters can still treat the row as untrusted.
+    """
+    if str(strategy or "").strip().lower() != "paper_exec":
+        return strategy
+    tag_set = {str(t).strip().lower() for t in (tags or []) if t}
+    for cand in _KNOWN_STRATEGY_NAMES_PRIORITY:
+        if cand in tag_set:
+            return cand
+    return strategy
 def _kraken_txid(payload: Dict[str, Any]) -> Optional[str]:
     # best-effort extraction; different pipelines may store txid under different keys
     for k in ("txid", "kraken_txid", "order_txid", "trade_txid"):
@@ -331,10 +372,16 @@ def _parse_ledger(
         tags = list(payload.get("tags") or [])
         extra = dict(payload.get("extra") or {}) if isinstance(payload.get("extra") or {}, dict) else {}
 
+        # Tag-based attribution recovery: legacy "paper_exec" rows carry the
+        # real strategy name in their tag list. Recover at read time so SCR
+        # sees true attribution without mutating hash-chained evidence files.
+        raw_strategy = str(payload.get("strategy") or "")
+        recovered_strategy = _recover_strategy_from_tags(raw_strategy, tags)
+
         pt = ParsedTrade(
             broker=broker,
             is_live=is_live,
-            strategy=str(payload.get("strategy") or ""),
+            strategy=recovered_strategy,
             symbol=str(payload.get("symbol") or ""),
             pnl=float(pnl),
             notional=float(notional),
