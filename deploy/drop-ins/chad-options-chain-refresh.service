@@ -1,0 +1,18 @@
+[Unit]
+Description=CHAD Pre-Market Options Chain Cache Refresh
+After=network-online.target chad-ibgateway.service
+Requires=chad-ibgateway.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.options_chain_refresh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-options-chain-refresh
+
+[Install]
+WantedBy=multi-user.target

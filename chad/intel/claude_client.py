@@ -32,6 +32,8 @@ import logging
 import os
 import threading
 import time
+
+import psutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +60,9 @@ DEFAULT_DAILY_TOKEN_CAP: int = int(
 )
 DEFAULT_DAILY_DOLLAR_CAP: float = float(
     os.environ.get("CHAD_ADVISORY_DAILY_DOLLAR_CAP", "5.0")
+)
+OLLAMA_MIN_RAM_MB: int = int(
+    os.environ.get("CHAD_OLLAMA_MIN_RAM_MB", "1500")
 )
 
 _MODEL_COST_PER_1K_TOKENS: dict = {
@@ -93,6 +98,11 @@ class ClaudeAPIError(ClaudeClientError):
 
 class ConfigurationError(ClaudeClientError):
     """Raised when no AI provider is available."""
+
+
+class OllamaUnavailableError(RuntimeError):
+    """Raised when Ollama inference is skipped due to system constraints."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +533,22 @@ class ClaudeClient:
         if not prompt or not prompt.strip():
             raise ClaudeClientError("prompt must not be empty")
 
+        # Tier 0: try Ollama for routine tasks; fall through to Haiku on failure
+        if task_type == "routine":
+            try:
+                if _ollama_ram_ok():
+                    _ollama = OllamaClient()
+                    return _ollama.chat_json(
+                        prompt=prompt,
+                        system=system,
+                    )
+            except Exception as _olm_err:
+                logging.getLogger("chad.intel.claude_client").warning(
+                    "ollama_tier0_failed fallback_to_haiku err=%s",
+                    _olm_err,
+                )
+            # Fall through to Claude Haiku below
+
         # Build system prompt with JSON instruction
         sys_parts = []
         if system:
@@ -706,6 +732,26 @@ OLLAMA_TIMEOUT_SEC = 30.0
 _ollama_logger = logging.getLogger("chad.ollama")
 
 
+def _ollama_ram_ok() -> bool:
+    """Return True if sufficient RAM is available for Ollama inference.
+
+    Reads CHAD_OLLAMA_MIN_RAM_MB (default 1500MB). Fail-open: if psutil
+    raises for any reason, returns True to allow the call through.
+    """
+    try:
+        available_mb = psutil.virtual_memory().available // 1024 // 1024
+        if available_mb < OLLAMA_MIN_RAM_MB:
+            logging.getLogger("chad.intel.claude_client").warning(
+                "ollama_ram_circuit_breaker available_mb=%d threshold_mb=%d",
+                available_mb,
+                OLLAMA_MIN_RAM_MB,
+            )
+            return False
+        return True
+    except Exception:
+        return True
+
+
 class OllamaClient:
     """
     Local Ollama model client for lightweight routine tasks.
@@ -752,6 +798,11 @@ class OllamaClient:
 
         Compatible with ClaudeClient.chat_json() interface.
         """
+        if not _ollama_ram_ok():
+            raise OllamaUnavailableError(
+                "RAM circuit breaker: insufficient available memory "
+                f"(threshold={OLLAMA_MIN_RAM_MB}MB)"
+            )
         import urllib.request
 
         full_prompt = prompt
@@ -793,6 +844,11 @@ class OllamaClient:
 
     def generate(self, prompt: str, *, max_tokens: int = 256) -> str:
         """Raw text generation without JSON parsing."""
+        if not _ollama_ram_ok():
+            raise OllamaUnavailableError(
+                "RAM circuit breaker: insufficient available memory "
+                f"(threshold={OLLAMA_MIN_RAM_MB}MB)"
+            )
         import urllib.request
 
         payload = json.dumps({

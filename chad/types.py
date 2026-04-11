@@ -248,6 +248,7 @@ class MarketContext:
     legend: Optional[LegendConsensus]
     portfolio: PortfolioSnapshot
     bars: Optional[Mapping[str, list]] = None
+    bars_1m: Mapping[str, Any] = field(default_factory=dict)
     spread_bps: Optional[Mapping[str, float]] = None
     dollar_volume: Optional[Mapping[str, float]] = None
     volume_usd: Optional[Mapping[str, float]] = None

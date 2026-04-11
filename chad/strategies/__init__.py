@@ -44,7 +44,8 @@ from .gamma import build_gamma_config, gamma_handler
 from .omega import build_omega_config, omega_handler
 from .delta import build_delta_config, delta_handler
 from .alpha_crypto import build_alpha_crypto_config, alpha_crypto_handler, AlphaCryptoParams
-from .alpha_forex import build_alpha_forex_config, alpha_forex_handler, AlphaForexParams
+# DEFERRED: alpha_forex import disabled with its registration (see _build_registry)
+# from .alpha_forex import build_alpha_forex_config, alpha_forex_handler, AlphaForexParams
 from chad.strategies.alpha_futures import build_alpha_futures_signals
 from .alpha_futures import alpha_futures_handler
 from .alpha_futures_config import build_alpha_futures_config
@@ -143,11 +144,16 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             build_config=build_alpha_crypto_config,
             handler=(lambda ctx: alpha_crypto_handler(ctx, AlphaCryptoParams())),
         ),
-        StrategyName.ALPHA_FOREX: StrategyRegistration(
-            name=StrategyName.ALPHA_FOREX,
-            build_config=build_alpha_forex_config,
-            handler=(lambda ctx: alpha_forex_handler(ctx, AlphaForexParams())),
-        ),
+        # DEFERRED: alpha_forex — FX universe (EUR-USD, GBP-USD, USD-CAD,
+        # USD-JPY) not mapped to active bar/price context. M6E (Micro EUR/FX
+        # future) is in universe but the symbol translation layer is not
+        # implemented. Produces 0 signals every cycle, polluting audit output.
+        # Re-enable when FX universe is formally defined.
+        # StrategyName.ALPHA_FOREX: StrategyRegistration(
+        #     name=StrategyName.ALPHA_FOREX,
+        #     build_config=build_alpha_forex_config,
+        #     handler=(lambda ctx: alpha_forex_handler(ctx, AlphaForexParams())),
+        # ),
         StrategyName.ALPHA_FUTURES: StrategyRegistration(
             name=StrategyName.ALPHA_FUTURES,
             build_config=build_alpha_futures_config,

@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # These imports are intentionally broad so that the builder remains compatible
 # with different versions of the CHAD codebase. If these types are not
@@ -153,6 +153,7 @@ class MarketContext:
     now: Optional[datetime] = None
     portfolio: Optional[object] = None
     legend: Optional[object] = None
+    bars_1m: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -390,6 +391,22 @@ class ContextBuilder:
         bars = await self.bars_provider.load_bars(universe)
         ticks = await self.ticks_provider.load_ticks(universe, bars)
 
+        # Load 1-minute bars — optional, fail-silent
+        _bars_1m: Dict[str, Any] = {}
+        _bars_1m_dir = Path("/home/ubuntu/chad_finale/data/bars/1m")
+        if _bars_1m_dir.exists():
+            for _f1m in sorted(_bars_1m_dir.glob("*.json")):
+                try:
+                    _sym1m = _f1m.stem
+                    _d1m = json.loads(_f1m.read_text(encoding="utf-8"))
+                    _bars_1m[_sym1m] = _d1m.get("bars", [])
+                except Exception:
+                    pass
+        self.logger.debug(
+            "context_builder.bars_1m loaded symbols=%d",
+            len(_bars_1m),
+        )
+
         # Compute last prices from ticks; fallback to last bar close
         prices: Dict[str, float] = {}
         for symbol in universe:
@@ -453,6 +470,7 @@ class ContextBuilder:
             now=self.now,
             portfolio=portfolio,
             legend=legend_consensus,
+            bars_1m=_bars_1m,
         )
 
         # Evidence for auditability

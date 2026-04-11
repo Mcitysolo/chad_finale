@@ -1,0 +1,10 @@
+[Unit]
+Description=CHAD Options Chain Refresh Timer — Mon-Fri 12:30 UTC (8:30 AM ET)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 12:30:00 UTC
+Persistent=true
+Unit=chad-options-chain-refresh.service
+
+[Install]
+WantedBy=timers.target
