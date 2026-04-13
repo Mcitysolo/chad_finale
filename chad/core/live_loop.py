@@ -58,9 +58,11 @@ Evidence logging
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -79,16 +81,36 @@ from chad.execution.paper_exec_evidence_writer import (
     StrategyAttributionError,
     write_paper_exec_evidence,
 )
-from ib_insync import IB
+from ib_insync import IB, util
+
+# ib_insync requires asyncio. patchAsyncio() applies nest_asyncio so the
+# main-thread loop is reentrant. Worker threads (e.g. Redis state-bus
+# listeners in chad/core/state_bus.py) that end up invoking IB calls have
+# no loop of their own; _ensure_thread_event_loop() below installs one
+# before each submission to avoid "no current event loop in thread ..."
+# from asyncio's default policy.
+util.patchAsyncio()
 
 ib = IB()
 ib.connect("127.0.0.1", 4002, clientId=99)
 
+
+def _ensure_thread_event_loop() -> None:
+    if threading.current_thread() is threading.main_thread():
+        return
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
 position_sync = BrokerPositionSync(ib)
-_paper_adapter = IbkrAdapter(config=IbkrConfig(
-    dry_run=(os.environ.get("CHAD_EXECUTION_MODE", "dry_run").strip().lower()
-             not in ("paper",)),
-))
+_paper_adapter = IbkrAdapter(
+    config=IbkrConfig(
+        dry_run=(os.environ.get("CHAD_EXECUTION_MODE", "dry_run").strip().lower()
+                 not in ("paper",)),
+    ),
+    ib_factory=lambda: ib,
+)
 LOOP_INTERVAL_SECONDS = 60
 _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
 
@@ -708,6 +730,7 @@ def run_once(logger: logging.Logger) -> None:
 
         # --- Submit to IBKR adapter and record paper evidence ---
         try:
+            _ensure_thread_event_loop()
             submitted = _paper_adapter.submit_strategy_trade_intents([intent])
             for order in submitted:
                 logger.info(

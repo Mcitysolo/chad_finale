@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Paper Fill Harvester Timer — every 5 minutes
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+Unit=ibkr_paper_fill_harvester.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

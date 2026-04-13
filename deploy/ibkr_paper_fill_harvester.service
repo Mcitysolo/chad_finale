@@ -1,0 +1,17 @@
+[Unit]
+Description=CHAD IBKR Paper Fill Harvester
+After=chad-ibgateway.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.portfolio.ibkr_paper_fill_harvester
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-paper-fill-harvester
+
+[Install]
+WantedBy=multi-user.target
