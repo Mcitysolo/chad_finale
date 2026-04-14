@@ -380,6 +380,32 @@ def _extract_intent(obj: Dict[str, Any]) -> Optional[IntentRow]:
     )
 
 
+def _count_registered_strategies() -> int:
+    """Count strategies dynamically; fall back to a sensible default."""
+    try:
+        from chad.strategies import iter_strategy_registrations
+        return len(list(iter_strategy_registrations()))
+    except Exception:
+        return 13
+
+
+def _load_open_positions(runtime_dir: Path) -> List[Dict[str, Any]]:
+    """Read open paper positions from runtime/position_guard.json."""
+    try:
+        data = _read_json(runtime_dir / "position_guard.json")
+        if not isinstance(data, dict):
+            return []
+        out: List[Dict[str, Any]] = []
+        for key, val in data.items():
+            if not isinstance(val, dict):
+                continue
+            if val.get("open") is True:
+                out.append(val)
+        return out
+    except Exception:
+        return []
+
+
 def load_today_intents(fills_dir: Optional[Path] = None) -> List[IntentRow]:
     """
     Load today's executed paper-trade intents from
@@ -591,7 +617,7 @@ def _generate_quiet_day_take() -> str:
     except Exception:
         return (
             "Quiet day — markets were closed and the system took a well-deserved rest. "
-            "Everything is loaded up and ready to go when Monday rolls around."
+            "Everything is loaded up and ready to go when markets reopen."
         )
 
 
@@ -625,6 +651,8 @@ class DailyCHADReport:
         today_trades = load_today_trades(self._trades_dir)
         week_trades = load_week_trades(self._trades_dir)
         today_intents = load_today_intents(self._fills_dir)
+        open_positions = _load_open_positions(self._runtime_dir)
+        strategy_count = _count_registered_strategies()
 
         total_pnl = sum(t.pnl for t in today_trades)
         total_trades = len(today_trades)
@@ -693,11 +721,19 @@ class DailyCHADReport:
                     "open positions don't count as profit or loss until they're closed out. "
                     "See WHAT DID WE DO TODAY below."
                 )
+            elif open_positions:
+                n_open = len(open_positions)
+                pos_word = "position" if n_open == 1 else "positions"
+                sections.append(f"$0 in closed profit/loss today ⚪")
+                sections.append(
+                    f"{n_open} {pos_word} still open — results pending when CHAD closes them. "
+                    f"Open positions don't count as profit or loss until they're closed out."
+                )
             else:
                 sections.append("Quiet day — no trades today ⚪")
                 day_of_week = now.weekday()
                 if day_of_week >= 5:
-                    sections.append("Markets are closed on weekends — we'll be back Monday!")
+                    sections.append("Markets are closed on weekends — we'll be back when they reopen!")
                 else:
                     sections.append("No clear signals today, so we sat on the sidelines. Sometimes the smartest move is no move at all.")
         elif total_pnl > 0:
@@ -778,7 +814,29 @@ class DailyCHADReport:
         # 6. WHAT'S WORKING
         sections.append("═══ WHAT'S WORKING ═══")
         if total_trades == 0:
-            sections.append("All 12 strategies are loaded and ready for Monday.")
+            if open_positions:
+                uniq_pos_symbols = sorted({
+                    str(p.get("symbol", "")).upper() for p in open_positions if p.get("symbol")
+                })
+                preview = ", ".join(uniq_pos_symbols[:8])
+                if len(uniq_pos_symbols) > 8:
+                    preview += f" (+{len(uniq_pos_symbols) - 8} more)"
+                n_open = len(open_positions)
+                pos_word = "position" if n_open == 1 else "positions"
+                sections.append(
+                    f"CHAD has {n_open} open {pos_word} right now ({preview})."
+                )
+                if today_intents:
+                    n_intents = len(today_intents)
+                    trade_word = "trade" if n_intents == 1 else "trades"
+                    sections.append(f"{n_intents} {trade_word} executed today.")
+                sections.append(
+                    f"{strategy_count} strategies loaded and monitoring markets."
+                )
+            else:
+                sections.append(
+                    f"All {strategy_count} strategies are loaded and ready."
+                )
         else:
             all_strategies = [
                 "alpha", "beta", "gamma", "gamma_reversion",
@@ -898,6 +956,13 @@ class DailyCHADReport:
         if total_pnl != 0:
             sign = "+" if total_pnl > 0 else ""
             sections.append(f"  Change today: {sign}{_format_money(total_pnl)}")
+        elif open_positions:
+            n_open = len(open_positions)
+            pos_word = "position" if n_open == 1 else "positions"
+            sections.append(
+                f"  Change today: $0 closed "
+                f"({n_open} {pos_word} open — results pending when CHAD closes them)"
+            )
         else:
             sections.append("  Change today: $0")
         if week_pnl != 0:

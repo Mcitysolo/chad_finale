@@ -41,6 +41,7 @@ Notes
   but does not build ib_insync Contract objects itself.
 """
 
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum
@@ -50,6 +51,8 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
+
+LOG = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -542,7 +545,16 @@ def build_ibkr_intents_from_plan(
 
         side = "BUY" if order.side is SignalSide.BUY else "SELL"
         strategy_name = order.primary_strategy.value
-        quantity = _normalize_quantity_for_spec(order.size, spec)
+        try:
+            quantity = _normalize_quantity_for_spec(order.size, spec)
+        except ValueError as _qty_err:
+            LOG.warning(
+                "intent_skipped_invalid_quantity symbol=%s size=%s reason=%s",
+                order.symbol,
+                order.size,
+                _qty_err,
+            )
+            continue
 
         # Symbol normalization:
         # - equities/etfs/futures pass through unchanged

@@ -353,7 +353,9 @@ class TestDailyCHADReport:
         assert "Quiet day" in msg or "no trades" in msg.lower()
         assert "Practice mode" in msg
         # Fix 1: quiet days show condensed strategy line, not full breakdown
-        assert "All 12 strategies are loaded and ready for Monday." in msg
+        assert "strategies are loaded and ready" in msg
+        # Day reference removed from the strategy line (AI take may still mention it)
+        assert "ready for Monday" not in msg
         assert "😴 No trades today" not in msg
         # Fix 4: CHAD's Take always present
         assert "CHAD'S TAKE" in msg
