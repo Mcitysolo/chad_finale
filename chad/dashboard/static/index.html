@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CHAD — Live</title>
+<style>
+  :root {
+    --bg: #FFFFFF;
+    --card: #F8F9FA;
+    --navy: #1A1A2E;
+    --text: #1A1A2E;
+    --muted: #6B7280;
+    --border: #E5E7EB;
+    --green: #00C805;
+    --red: #FF3B30;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 4px 20px; border-bottom: 1px solid var(--border); margin-bottom: 20px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 22px; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 0 0 rgba(0,200,5,0.6);
+    animation: pulse 1.8s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(0,200,5,0.55); }
+    70% { box-shadow: 0 0 0 10px rgba(0,200,5,0); }
+    100% { box-shadow: 0 0 0 0 rgba(0,200,5,0); }
+  }
+  .live-tag { color: var(--green); font-weight: 700; font-size: 13px; letter-spacing: 1px; }
+  .clock { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 14px; }
+  .banner {
+    background: var(--red); color: white; padding: 10px 14px; border-radius: 8px;
+    margin-bottom: 14px; text-align: center; font-weight: 600;
+    display: none;
+  }
+  .banner.show { display: block; }
+
+  section { margin-bottom: 28px; }
+  .section-title { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; font-weight: 600; }
+
+  .hero {
+    border: 1px solid var(--border); border-radius: 16px; padding: 24px; background: #fff;
+  }
+  .hero h1 { margin: 0 0 6px; font-size: 36px; font-weight: 800; letter-spacing: -0.5px; }
+  .hero p { margin: 0 0 18px; color: var(--muted); font-size: 16px; }
+  .progress { height: 6px; background: #EEF0F3; border-radius: 999px; overflow: hidden; }
+  .progress > div { height: 100%; background: var(--green); border-radius: 999px; transition: width 400ms ease; }
+  .stats-row { margin-top: 14px; color: var(--muted); font-size: 14px; }
+
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px;
+  }
+  .card .label { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  .card .value { font-size: 28px; font-weight: 800; letter-spacing: -0.3px; }
+  .card .sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .flash-up { animation: flashUp 600ms ease; }
+  .flash-down { animation: flashDown 600ms ease; }
+  @keyframes flashUp { 0% { background: rgba(0,200,5,0.2); } 100% { background: transparent; } }
+  @keyframes flashDown { 0% { background: rgba(255,59,48,0.2); } 100% { background: transparent; } }
+
+  .grid-strat { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (min-width: 720px) { .grid-strat { grid-template-columns: repeat(3, 1fr); } }
+  .strat {
+    background: #fff; border: 1px solid var(--border); border-left: 3px solid var(--border);
+    border-radius: 12px; padding: 14px; transition: all 250ms ease;
+  }
+  .strat.active { border-left-color: var(--green); }
+  .strat .name { font-weight: 700; font-size: 15px; margin-bottom: 6px; }
+  .strat .status { color: var(--muted); font-size: 13px; }
+  .strat.active .status { color: var(--green); font-weight: 600; }
+  .strat .wr { display: inline-block; margin-top: 8px; padding: 2px 8px; border-radius: 999px; background: #EEF0F3; color: var(--muted); font-size: 11px; font-weight: 600; }
+  .strat.pulse { animation: pulseStrat 700ms ease; }
+  @keyframes pulseStrat { 0% { transform: scale(1); } 50% { transform: scale(1.03); } 100% { transform: scale(1); } }
+
+  .trade-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+  }
+  .trade-row:last-child { border-bottom: none; }
+  .trade-row .sym { font-weight: 700; font-size: 16px; }
+  .trade-row .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .badge {
+    display: inline-block; padding: 4px 12px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
+  }
+  .badge.short { background: rgba(255,59,48,0.12); color: var(--red); }
+  .badge.long  { background: rgba(0,200,5,0.12); color: var(--green); }
+  .count-badge { background: #EEF0F3; color: var(--muted); padding: 2px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; margin-left: 8px; }
+  .empty { padding: 24px; text-align: center; color: var(--muted); }
+
+  .temp {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  }
+  .temp .tile { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; text-align: center; }
+  .temp .tile .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .temp .tile .value { font-weight: 700; font-size: 18px; margin-top: 4px; }
+
+  footer {
+    border-top: 1px solid var(--border); padding: 14px 4px 24px; color: var(--muted);
+    display: flex; justify-content: space-between; font-size: 13px;
+  }
+  footer .ok { color: var(--green); font-weight: 600; }
+  footer .warn { color: var(--red); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <span>CHAD</span>
+      <span class="dot"></span>
+      <span class="live-tag">LIVE</span>
+    </div>
+    <div class="clock" id="clock">—</div>
+  </header>
+
+  <div class="banner" id="banner">⚠ Reconnecting...</div>
+
+  <section>
+    <div class="hero">
+      <h1 id="mode">—</h1>
+      <p id="modeDetail">—</p>
+      <div class="progress"><div id="progressBar" style="width:0%"></div></div>
+      <div class="stats-row" id="statsRow">—</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="row2">
+      <div class="card">
+        <div class="label">Account Value</div>
+        <div class="value" id="accountValue">—</div>
+        <div class="sub" id="accountSub">Practice money</div>
+      </div>
+      <div class="card">
+        <div class="label">Realized P&amp;L</div>
+        <div class="value" id="realizedPnl">—</div>
+        <div class="sub" id="realizedSub">—</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">What CHAD Is Watching Right Now</div>
+    <div class="grid-strat" id="strategies"></div>
+  </section>
+
+  <section>
+    <div class="section-title">CHAD's Open Trades <span class="count-badge" id="tradeCount">0</span></div>
+    <div class="card" id="trades" style="padding: 0;"></div>
+  </section>
+
+  <section>
+    <div class="section-title">Market Temperature</div>
+    <div class="temp">
+      <div class="tile"><div class="label">VIX</div><div class="value" id="vix">—</div></div>
+      <div class="tile"><div class="label">BTC</div><div class="value" id="btc">—</div></div>
+      <div class="tile"><div class="label">Regime</div><div class="value" id="regime">—</div></div>
+    </div>
+  </section>
+
+  <footer>
+    <div id="health">—</div>
+    <div>Last updated: <span id="updated">never</span></div>
+  </footer>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let lastState = null;
+  let lastUpdate = null;
+  let prevRealized = null;
+  let prevAccount = null;
+  let prevSignals = {};
+
+  function fmtMoney(x) {
+    if (x === null || x === undefined) return "—";
+    const s = x < 0 ? "-" : "";
+    return s + "$" + Math.round(Math.abs(x)).toLocaleString();
+  }
+
+  function flash(el, up) {
+    el.classList.remove("flash-up", "flash-down");
+    void el.offsetWidth;
+    el.classList.add(up ? "flash-up" : "flash-down");
+  }
+
+  function render(d) {
+    // Clock
+    const cs = d.chad_status || {};
+    $("mode").textContent = (cs.mode || "—") + " Mode";
+    $("modeDetail").textContent = cs.mode_detail || "";
+    $("progressBar").style.width = (cs.progress_to_next_level_pct || 0) + "%";
+    $("statsRow").textContent =
+      (cs.trades_completed ?? 0) + " trades · " +
+      (cs.win_rate_pct ?? 0) + "% wins · " +
+      (cs.sizing_label || "");
+
+    // Portfolio
+    const pf = d.portfolio || {};
+    const av = $("accountValue");
+    av.textContent = pf.account_value_label || "—";
+    if (prevAccount !== null && pf.account_value !== prevAccount) {
+      flash(av, pf.account_value > prevAccount);
+    }
+    prevAccount = pf.account_value;
+
+    const rp = $("realizedPnl");
+    rp.textContent = fmtMoney(pf.realized_pnl);
+    rp.className = "value " + (pf.realized_pnl > 0 ? "pos" : pf.realized_pnl < 0 ? "neg" : "");
+    if (prevRealized !== null && pf.realized_pnl !== prevRealized) {
+      flash(rp, pf.realized_pnl > prevRealized);
+    }
+    prevRealized = pf.realized_pnl;
+    $("realizedSub").textContent = pf.realized_pnl_label || "—";
+
+    // Strategies
+    const sg = $("strategies");
+    sg.innerHTML = "";
+    (d.strategies || []).forEach((s) => {
+      const div = document.createElement("div");
+      div.className = "strat" + (s.status === "active" ? " active" : "");
+      const prev = prevSignals[s.internal_name];
+      if (prev !== undefined && s.signals_now > prev) {
+        div.classList.add("pulse");
+      }
+      prevSignals[s.internal_name] = s.signals_now;
+      let wr = "";
+      if (s.total_trades > 10) {
+        wr = '<div class="wr">' + Math.round(s.win_rate * 100) + "% wins · " + s.total_trades + " trades</div>";
+      }
+      div.innerHTML =
+        '<div class="name">' + s.name + "</div>" +
+        '<div class="status">' + s.status_label + "</div>" +
+        wr;
+      sg.appendChild(div);
+    });
+
+    // Open positions
+    const pos = d.open_positions || [];
+    $("tradeCount").textContent = pos.length;
+    const tr = $("trades");
+    if (pos.length === 0) {
+      tr.innerHTML = '<div class="empty">No open trades right now</div>';
+    } else {
+      tr.innerHTML = "";
+      pos.forEach((p) => {
+        const row = document.createElement("div");
+        row.className = "trade-row";
+        const cls = p.direction === "Short" ? "short" : "long";
+        row.innerHTML =
+          "<div><div class='sym'>" + p.symbol + " <span style='color:#6B7280;font-weight:500;font-size:13px;'>×" + p.quantity + "</span></div>" +
+          "<div class='sub'>" + p.direction_plain + " · " + p.strategy_plain + "</div></div>" +
+          "<span class='badge " + cls + "'>" + p.direction.toUpperCase() + "</span>";
+        tr.appendChild(row);
+      });
+    }
+
+    // Intelligence
+    const it = d.intelligence || {};
+    $("vix").textContent = it.vix_label || "—";
+    $("btc").textContent = it.btc_price ? "$" + Math.round(it.btc_price).toLocaleString() : "—";
+    $("regime").textContent = it.market_regime || "—";
+
+    // Footer
+    const sh = d.system_health || {};
+    $("health").innerHTML = sh.all_good
+      ? '<span class="ok">✅ ' + sh.summary + "</span>"
+      : '<span class="warn">⚠ ' + sh.summary + "</span>";
+
+    lastUpdate = new Date();
+    updateClock();
+  }
+
+  function updateClock() {
+    const now = new Date();
+    $("clock").textContent = now.toISOString().slice(11, 19) + " UTC";
+    if (lastUpdate) {
+      const sec = Math.round((now - lastUpdate) / 1000);
+      $("updated").textContent = sec < 5 ? "just now" : sec + " seconds ago";
+    }
+  }
+  setInterval(updateClock, 1000);
+
+  // WebSocket with auto-reconnect
+  let ws = null;
+  function connect() {
+    try {
+      ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    } catch (e) {
+      $("banner").classList.add("show");
+      setTimeout(connect, 3000);
+      return;
+    }
+    ws.onopen = () => $("banner").classList.remove("show");
+    ws.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        lastState = d;
+        render(d);
+      } catch (err) { /* ignore */ }
+    };
+    ws.onclose = () => {
+      $("banner").classList.add("show");
+      setTimeout(connect, 3000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch(_){} };
+  }
+
+  // Initial fetch then websocket
+  fetch("/api/state").then(r => r.json()).then(render).catch(()=>{});
+  connect();
+</script>
+</body>
+</html>
