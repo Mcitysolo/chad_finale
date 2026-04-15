@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Reconciliation Publisher Timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=300
+Persistent=true
+Unit=chad-reconciliation-publisher.service
+
+[Install]
+WantedBy=timers.target

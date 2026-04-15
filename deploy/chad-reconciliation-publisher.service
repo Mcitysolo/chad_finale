@@ -1,0 +1,17 @@
+[Unit]
+Description=CHAD Reconciliation Publisher
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.ops.reconciliation_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-reconciliation-publisher
+
+[Install]
+WantedBy=multi-user.target

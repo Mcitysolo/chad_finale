@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Reddit Sentiment Refresh Timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=7200
+Persistent=true
+Unit=chad-reddit-sentiment-refresh.service
+
+[Install]
+WantedBy=timers.target

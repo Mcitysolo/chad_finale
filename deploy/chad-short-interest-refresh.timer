@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Short Interest Refresh Timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=21600
+Persistent=true
+Unit=chad-short-interest-refresh.service
+
+[Install]
+WantedBy=timers.target

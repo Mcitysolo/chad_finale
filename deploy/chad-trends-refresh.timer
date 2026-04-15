@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Google Trends Refresh Timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=14400
+Persistent=true
+Unit=chad-trends-refresh.service
+
+[Install]
+WantedBy=timers.target

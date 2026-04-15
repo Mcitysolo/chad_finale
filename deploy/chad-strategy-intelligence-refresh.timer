@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD Strategy Intelligence Refresh Timer
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=900
+Persistent=true
+Unit=chad-strategy-intelligence-refresh.service
+
+[Install]
+WantedBy=timers.target
