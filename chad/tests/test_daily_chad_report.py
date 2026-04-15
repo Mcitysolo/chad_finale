@@ -598,16 +598,19 @@ class TestMorningBrief:
         runtime.mkdir()
         brief = MorningBrief(repo_root=tmp_path)
         msg = brief.generate()
-        assert "Good morning" in msg
-        assert "Markets open" in msg
+        assert "CHAD Pre-Market Brief" in msg
+        assert "OVERNIGHT" in msg
         assert "CHAD 🤝" in msg
-        assert "full report" in msg
+        assert "CHAD'S TAKE" in msg
 
     def test_morning_brief_has_sections(self, tmp_path):
         runtime = tmp_path / "runtime"
         runtime.mkdir()
         brief = MorningBrief(repo_root=tmp_path)
         msg = brief.generate()
-        assert "Good morning" in msg
+        assert "CHAD Pre-Market Brief" in msg
+        assert "WHAT CHAD IS WATCHING" in msg
+        assert "STRATEGY POSTURE" in msg
+        assert "CHAD'S PERFORMANCE" in msg
         # VIX line is omitted when data is unavailable (no "waiting for data")
         assert "waiting for data" not in msg

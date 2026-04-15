@@ -569,13 +569,16 @@ def _generate_chads_take(
         text, _, _ = client._call_claude(
             prompt=prompt,
             system=(
-                "You are CHAD, a friendly trading assistant explaining today's performance "
-                "to someone with zero trading knowledge. Use simple language, sports analogies, "
-                "and everyday comparisons. Never use financial jargon. Keep it to 2-3 sentences."
+                "You are CHAD — an elite autonomous trading system with the precision "
+                "of Jim Simons, the macro vision of Ray Dalio, and the opportunistic "
+                "instincts of Stanley Druckenmiller. Analyze today's trading results "
+                "and provide a sharp, specific 2-3 sentence assessment. Reference "
+                "actual P&L, positions, and market conditions. Be honest about losses. "
+                "No generic advice, no jargon bloat — confident, data-driven, precise."
             ),
-            task_type="routine",
-            max_tokens=200,
-            temperature=0.7,
+            task_type="standard",
+            max_tokens=220,
+            temperature=0.6,
         )
         return text.strip()
     except Exception:
@@ -1032,13 +1035,97 @@ class MorningBrief:
         _send_telegram(message)
         return True
 
-    def _scan_opportunities(self) -> Optional[str]:
-        """
-        Scan overnight data for opportunities worth watching.
+    def _load_fresh_feed(self, path: Path, max_age_hours: float = 6.0) -> Optional[Dict[str, Any]]:
+        """Load a JSON feed; return None if missing or stale (> max_age_hours)."""
+        try:
+            if not path.exists():
+                return None
+            data = _read_json(path)
+            if not isinstance(data, dict):
+                return None
+            ts_str = data.get("last_updated_utc") or data.get("ts_utc")
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                    age_h = (_utc_now() - ts).total_seconds() / 3600.0
+                    if age_h > max_age_hours:
+                        return None
+                except Exception:
+                    pass
+            return data
+        except Exception:
+            return None
 
-        Reads price_cache, trends_state, and kraken_prices, then asks
-        Claude Haiku for 2-3 concise observations. Fails silently.
-        """
+    def _gather_watch_items(self) -> List[str]:
+        """Pull 2-3 concrete watch items from intelligence feeds."""
+        runtime = self._root / "runtime"
+        items: List[str] = []
+
+        trends = self._load_fresh_feed(runtime / "trends_state.json") or {}
+        for sym, v in (trends.get("signals") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            ratio = _safe_float(v.get("ratio"))
+            sig = str(v.get("signal", "")).upper()
+            if sig in ("RISING", "HIGH") or ratio >= 1.3:
+                items.append(f"{sym} search interest surging ({ratio:.2f}x avg) — retail attention building")
+            if len(items) >= 2:
+                break
+
+        reddit = self._load_fresh_feed(runtime / "reddit_sentiment.json") or {}
+        for sym, v in (reddit.get("signals") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            mentions = int(_safe_float(v.get("mention_count")))
+            score = _safe_float(v.get("sentiment_score"))
+            sig = str(v.get("signal", "")).upper()
+            if mentions >= 20 or sig in ("BULLISH", "BEARISH"):
+                tone = "bullish" if score > 0 else ("bearish" if score < 0 else "active")
+                items.append(f"{sym} heavy Reddit discussion ({mentions} mentions, {tone}) — momentum catalyst")
+                if len(items) >= 3:
+                    break
+
+        shorts = self._load_fresh_feed(runtime / "short_interest.json") or {}
+        for sym, v in (shorts.get("signals") or {}).items():
+            if not isinstance(v, dict):
+                continue
+            sf = _safe_float(v.get("short_float_pct"))
+            if v.get("squeeze_risk") or sf >= 0.15:
+                items.append(f"{sym} short float at {sf*100:.0f}% — squeeze risk on upside break")
+                if len(items) >= 3:
+                    break
+
+        return items[:3]
+
+    def _chads_take(self, context: Dict[str, Any]) -> Optional[str]:
+        """Elite prodigy take — Simons/Dalio/Druckenmiller voice."""
+        try:
+            from chad.intel.claude_client import ClaudeClient
+            client = ClaudeClient.load()
+            result = client.chat_json(
+                (
+                    "Pre-market context:\n"
+                    + json.dumps(context, default=str)[:3000]
+                    + "\n\nReturn JSON {\"text\": \"2-3 sentence pre-market take\"}."
+                ),
+                system=(
+                    "You are CHAD — an elite autonomous trading system. Your knowledge "
+                    "spans quantitative finance, macro economics, and market microstructure. "
+                    "You think like Jim Simons on quant precision, Ray Dalio on macro, "
+                    "and Stanley Druckenmiller on opportunistic positioning. Be specific, "
+                    "data-driven, and confident. Reference the actual market data provided. "
+                    "Maximum 3 sentences. No generic advice. Wrap in JSON {text: ...}."
+                ),
+                task_type="standard",
+            )
+            text = str(result.get("text", "")).strip()
+            return text or None
+        except Exception as exc:
+            logging.getLogger("chad.morning_brief").debug("CHAD's take failed: %s", exc)
+            return None
+
+    def _scan_opportunities(self) -> Optional[str]:
+        """Legacy opportunity scan — kept for backward compatibility."""
         try:
             runtime = self._root / "runtime"
             price_cache = _read_json(runtime / "price_cache.json") or {}
@@ -1111,43 +1198,122 @@ class MorningBrief:
             return None
 
     def generate(self) -> str:
+        runtime = self._root / "runtime"
+        now = _utc_now()
         vix = _get_vix()
         spy_price = _get_price("SPY") or _get_spy_from_bars()
+        spy_change = _get_spy_change()
         btc_price = _get_price("BTC-USD") or _get_btc_from_kraken()
 
-        lines: List[str] = []
-        lines.append("\u2600\ufe0f Good morning! Markets open in 30 minutes.")
-        lines.append("")
-        lines.append("Here's what I'm watching today:")
-
-        if spy_price is not None:
-            spy_change = _get_spy_change()
-            if spy_change is not None:
-                direction = "up" if spy_change >= 0 else "down"
-                lines.append(f"- Stock market (SPY): {_format_money(spy_price)} \u2014 {direction} overnight")
-            else:
-                lines.append(f"- Stock market (SPY): {_format_money(spy_price)}")
-
-        if vix is not None:
-            lines.append(f"- Fear gauge (VIX): {vix:.1f} \u2014 {vix_description(vix)}")
-
-        if btc_price is not None:
-            lines.append(f"- Bitcoin: {_format_money(btc_price)}")
-
-        # Portfolio equity
+        # Crypto 24h change for context
+        btc_chg_pct: Optional[float] = None
         try:
-            caps_path = self._root / "runtime" / "dynamic_caps.json"
-            if caps_path.exists():
-                caps = json.loads(caps_path.read_text(encoding="utf-8"))
-                equity = caps.get("total_equity")
-                if isinstance(equity, (int, float)) and equity > 0:
-                    lines.append(f"- Portfolio equity: {_format_money(equity)}")
+            kp = _read_json(runtime / "kraken_prices.json") or {}
+            tick = (kp.get("ticks") or {}).get("BTC-USD") or {}
+            btc_chg_pct = _safe_float(tick.get("change_24h_pct")) if tick.get("change_24h_pct") is not None else None
         except Exception:
             pass
 
-        # Open positions count
+        strat_intel = self._load_fresh_feed(runtime / "strategy_intelligence.json", max_age_hours=48.0) or {}
+        expectancy = _read_json(runtime / "expectancy_state.json") or {}
+
+        lines: List[str] = []
+        day_date = now.strftime("%A, %B %d")
+        lines.append(f"\U0001f305 CHAD Pre-Market Brief \u2014 {day_date}")
+        lines.append("")
+
+        # ═══ OVERNIGHT ═══
+        lines.append("\u2550\u2550\u2550 OVERNIGHT \u2550\u2550\u2550")
+        if vix is not None:
+            lines.append(f"Fear gauge (VIX): {vix:.1f} \u2014 {vix_description(vix)}")
+        if spy_price is not None:
+            if spy_change is not None:
+                direction = "up" if spy_change >= 0 else "down"
+                lines.append(f"SPY: {_format_money(spy_price)} ({direction} {abs(spy_change):.2f}% overnight)")
+            else:
+                lines.append(f"SPY: {_format_money(spy_price)}")
+        if btc_price is not None:
+            if btc_chg_pct is not None:
+                lines.append(f"BTC: {_format_money(btc_price)} ({btc_chg_pct:+.2f}% 24h)")
+            else:
+                lines.append(f"BTC: {_format_money(btc_price)}")
+        lines.append("")
+
+        # ═══ WHAT CHAD IS WATCHING ═══
+        lines.append("\u2550\u2550\u2550 WHAT CHAD IS WATCHING \u2550\u2550\u2550")
+        watch = self._gather_watch_items()
+        if watch:
+            for w in watch:
+                lines.append(f"\u2022 {w}")
+        else:
+            lines.append("\u2022 No elevated signals across trends/reddit/shorts — baseline watch only")
+        lines.append("")
+
+        # ═══ TODAY'S STRATEGY POSTURE ═══
+        lines.append("\u2550\u2550\u2550 TODAY'S STRATEGY POSTURE \u2550\u2550\u2550")
+        regime_profiles = strat_intel.get("regime_profile") or []
+        regime_summary = "UNKNOWN"
+        if isinstance(regime_profiles, list) and regime_profiles:
+            profiles = [str(r.get("profile", "")).lower() for r in regime_profiles if isinstance(r, dict)]
+            if profiles:
+                if any(p == "conservative" for p in profiles):
+                    regime_summary = "CONSERVATIVE (risk-off bias)"
+                elif all(p == "aggressive" for p in profiles):
+                    regime_summary = "AGGRESSIVE (risk-on)"
+                elif all(p == "normal" for p in profiles):
+                    regime_summary = "NEUTRAL"
+                else:
+                    regime_summary = "MIXED"
+        lines.append(f"Regime: {regime_summary}")
+
+        biases = strat_intel.get("confidence_bias") or []
+        notable_biases: List[str] = []
+        if isinstance(biases, list):
+            for b in biases:
+                if not isinstance(b, dict):
+                    continue
+                adj = _safe_float(b.get("adjustment"))
+                if abs(adj) >= 0.05:
+                    sym = b.get("symbol", "?")
+                    strat = translate_strategy(str(b.get("strategy", "")))
+                    tone = "cautious" if adj < 0 else "confident"
+                    notable_biases.append(f"{strat} {tone} on {sym} ({adj:+.2f})")
+                if len(notable_biases) >= 3:
+                    break
+        if notable_biases:
+            for nb in notable_biases:
+                lines.append(f"\u2022 {nb}")
+        else:
+            lines.append("\u2022 Confidence biases neutral across strategies")
+        lines.append("")
+
+        # ═══ CHAD'S PERFORMANCE ═══
+        lines.append("\u2550\u2550\u2550 CHAD'S PERFORMANCE \u2550\u2550\u2550")
         try:
-            pg_path = self._root / "runtime" / "positions_snapshot.json"
+            scr = _read_json(runtime / "scr_state.json") or {}
+            scr_state = scr.get("state", "UNKNOWN")
+            sizing = scr.get("sizing_factor")
+            if isinstance(sizing, (int, float)):
+                lines.append(f"SCR: {scr_state} (sizing {sizing:.2f}x)")
+            else:
+                lines.append(f"SCR: {scr_state}")
+        except Exception:
+            pass
+        top = expectancy.get("top_performer")
+        strats = expectancy.get("strategies") or {}
+        if top and isinstance(strats, dict) and top in strats:
+            s = strats[top]
+            lines.append(
+                f"Top strategy: {translate_strategy(str(top))} \u2014 "
+                f"win rate {_safe_float(s.get('win_rate'))*100:.0f}%, "
+                f"expectancy {_format_money(_safe_float(s.get('expectancy')))}"
+            )
+        clean = expectancy.get("total_clean_trades")
+        if isinstance(clean, (int, float)):
+            lines.append(f"Clean trades logged: {int(clean)}")
+        # Open positions
+        try:
+            pg_path = runtime / "positions_snapshot.json"
             if pg_path.exists():
                 snap = json.loads(pg_path.read_text(encoding="utf-8"))
                 positions = snap.get("positions", [])
@@ -1157,39 +1323,34 @@ class MorningBrief:
                         if isinstance(p, dict) and abs(_safe_float(p.get("position", 0))) > 0
                     )
                     if open_count > 0:
-                        lines.append(f"- Open positions: {open_count}")
+                        lines.append(f"Open positions: {open_count}")
         except Exception:
             pass
-
-        # Risk posture
-        try:
-            scr_path = self._root / "runtime" / "scr_state.json"
-            if scr_path.exists():
-                scr = json.loads(scr_path.read_text(encoding="utf-8"))
-                scr_state = scr.get("state", "UNKNOWN")
-                sizing = scr.get("sizing_factor")
-                if isinstance(sizing, (int, float)):
-                    lines.append(f"- Risk posture: {scr_state} (sizing={sizing:.2f})")
-                else:
-                    lines.append(f"- Risk posture: {scr_state}")
-        except Exception:
-            pass
-
-        # Opportunity scan — AI-generated watchlist
-        opps = self._scan_opportunities()
-        if opps:
-            lines.append("")
-            lines.append("\U0001f440 Worth watching today:")
-            for line in opps.splitlines():
-                stripped = line.strip()
-                if stripped:
-                    # Normalize to bullet format
-                    if not stripped.startswith("\u2022"):
-                        stripped = f"\u2022 {stripped}"
-                    lines.append(f"  {stripped}")
-
         lines.append("")
-        lines.append("I'm ready to trade. I'll send you a full report at the end of the day.")
+
+        # ═══ CHAD'S TAKE ═══
+        lines.append("\u2550\u2550\u2550 CHAD'S TAKE \u2550\u2550\u2550")
+        take_ctx: Dict[str, Any] = {
+            "vix": vix,
+            "spy_price": spy_price,
+            "spy_change_pct": spy_change,
+            "btc_price": btc_price,
+            "btc_change_24h_pct": btc_chg_pct,
+            "regime": regime_summary,
+            "watch_items": watch,
+            "notable_biases": notable_biases,
+            "top_performer": top,
+            "clean_trades": clean,
+        }
+        take = self._chads_take(take_ctx)
+        if take:
+            lines.append(take)
+        else:
+            lines.append(
+                "Feeds are thin this morning — trading the mechanical edge, not the narrative. "
+                "Position sizing stays disciplined until the tape gives us a reason to press."
+            )
+        lines.append("")
         lines.append("\u2014 CHAD \U0001f91d")
 
         return "\n".join(lines)

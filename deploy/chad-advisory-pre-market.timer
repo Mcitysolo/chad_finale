@@ -1,0 +1,10 @@
+[Unit]
+Description=CHAD Advisory Pre-Market Refresh Timer
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 12:45:00 UTC
+Persistent=true
+Unit=chad-advisory-pre-market.service
+
+[Install]
+WantedBy=timers.target
