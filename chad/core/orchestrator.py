@@ -784,7 +784,7 @@ class Orchestrator:
         Fail-closed:
         - Any overlay failure => base weights.
         """
-        base = StrategyAllocation.from_env_or_default()
+        base = StrategyAllocation.from_env_or_default(repo_root=self._repo_root)
         allocation = base
         strategy = _allocator_factory()
         mode = getattr(strategy, "name", "unknown")
@@ -799,6 +799,11 @@ class Orchestrator:
                     adjusted_clean[k] = 0.0
                 else:
                     adjusted_clean[k] = max(0.0, float(adjusted.get(k, bw)))
+            # Add strategies present in governed config but missing from base,
+            # so newly-activated strategies are not silently dropped.
+            for k, w in base.weights.items():
+                if k not in adjusted_clean and float(w) > 0.0:
+                    adjusted_clean[k] = float(w)
             # 50/30/20 chassis enforcement (after overlays, before cap build)
             adjusted_clean = enforce_chassis(adjusted_clean)
             allocation = StrategyAllocation(weights=adjusted_clean)

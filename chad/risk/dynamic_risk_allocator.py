@@ -31,13 +31,20 @@ logger = logging.getLogger(__name__)
 # Zero-weight strategies are never resurrected by any overlay.
 # ──────────────────────────────────────────────────────────────────────
 DEFAULT_STRATEGY_WEIGHTS: Dict[str, float] = {
-    "alpha": 0.35,
-    "beta": 0.30,
-    "gamma": 0.15,
-    "omega": 0.10,
-    "delta": 0.05,
-    "crypto": 0.03,
-    "forex": 0.03,
+    "alpha": 0.16,
+    "beta": 0.25,
+    "gamma": 0.07,
+    "gamma_reversion": 0.04,
+    "alpha_futures": 0.09,
+    "gamma_futures": 0.05,
+    "alpha_options": 0.07,
+    "omega": 0.05,
+    "omega_macro": 0.03,
+    "omega_vol": 0.05,
+    "delta": 0.02,
+    "delta_pairs": 0.05,
+    "crypto": 0.04,
+    "alpha_intraday": 0.03,
 }
 
 # Governed config file path — written atomically by ActionApplier
@@ -382,7 +389,7 @@ class DynamicRiskAllocator:
 # ---------------------------------------------------------------------------
 
 ALPHA_STRATEGIES = frozenset({
-    "alpha", "alpha_futures", "alpha_options",
+    "alpha", "alpha_futures", "alpha_intraday", "alpha_options",
     "gamma", "gamma_futures", "gamma_reversion",
 })
 BETA_STRATEGIES = frozenset({"beta"})
