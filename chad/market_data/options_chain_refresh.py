@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "runtime"
 CACHE_PATH = RUNTIME_DIR / "options_chains_cache.json"
+BARS_1D_DIR = REPO_ROOT / "data" / "bars" / "1d"
 
 IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4002
@@ -57,17 +58,51 @@ def _log(msg: str) -> None:
     print(f"{_ts()} {msg}", flush=True)
 
 
+def _spot_price_from_bars(symbol: str) -> float | None:
+    """Fallback: read latest close from data/bars/1d/<symbol>.json."""
+    try:
+        bars_path = BARS_1D_DIR / f"{symbol}.json"
+        d = json.loads(bars_path.read_text())
+        bars = d.get("bars", [])
+        if bars:
+            last = bars[-1]
+            close = last.get("close") or last.get("c") or last.get("Close")
+            if close:
+                _log(
+                    f"spot_price_from_bars symbol={symbol} price={close} "
+                    f"ts={last.get('ts_utc','?')}"
+                )
+                return float(close)
+    except Exception as e:
+        _log(f"spot_price_from_bars_failed symbol={symbol} err={e}")
+    return None
+
+
 def _fetch_spy_price(ib: Any, symbol: str) -> float:
-    """Fetch the current price for the underlying via market data snapshot."""
+    """Fetch current price via market data snapshot, fall back to bar data."""
     from ib_insync import Stock
 
     stock = Stock(symbol, "SMART", "USD")
-    qualified = ib.qualifyContracts(stock)
-    if not qualified:
-        raise RuntimeError(f"qualifyContracts failed for {symbol}")
+    try:
+        qualified = ib.qualifyContracts(stock)
+        if not qualified:
+            raise RuntimeError(f"qualifyContracts failed for {symbol}")
+    except Exception as exc:
+        _log(f"qualifyContracts_failed symbol={symbol} err={exc}")
+        bar_price = _spot_price_from_bars(symbol)
+        if bar_price and bar_price > 0:
+            return bar_price
+        raise
 
-    ticker = ib.reqMktData(stock, "", False, False)
-    ib.sleep(2.0)
+    try:
+        ticker = ib.reqMktData(stock, "", False, False)
+        ib.sleep(2.0)
+    except Exception as exc:
+        _log(f"reqMktData_failed symbol={symbol} err={exc}")
+        bar_price = _spot_price_from_bars(symbol)
+        if bar_price and bar_price > 0:
+            return bar_price
+        raise
 
     price = 0.0
     for attr in ("last", "close", "marketPrice"):
@@ -99,6 +134,14 @@ def _fetch_spy_price(ib: Any, symbol: str) -> float:
         pass
 
     if price <= 0:
+        _log(
+            f"live_spot_unavailable symbol={symbol} "
+            f"(likely no market data subscription / Error 10089), "
+            f"falling back to bar close"
+        )
+        bar_price = _spot_price_from_bars(symbol)
+        if bar_price and bar_price > 0:
+            return bar_price
         raise RuntimeError(f"could not resolve spot price for {symbol}")
 
     return price
@@ -231,6 +274,27 @@ def run(symbols: Sequence[str]) -> int:
         if not ib.isConnected():
             _log(f"ERROR IBKR not connected after connect()")
             return 1
+
+        def _on_ib_error(reqId, errorCode, errorString, contract):
+            if errorCode == 10089:
+                _log(
+                    f"ibkr_error_10089 reqId={reqId} "
+                    f"msg='market data subscription required' — "
+                    f"will fall back to bar data for spot price"
+                )
+            elif errorCode in (2104, 2106, 2158, 2107, 2119, 2100):
+                # market data farm connectivity info — benign
+                return
+            else:
+                _log(
+                    f"ibkr_error reqId={reqId} code={errorCode} "
+                    f"msg={errorString}"
+                )
+
+        try:
+            ib.errorEvent += _on_ib_error
+        except Exception:
+            pass
 
         chains: Dict[str, Any] = {}
         success = 0
