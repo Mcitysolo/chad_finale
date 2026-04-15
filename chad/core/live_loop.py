@@ -92,7 +92,7 @@ from ib_insync import IB, util
 util.patchAsyncio()
 
 ib = IB()
-ib.connect("127.0.0.1", 4002, clientId=99)
+ib.connect("127.0.0.1", 4002, clientId=99, timeout=120)
 
 
 def _ensure_thread_event_loop() -> None:
