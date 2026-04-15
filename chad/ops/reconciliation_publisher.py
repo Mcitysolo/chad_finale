@@ -38,9 +38,16 @@ TTL_SECONDS = 300
 # Pre-existing paper account positions not opened by CHAD. Excluded
 # from the mismatch check so they do not flip status to RED.
 try:
-    from chad.core.position_reconciler import KNOWN_NON_CHAD_SYMBOLS  # type: ignore
+    from chad.core.position_reconciler import KNOWN_NON_CHAD_SYMBOLS as _RECONCILER_NON_CHAD  # type: ignore
 except Exception:  # noqa: BLE001
-    KNOWN_NON_CHAD_SYMBOLS = frozenset({"AAPL", "MSFT"})
+    _RECONCILER_NON_CHAD = frozenset({"AAPL", "MSFT"})
+
+# Publisher-only augmentation: symbols present at broker as pre-existing
+# paper positions that CHAD never opened. Kept separate from the
+# position_reconciler set so CHAD can still auto-close its own future
+# positions on these symbols via thesis-flip reconciliation.
+_BROKER_PREEXISTING = frozenset({"NVDA"})
+KNOWN_NON_CHAD_SYMBOLS = _RECONCILER_NON_CHAD | _BROKER_PREEXISTING
 
 
 def _utc_now_iso() -> str:
