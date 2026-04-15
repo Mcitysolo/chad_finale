@@ -25,6 +25,7 @@
     "crypto": 0.04,
     "delta": 0.03,
     "delta_pairs": 0.05,
+    "alpha_intraday": 0.0,
     "gamma": 0.07,
     "gamma_futures": 0.05,
     "gamma_reversion": 0.04,

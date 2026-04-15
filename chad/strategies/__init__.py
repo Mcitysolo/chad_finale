@@ -44,6 +44,7 @@ from .gamma import build_gamma_config, gamma_handler
 from .omega import build_omega_config, omega_handler
 from .delta import build_delta_config, delta_handler
 from .alpha_crypto import build_alpha_crypto_config, alpha_crypto_handler, AlphaCryptoParams
+from .alpha_intraday import build_alpha_intraday_config, alpha_intraday_handler
 # DEFERRED: alpha_forex import disabled with its registration (see _build_registry)
 # from .alpha_forex import build_alpha_forex_config, alpha_forex_handler, AlphaForexParams
 from chad.strategies.alpha_futures import build_alpha_futures_signals
@@ -143,6 +144,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.ALPHA_CRYPTO,
             build_config=build_alpha_crypto_config,
             handler=(lambda ctx: alpha_crypto_handler(ctx, AlphaCryptoParams())),
+        ),
+        StrategyName.ALPHA_INTRADAY: StrategyRegistration(
+            name=StrategyName.ALPHA_INTRADAY,
+            build_config=build_alpha_intraday_config,
+            handler=alpha_intraday_handler,
         ),
         # DEFERRED: alpha_forex — FX universe (EUR-USD, GBP-USD, USD-CAD,
         # USD-JPY) not mapped to active bar/price context. M6E (Micro EUR/FX

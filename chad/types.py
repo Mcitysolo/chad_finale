@@ -53,6 +53,7 @@ class StrategyName(str, Enum):
     OMEGA = "omega"
     DELTA = "delta"
     ALPHA_CRYPTO = "alpha_crypto"
+    ALPHA_INTRADAY = "alpha_intraday"
     ALPHA_FOREX = "alpha_forex"
     ALPHA_FUTURES = "alpha_futures"
     GAMMA_FUTURES = "gamma_futures"
