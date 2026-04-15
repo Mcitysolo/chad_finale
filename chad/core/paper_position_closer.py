@@ -37,6 +37,8 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ib_insync import IB, MarketOrder, LimitOrder, Stock  # type: ignore
+else:
+    from ib_insync import IB, MarketOrder, LimitOrder, Stock  # runtime import
 
 
 def _lazy_ibkr_types() -> tuple[Any, Any, Any, Any]:
