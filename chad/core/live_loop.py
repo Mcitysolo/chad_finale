@@ -559,6 +559,35 @@ def run_once(logger: logging.Logger) -> None:
             )
             return
 
+    # ------------------------------------------------------------------
+    # Position reconciler — close open positions when the net strategy
+    # signal direction flips. Runs BEFORE intent planning so close
+    # intents bypass the pipeline's netting step and cannot be
+    # suppressed by same-symbol opposite-side new signals.
+    # ------------------------------------------------------------------
+    try:
+        from chad.core.position_reconciler import (
+            apply_close_intents,
+            load_open_positions,
+            reconcile_positions_with_signals,
+        )
+
+        _open_positions = load_open_positions()
+        _reconciler_closes = reconcile_positions_with_signals(
+            open_positions=_open_positions,
+            routed_signals=list(routed_signals or []),
+            prices={},
+        )
+        if _reconciler_closes:
+            logger.info(
+                "reconciler_close_intents count=%d symbols=%s",
+                len(_reconciler_closes),
+                [c["symbol"] for c in _reconciler_closes],
+            )
+            apply_close_intents(_reconciler_closes, _paper_adapter)
+    except Exception as _rec_err:  # noqa: BLE001
+        logger.warning("position_reconciler failed (non-fatal): %s", _rec_err)
+
     _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
 
     # Throttled (5-min) refresh of runtime/kraken_balances.json so the

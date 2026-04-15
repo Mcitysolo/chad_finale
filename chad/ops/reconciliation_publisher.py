@@ -35,6 +35,13 @@ IBKR_CLIENT_ID = 83
 IBKR_TIMEOUT_SEC = 15
 TTL_SECONDS = 300
 
+# Pre-existing paper account positions not opened by CHAD. Excluded
+# from the mismatch check so they do not flip status to RED.
+try:
+    from chad.core.position_reconciler import KNOWN_NON_CHAD_SYMBOLS  # type: ignore
+except Exception:  # noqa: BLE001
+    KNOWN_NON_CHAD_SYMBOLS = frozenset({"AAPL", "MSFT"})
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -114,9 +121,13 @@ def main() -> int:
         return 0
 
     mismatches: List[Dict[str, Any]] = []
+    excluded: List[str] = []
     symbols = set(chad_side) | set(broker_side)
     worst = 0.0
     for sym in sorted(symbols):
+        if sym in KNOWN_NON_CHAD_SYMBOLS:
+            excluded.append(sym)
+            continue
         c = chad_side.get(sym, 0.0)
         b = broker_side.get(sym, 0.0)
         diff = abs(c - b)
@@ -138,6 +149,7 @@ def main() -> int:
         "counts": {"chad_open": len(chad_side), "broker_positions": len(broker_side)},
         "worst_diff": worst,
         "mismatches": mismatches,
+        "excluded_symbols": excluded,
         "notes": [],
     })
     LOG.info("reconciliation status=%s worst_diff=%.2f mismatches=%d",
