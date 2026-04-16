@@ -54,17 +54,17 @@ SCR_CONFIG_PATH = Path("/home/ubuntu/chad_finale/runtime/scr_config.json")
 @dataclass(frozen=True)
 class SCRConfig:
     # Warmup gating
-    warmup_min_trades: int = 50
+    warmup_min_trades: int = 100
     warmup_allow_live: bool = False
 
     # CONFIDENT thresholds
-    confident_min_win_rate: float = 0.55
-    confident_min_sharpe: float = 0.70
+    confident_min_win_rate: float = 0.50
+    confident_min_sharpe: float = 0.50
     confident_max_drawdown: float = -10000.0  # Max DD must be >= this (less negative is better)
 
     # CAUTIOUS thresholds
-    cautious_min_win_rate: float = 0.45
-    cautious_min_sharpe: float = 0.30
+    cautious_min_win_rate: float = 0.35
+    cautious_min_sharpe: float = 0.10
     cautious_max_drawdown: float = -15000.0
 
     # Sizing factors per band
