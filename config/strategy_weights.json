@@ -1,25 +1,6 @@
 {
-  "applied_action_id": "alpha_intraday_fund_3pct_20260415",
+  "applied_action_id": "omega_momentum_options_fund_3pct_20260416",
   "previous_weights": {
-    "alpha": 0.16,
-    "alpha_futures": 0.09,
-    "alpha_intraday": 0.0,
-    "alpha_options": 0.07,
-    "beta": 0.25,
-    "crypto": 0.04,
-    "delta": 0.03,
-    "delta_pairs": 0.05,
-    "gamma": 0.07,
-    "gamma_futures": 0.05,
-    "gamma_reversion": 0.04,
-    "omega": 0.06,
-    "omega_macro": 0.04,
-    "omega_vol": 0.05
-  },
-  "reason": "Fund alpha_intraday at 3% \u2014 reduce omega/delta/omega_macro proportionally",
-  "schema_version": "strategy_weights.v1",
-  "updated_ts_utc": "2026-04-15T21:38:24Z",
-  "weights": {
     "alpha": 0.16,
     "alpha_futures": 0.09,
     "alpha_intraday": 0.03,
@@ -33,6 +14,26 @@
     "gamma_reversion": 0.04,
     "omega": 0.05,
     "omega_macro": 0.03,
+    "omega_vol": 0.05
+  },
+  "reason": "",
+  "schema_version": "strategy_weights.v1",
+  "updated_ts_utc": "2026-04-16T02:35:55Z",
+  "weights": {
+    "alpha": 0.16,
+    "alpha_futures": 0.09,
+    "alpha_intraday": 0.03,
+    "alpha_options": 0.04,
+    "beta": 0.25,
+    "crypto": 0.04,
+    "delta": 0.02,
+    "delta_pairs": 0.05,
+    "gamma": 0.07,
+    "gamma_futures": 0.05,
+    "gamma_reversion": 0.04,
+    "omega": 0.05,
+    "omega_macro": 0.03,
+    "omega_momentum_options": 0.03,
     "omega_vol": 0.05
   }
 }

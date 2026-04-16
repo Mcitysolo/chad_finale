@@ -37,7 +37,8 @@ DEFAULT_STRATEGY_WEIGHTS: Dict[str, float] = {
     "gamma_reversion": 0.04,
     "alpha_futures": 0.09,
     "gamma_futures": 0.05,
-    "alpha_options": 0.07,
+    "alpha_options": 0.04,
+    "omega_momentum_options": 0.03,
     "omega": 0.05,
     "omega_macro": 0.03,
     "omega_vol": 0.05,
@@ -390,7 +391,7 @@ class DynamicRiskAllocator:
 
 ALPHA_STRATEGIES = frozenset({
     "alpha", "alpha_futures", "alpha_intraday", "alpha_options",
-    "gamma", "gamma_futures", "gamma_reversion",
+    "omega_momentum_options", "gamma", "gamma_futures", "gamma_reversion",
 })
 BETA_STRATEGIES = frozenset({"beta"})
 ADAPTIVE_STRATEGIES = frozenset({

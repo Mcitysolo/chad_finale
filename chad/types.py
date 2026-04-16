@@ -62,6 +62,7 @@ class StrategyName(str, Enum):
     ALPHA_OPTIONS = "alpha_options"
     OMEGA_VOL = "omega_vol"
     DELTA_PAIRS = "delta_pairs"
+    OMEGA_MOMENTUM_OPTIONS = "omega_momentum_options"
 
 class AssetClass(str, Enum):
     EQUITY = "equity"
