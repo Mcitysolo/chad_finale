@@ -4,24 +4,37 @@ Serves a plain-English dashboard that reflects CHAD's current
 status, portfolio, open positions, strategy activity, and system
 health. All runtime state files are read defensively; missing
 files return sensible fallbacks rather than crashing.
+
+v2: adds password auth (HTTP Basic + session cookie) and new
+endpoints /api/recent-trades, /api/leaderboard, /api/market.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import secrets
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = REPO / "runtime"
+DATA = REPO / "data"
 STATIC = Path(__file__).resolve().parent / "static"
+
+DASHBOARD_USER = "chad"
+DASHBOARD_PASSWORD = os.environ.get("CHAD_DASHBOARD_PASSWORD", "chad2026")
+SESSION_COOKIE = "chad_session"
+SESSION_TTL_SECONDS = 24 * 3600
+SESSIONS: dict[str, float] = {}
 
 STRATEGY_NAMES = {
     "alpha": "Stock Strategy",
@@ -73,10 +86,23 @@ def _fmt_money(x: float | int | None) -> str:
     return f"{sign}${abs(x):,.0f}"
 
 
+def _fmt_money_signed(x: float | int | None) -> str:
+    if x is None:
+        return "—"
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    if x > 0:
+        return f"+${x:,.0f}" if abs(x) >= 10 else f"+${x:,.2f}"
+    if x < 0:
+        return f"-${abs(x):,.0f}" if abs(x) >= 10 else f"-${abs(x):,.2f}"
+    return "$0"
+
+
 def _sharpe_to_score(sharpe: float | None) -> int:
     if sharpe is None:
         return 0
-    # Piecewise linear: -1->0, 0->20, 0.3->40, 0.7->75, 1.0+->100
     pts = [(-1.0, 0), (0.0, 20), (0.3, 40), (0.7, 75), (1.0, 100)]
     if sharpe <= pts[0][0]:
         return 0
@@ -111,22 +137,89 @@ def _next_level(score: int) -> tuple[str, str, int]:
     return "Max", "Peak performance", 100
 
 
-def _vix_label(v: float | None) -> str:
+def _vix_label_color(v: float | None) -> tuple[str, str]:
+    if v is None:
+        return "Unknown", "grey"
+    if v < 15:
+        return "Calm", "green"
+    if v < 20:
+        return "Normal", "grey"
+    if v < 25:
+        return "Cautious", "yellow"
+    if v < 30:
+        return "Nervous", "orange"
+    return "Fearful", "red"
+
+
+def _vix_label_legacy(v: float | None) -> str:
+    label, _ = _vix_label_color(v)
     if v is None:
         return "Unknown"
-    if v < 15:
-        return f"Calm ({v:.0f})"
-    if v < 22:
-        return f"Steady ({v:.0f})"
-    if v < 30:
-        return f"Nervous ({v:.0f})"
-    return f"Fearful ({v:.0f})"
+    return f"{label} ({v:.0f})"
 
+
+def _market_is_open(now_utc: datetime) -> bool:
+    if now_utc.weekday() >= 5:
+        return False
+    minutes = now_utc.hour * 60 + now_utc.minute
+    return 14 * 60 + 30 <= minutes < 21 * 60
+
+
+# ------------------------- Auth -------------------------
+
+def _session_valid(token: str | None) -> bool:
+    if not token:
+        return False
+    expiry = SESSIONS.get(token)
+    if not expiry:
+        return False
+    if expiry < time.time():
+        SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+def _check_basic(auth_header: str | None) -> bool:
+    if not auth_header or not auth_header.lower().startswith("basic "):
+        return False
+    try:
+        raw = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8", "replace")
+        user, _, pw = raw.partition(":")
+    except Exception:
+        return False
+    return secrets.compare_digest(user, DASHBOARD_USER) and secrets.compare_digest(pw, DASHBOARD_PASSWORD)
+
+
+def _new_session_token() -> str:
+    tok = secrets.token_urlsafe(32)
+    SESSIONS[tok] = time.time() + SESSION_TTL_SECONDS
+    return tok
+
+
+def _request_authenticated(request: Request) -> bool:
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if _session_valid(cookie):
+        return True
+    return _check_basic(request.headers.get("authorization"))
+
+
+def _ws_authenticated(websocket: WebSocket) -> bool:
+    token = websocket.query_params.get("token")
+    if token:
+        try:
+            raw = base64.b64decode(token).decode("utf-8", "replace")
+            user, _, pw = raw.partition(":")
+            if secrets.compare_digest(user, DASHBOARD_USER) and secrets.compare_digest(pw, DASHBOARD_PASSWORD):
+                return True
+        except Exception:
+            pass
+    cookie = websocket.cookies.get(SESSION_COOKIE)
+    return _session_valid(cookie)
+
+
+# ------------------------- State Builder -------------------------
 
 class StateBuilder:
-    """Builds the dashboard state dict. Caches portions that are
-    expensive to recompute (IBKR, systemctl)."""
-
     def __init__(self) -> None:
         self._portfolio_cache: dict | None = None
         self._portfolio_cache_ts: float = 0.0
@@ -138,7 +231,6 @@ class StateBuilder:
         self._ibkr_connected: bool = False
 
     def _ibkr_snapshot(self) -> tuple[bool, list]:
-        """Best-effort IBKR positions pull. Short timeout; never blocks event loop long."""
         try:
             from ib_insync import IB  # type: ignore
         except Exception:
@@ -212,6 +304,9 @@ class StateBuilder:
                     "direction": direction,
                     "direction_plain": plain,
                     "quantity": rec.get("quantity", 0),
+                    "entry_price": rec.get("entry_price") or rec.get("fill_price"),
+                    "opened_at": rec.get("opened_at") or rec.get("ts_utc"),
+                    "strategy": strat,
                     "strategy_plain": STRATEGY_NAMES.get(strat, strat.title()),
                     "is_chad_trade": True,
                 }
@@ -227,11 +322,19 @@ class StateBuilder:
         score = _sharpe_to_score(sharpe)
         next_name, next_detail, next_threshold = _next_level(score)
         progress = int(min(100, round(score * 100 / max(1, next_threshold))))
+        warmup_total = 100
+        warmup_remaining = max(0, warmup_total - trades) if (scr.get("state") or "").upper() == "WARMUP" else 0
+        warmup_progress = int(min(100, round(trades * 100 / warmup_total))) if warmup_total else 100
+        sizing_pct = int(round(float(scr.get("sizing_factor") or 0.0) * 100))
         return {
             "mode": mode,
             "mode_detail": detail,
             "sizing_label": sizing_label,
+            "sizing_pct": sizing_pct,
             "trades_completed": trades,
+            "warmup_total": warmup_total,
+            "warmup_remaining": warmup_remaining,
+            "warmup_progress_pct": warmup_progress,
             "win_rate_pct": round(win_rate * 100, 1),
             "performance_score": score,
             "progress_to_next_level_pct": progress,
@@ -256,21 +359,20 @@ class StateBuilder:
             win_rate = float(s.get("win_rate") or 0.0)
             expectancy = float(s.get("expectancy") or 0.0)
             perf_status = s.get("status", "new" if total < 10 else "underperforming")
-            # Signals now: approximate from allocation weight (>0 means active in rotation)
             weight = float(weights.get(name) or 0.0)
             signals = int(round(weight * 20)) if weight > 0 else 0
             if signals > 0:
-                status = "active"
+                status_str = "active"
                 status_label = f"Watching {signals} opportunities"
             else:
-                status = "idle"
+                status_str = "idle"
                 status_label = "Waiting for the right moment"
             out.append(
                 {
                     "name": STRATEGY_NAMES.get(name, name.title()),
                     "internal_name": name,
                     "signals_now": signals,
-                    "status": status,
+                    "status": status_str,
                     "status_label": status_label,
                     "win_rate": round(win_rate, 3),
                     "expectancy": round(expectancy, 2),
@@ -329,13 +431,12 @@ class StateBuilder:
         prices = _load_json(RUNTIME / "price_cache.json").get("prices") or {}
         trends = _load_json(RUNTIME / "trends_state.json").get("signals") or {}
         reddit = _load_json(RUNTIME / "reddit_sentiment.json").get("signals") or {}
-        # VIX not in price cache; try VIXY as proxy or leave unknown
+        kraken = _load_json(RUNTIME / "kraken_prices.json").get("prices") or {}
         vix = prices.get("VIX")
         if vix is None:
-            # Rough proxy: VIXY ETF ~ 28 when VIX ~ 19
             vixy = prices.get("VIXY")
             vix = round(vixy * 0.67, 2) if isinstance(vixy, (int, float)) else None
-        btc = prices.get("BTC") or prices.get("BTCUSD")
+        btc = prices.get("BTC") or prices.get("BTCUSD") or kraken.get("BTC-USD")
         spy_signal = trends.get("SPY", {}).get("signal", "NEUTRAL").lower()
         top_reddit = None
         best_mentions = -1
@@ -348,7 +449,7 @@ class StateBuilder:
         regime = event_risk.get("regime") or "NEUTRAL"
         return {
             "vix": vix,
-            "vix_label": _vix_label(vix),
+            "vix_label": _vix_label_legacy(vix),
             "btc_price": btc,
             "spy_trend": spy_signal,
             "top_reddit_mention": top_reddit,
@@ -357,7 +458,6 @@ class StateBuilder:
 
     def build(self) -> dict[str, Any]:
         scr = _load_json(RUNTIME / "scr_state.json")
-        # IBKR snapshot in a background refresh (cheap miss: skip if cache fresh)
         connected = self._ibkr_connected
         return {
             "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -379,7 +479,50 @@ class StateBuilder:
 
 
 builder = StateBuilder()
-app = FastAPI(title="CHAD Dashboard", version="1.0")
+app = FastAPI(title="CHAD Dashboard", version="2.0")
+
+
+# ------------------------- Pages -------------------------
+
+LOGIN_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>CHAD — Sign in</title>
+<style>
+:root{--bg:#F7F8FA;--card:#FFFFFF;--border:#E8EAED;--text:#0D1117;--sub:#6B7280;--green:#00C805;--red:#FF3B30;--radius:12px;--shadow:0 4px 12px rgba(0,0,0,.10);}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;color:var(--text);}
+.card{width:400px;max-width:calc(100vw - 32px);background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:40px 32px;border:1px solid var(--border);}
+.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:28px;letter-spacing:-.5px;}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(0,200,5,.6);animation:pulse 1.8s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(0,200,5,.6)}70%{box-shadow:0 0 0 10px rgba(0,200,5,0)}100%{box-shadow:0 0 0 0 rgba(0,200,5,0)}}
+.sub{margin-top:6px;color:var(--sub);font-size:13px;}
+form{margin-top:28px;display:flex;flex-direction:column;gap:12px;}
+input[type=password]{width:100%;padding:14px 16px;border:1px solid var(--border);border-radius:10px;font-size:15px;outline:none;transition:border .15s, box-shadow .15s;background:var(--card);color:var(--text);}
+input[type=password]:focus{border-color:var(--text);box-shadow:0 0 0 3px rgba(13,17,23,.08);}
+button{width:100%;padding:14px 16px;border:0;border-radius:10px;background:var(--text);color:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .12s;}
+button:hover{opacity:.92}
+.err{color:var(--red);font-size:13px;min-height:18px;}
+.foot{margin-top:18px;color:var(--sub);font-size:11px;text-align:center;letter-spacing:.04em;text-transform:uppercase;}
+</style></head><body>
+<div class="card">
+  <div class="logo">CHAD<span class="dot"></span></div>
+  <div class="sub">Capital Heuristic Autonomous Deployer</div>
+  <form id="f" method="post" action="/login">
+    <input type="password" name="password" id="pw" placeholder="Password" autocomplete="current-password" autofocus required/>
+    <button type="submit">Sign in</button>
+    <div class="err" id="err">__ERR__</div>
+  </form>
+  <div class="foot">Paper trading · v7.0</div>
+</div>
+</body></html>
+"""
+
+
+def _login_page(error: str = "") -> HTMLResponse:
+    body = LOGIN_HTML.replace("__ERR__", error)
+    return HTMLResponse(body, status_code=200 if not error else 401)
 
 
 @app.get("/health")
@@ -387,18 +530,321 @@ async def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/login")
+async def login_get(request: Request) -> HTMLResponse:
+    return _login_page()
+
+
+@app.post("/login")
+async def login_post(request: Request) -> Response:
+    body = await request.body()
+    try:
+        form = parse_qs(body.decode("utf-8", "replace"))
+    except Exception:
+        form = {}
+    pw_list = form.get("password") or [""]
+    pw = pw_list[0] if pw_list else ""
+    if not secrets.compare_digest(pw, DASHBOARD_PASSWORD):
+        return _login_page("Incorrect password")
+    tok = _new_session_token()
+    resp = Response(status_code=302, headers={"Location": "/"})
+    resp.set_cookie(
+        SESSION_COOKIE, tok,
+        max_age=SESSION_TTL_SECONDS, httponly=True, samesite="lax", path="/",
+    )
+    return resp
+
+
+@app.post("/logout")
+@app.get("/logout")
+async def logout(request: Request) -> Response:
+    tok = request.cookies.get(SESSION_COOKIE)
+    if tok:
+        SESSIONS.pop(tok, None)
+    resp = Response(status_code=302, headers={"Location": "/login"})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+
+@app.get("/")
+async def root(request: Request) -> Response:
+    if not _request_authenticated(request):
+        return _login_page()
+    return FileResponse(str(STATIC / "index.html"))
+
+
+# ------------------------- Auth middleware for /api -------------------------
+
+@app.middleware("http")
+async def api_auth(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/"):
+        if not _request_authenticated(request):
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="CHAD"'},
+            )
+    return await call_next(request)
+
+
+# ------------------------- /api/state -------------------------
+
 @app.get("/api/state")
 async def api_state() -> JSONResponse:
     return JSONResponse(builder.build())
 
 
-@app.get("/")
-async def root() -> FileResponse:
-    return FileResponse(str(STATIC / "index.html"))
+# ------------------------- /api/recent-trades -------------------------
 
+def _iter_recent_closed_trades(limit: int) -> list[dict]:
+    """Prefer closed-trade history (has pnl); fall back to fills."""
+    trades_dir = DATA / "trades"
+    fills_dir = DATA / "fills"
+    out: list[dict] = []
+
+    files: list[Path] = []
+    if trades_dir.exists():
+        files = sorted(
+            [p for p in trades_dir.iterdir() if p.name.startswith("trade_history_") and p.suffix == ".ndjson"],
+            reverse=True,
+        )
+    records: list[dict] = []
+    for f in files[:5]:
+        try:
+            with open(f, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    p = obj.get("payload") or obj
+                    if not isinstance(p, dict):
+                        continue
+                    records.append(p)
+        except Exception:
+            continue
+
+    records.sort(key=lambda r: r.get("exit_time_utc") or r.get("fill_time_utc") or "", reverse=True)
+
+    for p in records[:limit]:
+        pnl = p.get("pnl")
+        try:
+            pnl_f = float(pnl) if pnl is not None else 0.0
+        except Exception:
+            pnl_f = 0.0
+        if abs(pnl_f) < 1e-6:
+            outcome = "flat"
+        elif pnl_f > 0:
+            outcome = "win"
+        else:
+            outcome = "loss"
+        strat = p.get("strategy") or "unknown"
+        out.append(
+            {
+                "symbol": p.get("symbol", "?"),
+                "side": (p.get("side") or "").upper(),
+                "qty": p.get("quantity"),
+                "price": p.get("exit_price") or p.get("fill_price"),
+                "strategy": strat,
+                "strategy_plain": STRATEGY_NAMES.get(strat, strat.title()),
+                "ts_utc": p.get("exit_time_utc") or p.get("fill_time_utc"),
+                "pnl": round(pnl_f, 2),
+                "pnl_label": _fmt_money_signed(pnl_f),
+                "outcome": outcome,
+            }
+        )
+
+    if out:
+        return out
+
+    # Fallback: recent fills (no PnL available)
+    if fills_dir.exists():
+        files = sorted(
+            [p for p in fills_dir.iterdir() if p.name.startswith("FILLS_") and p.suffix == ".ndjson"],
+            reverse=True,
+        )
+        recs: list[dict] = []
+        for f in files[:3]:
+            try:
+                with open(f, "r") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        p = obj.get("payload") or obj
+                        if not isinstance(p, dict):
+                            continue
+                        if p.get("status") != "paper_fill":
+                            continue
+                        recs.append(p)
+            except Exception:
+                continue
+        recs.sort(key=lambda r: r.get("fill_time_utc") or "", reverse=True)
+        for p in recs[:limit]:
+            strat = p.get("strategy") or "unknown"
+            out.append(
+                {
+                    "symbol": p.get("symbol", "?"),
+                    "side": (p.get("side") or "").upper(),
+                    "qty": p.get("quantity"),
+                    "price": p.get("fill_price"),
+                    "strategy": strat,
+                    "strategy_plain": STRATEGY_NAMES.get(strat, strat.title()),
+                    "ts_utc": p.get("fill_time_utc"),
+                    "pnl": None,
+                    "pnl_label": "—",
+                    "outcome": "flat",
+                }
+            )
+    return out
+
+
+@app.get("/api/recent-trades")
+async def api_recent_trades() -> JSONResponse:
+    return JSONResponse({"trades": _iter_recent_closed_trades(10)})
+
+
+# ------------------------- /api/leaderboard -------------------------
+
+@app.get("/api/leaderboard")
+async def api_leaderboard() -> JSONResponse:
+    exp = _load_json(RUNTIME / "expectancy_state.json")
+    caps = _load_json(RUNTIME / "dynamic_caps.json")
+    weights = caps.get("normalized_weights") or {}
+    strats = exp.get("strategies") or {}
+
+    items = []
+    for name, s in strats.items():
+        total = int(s.get("total_trades") or 0)
+        win_rate = float(s.get("win_rate") or 0.0)
+        expectancy = float(s.get("expectancy") or 0.0)
+        weight = float(weights.get(name) or 0.0)
+        signals = int(round(weight * 20)) if weight > 0 else 0
+        items.append(
+            {
+                "name": STRATEGY_NAMES.get(name, name.title()),
+                "internal": name,
+                "win_rate": round(win_rate, 3),
+                "win_rate_pct": f"{int(round(win_rate * 100))}%",
+                "total_trades": total,
+                "expectancy": round(expectancy, 2),
+                "expectancy_label": _fmt_money_signed(expectancy),
+                "status": s.get("status", "new"),
+                "signals_now": signals,
+            }
+        )
+
+    ranked = sorted(
+        [x for x in items if x["total_trades"] >= 10],
+        key=lambda x: (-x["win_rate"], -x["total_trades"]),
+    )
+    building = sorted(
+        [x for x in items if x["total_trades"] < 10],
+        key=lambda x: -x["total_trades"],
+    )
+    for i, x in enumerate(ranked, 1):
+        x["rank"] = i
+    for x in building:
+        x["rank"] = None
+
+    return JSONResponse({"strategies": ranked + building, "ranked_count": len(ranked)})
+
+
+# ------------------------- /api/market -------------------------
+
+@app.get("/api/market")
+async def api_market() -> JSONResponse:
+    prices = _load_json(RUNTIME / "price_cache.json").get("prices") or {}
+    ticks = _load_json(RUNTIME / "price_cache.json").get("ticks") or {}
+    kraken = _load_json(RUNTIME / "kraken_prices.json") or {}
+    kraken_prices = kraken.get("prices") or {}
+    kraken_ticks = kraken.get("ticks") or {}
+    trends = _load_json(RUNTIME / "trends_state.json").get("signals") or {}
+    reddit = _load_json(RUNTIME / "reddit_sentiment.json").get("signals") or {}
+    event_risk = _load_json(RUNTIME / "event_risk.json")
+
+    vix = prices.get("VIX")
+    if vix is None:
+        vixy = prices.get("VIXY")
+        vix = round(vixy * 0.67, 2) if isinstance(vixy, (int, float)) else None
+    vix_label, vix_color = _vix_label_color(vix)
+
+    spy_price = prices.get("SPY")
+    spy_change = None
+    if isinstance(ticks, dict):
+        t = ticks.get("SPY") if isinstance(ticks.get("SPY"), dict) else None
+        if t:
+            prev = t.get("prev_close") or t.get("open")
+            if spy_price and prev:
+                try:
+                    spy_change = round((float(spy_price) - float(prev)) / float(prev) * 100, 2)
+                except Exception:
+                    spy_change = None
+
+    btc_price = kraken_prices.get("BTC-USD") or prices.get("BTC")
+    btc_change = None
+    btc_tick = kraken_ticks.get("BTC-USD") if isinstance(kraken_ticks, dict) else None
+    if isinstance(btc_tick, dict):
+        prev = btc_tick.get("prev_close") or btc_tick.get("open_24h")
+        if btc_price and prev:
+            try:
+                btc_change = round((float(btc_price) - float(prev)) / float(prev) * 100, 2)
+            except Exception:
+                btc_change = None
+
+    regime_raw = str(event_risk.get("regime") or event_risk.get("severity") or "NEUTRAL").upper()
+    regime_map = {
+        "LOW": ("RISK ON", "green"),
+        "MEDIUM": ("NEUTRAL", "grey"),
+        "HIGH": ("RISK OFF", "red"),
+        "NEUTRAL": ("NEUTRAL", "grey"),
+        "RISK_ON": ("RISK ON", "green"),
+        "RISK_OFF": ("RISK OFF", "red"),
+    }
+    regime_label, regime_color = regime_map.get(regime_raw, (regime_raw, "grey"))
+
+    mentions = sorted(
+        [(k, int(v.get("mention_count") or 0)) for k, v in reddit.items() if isinstance(v, dict)],
+        key=lambda x: -x[1],
+    )
+    top_mentions = [k for k, _ in mentions[:3]] or []
+
+    now_utc = datetime.now(timezone.utc)
+    is_open = _market_is_open(now_utc)
+
+    return JSONResponse(
+        {
+            "vix": round(float(vix), 2) if isinstance(vix, (int, float)) else None,
+            "vix_label": vix_label,
+            "vix_color": vix_color,
+            "spy_price": float(spy_price) if isinstance(spy_price, (int, float)) else None,
+            "spy_change_pct": spy_change,
+            "btc_price": float(btc_price) if isinstance(btc_price, (int, float)) else None,
+            "btc_change_pct": btc_change,
+            "market_regime": regime_label,
+            "regime_color": regime_color,
+            "top_mentions": top_mentions,
+            "market_open": is_open,
+            "market_open_label": "Market Open" if is_open else "Market Closed",
+        }
+    )
+
+
+# ------------------------- WebSocket -------------------------
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket) -> None:
+    if not _ws_authenticated(websocket):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     try:
         while True:
