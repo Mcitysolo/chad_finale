@@ -60,12 +60,12 @@ class SCRConfig:
     # CONFIDENT thresholds
     confident_min_win_rate: float = 0.55
     confident_min_sharpe: float = 0.70
-    confident_max_drawdown: float = -2000.0  # Max DD must be >= this (less negative is better)
+    confident_max_drawdown: float = -10000.0  # Max DD must be >= this (less negative is better)
 
     # CAUTIOUS thresholds
     cautious_min_win_rate: float = 0.45
     cautious_min_sharpe: float = 0.30
-    cautious_max_drawdown: float = -5000.0
+    cautious_max_drawdown: float = -15000.0
 
     # Sizing factors per band
     warmup_sizing_factor: float = 0.10
