@@ -92,6 +92,11 @@ from ib_insync import IB, util
 util.patchAsyncio()
 
 ib = IB()
+# Monkey-patch: skip reqExecutionsAsync on connect to avoid
+# cold-start hang when gateway has large execution backlog.
+# The fill harvester (clientId=79) handles execution history separately.
+import ib_insync.ib as _ib_module
+_ib_module.IB.reqExecutionsAsync = lambda self, *a, **kw: []
 ib.connect("127.0.0.1", 4002, clientId=99, timeout=120)
 
 
