@@ -547,17 +547,18 @@ def load_and_compute(
             continue
         effective.append(t)
 
-    effective_trades = len(effective)
-
     # Metrics
     # total_pnl is defined over ALL finite trades (total_trades), not just effective.
     # (Tests and ops reports expect this.)
     total_pnl = float(sum(float(t.pnl) for t in trades)) if trades else 0.0
 
     # Performance metrics used for trust/SCR are based on effective trades only.
-    pnls = [float(t.pnl) for t in effective]
+    # Exclude PnL=0 trades: these are open positions or unmatched entry fills,
+    # not closed trades. Counting them dilutes win_rate (they look like losses).
+    pnls = [float(t.pnl) for t in effective if float(t.pnl) != 0.0]
+    effective_trades = len(pnls)
 
-    # Win rate: pnl > 0
+    # Win rate: pnl > 0 (denominator is closed trades only)
     wins = sum(1 for p in pnls if p > 0.0)
     win_rate = float(wins) / float(effective_trades) if effective_trades > 0 else 0.0
 
