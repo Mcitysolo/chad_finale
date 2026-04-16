@@ -96,7 +96,8 @@ ib = IB()
 # cold-start hang when gateway has large execution backlog.
 # The fill harvester (clientId=79) handles execution history separately.
 import ib_insync.ib as _ib_module
-_ib_module.IB.reqExecutionsAsync = lambda self, *a, **kw: []
+async def _noop_executions(self, *a, **kw): return []
+_ib_module.IB.reqExecutionsAsync = _noop_executions
 ib.connect("127.0.0.1", 4002, clientId=99, timeout=120)
 
 
