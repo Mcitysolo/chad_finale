@@ -190,6 +190,11 @@ class _AlphaState:
 
 _STATE = _AlphaState()
 
+# Per-symbol daily signal counter — prevents churn on trending symbols.
+# Format: {date_str: {symbol: count}}
+_DAILY_SIGNALS: Dict[str, Dict[str, int]] = {}
+_MAX_SIGNALS_PER_SYMBOL_PER_DAY = 3
+
 
 # ---------------------------------------------------------------------------
 # Core signal engine
@@ -310,6 +315,10 @@ def build_alpha_signals(
         if abs(size - pos) < p.min_delta_size:
             continue
 
+        today_key = now.strftime("%Y-%m-%d")
+        if _DAILY_SIGNALS.get(today_key, {}).get(sym, 0) >= _MAX_SIGNALS_PER_SYMBOL_PER_DAY:
+            continue
+
         if regime == "uptrend":
             side = SignalSide.BUY
             reason = "trend_momentum"
@@ -337,6 +346,12 @@ def build_alpha_signals(
         )
 
         _STATE.set(sym, {"size": size, "entry": px, "held": held + 1, "peak": max(px, peak or px)})
+
+        _DAILY_SIGNALS.setdefault(today_key, {})[sym] = (
+            _DAILY_SIGNALS.get(today_key, {}).get(sym, 0) + 1
+        )
+        for _stale in [k for k in _DAILY_SIGNALS if k != today_key]:
+            del _DAILY_SIGNALS[_stale]
 
         if len(signals) >= p.max_symbols_per_cycle:
             break
