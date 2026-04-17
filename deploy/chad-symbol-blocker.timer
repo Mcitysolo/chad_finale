@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CHAD symbol performance blocker every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=chad-symbol-blocker.service
+
+[Install]
+WantedBy=timers.target

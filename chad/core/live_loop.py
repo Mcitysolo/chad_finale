@@ -132,6 +132,7 @@ _redis_live_gate_ts: Optional[str] = None
 
 
 from chad.core.kraken_execution import execute_kraken_intents as _execute_kraken_intents
+from chad.risk.symbol_performance_blocker import is_symbol_blocked
 
 
 _KRAKEN_BALANCE_PROVIDER = None  # lazy singleton
@@ -726,6 +727,19 @@ def run_once(logger: logging.Logger) -> None:
                 getattr(intent, "side", None),
                 getattr(intent, "quantity", None),
                 extra={"suppression_reason": SuppressionReason.SAME_SIDE_POSITION_OPEN.value},
+            )
+            continue
+
+        # Per-symbol performance blocker — suppress new entries on symbols
+        # with 3 consecutive losses. Flip (exit-and-reverse) and explicit
+        # EXIT/CLOSE intents always pass through. Fail-open.
+        _side_str = str(getattr(intent, "side", "") or "").upper()
+        _is_exit_intent = is_flip_signal(intent) or _side_str in {"EXIT", "CLOSE"}
+        if not _is_exit_intent and is_symbol_blocked(getattr(intent, "symbol", "") or ""):
+            logger.info(
+                "SKIP suppression=symbol_performance_blocked → %s %s",
+                getattr(intent, "symbol", None),
+                getattr(intent, "side", None),
             )
             continue
 

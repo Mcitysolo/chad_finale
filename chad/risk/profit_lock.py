@@ -167,6 +167,9 @@ class ProfitLockConfig:
     lock3_sizing_factor: float = 0.10
     hard_stop_sizing_factor: float = 0.00
     enable_on_negative_equity_unknown: bool = False
+    # Daily loss limit: halt new entries if realized PnL today drops below
+    # -daily_loss_limit_pct% of equity. Additive to profit-lock tiers above.
+    daily_loss_limit_pct: float = 3.0
 
     @classmethod
     def from_env(cls) -> "ProfitLockConfig":
@@ -195,6 +198,9 @@ class ProfitLockConfig:
             enable_on_negative_equity_unknown=getenv_bool(
                 "CHAD_PROFIT_LOCK_ENABLE_ON_UNKNOWN_EQUITY",
                 cls.enable_on_negative_equity_unknown,
+            ),
+            daily_loss_limit_pct=getenv_float(
+                "CHAD_DAILY_LOSS_LIMIT_PCT", cls.daily_loss_limit_pct
             ),
         )
 
@@ -603,12 +609,37 @@ class ProfitLockEngine:
     async def build_state(self, days: int = 0) -> Mapping[str, Any]:
         """Assemble the complete profit‑lock state object."""
         decision, inputs = await self.compute_decision(days=days)
+
+        realized_today = float(inputs.get("realized_pnl", 0.0))
+        equity = inputs.get("account_equity")
+        equity_known = bool(inputs.get("equity_known", False))
+        limit_pct = float(self.config.daily_loss_limit_pct)
+        daily_loss_today = realized_today if realized_today < 0.0 else 0.0
+        loss_limit_dollars = (
+            float(equity) * (limit_pct / 100.0)
+            if equity_known and isinstance(equity, (int, float))
+            else None
+        )
+        daily_loss_limit_hit = False
+        if loss_limit_dollars is not None and realized_today <= -loss_limit_dollars:
+            daily_loss_limit_hit = True
+            logger.warning(
+                "DAILY_LOSS_LIMIT: realized_today=$%.2f limit=-$%.2f",
+                realized_today,
+                loss_limit_dollars,
+            )
+
+        final_stop_new_entries = bool(decision.stop_new_entries) or daily_loss_limit_hit
+        explain = decision.explain
+        if daily_loss_limit_hit:
+            explain = f"{explain} | daily_loss_limit_hit"
+
         state = {
             "ts_utc": _utc_now().isoformat().replace("+00:00", "Z"),
             "ttl_seconds": int(self.config.ttl_seconds),
             "mode": decision.mode.name,
             "sizing_factor": float(decision.sizing_factor),
-            "stop_new_entries": bool(decision.stop_new_entries),
+            "stop_new_entries": final_stop_new_entries,
             "profit_lock_active": bool(
                 decision.mode
                 not in {
@@ -617,7 +648,13 @@ class ProfitLockEngine:
                     ProfitLockMode.INACTIVE_EQUITY_UNKNOWN,
                 }
             ),
-            "explain": decision.explain,
+            "explain": explain,
+            "daily_loss_today": float(daily_loss_today),
+            "daily_loss_limit_pct": limit_pct,
+            "daily_loss_limit_dollars": (
+                float(loss_limit_dollars) if loss_limit_dollars is not None else None
+            ),
+            "daily_loss_limit_hit": bool(daily_loss_limit_hit),
             "inputs": inputs,
             "thresholds_pct": {
                 "warn": float(self.config.warn_profit_pct),
@@ -625,6 +662,7 @@ class ProfitLockEngine:
                 "lock2": float(self.config.lock2_profit_pct),
                 "lock3": float(self.config.lock3_profit_pct),
                 "hard_stop": float(self.config.hard_stop_profit_pct),
+                "daily_loss_limit": limit_pct,
             },
             "factors": {
                 "lock1": float(self.config.lock1_sizing_factor),
