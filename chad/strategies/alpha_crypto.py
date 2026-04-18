@@ -628,7 +628,15 @@ def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List:
         a = _atr(highs, lows, closes, params.atr_period)
         roll_high = _rolling_max(highs, params.breakout_lookback)
 
-        close = closes[-1]
+        # Crypto trades 24/7 — use live Kraken spot for the current close
+        # when available; fall back to the last daily bar close. Indicators
+        # (EMA/ATR/rolling high) are still computed on bar history, which
+        # provides the historical window for regime/momentum evaluation.
+        _live_price = prices.get(symbol)
+        if _live_price is not None and _live_price > 0:
+            close = float(_live_price)
+        else:
+            close = closes[-1]
         ef = ema_fast[-1]
         es = ema_slow[-1]
         atr_v = a[-1]
