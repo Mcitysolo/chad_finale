@@ -1,0 +1,12 @@
+[Unit]
+Description=CHAD Options Position Monitor — stop/target/time exit enforcement
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.portfolio.options_position_monitor
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30

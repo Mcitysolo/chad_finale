@@ -1,0 +1,14 @@
+[Unit]
+Description=CHAD Expectancy Tracker (oneshot)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python -m chad.analytics.expectancy_tracker
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-expectancy-tracker

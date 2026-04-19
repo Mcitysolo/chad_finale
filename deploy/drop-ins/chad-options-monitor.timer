@@ -1,0 +1,10 @@
+[Unit]
+Description=CHAD Options Monitor Timer — every 60 seconds during market hours
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

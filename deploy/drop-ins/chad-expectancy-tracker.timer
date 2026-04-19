@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CHAD expectancy tracker every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=chad-expectancy-tracker.service
+
+[Install]
+WantedBy=timers.target
