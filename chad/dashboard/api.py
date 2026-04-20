@@ -31,7 +31,14 @@ DATA = REPO / "data"
 STATIC = Path(__file__).resolve().parent / "static"
 
 DASHBOARD_USER = "chad"
-DASHBOARD_PASSWORD = os.environ.get("CHAD_DASHBOARD_PASSWORD", "chad2026")
+_pw = os.environ.get("CHAD_DASHBOARD_PASSWORD")
+if not _pw:
+    raise RuntimeError(
+        "CHAD_DASHBOARD_PASSWORD environment variable is required. "
+        "Set it in /etc/chad/dashboard.env (mode 0640 root:chad). "
+        "See Step 9 of the overhaul for the expected deployment."
+    )
+DASHBOARD_PASSWORD = _pw
 SESSION_COOKIE = "chad_session"
 SESSION_TTL_SECONDS = 24 * 3600
 SESSIONS: dict[str, float] = {}
