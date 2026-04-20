@@ -281,6 +281,15 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
         side = str(head.get("side", "")).strip().upper()
         total_qty = sum(float(lot.get("quantity", 0) or 0) for lot in lots)
         key = f"{strategy}|{symbol}"
+        # ISSUE-56: when a strategy queue claims a symbol, close any stale
+        # broker_sync|<symbol> anchor so the guard does not double-count.
+        if strategy != "broker_sync":
+            broker_sync_key = f"broker_sync|{symbol}"
+            bs_entry = guard_state.get(broker_sync_key)
+            if bs_entry and bs_entry.get("open"):
+                bs_entry["open"] = False
+                bs_entry["updated_at_utc"] = now_iso
+                bs_entry["closed_by"] = "strategy_ownership_assumed"
         guard_state[key] = {
             "open": True,
             "updated_at_utc": now_iso,

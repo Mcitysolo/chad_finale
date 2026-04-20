@@ -101,3 +101,77 @@ def test_replace_position_closes_existing_broker_sync(tmp_state):
     assert state["alpha|SPY"]["open"] is True
     assert state["alpha|SPY"]["side"] == "SELL"
     assert state["alpha|SPY"]["last_state"] == "FLIPPED"
+
+
+def _seed_trade_closer(path, queues):
+    import json
+    path.write_text(json.dumps({"queues": queues, "processed_fill_ids": []}),
+                    encoding="utf-8")
+
+
+def test_rebuild_clears_broker_sync_when_strategy_entry_added(tmp_path, monkeypatch):
+    """
+    When _rebuild_guard_from_paper_ledger writes a strategy-named entry
+    for a symbol that already has a broker_sync|<symbol> entry, the
+    broker_sync anchor is closed.
+    """
+    import logging
+    from chad.core import live_loop
+
+    guard_path = tmp_path / "position_guard.json"
+    tc_path = tmp_path / "trade_closer_state.json"
+    monkeypatch.setattr(position_guard, "STATE_PATH", guard_path)
+    monkeypatch.setattr(live_loop, "_TRADE_CLOSER_STATE_PATH", tc_path)
+
+    _seed(guard_path, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+        }
+    })
+    _seed_trade_closer(tc_path, [{
+        "strategy": "delta", "symbol": "SPY", "sec_type": "STK",
+        "lots": [{"side": "BUY", "quantity": 30.0,
+                  "fill_price": 700.0, "lot_ts_utc": "2026-04-20T00:00:00Z",
+                  "fill_id": "test-fill-1"}],
+    }])
+
+    live_loop._rebuild_guard_from_paper_ledger(logging.getLogger("test"))
+    state = _load(guard_path)
+    assert state["delta|SPY"]["open"] is True
+    assert state["delta|SPY"]["quantity"] == 30.0
+    assert state["broker_sync|SPY"]["open"] is False
+    assert state["broker_sync|SPY"]["closed_by"] == "strategy_ownership_assumed"
+
+
+def test_rebuild_preserves_broker_sync_when_no_strategy_entry_for_symbol(tmp_path, monkeypatch):
+    """
+    broker_sync entries for symbols without a corresponding strategy queue
+    are preserved (close-sweep whitelist protects them).
+    """
+    import logging
+    from chad.core import live_loop
+
+    guard_path = tmp_path / "position_guard.json"
+    tc_path = tmp_path / "trade_closer_state.json"
+    monkeypatch.setattr(position_guard, "STATE_PATH", guard_path)
+    monkeypatch.setattr(live_loop, "_TRADE_CLOSER_STATE_PATH", tc_path)
+
+    _seed(guard_path, {
+        "broker_sync|GLD": {
+            "open": True, "strategy": "broker_sync", "symbol": "GLD",
+            "side": "SELL", "quantity": 1108.0, "last_state": "OPEN",
+        }
+    })
+    _seed_trade_closer(tc_path, [{
+        "strategy": "alpha", "symbol": "SPY", "sec_type": "STK",
+        "lots": [{"side": "BUY", "quantity": 10.0,
+                  "fill_price": 700.0, "lot_ts_utc": "2026-04-20T00:00:00Z",
+                  "fill_id": "test-fill-2"}],
+    }])
+
+    live_loop._rebuild_guard_from_paper_ledger(logging.getLogger("test"))
+    state = _load(guard_path)
+    assert state["broker_sync|GLD"]["open"] is True
+    assert state["broker_sync|GLD"]["quantity"] == 1108.0
+    assert state["alpha|SPY"]["open"] is True
