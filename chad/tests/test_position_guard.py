@@ -1,0 +1,103 @@
+"""ISSUE-56 regression tests: broker_sync anchor yields to strategy ownership."""
+from dataclasses import dataclass
+
+import pytest
+
+from chad.core import position_guard
+
+
+@dataclass
+class _Intent:
+    strategy: str
+    symbol: str
+    side: str
+    quantity: float
+
+
+@pytest.fixture
+def tmp_state(tmp_path, monkeypatch):
+    state_path = tmp_path / "position_guard.json"
+    monkeypatch.setattr(position_guard, "STATE_PATH", state_path)
+    return state_path
+
+
+def _seed(path, state):
+    import json
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _load(path):
+    import json
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_mark_position_open_closes_existing_broker_sync(tmp_state):
+    _seed(tmp_state, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+        }
+    })
+    position_guard.mark_position_open(_Intent("alpha", "SPY", "BUY", 30.0))
+    state = _load(tmp_state)
+    assert state["alpha|SPY"]["open"] is True
+    assert state["alpha|SPY"]["quantity"] == 30.0
+    assert state["broker_sync|SPY"]["open"] is False
+    assert state["broker_sync|SPY"]["closed_by"] == "strategy_ownership_assumed"
+
+
+def test_mark_position_open_no_anchor_noop_on_broker_sync(tmp_state):
+    _seed(tmp_state, {})
+    position_guard.mark_position_open(_Intent("alpha", "SPY", "BUY", 30.0))
+    state = _load(tmp_state)
+    assert "alpha|SPY" in state
+    assert "broker_sync|SPY" not in state
+
+
+def test_mark_position_open_sequential_strategies_same_symbol(tmp_state):
+    _seed(tmp_state, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+        }
+    })
+    position_guard.mark_position_open(_Intent("alpha", "SPY", "BUY", 15.0))
+    position_guard.mark_position_open(_Intent("delta", "SPY", "BUY", 15.0))
+    state = _load(tmp_state)
+    assert state["broker_sync|SPY"]["open"] is False
+    assert state["alpha|SPY"]["open"] is True
+    assert state["delta|SPY"]["open"] is True
+
+
+def test_mark_position_open_closed_broker_sync_untouched(tmp_state):
+    _seed(tmp_state, {
+        "broker_sync|SPY": {
+            "open": False, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "closed_by": "prior_close",
+        }
+    })
+    position_guard.mark_position_open(_Intent("alpha", "SPY", "BUY", 30.0))
+    state = _load(tmp_state)
+    assert state["broker_sync|SPY"]["open"] is False
+    assert state["broker_sync|SPY"]["closed_by"] == "prior_close"
+    assert state["alpha|SPY"]["open"] is True
+
+
+def test_replace_position_closes_existing_broker_sync(tmp_state):
+    _seed(tmp_state, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+        },
+        "alpha|SPY": {
+            "open": True, "strategy": "alpha", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+        },
+    })
+    position_guard.replace_position(_Intent("alpha", "SPY", "SELL", 30.0))
+    state = _load(tmp_state)
+    assert state["broker_sync|SPY"]["open"] is False
+    assert state["broker_sync|SPY"]["closed_by"] == "strategy_ownership_assumed"
+    assert state["alpha|SPY"]["open"] is True
+    assert state["alpha|SPY"]["side"] == "SELL"
+    assert state["alpha|SPY"]["last_state"] == "FLIPPED"
