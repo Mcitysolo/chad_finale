@@ -24,12 +24,13 @@ import logging
 import random
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig
+from chad.execution.intent_schema import DEFAULT_TTL_SECONDS, utc_now_iso
 from chad.execution.kraken_trade_router import KrakenTradeRouter, TradeRequest, TradeResponse
 from chad.portfolio.kraken_trade_result_logger import KrakenTradeEvent, log_kraken_trade_event
 from chad.risk.dynamic_caps import check_risk, load_dynamic_caps
@@ -58,6 +59,15 @@ class StrategyTradeIntent:
     # Optional upstream metadata (helps make derived key stable across restarts)
     trace_id: Optional[str] = None
     cycle_id: Optional[str] = None
+
+    # Canonical intent schema extensions (Phase-8 Session 1 / audit_m).
+    # Defaults keep every existing construction site backward-compatible.
+    confidence: float = 0.5
+    entry_reason: str = ""
+    regime_state: str = "unknown"
+    expected_pnl: float = 0.0
+    created_at: str = field(default_factory=utc_now_iso)
+    ttl_seconds: int = DEFAULT_TTL_SECONDS
     plan_hash: Optional[str] = None
 
 

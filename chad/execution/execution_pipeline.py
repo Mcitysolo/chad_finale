@@ -49,6 +49,7 @@ from functools import lru_cache
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
+from chad.execution.intent_schema import utc_now_iso
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
 
@@ -574,6 +575,11 @@ def build_ibkr_intents_from_plan(
             quantity=quantity,
             notional_estimate=order.notional,
             limit_price=None,
+            confidence=float(getattr(order, "confidence", 0.5) or 0.5),
+            entry_reason=str(getattr(order, "reason", "") or ""),
+            regime_state=str(getattr(order, "regime_state", "unknown") or "unknown"),
+            expected_pnl=float(getattr(order, "expected_pnl", 0.0) or 0.0),
+            created_at=utc_now_iso(),
         )
         intents.append(intent)
 
@@ -753,6 +759,11 @@ def _build_kraken_intent_from_routed_signal(
         volume=float(volume_dec),
         notional_estimate=float(capped_notional),
         price=None,
+        confidence=float(getattr(signal, "confidence", 0.5) or 0.5),
+        entry_reason=str(getattr(signal, "reason", "") or ""),
+        regime_state=str(getattr(signal, "regime_state", "unknown") or "unknown"),
+        expected_pnl=float(getattr(signal, "expected_pnl", 0.0) or 0.0),
+        created_at=utc_now_iso(),
     )
 
 

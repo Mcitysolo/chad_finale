@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -14,6 +14,7 @@ from chad.execution.ibkr_trade_router import (
     IBKRTradeRouter,
     _call_with_timeout,
 )
+from chad.execution.intent_schema import DEFAULT_TTL_SECONDS, utc_now_iso
 
 
 # --------------------------------------------------------------------------- #
@@ -37,6 +38,15 @@ class StrategyTradeIntent:
     quantity: float
     notional_estimate: float
     limit_price: Optional[float] = None
+
+    # Canonical intent schema extensions (Phase-8 Session 1 / audit_m).
+    # Defaults keep every existing construction site backward-compatible.
+    confidence: float = 0.5
+    entry_reason: str = ""
+    regime_state: str = "unknown"
+    expected_pnl: float = 0.0
+    created_at: str = field(default_factory=utc_now_iso)
+    ttl_seconds: int = DEFAULT_TTL_SECONDS
 
 
 @dataclass(frozen=True)
