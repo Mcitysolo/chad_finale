@@ -301,3 +301,105 @@ def test_run_once_writes_trade_history(tmp_path):
     assert summary["total_pnl"] == pytest.approx(50.0)
     assert "alpha_test" in summary["by_strategy"]
     assert summary["by_strategy"]["alpha_test"]["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-74: fill_id synthesis for broker_sync anchor lots
+# ---------------------------------------------------------------------------
+
+def test_synthesize_fill_id_for_broker_sync_lot(tmp_path):
+    """
+    Step 13.5 broker_sync rebuild writes queue lots from a position snapshot
+    that has no exec_id, so the lot lacks fill_id. load_state() must
+    synthesize a deterministic syn_<sha256[:24]> id on load so downstream
+    matching at _match_fill does not raise KeyError.
+    """
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "processed_fill_ids": [],
+                "queues": [
+                    {
+                        "strategy": "broker_sync",
+                        "symbol": "GLD",
+                        "lots": [
+                            {
+                                "side": "SELL",
+                                "quantity": 1108.0,
+                                "fill_price": 311.50,
+                                "lot_ts_utc": "2026-04-20T20:27:54.400505Z",
+                                "source": "step_13_5_post_paper_fills",
+                                "tags": ["reconciled_step_13_5"],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    closer = TradeCloser(
+        fills_dir=tmp_path / "fills",
+        trades_dir=tmp_path / "trades",
+        state_path=state_path,
+    )
+    closer.load_state()
+
+    key = ("broker_sync", "GLD")
+    assert key in closer.queues
+    lot = closer.queues[key][0]
+    assert "fill_id" in lot
+    assert lot["fill_id"].startswith("syn_")
+    assert len(lot["fill_id"]) == len("syn_") + 24
+
+    # Determinism: a fresh TradeCloser loading the same state yields the
+    # same synthetic id.
+    closer2 = TradeCloser(
+        fills_dir=tmp_path / "fills",
+        trades_dir=tmp_path / "trades",
+        state_path=state_path,
+    )
+    closer2.load_state()
+    assert closer2.queues[key][0]["fill_id"] == lot["fill_id"]
+
+
+def test_preserve_existing_fill_id_when_present(tmp_path):
+    """
+    When a lot already has a fill_id, load_state() must not overwrite it.
+    """
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "processed_fill_ids": [],
+                "queues": [
+                    {
+                        "strategy": "alpha_test",
+                        "symbol": "MES",
+                        "lots": [
+                            {
+                                "fill_id": "existing_123",
+                                "side": "BUY",
+                                "quantity": 1.0,
+                                "fill_price": 5000.0,
+                                "ts_utc": "2026-04-20T20:00:00Z",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    closer = TradeCloser(
+        fills_dir=tmp_path / "fills",
+        trades_dir=tmp_path / "trades",
+        state_path=state_path,
+    )
+    closer.load_state()
+
+    key = ("alpha_test", "MES")
+    assert closer.queues[key][0]["fill_id"] == "existing_123"

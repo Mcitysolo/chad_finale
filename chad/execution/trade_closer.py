@@ -221,7 +221,30 @@ class TradeCloser:
                 key = (str(entry["strategy"]), str(entry["symbol"]))
                 lots = entry.get("lots", []) or []
                 for lot in lots:
-                    self.queues[key].append(dict(lot))
+                    normalized = dict(lot)
+                    if not normalized.get("fill_id"):
+                        # Synthesize deterministic id for lots lacking one
+                        # (e.g. broker_sync anchor lots rebuilt from a
+                        # position snapshot that has no exec_id). Mirrors
+                        # _extract_fill's synthesis at line 138-153.
+                        seed = json.dumps(
+                            {
+                                "strategy": key[0],
+                                "symbol": key[1],
+                                "side": normalized.get("side"),
+                                "qty": normalized.get("quantity"),
+                                "px": normalized.get("fill_price"),
+                                "ts": normalized.get("lot_ts_utc")
+                                or normalized.get("ts_utc"),
+                            },
+                            sort_keys=True,
+                            default=str,
+                        )
+                        normalized["fill_id"] = (
+                            "syn_"
+                            + hashlib.sha256(seed.encode()).hexdigest()[:24]
+                        )
+                    self.queues[key].append(normalized)
             except Exception:
                 continue
 
