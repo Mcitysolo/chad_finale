@@ -87,6 +87,44 @@ def reconcile_positions_with_signals(
             if symbol in KNOWN_NON_CHAD_SYMBOLS:
                 continue
 
+            # ISSUE-29 fix: skip partial_attribution_residual entries.
+            # These are broker_sync lots being gradually claimed by strategies
+            # via position_guard._reduce_or_close_broker_sync (ISSUE-56 v2).
+            # They are NOT orphans — they will be consumed over subsequent
+            # cycles as attribution completes. Flap-closing them destroys
+            # the residual that represents unclaimed broker_truth.
+            position_meta = position.get("meta") or position.get("extra") or {}
+            if (
+                position_meta.get("partial_attribution_residual")
+                or position.get("source") == "partial_attribution_residual"
+                or position.get("closed_by") == "partial_attribution_residual"
+            ):
+                LOG.debug(
+                    "RECONCILER_SKIP partial_attribution_residual entry %s — "
+                    "not an orphan, awaiting strategy attribution",
+                    position_key,
+                )
+                continue
+
+            # ISSUE-29 extension: when a strategy entry exists alongside an
+            # OPEN broker_sync residual for the same symbol, attribution is
+            # in progress. Flap-closing the strategy side leaves the residual
+            # alone and the publisher sees chad < broker — looks like drift.
+            strategy_name = str(position.get("strategy", "") or "")
+            if strategy_name and strategy_name != "broker_sync":
+                paired_bs = open_positions.get(f"broker_sync|{symbol}")
+                if (
+                    isinstance(paired_bs, dict)
+                    and paired_bs.get("open")
+                    and paired_bs.get("closed_by") == "partial_attribution_residual"
+                ):
+                    LOG.debug(
+                        "RECONCILER_SKIP strategy entry %s — paired broker_sync "
+                        "is partial_attribution_residual, attribution in progress",
+                        position_key,
+                    )
+                    continue
+
             buy_size = 0.0
             sell_size = 0.0
             for _strat, sig in pairs:
