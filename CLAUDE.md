@@ -5,9 +5,9 @@
 - Canonical root: /home/ubuntu/chad_finale
 - Python binary: python3 (never python)
 - Virtual environment: /home/ubuntu/chad_finale/venv
-- Current trading posture: DRY_RUN / PAUSED — live promotion in progress
+- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper; SCR=WARMUP, sizing_factor=0.1, sharpe_like=+0.806, effective_trades=37 (as of 2026-04-21)
 - Account equity: ~$994k paper
-- Hardening status: P0-P2 complete, GAP-1 through GAP-25 complete
+- Hardening status: P0-P2 complete, GAP-1 through GAP-25 complete; 2026-04-19/21 Overhaul complete
 
 ## Governance Rules — Non-Negotiable
 1. One change at a time. Baseline, change, verify, proceed.
@@ -34,7 +34,7 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 - GAP-1 through GAP-25: governance audit items — DONE
 
 ### Pre-Live Operator Tasks
-1. OS reboot — pending kernel update requires restart
+1. OS reboot — no pending kernel update as of 2026-04-21 (kernel 6.17.0-1009-aws current; reboot deferred to next actual kernel update)
 2. Disk cleanup — prune backup archives to below 75% usage
 3. IB Gateway latency — investigate and resolve dangerous (>750ms) classification
 4. Verify all 82 tests pass after reboot
@@ -61,6 +61,7 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 - STABILITY_FREEZE_20260307_GREEN — original stable baseline
 - PRE_HARDENING_20260402 — snapshot before P0 hardening began
 - RATIFICATION_MASTER_20260402 — all hardening and GAP items complete
+- REVERT_PRE_OVERHAUL_20260419 — snapshot before 2026-04-19/21 overhaul (commit 45f3728; tarball /home/ubuntu/chad_revert_points/runtime_pre_overhaul_20260419.tar.gz)
 
 ## Rollback Command
 git checkout RATIFICATION_MASTER_20260402
