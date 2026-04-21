@@ -104,22 +104,56 @@ def is_flip_signal(intent) -> bool:
     return open_side != "" and new_side != "" and open_side != new_side
 
 
+def _reduce_or_close_broker_sync(
+    state: Dict[str, dict],
+    broker_sync_key: str,
+    strategy: str,
+    side: str,
+    quantity: float,
+) -> None:
+    """ISSUE-56 v2: reduce-not-close for partial broker_sync attribution.
+
+    Same side, residual > 0  → reduce quantity, keep open=True.
+    Same side, residual <= 0 → soft-close (full attribution).
+    Opposite side            → untouched (flip intent; reconciliation surfaces drift).
+    """
+    if strategy == "broker_sync":
+        return
+    bs_entry = state.get(broker_sync_key)
+    if not bs_entry or not bs_entry.get("open"):
+        return
+    bs_side = str(bs_entry.get("side", "") or "").upper()
+    incoming_side = str(side or "").upper()
+    if bs_side != incoming_side:
+        return
+    bs_qty = abs(float(bs_entry.get("quantity", 0) or 0))
+    residual = bs_qty - abs(float(quantity or 0))
+    bs_entry["updated_at_utc"] = _utc_now_iso()
+    if residual <= 0:
+        bs_entry["open"] = False
+        bs_entry["closed_by"] = "strategy_ownership_assumed"
+    else:
+        bs_entry["quantity"] = residual
+        bs_entry["open"] = True
+        bs_entry["closed_by"] = "partial_attribution_residual"
+
+
 def mark_position_open(intent) -> None:
     state = _load_state()
+    strategy = _intent_strategy(intent)
     symbol = _intent_symbol(intent)
-    key = _position_key(_intent_strategy(intent), symbol)
+    side = _intent_side(intent)
+    quantity = float(getattr(intent, "quantity", 0.0) or 0.0)
+    key = _position_key(strategy, symbol)
     broker_sync_key = _position_key("broker_sync", symbol)
-    if broker_sync_key in state and state[broker_sync_key].get("open"):
-        state[broker_sync_key]["open"] = False
-        state[broker_sync_key]["updated_at_utc"] = _utc_now_iso()
-        state[broker_sync_key]["closed_by"] = "strategy_ownership_assumed"
+    _reduce_or_close_broker_sync(state, broker_sync_key, strategy, side, quantity)
     state[key] = {
         "open": True,
         "updated_at_utc": _utc_now_iso(),
-        "strategy": _intent_strategy(intent),
+        "strategy": strategy,
         "symbol": symbol,
-        "side": _intent_side(intent),
-        "quantity": float(getattr(intent, "quantity", 0.0) or 0.0),
+        "side": side,
+        "quantity": quantity,
         "last_state": PositionState.OPEN.value,
     }
     _save_state(state)
@@ -142,20 +176,20 @@ def replace_position(intent) -> None:
     then open the new side.
     """
     state = _load_state()
+    strategy = _intent_strategy(intent)
     symbol = _intent_symbol(intent)
-    key = _position_key(_intent_strategy(intent), symbol)
+    side = _intent_side(intent)
+    quantity = float(getattr(intent, "quantity", 0.0) or 0.0)
+    key = _position_key(strategy, symbol)
     broker_sync_key = _position_key("broker_sync", symbol)
-    if broker_sync_key in state and state[broker_sync_key].get("open"):
-        state[broker_sync_key]["open"] = False
-        state[broker_sync_key]["updated_at_utc"] = _utc_now_iso()
-        state[broker_sync_key]["closed_by"] = "strategy_ownership_assumed"
+    _reduce_or_close_broker_sync(state, broker_sync_key, strategy, side, quantity)
     state[key] = {
         "open": True,
         "updated_at_utc": _utc_now_iso(),
-        "strategy": _intent_strategy(intent),
+        "strategy": strategy,
         "symbol": symbol,
-        "side": _intent_side(intent),
-        "quantity": float(getattr(intent, "quantity", 0.0) or 0.0),
+        "side": side,
+        "quantity": quantity,
         "last_state": PositionState.FLIPPED.value,
     }
     _save_state(state)

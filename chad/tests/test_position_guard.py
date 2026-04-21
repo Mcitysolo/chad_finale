@@ -84,6 +84,7 @@ def test_mark_position_open_closed_broker_sync_untouched(tmp_state):
 
 
 def test_replace_position_closes_existing_broker_sync(tmp_state):
+    """Same-side full-attribution via replace_position: residual=0 → soft-close."""
     _seed(tmp_state, {
         "broker_sync|SPY": {
             "open": True, "strategy": "broker_sync", "symbol": "SPY",
@@ -91,15 +92,15 @@ def test_replace_position_closes_existing_broker_sync(tmp_state):
         },
         "alpha|SPY": {
             "open": True, "strategy": "alpha", "symbol": "SPY",
-            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+            "side": "SELL", "quantity": 30.0, "last_state": "OPEN",
         },
     })
-    position_guard.replace_position(_Intent("alpha", "SPY", "SELL", 30.0))
+    position_guard.replace_position(_Intent("alpha", "SPY", "BUY", 30.0))
     state = _load(tmp_state)
     assert state["broker_sync|SPY"]["open"] is False
     assert state["broker_sync|SPY"]["closed_by"] == "strategy_ownership_assumed"
     assert state["alpha|SPY"]["open"] is True
-    assert state["alpha|SPY"]["side"] == "SELL"
+    assert state["alpha|SPY"]["side"] == "BUY"
     assert state["alpha|SPY"]["last_state"] == "FLIPPED"
 
 
@@ -175,3 +176,79 @@ def test_rebuild_preserves_broker_sync_when_no_strategy_entry_for_symbol(tmp_pat
     assert state["broker_sync|GLD"]["open"] is True
     assert state["broker_sync|GLD"]["quantity"] == 1108.0
     assert state["alpha|SPY"]["open"] is True
+
+
+def test_mark_position_open_partial_attribution_reduces_broker_sync(tmp_state):
+    """ISSUE-56 v2: partial same-side attribution reduces broker_sync, keeps open."""
+    _seed(tmp_state, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 60.0, "last_state": "OPEN",
+        }
+    })
+    position_guard.mark_position_open(_Intent("delta", "SPY", "BUY", 10.0))
+    state = _load(tmp_state)
+    assert state["broker_sync|SPY"]["open"] is True
+    assert state["broker_sync|SPY"]["quantity"] == 50.0
+    assert state["broker_sync|SPY"]["closed_by"] == "partial_attribution_residual"
+    assert state["delta|SPY"]["open"] is True
+    assert state["delta|SPY"]["quantity"] == 10.0
+    # Publisher sum: 50 (broker_sync residual) + 10 (delta) = 60 = broker truth
+
+
+def test_mark_position_open_opposite_side_does_not_reduce(tmp_state):
+    """ISSUE-56 v2: opposite-side strategy is a flip intent, not attribution."""
+    _seed(tmp_state, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 60.0, "last_state": "OPEN",
+        }
+    })
+    position_guard.mark_position_open(_Intent("delta", "SPY", "SELL", 10.0))
+    state = _load(tmp_state)
+    assert state["broker_sync|SPY"]["open"] is True
+    assert state["broker_sync|SPY"]["quantity"] == 60.0
+    assert "closed_by" not in state["broker_sync|SPY"]
+    assert state["delta|SPY"]["open"] is True
+    assert state["delta|SPY"]["side"] == "SELL"
+
+
+def test_rebuild_partial_attribution_multi_strategy(tmp_path, monkeypatch):
+    """ISSUE-56 v2: rebuild reduces broker_sync across multiple strategy claims."""
+    import logging
+    from chad.core import live_loop
+
+    guard_path = tmp_path / "position_guard.json"
+    tc_path = tmp_path / "trade_closer_state.json"
+    monkeypatch.setattr(position_guard, "STATE_PATH", guard_path)
+    monkeypatch.setattr(live_loop, "_TRADE_CLOSER_STATE_PATH", tc_path)
+
+    _seed(guard_path, {
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 60.0, "last_state": "OPEN",
+        }
+    })
+    _seed_trade_closer(tc_path, [
+        {
+            "strategy": "alpha", "symbol": "SPY", "sec_type": "STK",
+            "lots": [{"side": "BUY", "quantity": 20.0, "fill_price": 700.0,
+                      "lot_ts_utc": "2026-04-20T00:00:00Z", "fill_id": "a1"}],
+        },
+        {
+            "strategy": "delta", "symbol": "SPY", "sec_type": "STK",
+            "lots": [{"side": "BUY", "quantity": 10.0, "fill_price": 700.0,
+                      "lot_ts_utc": "2026-04-20T00:00:00Z", "fill_id": "d1"}],
+        },
+    ])
+
+    live_loop._rebuild_guard_from_paper_ledger(logging.getLogger("test"))
+    state = _load(guard_path)
+    assert state["alpha|SPY"]["open"] is True
+    assert state["alpha|SPY"]["quantity"] == 20.0
+    assert state["delta|SPY"]["open"] is True
+    assert state["delta|SPY"]["quantity"] == 10.0
+    assert state["broker_sync|SPY"]["open"] is True
+    assert state["broker_sync|SPY"]["quantity"] == 30.0
+    assert state["broker_sync|SPY"]["closed_by"] == "partial_attribution_residual"
+    # Publisher sum: 30 (broker_sync residual) + 20 (alpha) + 10 (delta) = 60 = broker truth

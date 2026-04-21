@@ -281,15 +281,27 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
         side = str(head.get("side", "")).strip().upper()
         total_qty = sum(float(lot.get("quantity", 0) or 0) for lot in lots)
         key = f"{strategy}|{symbol}"
-        # ISSUE-56: when a strategy queue claims a symbol, close any stale
-        # broker_sync|<symbol> anchor so the guard does not double-count.
+        # ISSUE-56 v2: when a strategy queue claims a symbol, reduce the
+        # matching broker_sync|<symbol> anchor by the strategy's quantity.
+        # Same side + residual > 0 → keep open at residual (partial attribution).
+        # Same side + residual <= 0 → soft-close (full attribution).
+        # Opposite side → leave untouched (flip intent; reconciliation surfaces drift).
         if strategy != "broker_sync":
             broker_sync_key = f"broker_sync|{symbol}"
             bs_entry = guard_state.get(broker_sync_key)
             if bs_entry and bs_entry.get("open"):
-                bs_entry["open"] = False
-                bs_entry["updated_at_utc"] = now_iso
-                bs_entry["closed_by"] = "strategy_ownership_assumed"
+                bs_side = str(bs_entry.get("side", "") or "").upper()
+                if side == bs_side:
+                    bs_qty = abs(float(bs_entry.get("quantity", 0) or 0))
+                    residual = bs_qty - abs(float(total_qty or 0))
+                    bs_entry["updated_at_utc"] = now_iso
+                    if residual <= 0:
+                        bs_entry["open"] = False
+                        bs_entry["closed_by"] = "strategy_ownership_assumed"
+                    else:
+                        bs_entry["quantity"] = residual
+                        bs_entry["open"] = True
+                        bs_entry["closed_by"] = "partial_attribution_residual"
         guard_state[key] = {
             "open": True,
             "updated_at_utc": now_iso,
