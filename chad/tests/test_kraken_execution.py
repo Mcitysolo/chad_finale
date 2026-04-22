@@ -99,7 +99,12 @@ def test_intent_builder_btc_basic() -> None:
     assert intent is not None
     assert intent.pair == "XBT/USD"
     assert intent.side == "buy"
-    assert intent.ordertype == "market"
+    # Phase-8 Session 8 (E4 Kraken): ordertype is now "limit" when bar data
+    # is available (BTC-USD has seeded 1d bars in the repo). Falls back to
+    # "market" only when the bar file is absent.
+    assert intent.ordertype == "limit"
+    assert intent.price is not None
+    assert intent.price > 0
     assert intent.strategy == "alpha_crypto"
     # volume = notional/price; notional defaults to net_size*price = 0.01*80000 = 800
     # so volume back-computes to 0.01 (within float tolerance)

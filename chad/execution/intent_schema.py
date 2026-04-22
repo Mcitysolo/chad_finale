@@ -64,6 +64,11 @@ INTENT_SCHEMA: Dict[str, Dict[str, Any]] = {
         "default": "normal",
         "description": "Passive vs aggressive hint for E4 order-type selector: 'normal' → passive LMT at mid; 'high' → marketable LMT through market",
     },
+    "bar_timestamp": {
+        "type": str,
+        "default": "",
+        "description": "ISO8601 UTC (or YYYY-MM-DD) timestamp of the bar that generated this signal. A4 data_freshness_gate validates its age. Empty string → gate degrades to None-passthrough.",
+    },
 }
 
 

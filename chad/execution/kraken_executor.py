@@ -81,6 +81,10 @@ class StrategyTradeIntent:
     # passive LMT near mid; "high" → marketable LMT through the market.
     order_urgency: str = "normal"
 
+    # Phase-8 Session 8 (A4 full threading): timestamp of the source bar
+    # that produced this signal. ISO8601 UTC or YYYY-MM-DD.
+    bar_timestamp: str = ""
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

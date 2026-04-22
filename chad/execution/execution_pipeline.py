@@ -43,10 +43,11 @@ Notes
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum
 from functools import lru_cache
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from chad.analytics.signal_confidence import (
     compute_confidence,
@@ -132,8 +133,11 @@ _WHOLE_UNIT_SEC_TYPES = frozenset({"STK", "FUT", "OPT"})
 # (data_freshness/A4, stale_intent/E2, too_late_to_chase/E5, net_ev/R7) use
 # these defaults unless overridden by CHAD_ROUTING_GATES_* env vars. Zero-
 # config behavior: gates are active with sensible defaults.
+# Session 8 note: max_bar_age_seconds is tuned for the current daily-bar
+# data source (1d bars; 48h tolerates a weekend). Operators running
+# against intraday bars should tighten this via config.
 _routing_gates_config: Dict[str, float] = {
-    "max_bar_age_seconds": 300,
+    "max_bar_age_seconds": 172800,
     "price_tolerance_pct": 0.005,
     "degraded_ttl_seconds": 60,
     "estimated_commission": 1.0,
@@ -290,6 +294,42 @@ def _load_latest_bar_for_symbol(symbol: str) -> Optional[Dict[str, object]]:
     if not isinstance(last, dict):
         return None
     return last
+
+
+def load_latest_bar(symbol: str) -> Optional[Dict[str, object]]:
+    """Public alias for _load_latest_bar_for_symbol.
+
+    Phase-8 Session 8 (A4/E5 full threading): exposes the bar-loading
+    helper for gate wiring. Never raises — returns None on any error.
+    """
+    return _load_latest_bar_for_symbol(symbol)
+
+
+def _parse_bar_timestamp(ts_raw: object) -> Optional[datetime]:
+    """Parse a bar's ts_utc field into a timezone-aware UTC datetime.
+
+    Accepts:
+      * YYYY-MM-DD (daily bars; midnight UTC assumed)
+      * full ISO8601 with or without tz
+
+    Returns None for anything unparseable. Used by callers that want to
+    pass a concrete datetime into run_all_gates.bar_timestamp.
+    """
+    if not ts_raw:
+        return None
+    s = str(ts_raw).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _stop_bus_active() -> bool:
@@ -918,7 +958,20 @@ def build_ibkr_intents_from_plan(
         # A high-urgency intent or a wide estimated spread forces a marketable
         # limit priced through the market; otherwise we submit a passive LMT
         # at the strategy's reference price.
+        # Phase-8 Session 8 (A4/E5 full threading): the same bar feeds
+        # bar_timestamp (A4) and current_price (E5) so the routing gates
+        # compare against real data rather than degrading to time-based mode.
         latest_bar = _load_latest_bar_for_symbol(order.symbol)
+        bar_ts_raw = ""
+        bar_close: Optional[float] = None
+        if latest_bar is not None:
+            bar_ts_raw = str(latest_bar.get("ts_utc") or "")
+            try:
+                bc = float(latest_bar.get("close") or 0.0)
+                if bc > 0.0:
+                    bar_close = bc
+            except (TypeError, ValueError):
+                bar_close = None
         spread_pct = estimate_spread_pct(order.symbol, latest_bar)
         order_params = select_order_type(
             urgency=getattr(order, "order_urgency", "normal"),
@@ -956,15 +1009,20 @@ def build_ibkr_intents_from_plan(
                 None, fallback_strategy=strategy_name
             ),
             order_urgency=str(getattr(order, "order_urgency", "normal")),
+            bar_timestamp=bar_ts_raw,
         )
 
-        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Reject intents that
-        # fail any pre-OMS validation. current_price equals creation price at
-        # build time, so E5 operates in its degraded time-based mode here.
+        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7 + Session 8 full
+        # threading). bar_timestamp and current_price come from the same
+        # latest bar loaded above, so A4 and E5 can validate against real
+        # data instead of degrading to their None-passthrough / time-based
+        # paths.
+        gate_bar_ts = _parse_bar_timestamp(bar_ts_raw)
+        gate_current_price: Optional[float] = bar_close if bar_close and bar_close > 0 else float(order.price)
         passed, _reason = run_all_gates(
             intent=intent,
-            bar_timestamp=None,
-            current_price=float(order.price),
+            bar_timestamp=gate_bar_ts,
+            current_price=gate_current_price,
             config=_routing_gates_config,
             event_calendar=_get_event_calendar(),
         )
@@ -1180,14 +1238,45 @@ def _build_kraken_intent_from_routed_signal(
     if signal_urgency not in ("normal", "high"):
         signal_urgency = "normal"
 
+    # Phase-8 Session 8 (E4 Kraken): apply the passive/aggressive order-type
+    # selector to the Kraken lane, matching the IBKR path. Kraken's ordertype
+    # vocabulary differs — "market" vs "limit" (lowercase) — so we translate
+    # the selector's LMT output accordingly. Aggressive: limit priced through
+    # the market; passive: limit at the bar's close. Missing bar data keeps
+    # the legacy "market" routing so the change cannot break existing callers
+    # that don't emit signals with enough metadata.
+    kraken_latest_bar = _load_latest_bar_for_symbol(symbol)
+    kraken_bar_ts = ""
+    if kraken_latest_bar is not None:
+        kraken_bar_ts = str(kraken_latest_bar.get("ts_utc") or "")
+    kraken_spread_pct = estimate_spread_pct(symbol, kraken_latest_bar)
+    kraken_order_params = select_order_type(
+        urgency=signal_urgency,
+        estimated_spread_pct=kraken_spread_pct,
+    )
+    if kraken_latest_bar is not None:
+        kraken_ordertype = "limit"
+        if kraken_order_params["aggressive"]:
+            kraken_price: Optional[float] = compute_aggressive_limit_price(
+                side=("BUY" if side_attr is SignalSide.BUY else "SELL"),
+                reference_price=float(current_price),
+                price_offset_pct=float(kraken_order_params["price_offset_pct"]),
+            )
+        else:
+            kraken_price = float(current_price)
+    else:
+        # No bar data → keep the historical market-order behaviour.
+        kraken_ordertype = "market"
+        kraken_price = None
+
     return KrakenStrategyTradeIntent(
         strategy=primary_strategy_name,
         pair=pair,
         side=side,
-        ordertype="market",
+        ordertype=kraken_ordertype,
         volume=float(volume_dec),
         notional_estimate=float(attenuated_notional),
-        price=None,
+        price=kraken_price,
         confidence=confidence,
         entry_reason=str(getattr(signal, "reason", "") or ""),
         regime_state=regime_state,
@@ -1197,6 +1286,7 @@ def _build_kraken_intent_from_routed_signal(
         signal_strength=raw_strength,
         signal_family=_STRATEGY_SIGNAL_FAMILY.get(primary_strategy_name, "unknown"),
         order_urgency=signal_urgency,
+        bar_timestamp=kraken_bar_ts,
     )
 
 
@@ -1231,12 +1321,13 @@ def build_kraken_intents_from_routed_signals(
         if intent is None:
             continue
 
-        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7 + Session 7: S5).
-        # Same gate set as the IBKR path — covers the Kraken execution lane
-        # before OMS submission.
+        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7 + Session 7: S5 +
+        # Session 8 full threading). Bar timestamp and current_price come
+        # from the Kraken intent's source bar.
+        kraken_bar_ts_parsed = _parse_bar_timestamp(getattr(intent, "bar_timestamp", ""))
         passed, _reason = run_all_gates(
             intent=intent,
-            bar_timestamp=None,
+            bar_timestamp=kraken_bar_ts_parsed,
             current_price=float(price),
             config=_routing_gates_config,
             event_calendar=_get_event_calendar(),

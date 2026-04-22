@@ -234,3 +234,142 @@ def test_run_all_gates_with_empty_config_uses_defaults():
     passed, reason = run_all_gates(intent=intent)
     assert passed is True
     assert reason == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Phase-8 Session 8: full A4/E5 threading — tests with real values
+# ---------------------------------------------------------------------------
+
+
+def test_e5_with_real_price_within_tolerance_passes():
+    """E5 accepts the intent when current_price is within 0.5% of intent_price."""
+    intent = _intent(limit_price=100.0)
+    passed, reason = too_late_to_chase_gate(
+        intent, current_price=100.40, price_tolerance_pct=0.005
+    )
+    assert passed is True
+    assert reason == "ok"
+
+
+def test_e5_with_real_price_beyond_tolerance_rejects():
+    """E5 rejects the intent when current_price drifts beyond tolerance."""
+    intent = _intent(limit_price=100.0)
+    passed, reason = too_late_to_chase_gate(
+        intent, current_price=101.0, price_tolerance_pct=0.005
+    )
+    assert passed is False
+    assert "price_moved" in reason
+
+
+def test_a4_with_real_bar_timestamp_stale_rejects():
+    """A4 rejects when the bar predates max_bar_age_seconds."""
+    intent = _intent()
+    # Bar 10 minutes old; tolerance 5 minutes → reject.
+    stale_bar_ts = datetime.now(timezone.utc) - timedelta(minutes=10)
+    passed, reason = data_freshness_gate(
+        intent, bar_timestamp=stale_bar_ts, max_bar_age_seconds=300
+    )
+    assert passed is False
+    assert "bar_stale" in reason
+
+
+def test_a4_with_real_bar_timestamp_fresh_passes():
+    """A4 accepts when the bar is within the freshness window."""
+    intent = _intent()
+    fresh_bar_ts = datetime.now(timezone.utc) - timedelta(seconds=30)
+    passed, reason = data_freshness_gate(
+        intent, bar_timestamp=fresh_bar_ts, max_bar_age_seconds=300
+    )
+    assert passed is True
+    assert reason == "ok"
+
+
+def test_a4_with_daily_bar_in_48h_window_passes():
+    """Real-world: 1d bars sampled yesterday still pass at 48h tolerance."""
+    intent = _intent()
+    yesterday = datetime.now(timezone.utc) - timedelta(hours=20)
+    passed, reason = data_freshness_gate(
+        intent, bar_timestamp=yesterday, max_bar_age_seconds=172800
+    )
+    assert passed is True
+
+
+def test_run_all_gates_threading_end_to_end():
+    """run_all_gates receives real bar_ts + current_price and passes cleanly."""
+    intent = _intent(limit_price=100.0, expected_pnl=10.0)
+    fresh_bar_ts = datetime.now(timezone.utc) - timedelta(seconds=5)
+    passed, reason = run_all_gates(
+        intent=intent,
+        bar_timestamp=fresh_bar_ts,
+        current_price=100.10,
+        config={
+            "max_bar_age_seconds": 300,
+            "price_tolerance_pct": 0.005,
+            "estimated_commission": 1.0,
+            "min_edge": 0.0,
+        },
+    )
+    assert passed is True
+    assert reason == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Phase-8 Session 8: E4 Kraken order-type selector — basic coverage
+# ---------------------------------------------------------------------------
+
+
+def test_e4_kraken_passive_order_params():
+    """Kraken builder emits ordertype='limit' with passive pricing on normal urgency."""
+    from chad.execution.execution_pipeline import _build_kraken_intent_from_routed_signal
+    from chad.types import AssetClass, SignalSide
+    from dataclasses import dataclass
+
+    @dataclass
+    class _RS:
+        symbol: str = "BTC-USD"
+        side: object = SignalSide.BUY
+        net_size: float = 0.01
+        asset_class: object = AssetClass.CRYPTO
+        notional: float = 800.0
+        order_urgency: str = "normal"
+        signal_strength: float = 0.0
+        regime_state: str = "unknown"
+        confidence: float = 0.5
+        expected_pnl: float = 0.0
+        reason: str = ""
+        source_strategies: tuple = ()
+
+    intent = _build_kraken_intent_from_routed_signal(_RS(), current_price=80000.0)
+    assert intent is not None
+    assert intent.ordertype == "limit"
+    # Passive: price at reference (no 10bps offset).
+    assert intent.price == pytest.approx(80000.0, rel=1e-9)
+
+
+def test_e4_kraken_aggressive_order_params():
+    """Kraken builder emits aggressive limit (through market) on high urgency."""
+    from chad.execution.execution_pipeline import _build_kraken_intent_from_routed_signal
+    from chad.types import AssetClass, SignalSide
+    from dataclasses import dataclass
+
+    @dataclass
+    class _RS:
+        symbol: str = "BTC-USD"
+        side: object = SignalSide.BUY
+        net_size: float = 0.01
+        asset_class: object = AssetClass.CRYPTO
+        notional: float = 800.0
+        order_urgency: str = "high"
+        signal_strength: float = 0.0
+        regime_state: str = "unknown"
+        confidence: float = 0.5
+        expected_pnl: float = 0.0
+        reason: str = ""
+        source_strategies: tuple = ()
+
+    intent = _build_kraken_intent_from_routed_signal(_RS(), current_price=80000.0)
+    assert intent is not None
+    assert intent.ordertype == "limit"
+    # Aggressive BUY: 10bps above reference → 80080.
+    assert intent.price > 80000.0
+    assert intent.price == pytest.approx(80080.0, rel=1e-3)

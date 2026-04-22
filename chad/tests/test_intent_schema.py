@@ -29,6 +29,8 @@ CANONICAL_FIELDS = (
     "signal_family",
     # Phase-8 Session 6 (E4): order_urgency hint for passive/aggressive routing.
     "order_urgency",
+    # Phase-8 Session 8 (A4 full threading): bar timestamp for data freshness.
+    "bar_timestamp",
 )
 
 

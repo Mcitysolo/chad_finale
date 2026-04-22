@@ -68,6 +68,12 @@ class StrategyTradeIntent:
     #   the market. Consumed by order_type_selector.select_order_type().
     order_urgency: str = "normal"
 
+    # Phase-8 Session 8 (A4 full threading): timestamp of the source bar
+    # that produced this signal. ISO8601 UTC or YYYY-MM-DD. A4
+    # data_freshness_gate compares its age against max_bar_age_seconds.
+    # Empty string preserves the Session-2 None-passthrough behavior.
+    bar_timestamp: str = ""
+
 
 @dataclass(frozen=True)
 class RiskGateResult:
