@@ -67,6 +67,9 @@ from chad.execution.order_type_selector import (
     select_order_type,
 )
 from chad.execution.routing_gates import run_all_gates
+from chad.risk.composite_size_cap import CompositeSizeCap
+from chad.risk.correlation_monitor import CorrelationMonitor
+from chad.risk.vol_adjusted_sizer import VolAdjustedSizer
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
 
@@ -137,6 +140,125 @@ _routing_gates_config: Dict[str, float] = {
     "estimated_spread": 0.0,
     "min_edge": 0.0,
 }
+
+
+# Phase-8 Session 7: lazy singletons for the sizing layer. Building from
+# config on first use keeps tests light and avoids a hard dependency on the
+# config file at import time.
+_VOL_SIZER: Optional[VolAdjustedSizer] = None
+_SIZE_CAP: Optional[CompositeSizeCap] = None
+_CORR_MONITOR: Optional[CorrelationMonitor] = None
+_EVENT_CALENDAR: Any = None
+
+
+def _get_vol_sizer() -> VolAdjustedSizer:
+    global _VOL_SIZER
+    if _VOL_SIZER is None:
+        _VOL_SIZER = VolAdjustedSizer.from_config()
+    return _VOL_SIZER
+
+
+def _get_size_cap() -> CompositeSizeCap:
+    global _SIZE_CAP
+    if _SIZE_CAP is None:
+        _SIZE_CAP = CompositeSizeCap.from_config()
+    return _SIZE_CAP
+
+
+def _get_correlation_monitor() -> CorrelationMonitor:
+    global _CORR_MONITOR
+    if _CORR_MONITOR is None:
+        _CORR_MONITOR = CorrelationMonitor.from_config()
+    return _CORR_MONITOR
+
+
+def _get_event_calendar() -> Any:
+    """Return a cached EventCalendar; None when the module / config is unavailable."""
+    global _EVENT_CALENDAR
+    if _EVENT_CALENDAR is None:
+        try:
+            from chad.analytics.event_calendar import EventCalendar
+            _EVENT_CALENDAR = EventCalendar()
+        except Exception:  # noqa: BLE001
+            _EVENT_CALENDAR = False  # sentinel — don't retry each call
+    return _EVENT_CALENDAR or None
+
+
+def _get_open_symbols() -> List[str]:
+    """Best-effort read of currently open position symbols from position_guard.
+
+    Returns [] when the guard file is missing or unreadable — the sizers
+    treat an empty book as "no correlation pressure".
+    """
+    try:
+        from chad.core.position_guard import _load_state
+        state = _load_state()
+    except Exception:  # noqa: BLE001
+        return []
+    out: List[str] = []
+    for key, record in (state or {}).items():
+        if not isinstance(record, dict) or not record.get("open"):
+            continue
+        sym = record.get("symbol")
+        if not sym:
+            # Fall back to "<strategy>|<symbol>" key decomposition.
+            if isinstance(key, str) and "|" in key:
+                sym = key.split("|", 1)[1]
+        if sym:
+            out.append(str(sym).upper())
+    return out
+
+
+def _get_account_equity() -> float:
+    """Best-effort read of account equity from pnl_state.json."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        root = _Path(__file__).resolve().parents[2]
+        path = root / "runtime" / "pnl_state.json"
+        if not path.is_file():
+            return 0.0
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0.0
+    if not isinstance(data, dict):
+        return 0.0
+    try:
+        return float(data.get("account_equity") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_sizing_layer(
+    base_size: float,
+    symbol: str,
+    reference_price: float,
+    open_symbols: List[str],
+) -> int:
+    """Apply R3 → R5 → R6 to a floating-point base_size and return integer shares.
+
+    Never returns 0 for a positive base_size — the minimum is 1 share so the
+    routing-gates decide rejection, not the sizer.
+    """
+    base_int = max(0, int(base_size))
+    if base_int <= 0:
+        return 0
+    # R3: vol-adjust.
+    r3_size = _get_vol_sizer().adjust(base_int, symbol)
+    # R5: composite cap.
+    r5_size = _get_size_cap().apply(
+        vol_adjusted_size=r3_size,
+        symbol=symbol,
+        account_equity=_get_account_equity(),
+        reference_price=reference_price,
+    )
+    # R6: correlation reducer.
+    corr_mult = _get_correlation_monitor().get_size_multiplier(
+        open_symbols=open_symbols,
+        new_symbol=symbol,
+    )
+    final_size = max(1, int(r5_size * corr_mult))
+    return final_size
 
 
 def _load_latest_bar_for_symbol(symbol: str) -> Optional[Dict[str, object]]:
@@ -745,6 +867,31 @@ def build_ibkr_intents_from_plan(
             size_mult = 1.0
 
         attenuated_size = float(order.size) * size_mult
+
+        # Phase-8 Session 7: risk sizing layer. Apply R3 vol-adjust, then
+        # R5 composite cap (per-symbol / sector / liquidity / margin), then
+        # R6 correlation reducer — in that order. The integer output feeds
+        # back into _normalize_quantity_for_spec which rounds for the
+        # instrument type (whole units for STK/FUT/OPT, steps for FX).
+        # Sizing is only applied on equity-like asset classes; futures
+        # already go through futures_position_sizer upstream and crypto
+        # uses the Kraken-specific path.
+        if order.asset_class in (AssetClass.EQUITY, AssetClass.ETF):
+            sized = _apply_sizing_layer(
+                base_size=attenuated_size,
+                symbol=order.symbol,
+                reference_price=float(order.price),
+                open_symbols=_get_open_symbols(),
+            )
+            if sized <= 0:
+                LOG.warning(
+                    "intent_skipped_sizing_zero symbol=%s base=%s",
+                    order.symbol,
+                    attenuated_size,
+                )
+                continue
+            attenuated_size = float(sized)
+
         try:
             quantity = _normalize_quantity_for_spec(attenuated_size, spec)
         except ValueError as _qty_err:
@@ -819,6 +966,7 @@ def build_ibkr_intents_from_plan(
             bar_timestamp=None,
             current_price=float(order.price),
             config=_routing_gates_config,
+            event_calendar=_get_event_calendar(),
         )
         if not passed:
             continue
@@ -1083,13 +1231,15 @@ def build_kraken_intents_from_routed_signals(
         if intent is None:
             continue
 
-        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Same gate set as the
-        # IBKR path — covers the Kraken execution lane before OMS submission.
+        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7 + Session 7: S5).
+        # Same gate set as the IBKR path — covers the Kraken execution lane
+        # before OMS submission.
         passed, _reason = run_all_gates(
             intent=intent,
             bar_timestamp=None,
             current_price=float(price),
             config=_routing_gates_config,
+            event_calendar=_get_event_calendar(),
         )
         if not passed:
             continue

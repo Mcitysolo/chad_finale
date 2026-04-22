@@ -1,0 +1,25 @@
+{
+  "schema_version": "sizing.v1",
+  "notes": "Phase-8 Session 7 sizing layer — R3 vol sizer + R5 composite cap + R6 correlation reducer. Operator-tuned.",
+
+  "vol_adjusted_sizer": {
+    "target_daily_vol": 0.01,
+    "lookback_days": 20,
+    "floor_multiplier": 0.1,
+    "ceiling_multiplier": 2.0
+  },
+
+  "composite_cap": {
+    "max_per_symbol": 1000,
+    "max_sector_exposure": 5000,
+    "max_adv_pct": 0.01,
+    "max_position_pct": 0.10,
+    "avg_price_assumption": 50.0
+  },
+
+  "correlation_monitor": {
+    "threshold": 0.7,
+    "lookback_days": 20,
+    "floor_multiplier": 0.1
+  }
+}

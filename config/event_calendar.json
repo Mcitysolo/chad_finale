@@ -1,0 +1,11 @@
+{
+  "schema_version": "event_calendar.v1",
+  "notes": "Operator-maintained list of scheduled macro catalysts. Each event suppresses new entries within suppress_hours of event time. type='macro' affects all symbols; type='earnings' (future) scoped to a specific symbol.",
+  "events": [
+    {"date": "2026-05-07", "time": "18:00", "name": "FOMC Rate Decision", "type": "macro", "suppress_hours": 24},
+    {"date": "2026-05-13", "time": "12:30", "name": "CPI Release", "type": "macro", "suppress_hours": 12},
+    {"date": "2026-05-15", "time": "12:30", "name": "Retail Sales", "type": "macro", "suppress_hours": 6},
+    {"date": "2026-05-30", "time": "12:30", "name": "Non-Farm Payrolls", "type": "macro", "suppress_hours": 12},
+    {"date": "2026-06-18", "time": "18:00", "name": "FOMC Rate Decision", "type": "macro", "suppress_hours": 24}
+  ]
+}

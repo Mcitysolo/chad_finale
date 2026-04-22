@@ -10,6 +10,7 @@ Gates (applied in order by run_all_gates):
   2. stale_intent_gate (E2) — intent not expired
   3. too_late_to_chase_gate (E5) — price not moved away
   4. net_ev_gate (R7) — expected edge positive after costs
+  5. event_risk_gate (S5) — inside a macro-catalyst suppression window
 
 All gates are backward compatible: if optional fields on older intent
 objects are missing, the gate degrades to a pass (with a reason string
@@ -41,6 +42,8 @@ REASON_CURRENT_PRICE_MISSING = "current_price_missing"
 REASON_INTENT_PRICE_MISSING = "intent_price_missing"
 REASON_NEGATIVE_EV = "net_ev_below_min_edge"
 REASON_MISSING_EXPECTED_PNL = "expected_pnl_missing"
+REASON_EVENT_RISK_REJECT = "event_risk_reject"
+REASON_EVENT_RISK_REDUCE = "event_risk_reduce_50pct"
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +267,80 @@ def net_ev_gate(
     return True, REASON_OK
 
 
+def event_risk_gate(
+    intent: Any,
+    calendar: Any = None,
+    now: Optional[datetime] = None,
+) -> Tuple[bool, str]:
+    """S5 — suppress entries near scheduled macro catalysts.
+
+    ``calendar`` is an optional EventCalendar instance. When None, or
+    when the intent has no symbol, the gate passes (backward compatible
+    with pre-Session-7 callers that don't pass a calendar).
+
+    Behavior inside an event window:
+
+      * intent.order_urgency == "high"  → REJECT (return False)
+      * intent.order_urgency == "normal" (or missing) → reduce intent
+        size by 50% in place and PASS (return True)
+
+    The 50% reduction is applied to both ``quantity`` (IBKR) and
+    ``volume`` (Kraken) if present. Quantity floors at 1 unit so the
+    intent still survives to the broker. Notional is scaled alongside.
+    """
+    if calendar is None:
+        return True, REASON_OK
+    symbol = getattr(intent, "symbol", None) or getattr(intent, "pair", None) or ""
+    urgency = getattr(intent, "order_urgency", "normal") or "normal"
+
+    try:
+        verdict = calendar.get_suppression(symbol=symbol, urgency=urgency, now=now)
+    except Exception as exc:  # noqa: BLE001
+        # Calendar errors must not halt the pipeline — fail open.
+        LOG.warning("event_risk_gate calendar error: %s", exc)
+        return True, REASON_OK
+
+    if not verdict.get("suppress"):
+        return True, REASON_OK
+
+    action = verdict.get("action")
+    if action == "reject":
+        return False, f"{REASON_EVENT_RISK_REJECT}:{verdict.get('reason', '')}"
+
+    # reduce_50pct — halve quantity in place; quantity must floor at 1.
+    for attr in ("quantity", "volume"):
+        raw = getattr(intent, attr, None)
+        if raw is None:
+            continue
+        try:
+            current = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if current <= 0:
+            continue
+        new_val = current * 0.5
+        if isinstance(raw, int):
+            new_val = max(1, int(new_val))
+        else:
+            new_val = max(1e-8, new_val)
+        try:
+            object.__setattr__(intent, attr, new_val)
+        except (AttributeError, TypeError):
+            # Frozen dataclass — leave in place; we still pass with a
+            # flagged reason so the operator sees that reduction was
+            # requested but not applied.
+            return True, f"{REASON_EVENT_RISK_REDUCE}:frozen"
+    notional = getattr(intent, "notional_estimate", None)
+    if notional is not None:
+        try:
+            scaled = float(notional) * 0.5
+            object.__setattr__(intent, "notional_estimate", scaled)
+        except (TypeError, AttributeError):
+            pass
+
+    return True, f"{REASON_EVENT_RISK_REDUCE}:{verdict.get('reason', '')}"
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -274,6 +351,7 @@ _GATE_ORDER = (
     "stale_intent",
     "too_late_to_chase",
     "net_ev",
+    "event_risk",
 )
 
 
@@ -282,13 +360,19 @@ def run_all_gates(
     bar_timestamp: Optional[datetime] = None,
     current_price: Optional[float] = None,
     config: Optional[dict] = None,
+    event_calendar: Any = None,
+    now: Optional[datetime] = None,
 ) -> Tuple[bool, str]:
     """
-    Run all 4 gates in order. Return (True, "ok") if all pass, else
+    Run all 5 gates in order. Return (True, "ok") if all pass, else
     (False, "<gate_name>:<reason>") on the first failure.
 
     On failure, emits a GATE_REJECT structured log entry with intent
     symbol and strategy for operational observability.
+
+    Session 7 addition: Gate 5 is the event-risk suppression gate.
+    Pass ``event_calendar=EventCalendar()`` to activate it; omitting
+    the argument preserves pre-Session-7 4-gate behavior.
     """
     cfg = dict(config or {})
     max_bar_age_seconds = int(cfg.get("max_bar_age_seconds", 300))
@@ -310,6 +394,10 @@ def run_all_gates(
         (
             "net_ev",
             lambda: net_ev_gate(intent, estimated_commission, estimated_spread, min_edge),
+        ),
+        (
+            "event_risk",
+            lambda: event_risk_gate(intent, event_calendar, now),
         ),
     )
 
@@ -347,6 +435,7 @@ __all__ = [
     "stale_intent_gate",
     "too_late_to_chase_gate",
     "net_ev_gate",
+    "event_risk_gate",
     "run_all_gates",
     "REASON_OK",
     "REASON_BAR_STALE",
@@ -358,4 +447,6 @@ __all__ = [
     "REASON_INTENT_PRICE_MISSING",
     "REASON_NEGATIVE_EV",
     "REASON_MISSING_EXPECTED_PNL",
+    "REASON_EVENT_RISK_REJECT",
+    "REASON_EVENT_RISK_REDUCE",
 ]
