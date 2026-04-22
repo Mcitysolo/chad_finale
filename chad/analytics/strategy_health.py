@@ -65,6 +65,34 @@ WEIGHT_REGIME: float = 0.10
 
 DEFAULT_NEUTRAL_SCORE: float = 0.5
 
+# 2026-04-22 Audit-O fix: expectancy/ledger inputs sometimes surface
+# reconciliation-carryover pseudo-strategies that scorers should NOT
+# treat as real strategies. They have no regime affinity, no sharpe
+# proxy, and no slippage surface — scoring them produces spurious
+# 'neutral' rows that pollute downstream filters. Filter them here so
+# every caller sees the same whitelist.
+EXCLUDED_FROM_HEALTH: frozenset = frozenset({
+    "RECONCILED_PHASE2_20260419",
+    "reconciled_phase2_20260419_carryover",
+    "broker_sync",
+})
+
+
+def _is_excluded_strategy(name: str) -> bool:
+    s = str(name or "").strip()
+    if not s:
+        return True
+    if s in EXCLUDED_FROM_HEALTH:
+        return True
+    low = s.lower()
+    if low in EXCLUDED_FROM_HEALTH:
+        return True
+    # Prefix match so any RECONCILED_* variant is dropped without having
+    # to enumerate every timestamp.
+    if low.startswith("reconciled_phase2") or low.startswith("reconciled_phase"):
+        return True
+    return False
+
 # Per-strategy favorable-regime table. The keys overlap with
 # execution_pipeline._STRATEGY_SIGNAL_FAMILY so the same names used for
 # vote aggregation are reused here. A strategy missing from the table
@@ -313,6 +341,8 @@ class StrategyHealthScorer:
         """
         results: Dict[str, Dict[str, Any]] = {}
         for name in strategy_names:
+            if _is_excluded_strategy(name):
+                continue
             results[str(name)] = self.compute(
                 strategy=str(name),
                 expectancy_tracker=expectancy_tracker,
@@ -357,6 +387,7 @@ def read_health(path: Path = HEALTH_PATH) -> Dict[str, Any]:
 
 __all__ = [
     "DEFAULT_NEUTRAL_SCORE",
+    "EXCLUDED_FROM_HEALTH",
     "HEALTH_PATH",
     "SCHEMA_VERSION",
     "WEIGHT_REGIME",

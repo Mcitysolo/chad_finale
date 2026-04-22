@@ -56,19 +56,36 @@ def is_kraken_gate_enabled() -> bool:
     """
     Check LiveGate.kraken_enabled. Falls back to KRAKEN_ENABLED env var if the
     live_gate module cannot be evaluated for any reason.
+
+    2026-04-22 fix (Audit-O): LiveGateDecision exposes kraken_enabled on
+    decision.context.execution, not on the decision object itself — the
+    old getattr(decision, "kraken_enabled", None) always returned None and
+    fell through to the env-var path, which defaulted False when unset.
+    We now read the nested attribute and only fall back to the env when
+    the live_gate module is unavailable. Env fallback also defaults True
+    to match _load_execution_config's own default.
     """
     try:
         from chad.core.live_gate import evaluate_live_gate
         decision = evaluate_live_gate()
-        ke = getattr(decision, "kraken_enabled", None)
-        if ke is None and isinstance(decision, dict):
-            ke = decision.get("kraken_enabled")
+        ctx = getattr(decision, "context", None)
+        exec_cfg = getattr(ctx, "execution", None) if ctx is not None else None
+        ke = getattr(exec_cfg, "kraken_enabled", None)
+        if ke is None:
+            # Defensive fallbacks for older decision shapes.
+            ke = getattr(decision, "kraken_enabled", None)
+            if ke is None and isinstance(decision, dict):
+                ke = decision.get("kraken_enabled")
         if ke is not None:
             return bool(ke)
     except Exception:
         pass
     raw = (os.environ.get("KRAKEN_ENABLED") or "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 def get_kraken_executor():

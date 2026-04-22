@@ -1,7 +1,7 @@
 {
-  "_comment_1": "Phase-8 Session 4 (G2): regime → allowed strategy list. Calibrated 2026-04-22 (Audit-O) by signal-family affinity: momentum/trend families ship in trending regimes; mean-reversion in ranging; volatility in volatile; adverse silences everything. Strategy identifiers match chad.types.StrategyName values.",
+  "_comment_1": "Phase-8 Session 4 (G2): regime → allowed strategy list. Calibrated 2026-04-22 (Audit-O) by signal-family affinity: momentum/trend families ship in trending regimes; mean-reversion in ranging; volatility in volatile; adverse silences everything. Strategy identifiers match chad.types.StrategyName values. 2026-04-22 fix: volatile expanded to include alpha_futures/delta/gamma_futures — CHAD's demonstrated-fill strategies (health >0.7, n≥7) that remain effective in volatile regimes.",
   "_comment_2": "Unknown regime keys fall through to the 'unknown' bucket. An empty list for a regime silences ALL strategies under that regime.",
-  "_comment_3": "Consumed by chad.portfolio.regime_activation.filter_intents_by_regime(...) at the pre-routing intercept point.",
+  "_comment_3": "Consumed by chad.portfolio.regime_activation.filter_intents_by_regime(...) — now wired in chad.core.live_loop after _build_plan_and_intents so the matrix actually gates routed intents.",
   "schema_version": "regime_activation_matrix.v1",
   "regimes": {
     "trending_bull": [
@@ -18,7 +18,8 @@
       "delta_pairs", "gamma_reversion", "gamma"
     ],
     "volatile": [
-      "omega", "omega_vol", "omega_momentum_options"
+      "omega", "omega_vol", "omega_momentum_options",
+      "alpha_futures", "delta", "gamma_futures"
     ],
     "unknown": [
       "alpha", "beta", "delta", "gamma", "omega",

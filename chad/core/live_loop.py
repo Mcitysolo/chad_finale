@@ -852,6 +852,36 @@ def run_once(logger: logging.Logger) -> None:
 
     _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
 
+    # 2026-04-22 Audit-O fix: gate intents through the regime activation
+    # matrix. Fail-open on any error — if the matrix is missing/malformed
+    # or the regime label unknown, all intents pass through (current
+    # pre-wiring behavior). Applied to both IBKR and Kraken lanes so the
+    # matrix governs crypto too.
+    try:
+        from chad.portfolio.regime_activation import filter_intents_by_regime
+        from chad.analytics.regime_classifier import read_regime_state
+        _regime_now = str(read_regime_state().get("regime", "unknown"))
+        _kept_ibkr, _dropped_ibkr = filter_intents_by_regime(intents, _regime_now)
+        _kept_kr, _dropped_kr = filter_intents_by_regime(kraken_intents, _regime_now)
+        if _dropped_ibkr or _dropped_kr:
+            logger.info(
+                "REGIME_GATE regime=%s ibkr_kept=%d ibkr_dropped=%d kraken_kept=%d kraken_dropped=%d",
+                _regime_now,
+                len(_kept_ibkr), len(_dropped_ibkr),
+                len(_kept_kr), len(_dropped_kr),
+            )
+            for _intent, _reason in (_dropped_ibkr + _dropped_kr)[:8]:
+                logger.info(
+                    "REGIME_GATE_DROP strategy=%s symbol=%s reason=%s",
+                    getattr(_intent, "strategy", None),
+                    getattr(_intent, "symbol", None) or getattr(_intent, "pair", None),
+                    _reason,
+                )
+        intents = list(_kept_ibkr)
+        kraken_intents = list(_kept_kr)
+    except Exception as _rg_err:  # noqa: BLE001
+        logger.warning("regime_gate failed (fail-open, non-fatal): %s", _rg_err)
+
     # Throttled (5-min) refresh of runtime/kraken_balances.json so the
     # advisory engine, daily report, and alpha_crypto's CAD lane all see
     # the live Kraken account state. Non-fatal on any error.

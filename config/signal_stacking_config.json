@@ -1,8 +1,8 @@
 {
-  "_comment_1": "Phase-8 Session 5 (S1): signal stacking vote thresholds. Calibrated 2026-04-22 (Audit-O): min_votes raised 1→2 to require cross-family corroboration before an intent reaches the routing gates. window_seconds kept at 60s — 170 fills/day ≈ 7/hr so two signals within 60s is a meaningful quorum.",
+  "_comment_1": "Phase-8 Session 5 (S1): signal stacking vote thresholds. 2026-04-22 revert (Audit-O strategy-fixes): min_votes lowered 2→1 because current strategy mix only produces 1-2 active signal families per cycle, so a 2-vote quorum starves the router. Raise back to 2 when more strategy families (intraday + crypto + reversion) are consistently firing. window_seconds extended 60→300 so the 5-minute rolling window is ready for re-raising when quorum is viable.",
   "_comment_2": "window_seconds is the rolling window within which distinct signal_family submissions count toward quorum. Votes older than this age are discarded.",
   "_comment_3": "Consumed by chad.analytics.vote_collector.VoteCollector via load_config().",
   "schema_version": "signal_stacking_config.v1",
-  "min_votes": 2,
-  "window_seconds": 60
+  "min_votes": 1,
+  "window_seconds": 300
 }

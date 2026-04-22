@@ -82,12 +82,23 @@ def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 def _parse_date(ts: str) -> Optional[datetime]:
-    """Parse an ISO-8601 timestamp or bare YYYY-MM-DD string."""
+    """Parse an ISO-8601 timestamp or bare YYYY-MM-DD string.
+
+    2026-04-22 Audit-O fix: always return a tz-aware datetime. Some bar
+    providers emit naive ISO strings like "2026-04-22T12:00:00" while
+    entry_time is UTC-suffixed; comparing a naive to an aware datetime
+    raised ``TypeError: can't compare offset-naive and offset-aware
+    datetimes`` and killed compute_decay_for_pending mid-loop. Force the
+    naive branch to UTC so downstream comparisons are always safe.
+    """
     if not ts:
         return None
     try:
         # Full ISO8601
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
         pass
     try:

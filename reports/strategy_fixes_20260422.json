@@ -1,0 +1,108 @@
+{
+  "written_at_utc": "2026-04-22T19:45:00Z",
+  "source": "audit_O_strategy_fixes_pass",
+  "issues_fixed": {
+    "regime_matrix_wired": true,
+    "volatile_regime_updated": true,
+    "vote_starvation_fixed": true,
+    "kraken_gate_fixed": true,
+    "kraken_enabled_after_fix": true,
+    "bar_1m_ingestion": "not_restarted_per_CLAUDE_md_rule7",
+    "allocator_v3_fix": "no_code_change_data_problem",
+    "stray_health_keys_filtered": true,
+    "signal_decay_tz_fixed": true,
+    "stale_bar_warning_added": true
+  },
+  "regime_matrix_volatile_now_includes": [
+    "omega",
+    "omega_vol",
+    "omega_momentum_options",
+    "alpha_futures",
+    "delta",
+    "gamma_futures"
+  ],
+  "vote_collector_new_config": {
+    "min_votes": 1,
+    "window_seconds": 300
+  },
+  "issue_details": {
+    "issue_1_regime_matrix": {
+      "file_config": "config/regime_activation_matrix.json",
+      "file_wire": "chad/core/live_loop.py",
+      "note": "Volatile expanded from 3 to 6 strategies; filter_intents_by_regime invoked on both IBKR and Kraken lanes after _build_plan_and_intents. Fail-open on any error."
+    },
+    "issue_2_vote_collector": {
+      "file": "config/signal_stacking_config.json",
+      "change": "min_votes 2->1, window_seconds 60->300",
+      "test_updated": "chad/tests/test_calibration_applied.py::test_signal_stacking_min_votes_is_1"
+    },
+    "issue_3_kraken_gate": {
+      "file": "chad/core/kraken_execution.py",
+      "root_cause": "is_kraken_gate_enabled() called getattr(decision, 'kraken_enabled', None) but LiveGateDecision holds kraken_enabled at decision.context.execution.kraken_enabled — always None -> fell through to env var KRAKEN_ENABLED which is unset in prod -> returned False.",
+      "fix": "Read decision.context.execution.kraken_enabled; retain defensive fallbacks; env fallback now defaults True matching _load_execution_config.",
+      "verified": "is_kraken_gate_enabled() returns True in current env; LiveGate paper_kraken mode remains; no live orders possible (CHAD_KRAKEN_MODE=paper_kraken)."
+    },
+    "issue_4_bar_1m": {
+      "service": "chad-ibkr-bar-provider.service (client_id=9021, port=4002)",
+      "service_status": "active_running_since_2026-04-04",
+      "latest_1m_write_utc": "2026-04-22T02:45:21Z",
+      "current_time_utc_approx": "2026-04-22T19:36:00Z",
+      "age_at_audit": "~17 hours, crossed market open (13:30 UTC) with no writes",
+      "journal": "no_entries_today",
+      "action_taken": "documented only — CLAUDE.md rule 7 prohibits restarting live services without explicit operator instruction",
+      "recommended_operator_step": "systemctl restart chad-ibkr-bar-provider and monitor journalctl -fu chad-ibkr-bar-provider during market hours"
+    },
+    "issue_5_allocator_v3": {
+      "file": "chad/risk/allocator_v3.py",
+      "threshold_value": 1e-12,
+      "state_file": "runtime/allocator_v3_state.json",
+      "state_age": "ts_utc=2026-04-02T21:02:22Z — 20 days stale",
+      "root_cause": "not_a_threshold_problem: threshold already essentially zero. base_weights upstream only includes alpha_futures (other strategies have base_weight=0). alpha_futures has per_strategy.var=0 because its active-minute returns grid is degenerate.",
+      "action_taken": "no_code_change — documented as data/upstream issue. Lowering the threshold would not help. Will resolve when more strategies accumulate non-degenerate returns in brain_returns_1m_active.ndjson.",
+      "remaining": "investigate why runtime/allocator_v3_state.json has not been refreshed since 2026-04-02; confirm who publishes it (likely orchestrator or a timer job)"
+    },
+    "issue_6_strategy_health_filter": {
+      "file": "chad/analytics/strategy_health.py",
+      "change": "Added EXCLUDED_FROM_HEALTH frozenset + _is_excluded_strategy() helper; compute_all() skips excluded names. Prefix match on 'reconciled_phase2*' covers future timestamp variants."
+    },
+    "issue_7_signal_decay_tz": {
+      "file": "chad/analytics/signal_decay.py",
+      "root_cause": "_parse_date passed ISO strings without tz through datetime.fromisoformat() which returns naive objects. Comparing those to the YYYY-MM-DD path (which always attaches UTC) raised TypeError: can't compare offset-naive and offset-aware datetimes inside _find_entry_bar_index.",
+      "fix": "Force the ISO branch to UTC when tzinfo is None before returning."
+    },
+    "issue_8_stale_bar_warning": {
+      "file": "chad/execution/execution_pipeline.py",
+      "function": "load_latest_bar",
+      "threshold_days": 5,
+      "behavior": "emits STALE_BARS logger.warning once per symbol per process when age > 5 days; still returns the bar so shadow evaluation continues",
+      "smoke_tested": "IWM triggered warning at age_days=20 (last bar 2026-04-02)"
+    }
+  },
+  "tests": {
+    "full_suite_passed": 963,
+    "full_suite_failed": 3,
+    "regression_detected": false,
+    "failing_tests_all_pre_existing": [
+      "chad/tests/test_position_guard.py::test_rebuild_clears_broker_sync_when_strategy_entry_added",
+      "chad/tests/test_position_guard.py::test_rebuild_preserves_broker_sync_when_no_strategy_entry_for_symbol",
+      "chad/tests/test_position_guard.py::test_rebuild_partial_attribution_multi_strategy"
+    ],
+    "failing_tests_root_cause": "IB Gateway client_id=99 already in use — tests try to connect to a running live IB session and time out. Verified pre-existing by running the test suite on a clean stash of main with my changes reverted; same 3 tests fail."
+  },
+  "files_modified": [
+    "config/regime_activation_matrix.json",
+    "config/signal_stacking_config.json",
+    "chad/core/kraken_execution.py",
+    "chad/core/live_loop.py",
+    "chad/analytics/strategy_health.py",
+    "chad/analytics/signal_decay.py",
+    "chad/execution/execution_pipeline.py",
+    "chad/tests/test_calibration_applied.py"
+  ],
+  "runtime_not_staged": true,
+  "remaining_issues": [
+    "Issue 4: chad-ibkr-bar-provider is running but not writing bars today — operator must restart (CLAUDE.md rule 7 blocks me from doing it).",
+    "Issue 5: runtime/allocator_v3_state.json is 20 days stale; investigate why the state publisher has stopped running.",
+    "IB Gateway client_id=99 conflict breaking 3 position_guard tests — pre-existing, infrastructure-level, not caused by this pass."
+  ]
+}

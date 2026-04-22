@@ -296,13 +296,41 @@ def _load_latest_bar_for_symbol(symbol: str) -> Optional[Dict[str, object]]:
     return last
 
 
+_STALE_BAR_WARN_DAYS: int = 5
+_STALE_BAR_WARNED: set = set()
+
+
 def load_latest_bar(symbol: str) -> Optional[Dict[str, object]]:
     """Public alias for _load_latest_bar_for_symbol.
 
     Phase-8 Session 8 (A4/E5 full threading): exposes the bar-loading
     helper for gate wiring. Never raises — returns None on any error.
+
+    2026-04-22 Audit-O addition: emit a STALE_BARS warning (once per
+    symbol per process) when the latest bar is older than
+    ``_STALE_BAR_WARN_DAYS`` trading days. The warning is non-blocking —
+    callers still receive the stale bar so shadow evaluation can
+    proceed; the operator just gets a visible signal that data is
+    drifting (first observed for IWM/TLT/VXX on 2026-04-22).
     """
-    return _load_latest_bar_for_symbol(symbol)
+    bar = _load_latest_bar_for_symbol(symbol)
+    if bar is None:
+        return None
+    try:
+        ts_raw = bar.get("ts_utc") or bar.get("timestamp") or bar.get("date")
+        bar_dt = _parse_bar_timestamp(ts_raw) if ts_raw is not None else None
+        if bar_dt is not None:
+            age_days = (datetime.now(timezone.utc) - bar_dt).total_seconds() / 86400.0
+            sym_key = str(symbol or "").upper()
+            if age_days > _STALE_BAR_WARN_DAYS and sym_key not in _STALE_BAR_WARNED:
+                LOG.warning(
+                    "STALE_BARS symbol=%s age_days=%d latest_ts=%s",
+                    sym_key, int(age_days), ts_raw,
+                )
+                _STALE_BAR_WARNED.add(sym_key)
+    except Exception:  # noqa: BLE001 — warning path must never raise
+        pass
+    return bar
 
 
 def _parse_bar_timestamp(ts_raw: object) -> Optional[datetime]:

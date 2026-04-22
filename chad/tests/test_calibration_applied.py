@@ -37,9 +37,16 @@ def test_sizing_config_max_per_symbol_is_300():
     assert cfg["composite_cap"]["max_position_pct"] == pytest.approx(0.05)
 
 
-def test_signal_stacking_min_votes_is_2():
+def test_signal_stacking_min_votes_is_1():
+    """2026-04-22 revert: min_votes lowered back to 1 after Audit-O strategy-
+    fixes pass observed quorum starvation with only 1-2 strategy families
+    actively firing per cycle. Window extended to 300s so re-raising to 2
+    later doesn't require re-editing the config. See
+    reports/strategy_fixes_20260422.json for rationale.
+    """
     cfg = json.loads((REPO_ROOT / "config" / "signal_stacking_config.json").read_text())
-    assert cfg["min_votes"] == 2
+    assert cfg["min_votes"] == 1
+    assert cfg["window_seconds"] == 300
 
 
 def test_edge_decay_config_exists_and_threshold_is_5():
