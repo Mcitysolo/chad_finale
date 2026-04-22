@@ -766,6 +766,26 @@ class PaperExecutionEvidenceWriter:
         fee_meta = _append_hash_chained_record(fees_path, fee_payload)
         metric_meta = _append_hash_chained_record(exec_metrics_path, metric_payload)
 
+        # Phase-8 Session 3 (E3): append slippage record + update rolling stats.
+        # Failure is non-fatal — fills must always succeed even if tracker I/O
+        # breaks, so we swallow any exception here.
+        try:
+            from chad.analytics.slippage_tracker import get_default_tracker
+
+            tracker = get_default_tracker()
+            tracker.record_fill(
+                symbol=_safe_str(ev.symbol, "UNKNOWN"),
+                strategy=_safe_str(ev.strategy, ""),
+                side=_safe_str(ev.side, "BUY"),
+                expected_price=_safe_float(ev.expected_price, 0.0),
+                fill_price=_safe_float(ev.fill_price, 0.0),
+                quantity=_safe_float(ev.quantity, 0.0),
+                intent_id=_safe_str(ev.execution_id, ""),
+                fill_timestamp=_safe_str(ev.fill_time_utc, ""),
+            )
+        except Exception:
+            pass
+
         return {
             "fills_path": fill_meta["path"],
             "fees_path": fee_meta["path"],

@@ -70,6 +70,10 @@ class StrategyTradeIntent:
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     plan_hash: Optional[str] = None
 
+    # Phase-8 Session 3 extensions: see IBKR StrategyTradeIntent for rationale.
+    expected_price: float = 0.0
+    signal_strength: float = 0.0
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

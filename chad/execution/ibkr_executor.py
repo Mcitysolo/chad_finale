@@ -48,6 +48,15 @@ class StrategyTradeIntent:
     created_at: str = field(default_factory=utc_now_iso)
     ttl_seconds: int = DEFAULT_TTL_SECONDS
 
+    # Phase-8 Session 3 extensions:
+    #   expected_price — strategy's anticipated fill price at intent creation
+    #     (used for E3 slippage = fill_price - expected_price).
+    #   signal_strength — raw strength from signal metadata (pre-normalization);
+    #     normalized + combined with regime_quality + liquidity_quality to produce
+    #     the confidence field above. Kept alongside for scorecard traceability.
+    expected_price: float = 0.0
+    signal_strength: float = 0.0
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

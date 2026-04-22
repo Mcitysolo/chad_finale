@@ -48,6 +48,12 @@ from enum import Enum
 from functools import lru_cache
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from chad.analytics.signal_confidence import (
+    compute_confidence,
+    normalize_signal_strength,
+    regime_quality_from_state,
+    sizing_multiplier,
+)
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.execution.intent_schema import utc_now_iso
 from chad.execution.routing_gates import run_all_gates
@@ -128,6 +134,14 @@ class PlannedOrder:
     primary_strategy: StrategyName
     contributing_strategies: Sequence[StrategyName]
     metadata: Mapping[str, object] = field(default_factory=dict)
+    # Phase-8 Session 3: preserve signal-quality inputs through planning so
+    # the intent builder can compute confidence and apply the sizing
+    # multiplier. Defaults keep existing construction paths compatible.
+    confidence: float = 0.5
+    signal_strength: float = 0.0
+    regime_state: str = "unknown"
+    expected_pnl: float = 0.0
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -483,6 +497,14 @@ def build_execution_plan(
             "strategy_count": len(strategies),
         }
 
+        # Preserve signal-quality inputs from the survivor signal so the
+        # intent builder can compute confidence and apply S3 sizing.
+        survivor_confidence = _safe_float_attr(survivor, "confidence", 0.5)
+        survivor_signal_strength = _safe_float_attr(survivor, "signal_strength", 0.0)
+        survivor_expected_pnl = _safe_float_attr(survivor, "expected_pnl", 0.0)
+        survivor_regime_state = str(getattr(survivor, "regime_state", "unknown") or "unknown")
+        survivor_reason = str(getattr(survivor, "reason", "") or "")
+
         orders.append(
             PlannedOrder(
                 symbol=symbol,
@@ -494,10 +516,27 @@ def build_execution_plan(
                 primary_strategy=primary_strategy,
                 contributing_strategies=strategies,
                 metadata=metadata,
+                confidence=survivor_confidence,
+                signal_strength=survivor_signal_strength,
+                regime_state=survivor_regime_state,
+                expected_pnl=survivor_expected_pnl,
+                reason=survivor_reason,
             )
         )
 
     return ExecutionPlan(orders=orders, rejections=rejections)
+
+
+def _safe_float_attr(obj: object, name: str, default: float) -> float:
+    """Read a float-like attribute with a fallback — used for optional
+    signal metadata that older RoutedSignal builds may not carry."""
+    value = getattr(obj, name, None)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 # ============================================================================
@@ -560,13 +599,33 @@ def build_ibkr_intents_from_plan(
 
         side = "BUY" if order.side is SignalSide.BUY else "SELL"
         strategy_name = order.primary_strategy.value
+
+        # Phase-8 Session 3 (S3): compute confidence and apply sizing floor.
+        # Attenuation is OPT-IN: only when the strategy has populated
+        # signal_strength do we recompute confidence and scale size. Legacy
+        # strategies that emit neither signal_strength nor an explicit
+        # confidence still ship full-size so this change is backward
+        # compatible with every pre-Session-3 construction site.
+        raw_strength = float(order.signal_strength or 0.0)
+        if raw_strength != 0.0:
+            confidence = compute_confidence(
+                signal_strength=normalize_signal_strength(raw_strength, method="tanh"),
+                regime_quality=regime_quality_from_state(order.regime_state),
+                liquidity_quality=1.0,
+            )
+            size_mult = sizing_multiplier(confidence)
+        else:
+            confidence = float(order.confidence or 0.5)
+            size_mult = 1.0
+
+        attenuated_size = float(order.size) * size_mult
         try:
-            quantity = _normalize_quantity_for_spec(order.size, spec)
+            quantity = _normalize_quantity_for_spec(attenuated_size, spec)
         except ValueError as _qty_err:
             LOG.warning(
                 "intent_skipped_invalid_quantity symbol=%s size=%s reason=%s",
                 order.symbol,
-                order.size,
+                attenuated_size,
                 _qty_err,
             )
             continue
@@ -578,6 +637,10 @@ def build_ibkr_intents_from_plan(
         if order.asset_class == AssetClass.FOREX:
             broker_symbol = order.symbol.replace("-", "").replace("/", "").upper()
 
+        # Scale the notional to reflect the attenuated quantity so downstream
+        # cost/PnL calculations stay consistent with what was actually sent.
+        attenuated_notional = float(order.notional) * size_mult
+
         intent = IBKRStrategyTradeIntent(
             strategy=strategy_name,
             symbol=broker_symbol,
@@ -587,13 +650,15 @@ def build_ibkr_intents_from_plan(
             side=side,
             order_type=_DEFAULT_ORDER_TYPE,
             quantity=quantity,
-            notional_estimate=order.notional,
+            notional_estimate=attenuated_notional,
             limit_price=None,
-            confidence=float(getattr(order, "confidence", 0.5) or 0.5),
-            entry_reason=str(getattr(order, "reason", "") or ""),
-            regime_state=str(getattr(order, "regime_state", "unknown") or "unknown"),
-            expected_pnl=float(getattr(order, "expected_pnl", 0.0) or 0.0),
+            confidence=confidence,
+            entry_reason=str(order.reason or ""),
+            regime_state=str(order.regime_state or "unknown"),
+            expected_pnl=float(order.expected_pnl or 0.0),
             created_at=utc_now_iso(),
+            expected_price=float(order.price),
+            signal_strength=raw_strength,
         )
 
         # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Reject intents that
@@ -765,7 +830,26 @@ def _build_kraken_intent_from_routed_signal(
     if capped_notional <= 0:
         return None
 
-    volume_dec = capped_notional / price_dec
+    # Phase-8 Session 3 (S3): attenuate volume by the confidence-based sizing
+    # multiplier, OPT-IN via non-zero signal_strength on the routed signal.
+    # Strategies that did not populate signal_strength ship at legacy (full)
+    # size — this preserves backward compatibility with pre-Session-3 callers.
+    raw_strength = _safe_float_attr(signal, "signal_strength", 0.0)
+    regime_state = str(getattr(signal, "regime_state", "unknown") or "unknown")
+    if raw_strength != 0.0:
+        confidence = compute_confidence(
+            signal_strength=normalize_signal_strength(raw_strength, method="tanh"),
+            regime_quality=regime_quality_from_state(regime_state),
+            liquidity_quality=1.0,
+        )
+        size_mult = Decimal(str(sizing_multiplier(confidence)))
+    else:
+        confidence = float(getattr(signal, "confidence", 0.5) or 0.5)
+        size_mult = Decimal("1")
+
+    volume_dec = (capped_notional / price_dec) * size_mult
+    attenuated_notional = capped_notional * size_mult
+
     min_vol = _KRAKEN_MIN_VOLUMES.get(pair, Decimal("0.0001"))
     if volume_dec < min_vol:
         return None
@@ -784,13 +868,15 @@ def _build_kraken_intent_from_routed_signal(
         side=side,
         ordertype="market",
         volume=float(volume_dec),
-        notional_estimate=float(capped_notional),
+        notional_estimate=float(attenuated_notional),
         price=None,
-        confidence=float(getattr(signal, "confidence", 0.5) or 0.5),
+        confidence=confidence,
         entry_reason=str(getattr(signal, "reason", "") or ""),
-        regime_state=str(getattr(signal, "regime_state", "unknown") or "unknown"),
+        regime_state=regime_state,
         expected_pnl=float(getattr(signal, "expected_pnl", 0.0) or 0.0),
         created_at=utc_now_iso(),
+        expected_price=float(current_price),
+        signal_strength=raw_strength,
     )
 
 
