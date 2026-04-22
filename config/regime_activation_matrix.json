@@ -1,0 +1,44 @@
+{
+  "_comment_1": "Phase-8 Session 4 (G2): regime → allowed strategy list. Default: every CHAD strategy is allowed in every regime so this file, as shipped, does not change runtime behavior. Operators edit this to narrow which strategies are active under each regime label.",
+  "_comment_2": "Strategy identifiers must match chad.types.StrategyName values. Unknown regime keys fall through to the 'unknown' bucket. An empty list for a regime silences ALL strategies under that regime.",
+  "_comment_3": "Consumed by chad.portfolio.regime_activation.filter_intents_by_regime(...) at the pre-routing intercept point.",
+  "schema_version": "regime_activation_matrix.v1",
+  "regimes": {
+    "trending_bull": [
+      "alpha", "beta", "gamma", "omega", "delta",
+      "alpha_crypto", "alpha_intraday", "alpha_forex", "alpha_futures",
+      "gamma_futures", "omega_macro", "gamma_reversion",
+      "alpha_options", "omega_vol", "delta_pairs", "omega_momentum_options"
+    ],
+    "trending_bear": [
+      "alpha", "beta", "gamma", "omega", "delta",
+      "alpha_crypto", "alpha_intraday", "alpha_forex", "alpha_futures",
+      "gamma_futures", "omega_macro", "gamma_reversion",
+      "alpha_options", "omega_vol", "delta_pairs", "omega_momentum_options"
+    ],
+    "ranging": [
+      "alpha", "beta", "gamma", "omega", "delta",
+      "alpha_crypto", "alpha_intraday", "alpha_forex", "alpha_futures",
+      "gamma_futures", "omega_macro", "gamma_reversion",
+      "alpha_options", "omega_vol", "delta_pairs", "omega_momentum_options"
+    ],
+    "volatile": [
+      "alpha", "beta", "gamma", "omega", "delta",
+      "alpha_crypto", "alpha_intraday", "alpha_forex", "alpha_futures",
+      "gamma_futures", "omega_macro", "gamma_reversion",
+      "alpha_options", "omega_vol", "delta_pairs", "omega_momentum_options"
+    ],
+    "unknown": [
+      "alpha", "beta", "gamma", "omega", "delta",
+      "alpha_crypto", "alpha_intraday", "alpha_forex", "alpha_futures",
+      "gamma_futures", "omega_macro", "gamma_reversion",
+      "alpha_options", "omega_vol", "delta_pairs", "omega_momentum_options"
+    ],
+    "adverse": [
+      "alpha", "beta", "gamma", "omega", "delta",
+      "alpha_crypto", "alpha_intraday", "alpha_forex", "alpha_futures",
+      "gamma_futures", "omega_macro", "gamma_reversion",
+      "alpha_options", "omega_vol", "delta_pairs", "omega_momentum_options"
+    ]
+  }
+}

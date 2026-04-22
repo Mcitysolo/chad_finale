@@ -185,6 +185,83 @@ def _write_route_decision(detail: Dict[str, Any]) -> None:
         pass
 
 
+def _load_optional_metric(name: str) -> Optional[float]:
+    """Best-effort lookup of a regime classifier input.
+
+    Scans a small set of runtime/* JSON files for the named metric.
+    Missing keys or unreadable files return None — the classifier then
+    treats the input as unavailable and downgrades to 'unknown' if no
+    other signal is present.
+    """
+    candidate_paths = (
+        Path("/home/ubuntu/chad_finale/runtime/market_metrics.json"),
+        Path("/home/ubuntu/chad_finale/runtime/regime_inputs.json"),
+        Path("/home/ubuntu/chad_finale/runtime/macro_state.json"),
+    )
+    for path in candidate_paths:
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if name in data and data[name] is not None:
+            try:
+                return float(data[name])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _build_stop_bus_snapshot(logger: logging.Logger) -> Dict[str, Any]:
+    """Best-effort snapshot of halt-trigger inputs.
+
+    Missing inputs are simply omitted — the aggregator skips any trigger
+    whose keys aren't present, so partial snapshots are fine.
+    """
+    snap: Dict[str, Any] = {}
+
+    # Daily loss trigger: pnl_state.json carries today's realized PnL.
+    try:
+        pnl_path = Path("/home/ubuntu/chad_finale/runtime/pnl_state.json")
+        if pnl_path.is_file():
+            pnl = json.loads(pnl_path.read_text(encoding="utf-8"))
+            if isinstance(pnl, dict):
+                realized = pnl.get("realized_pnl", pnl.get("daily_realized_pnl"))
+                if realized is not None:
+                    snap["realized_pnl"] = float(realized)
+    except Exception:
+        pass
+
+    # Daily loss limit — operator-tuned env var, default generous so the
+    # trigger stays dormant unless explicitly configured.
+    try:
+        limit = os.environ.get("CHAD_DAILY_LOSS_LIMIT")
+        if limit is not None:
+            snap["daily_loss_limit"] = float(limit)
+    except (TypeError, ValueError):
+        pass
+
+    # Broker latency: ibkr_status.json publishes last latency measurement.
+    try:
+        status_path = Path("/home/ubuntu/chad_finale/runtime/ibkr_status.json")
+        if status_path.is_file():
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(status, dict):
+                lat = status.get("latency_ms") or status.get("avg_latency_ms")
+                if lat is not None:
+                    snap["avg_latency_ms"] = float(lat)
+    except Exception:
+        pass
+
+    # Reject-rate and data-staleness snapshots require windowed counters
+    # that the current codebase does not yet publish; they are left
+    # unpopulated and the aggregator skips them cleanly.
+    return snap
+
+
 def _build_router_signal_map(signals: List[object]) -> Dict[Tuple[str, str, str, float], object]:
     out: Dict[Tuple[str, str, str, float], object] = {}
 
@@ -519,6 +596,25 @@ def run_once(logger: logging.Logger) -> None:
     check so that stale local state does not suppress valid signals or
     allow phantom positions.
     """
+    # Phase-8 Session 4 (R2): honour an operator- or trigger-set STOP bus.
+    # A truthy runtime/stop_bus.json halts the cycle before any rebuild or
+    # routing so that reconciliation side-effects are not applied while
+    # trading is stopped. clear_stop_bus() (from chad.risk.stop_bus_state
+    # or the CLI script) is required to resume.
+    try:
+        from chad.risk.stop_bus_state import is_stop_bus_active, read_stop_bus
+        if is_stop_bus_active():
+            state = read_stop_bus()
+            logger.warning(
+                "STOP_BUS_ACTIVE reason=%s triggered_by=%s triggered_at=%s — skipping cycle",
+                state.get("reason", ""),
+                state.get("triggered_by", ""),
+                state.get("triggered_at", ""),
+            )
+            return
+    except Exception as _sb_err:  # noqa: BLE001
+        logger.warning("stop_bus check failed (non-fatal): %s", _sb_err)
+
     # P1-3: Rebuild position guard before any signal evaluation. In paper /
     # dry_run mode reconcile against the local trade_closer ledger so the
     # simulated positions survive across cycles; only query IB Gateway when
@@ -530,6 +626,28 @@ def run_once(logger: logging.Logger) -> None:
             _rebuild_guard_from_broker(logger)
     except Exception as exc:
         logger.warning("Guard rebuild failed (non-fatal): %s", exc)
+
+    # Phase-8 Session 4 (R2): evaluate halt triggers. The snapshot is
+    # best-effort from existing runtime state — any trigger whose inputs
+    # are missing is simply skipped (the aggregator ignores missing keys).
+    # If any trigger fires this persists runtime/stop_bus.json and halts
+    # the current cycle.
+    try:
+        from chad.risk.stop_bus_state import evaluate_and_persist
+        snapshot = _build_stop_bus_snapshot(logger)
+        sb_result = evaluate_and_persist(
+            snapshot=snapshot,
+            triggered_by="live_loop.run_once",
+        )
+        if sb_result.get("any_active"):
+            logger.warning(
+                "STOP_BUS_TRIGGERED cycle=halted triggers=%s reason=%s",
+                sb_result.get("active_triggers", []),
+                sb_result.get("reason", ""),
+            )
+            return
+    except Exception as _sbt_err:  # noqa: BLE001
+        logger.warning("stop_bus evaluation failed (non-fatal): %s", _sbt_err)
 
     strategy_detail: Dict[str, Any] = {
         "available_strategies": {},
@@ -615,6 +733,50 @@ def run_once(logger: logging.Logger) -> None:
             apply_close_intents(_reconciler_closes, _paper_adapter)
     except Exception as _rec_err:  # noqa: BLE001
         logger.warning("position_reconciler failed (non-fatal): %s", _rec_err)
+
+    # ------------------------------------------------------------------
+    # Phase-8 Session 4 (G1 + G3): regime classification and transition-
+    # driven position reduction. Both are non-fatal — a broken classifier
+    # must not stop the trading cycle.
+    # ------------------------------------------------------------------
+    try:
+        from chad.analytics.regime_classifier import (
+            classify_regime,
+            read_regime_state,
+            write_regime_state,
+        )
+        from chad.risk.regime_reduction import handle_regime_transition
+
+        previous_state = read_regime_state()
+        previous_regime = previous_state.get("regime")
+
+        # Inputs are best-effort — missing inputs degrade to 'unknown'.
+        regime_result = classify_regime(
+            realized_vol_percentile=_load_optional_metric("realized_vol_percentile"),
+            adx=_load_optional_metric("adx"),
+            trend_slope=_load_optional_metric("trend_slope"),
+            market_breadth=_load_optional_metric("market_breadth"),
+        )
+        new_state = write_regime_state(regime_result, source="live_loop.run_once")
+        logger.info(
+            "REGIME_CLASSIFIED regime=%s confidence=%.2f inputs=%s previous=%s",
+            new_state.get("regime"),
+            float(new_state.get("confidence") or 0.0),
+            new_state.get("inputs_used"),
+            new_state.get("previous_regime"),
+        )
+
+        if previous_regime and previous_regime != new_state.get("regime"):
+            transition = handle_regime_transition(
+                from_regime=previous_regime,
+                to_regime=new_state.get("regime"),
+                open_positions=load_open_positions(),
+            )
+            close_intents = transition.get("close_intents") or []
+            if close_intents:
+                apply_close_intents(close_intents, _paper_adapter)
+    except Exception as _reg_err:  # noqa: BLE001
+        logger.warning("regime classifier/reduction failed (non-fatal): %s", _reg_err)
 
     _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
 

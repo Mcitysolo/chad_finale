@@ -88,6 +88,21 @@ _routing_gates_config: Dict[str, float] = {
     "min_edge": 0.0,
 }
 
+
+def _stop_bus_active() -> bool:
+    """Phase-8 Session 4 (R2): pre-submit halt check.
+
+    Reads runtime/stop_bus.json via the risk.stop_bus_state helper. A
+    missing / malformed file returns False (fail-open) so a broken bus
+    file cannot silently halt trading forever. Import is lazy so pure
+    planning tests that never touch disk stay fast.
+    """
+    try:
+        from chad.risk.stop_bus_state import is_stop_bus_active
+        return bool(is_stop_bus_active())
+    except Exception:
+        return False
+
 # Reason codes are intentionally short and machine-friendly.
 _REASON_UNSUPPORTED_ASSET_CLASS = "unsupported_asset_class"
 _REASON_MISSING_PRICE = "missing_price"
@@ -582,6 +597,13 @@ def build_ibkr_intents_from_plan(
     This function routes futures correctly as FUT intents, but broker-side
     contract construction still needs expiry/local-symbol logic elsewhere.
     """
+    # Phase-8 Session 4 (R2): pre-submit STOP bus check. A truthy bus file
+    # halts order building entirely — callers receive an empty intent list
+    # and therefore submit nothing.
+    if _stop_bus_active():
+        LOG.warning("STOP_BUS_ACTIVE — IBKR intent building skipped")
+        return []
+
     intents: List[IBKRStrategyTradeIntent] = []
 
     for order in plan.orders:
@@ -892,6 +914,11 @@ def build_kraken_intents_from_routed_signals(
     Prices are looked up by the original CHAD canonical symbol (e.g. BTC-USD).
     Signals that fail any validation step are silently dropped (fail-closed).
     """
+    # Phase-8 Session 4 (R2): pre-submit STOP bus check for the Kraken lane.
+    if _stop_bus_active():
+        LOG.warning("STOP_BUS_ACTIVE — Kraken intent building skipped")
+        return []
+
     out: List[object] = []
     for rs in routed_signals:
         if getattr(rs, "asset_class", None) != AssetClass.CRYPTO:
