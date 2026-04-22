@@ -25,6 +25,8 @@ CANONICAL_FIELDS = (
     "expected_pnl",
     "created_at",
     "ttl_seconds",
+    # Phase-8 Session 5 (S1): signal_family added to the canonical schema.
+    "signal_family",
 )
 
 

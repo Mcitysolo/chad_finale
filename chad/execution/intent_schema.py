@@ -54,6 +54,11 @@ INTENT_SCHEMA: Dict[str, Dict[str, Any]] = {
         "default": DEFAULT_TTL_SECONDS,
         "description": "Intent validity window; submit layer drops intents older than created_at + ttl",
     },
+    "signal_family": {
+        "type": str,
+        "default": "unknown",
+        "description": "Signal family tag for S1 voting: momentum|mean_reversion|volatility|trend|options|macro|sentiment|unknown",
+    },
 }
 
 

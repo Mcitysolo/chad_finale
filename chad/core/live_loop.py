@@ -778,6 +778,22 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as _reg_err:  # noqa: BLE001
         logger.warning("regime classifier/reduction failed (non-fatal): %s", _reg_err)
 
+    # Phase-8 Session 5 (F4): edge decay monitor — halt strategies whose
+    # recent trades show a run of consecutive losses. Writes
+    # runtime/strategy_allocations.json atomically. Non-fatal — a broken
+    # monitor must not stop the cycle.
+    try:
+        from chad.risk.edge_decay_monitor import EdgeDecayMonitor
+        decay_results = EdgeDecayMonitor().check_all()
+        halted = [s for s, v in decay_results.items() if v.get("halted")]
+        if halted:
+            logger.warning(
+                "EDGE_DECAY_REPORT halted_strategies=%s (total_evaluated=%d)",
+                halted, len(decay_results),
+            )
+    except Exception as _decay_err:  # noqa: BLE001
+        logger.warning("edge_decay_monitor failed (non-fatal): %s", _decay_err)
+
     _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
 
     # Throttled (5-min) refresh of runtime/kraken_balances.json so the

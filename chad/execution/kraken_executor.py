@@ -74,6 +74,9 @@ class StrategyTradeIntent:
     expected_price: float = 0.0
     signal_strength: float = 0.0
 
+    # Phase-8 Session 5 (S1): signal family for vote aggregation.
+    signal_family: str = "unknown"
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

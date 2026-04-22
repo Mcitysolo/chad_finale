@@ -91,11 +91,16 @@ def compute_confidence(
     signal_strength: float,
     regime_quality: float = 1.0,
     liquidity_quality: float = 1.0,
+    tf_multiplier: float = 1.0,
 ) -> float:
-    """Compute confidence = signal_strength * regime_quality * liquidity_quality.
+    """Compute confidence = signal_strength * regime_quality * liquidity_quality * tf_multiplier.
 
     All inputs are clamped to [0, 1] before multiplication. The result is
     clamped to [0, 1] as well. Non-numeric inputs are treated as 0.
+
+    tf_multiplier (Phase-8 Session 5, S2): higher-timeframe confirmation
+    attenuator from chad.analytics.timeframe_confirmation. Default 1.0
+    keeps pre-Session-5 callers unchanged.
     """
     try:
         s = _clamp01(float(signal_strength))
@@ -109,7 +114,11 @@ def compute_confidence(
         liq = _clamp01(float(liquidity_quality))
     except (TypeError, ValueError):
         liq = 0.0
-    return _clamp01(s * r * liq)
+    try:
+        tf = _clamp01(float(tf_multiplier))
+    except (TypeError, ValueError):
+        tf = 1.0
+    return _clamp01(s * r * liq * tf)
 
 
 def sizing_multiplier(confidence: float, floor: float = SIZING_FLOOR) -> float:

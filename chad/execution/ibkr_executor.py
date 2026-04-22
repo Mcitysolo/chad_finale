@@ -57,6 +57,12 @@ class StrategyTradeIntent:
     expected_price: float = 0.0
     signal_strength: float = 0.0
 
+    # Phase-8 Session 5 (S1): signal family for vote aggregation.
+    #   One of {momentum, mean_reversion, volatility, trend, options, macro,
+    #           sentiment, unknown}. Used by the vote collector to count
+    #   independent families agreeing on a (symbol, side) pair.
+    signal_family: str = "unknown"
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

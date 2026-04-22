@@ -54,11 +54,56 @@ from chad.analytics.signal_confidence import (
     regime_quality_from_state,
     sizing_multiplier,
 )
+from chad.analytics.timeframe_confirmation import (
+    get_higher_tf_bias,
+    timeframe_confidence_multiplier,
+)
+from chad.analytics.vote_collector import get_default_collector as _get_vote_collector
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.execution.intent_schema import utc_now_iso
 from chad.execution.routing_gates import run_all_gates
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
+
+
+# Phase-8 Session 5 (S1): default signal family per strategy identifier.
+# Used when the routed signal does not carry an explicit signal_family tag
+# (the common case today). Consumed only by the S1 vote collector — it
+# does not change intent economics.
+_STRATEGY_SIGNAL_FAMILY: Dict[str, str] = {
+    "alpha": "momentum",
+    "alpha_crypto": "momentum",
+    "alpha_forex": "trend",
+    "alpha_futures": "momentum",
+    "alpha_intraday": "momentum",
+    "alpha_options": "options",
+    "beta": "trend",
+    "delta": "trend",
+    "delta_pairs": "mean_reversion",
+    "gamma": "volatility",
+    "gamma_futures": "trend",
+    "gamma_reversion": "mean_reversion",
+    "omega": "volatility",
+    "omega_macro": "macro",
+    "omega_momentum_options": "options",
+    "omega_vol": "volatility",
+}
+
+
+def _resolve_signal_family(intent: object, fallback_strategy: str = "") -> str:
+    """Return the signal family for an intent.
+
+    Order of preference:
+      1. explicit intent.signal_family (if a strategy has set it)
+      2. _STRATEGY_SIGNAL_FAMILY[strategy name] derived map
+      3. 'unknown'
+    """
+    explicit = getattr(intent, "signal_family", "") or ""
+    explicit = str(explicit or "").lower()
+    if explicit and explicit != "unknown":
+        return explicit
+    name = (getattr(intent, "strategy", "") or fallback_strategy or "").lower()
+    return _STRATEGY_SIGNAL_FAMILY.get(name, "unknown")
 
 LOG = logging.getLogger(__name__)
 
@@ -629,15 +674,28 @@ def build_ibkr_intents_from_plan(
         # confidence still ship full-size so this change is backward
         # compatible with every pre-Session-3 construction site.
         raw_strength = float(order.signal_strength or 0.0)
+        # Phase-8 Session 5 (S2): higher-timeframe confirmation multiplier.
+        # 1.0 if daily trend agrees with the intended side, 0.6 if it
+        # disagrees, 0.85 on neutral/missing data. Attenuation only —
+        # never blocks an intent and never drops confidence below 0.1
+        # (guaranteed by the multiplier's own clamping contract).
+        tf_bias = get_higher_tf_bias(order.symbol)
+        tf_mult = timeframe_confidence_multiplier(side, tf_bias)
+
         if raw_strength != 0.0:
             confidence = compute_confidence(
                 signal_strength=normalize_signal_strength(raw_strength, method="tanh"),
                 regime_quality=regime_quality_from_state(order.regime_state),
                 liquidity_quality=1.0,
+                tf_multiplier=tf_mult,
             )
             size_mult = sizing_multiplier(confidence)
         else:
-            confidence = float(order.confidence or 0.5)
+            base_conf = float(order.confidence or 0.5)
+            # Still apply TF attenuation to legacy confidence values so S2
+            # reaches pre-Session-3 strategies — but floor at 0.1 to keep
+            # this attenuation gentle rather than disabling.
+            confidence = max(0.1, min(1.0, base_conf * tf_mult))
             size_mult = 1.0
 
         attenuated_size = float(order.size) * size_mult
@@ -681,6 +739,9 @@ def build_ibkr_intents_from_plan(
             created_at=utc_now_iso(),
             expected_price=float(order.price),
             signal_strength=raw_strength,
+            signal_family=_resolve_signal_family(
+                None, fallback_strategy=strategy_name
+            ),
         )
 
         # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Reject intents that
@@ -695,7 +756,13 @@ def build_ibkr_intents_from_plan(
         if not passed:
             continue
 
-        intents.append(intent)
+        # Phase-8 Session 5 (S1): signal stacking vote check. With default
+        # min_votes=1 this is pass-through — submit() releases the intent
+        # immediately. When the operator raises min_votes, intents are
+        # held until distinct signal_family votes accumulate within the
+        # rolling window.
+        released = _get_vote_collector().submit(intent)
+        intents.extend(released)
 
     return intents
 
@@ -858,15 +925,23 @@ def _build_kraken_intent_from_routed_signal(
     # size — this preserves backward compatibility with pre-Session-3 callers.
     raw_strength = _safe_float_attr(signal, "signal_strength", 0.0)
     regime_state = str(getattr(signal, "regime_state", "unknown") or "unknown")
+    # Phase-8 Session 5 (S2): higher-timeframe confirmation multiplier.
+    # Keyed on the CHAD canonical symbol (e.g. BTC-USD) so it looks up
+    # data/bars/1d/BTC-USD.json directly.
+    tf_bias = get_higher_tf_bias(symbol)
+    ibkr_side_for_tf = "BUY" if side_attr is SignalSide.BUY else "SELL"
+    tf_mult = timeframe_confidence_multiplier(ibkr_side_for_tf, tf_bias)
     if raw_strength != 0.0:
         confidence = compute_confidence(
             signal_strength=normalize_signal_strength(raw_strength, method="tanh"),
             regime_quality=regime_quality_from_state(regime_state),
             liquidity_quality=1.0,
+            tf_multiplier=tf_mult,
         )
         size_mult = Decimal(str(sizing_multiplier(confidence)))
     else:
-        confidence = float(getattr(signal, "confidence", 0.5) or 0.5)
+        base_conf = float(getattr(signal, "confidence", 0.5) or 0.5)
+        confidence = max(0.1, min(1.0, base_conf * tf_mult))
         size_mult = Decimal("1")
 
     volume_dec = (capped_notional / price_dec) * size_mult
@@ -899,6 +974,7 @@ def _build_kraken_intent_from_routed_signal(
         created_at=utc_now_iso(),
         expected_price=float(current_price),
         signal_strength=raw_strength,
+        signal_family=_STRATEGY_SIGNAL_FAMILY.get(primary_strategy_name, "unknown"),
     )
 
 
@@ -944,7 +1020,10 @@ def build_kraken_intents_from_routed_signals(
         if not passed:
             continue
 
-        out.append(intent)
+        # Phase-8 Session 5 (S1): signal stacking. Default min_votes=1
+        # releases the intent immediately.
+        released = _get_vote_collector().submit(intent)
+        out.extend(released)
     return out
 
 

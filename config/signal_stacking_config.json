@@ -1,0 +1,8 @@
+{
+  "_comment_1": "Phase-8 Session 5 (S1): signal stacking vote thresholds. Default min_votes=1 is a pass-through — the vote collector releases every intent on first submission, matching pre-Session-5 behavior. Raise to 2 or 3 to require cross-family corroboration before an intent reaches the routing gates.",
+  "_comment_2": "window_seconds is the rolling window within which distinct signal_family submissions count toward quorum. Votes older than this age are discarded.",
+  "_comment_3": "Consumed by chad.analytics.vote_collector.VoteCollector via load_config().",
+  "schema_version": "signal_stacking_config.v1",
+  "min_votes": 1,
+  "window_seconds": 60
+}
