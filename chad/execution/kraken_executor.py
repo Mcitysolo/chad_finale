@@ -77,6 +77,10 @@ class StrategyTradeIntent:
     # Phase-8 Session 5 (S1): signal family for vote aggregation.
     signal_family: str = "unknown"
 
+    # Phase-8 Session 6 (E4): passive/aggressive order hint. "normal" →
+    # passive LMT near mid; "high" → marketable LMT through the market.
+    order_urgency: str = "normal"
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

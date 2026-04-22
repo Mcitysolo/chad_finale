@@ -63,6 +63,11 @@ class StrategyTradeIntent:
     #   independent families agreeing on a (symbol, side) pair.
     signal_family: str = "unknown"
 
+    # Phase-8 Session 6 (E4): passive/aggressive order hint.
+    #   "normal" → passive LMT near mid; "high" → marketable LMT through
+    #   the market. Consumed by order_type_selector.select_order_type().
+    order_urgency: str = "normal"
+
 
 @dataclass(frozen=True)
 class RiskGateResult:

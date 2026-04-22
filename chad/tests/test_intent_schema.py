@@ -27,6 +27,8 @@ CANONICAL_FIELDS = (
     "ttl_seconds",
     # Phase-8 Session 5 (S1): signal_family added to the canonical schema.
     "signal_family",
+    # Phase-8 Session 6 (E4): order_urgency hint for passive/aggressive routing.
+    "order_urgency",
 )
 
 

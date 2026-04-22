@@ -786,6 +786,24 @@ class PaperExecutionEvidenceWriter:
         except Exception:
             pass
 
+        # Phase-8 Session 6 (F2): record a pending entry for retrospective
+        # signal-decay measurement. Alpha at T+1/5/15/30 days is filled in
+        # later by SignalDecayRecorder.compute_decay_for_pending() once the
+        # necessary daily bars are on disk. Non-fatal.
+        try:
+            from chad.analytics.signal_decay import get_default_recorder as _get_decay_recorder
+
+            _get_decay_recorder().record_entry(
+                strategy=_safe_str(ev.strategy, ""),
+                symbol=_safe_str(ev.symbol, "UNKNOWN"),
+                side=_safe_str(ev.side, "BUY"),
+                entry_price=_safe_float(ev.fill_price, 0.0),
+                entry_time=_safe_str(ev.fill_time_utc, ""),
+                intent_id=_safe_str(ev.execution_id, ""),
+            )
+        except Exception:
+            pass
+
         return {
             "fills_path": fill_meta["path"],
             "fees_path": fee_meta["path"],

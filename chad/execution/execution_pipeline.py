@@ -61,6 +61,11 @@ from chad.analytics.timeframe_confirmation import (
 from chad.analytics.vote_collector import get_default_collector as _get_vote_collector
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.execution.intent_schema import utc_now_iso
+from chad.execution.order_type_selector import (
+    compute_aggressive_limit_price,
+    estimate_spread_pct,
+    select_order_type,
+)
 from chad.execution.routing_gates import run_all_gates
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
@@ -134,6 +139,37 @@ _routing_gates_config: Dict[str, float] = {
 }
 
 
+def _load_latest_bar_for_symbol(symbol: str) -> Optional[Dict[str, object]]:
+    """Best-effort load of the most recent 1d bar for spread estimation.
+
+    Reads data/bars/1d/{SYMBOL}.json. Missing files or parse errors
+    return None — callers treat this as "no bar data" and fall back to
+    the default spread estimate. No I/O is performed for empty symbols.
+    """
+    if not symbol:
+        return None
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        root = _Path(__file__).resolve().parents[2]
+        path = root / "data" / "bars" / "1d" / f"{str(symbol).upper()}.json"
+        if not path.is_file():
+            return None
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    bars = data.get("bars")
+    if not isinstance(bars, list) or not bars:
+        return None
+    last = bars[-1]
+    if not isinstance(last, dict):
+        return None
+    return last
+
+
 def _stop_bus_active() -> bool:
     """Phase-8 Session 4 (R2): pre-submit halt check.
 
@@ -202,6 +238,10 @@ class PlannedOrder:
     regime_state: str = "unknown"
     expected_pnl: float = 0.0
     reason: str = ""
+    # Phase-8 Session 6 (E4): passive/aggressive order hint propagated from
+    # the routed signal. "normal" is the default; strategies with breakout
+    # urgency set "high" to request a marketable limit.
+    order_urgency: str = "normal"
 
 
 @dataclass(frozen=True)
@@ -564,6 +604,11 @@ def build_execution_plan(
         survivor_expected_pnl = _safe_float_attr(survivor, "expected_pnl", 0.0)
         survivor_regime_state = str(getattr(survivor, "regime_state", "unknown") or "unknown")
         survivor_reason = str(getattr(survivor, "reason", "") or "")
+        # E4: propagate order_urgency ("normal" or "high"). Strategies that
+        # do not set this attribute default to "normal" — passive routing.
+        survivor_urgency = str(getattr(survivor, "order_urgency", "normal") or "normal").strip().lower()
+        if survivor_urgency not in ("normal", "high"):
+            survivor_urgency = "normal"
 
         orders.append(
             PlannedOrder(
@@ -581,6 +626,7 @@ def build_execution_plan(
                 regime_state=survivor_regime_state,
                 expected_pnl=survivor_expected_pnl,
                 reason=survivor_reason,
+                order_urgency=survivor_urgency,
             )
         )
 
@@ -721,6 +767,26 @@ def build_ibkr_intents_from_plan(
         # cost/PnL calculations stay consistent with what was actually sent.
         attenuated_notional = float(order.notional) * size_mult
 
+        # Phase-8 Session 6 (E4): passive/aggressive order-type selection.
+        # A high-urgency intent or a wide estimated spread forces a marketable
+        # limit priced through the market; otherwise we submit a passive LMT
+        # at the strategy's reference price.
+        latest_bar = _load_latest_bar_for_symbol(order.symbol)
+        spread_pct = estimate_spread_pct(order.symbol, latest_bar)
+        order_params = select_order_type(
+            urgency=getattr(order, "order_urgency", "normal"),
+            estimated_spread_pct=spread_pct,
+        )
+        if order_params["aggressive"]:
+            e4_limit_price: Optional[float] = compute_aggressive_limit_price(
+                side=side,
+                reference_price=float(order.price),
+                price_offset_pct=float(order_params["price_offset_pct"]),
+            )
+        else:
+            e4_limit_price = float(order.price)
+        e4_order_type = order_params["order_type"]
+
         intent = IBKRStrategyTradeIntent(
             strategy=strategy_name,
             symbol=broker_symbol,
@@ -728,10 +794,10 @@ def build_ibkr_intents_from_plan(
             exchange=spec.exchange,
             currency=spec.currency,
             side=side,
-            order_type=_DEFAULT_ORDER_TYPE,
+            order_type=e4_order_type,
             quantity=quantity,
             notional_estimate=attenuated_notional,
-            limit_price=None,
+            limit_price=e4_limit_price,
             confidence=confidence,
             entry_reason=str(order.reason or ""),
             regime_state=str(order.regime_state or "unknown"),
@@ -742,6 +808,7 @@ def build_ibkr_intents_from_plan(
             signal_family=_resolve_signal_family(
                 None, fallback_strategy=strategy_name
             ),
+            order_urgency=str(getattr(order, "order_urgency", "normal")),
         )
 
         # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Reject intents that
@@ -959,6 +1026,12 @@ def _build_kraken_intent_from_routed_signal(
     else:
         primary_strategy_name = "alpha_crypto"
 
+    signal_urgency = str(
+        getattr(signal, "order_urgency", "normal") or "normal"
+    ).strip().lower()
+    if signal_urgency not in ("normal", "high"):
+        signal_urgency = "normal"
+
     return KrakenStrategyTradeIntent(
         strategy=primary_strategy_name,
         pair=pair,
@@ -975,6 +1048,7 @@ def _build_kraken_intent_from_routed_signal(
         expected_price=float(current_price),
         signal_strength=raw_strength,
         signal_family=_STRATEGY_SIGNAL_FAMILY.get(primary_strategy_name, "unknown"),
+        order_urgency=signal_urgency,
     )
 
 

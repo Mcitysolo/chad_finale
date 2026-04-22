@@ -735,6 +735,18 @@ def run_once(logger: logging.Logger) -> None:
         logger.warning("position_reconciler failed (non-fatal): %s", _rec_err)
 
     # ------------------------------------------------------------------
+    # Phase-8 Session 6 (G1 feed): publish runtime/market_metrics.json from
+    # current daily bars so the regime classifier sees real vol / ADX /
+    # trend_slope / breadth inputs rather than defaulting to 'unknown'.
+    # Non-fatal — classifier already degrades gracefully without inputs.
+    # ------------------------------------------------------------------
+    try:
+        from chad.analytics.market_metrics_publisher import MarketMetricsPublisher
+        MarketMetricsPublisher().compute_and_publish()
+    except Exception as _mmp_err:  # noqa: BLE001
+        logger.warning("market_metrics_publisher failed (non-fatal): %s", _mmp_err)
+
+    # ------------------------------------------------------------------
     # Phase-8 Session 4 (G1 + G3): regime classification and transition-
     # driven position reduction. Both are non-fatal — a broken classifier
     # must not stop the trading cycle.
@@ -793,6 +805,50 @@ def run_once(logger: logging.Logger) -> None:
             )
     except Exception as _decay_err:  # noqa: BLE001
         logger.warning("edge_decay_monitor failed (non-fatal): %s", _decay_err)
+
+    # Phase-8 Session 6 (F2): compute retrospective signal decay for any
+    # pending entries whose bars are now on disk. Lightweight — only
+    # processes entries that have not yet been measured. Non-fatal.
+    try:
+        from chad.analytics.signal_decay import get_default_recorder as _get_decay_recorder
+        _measured = _get_decay_recorder().compute_decay_for_pending()
+        if _measured:
+            logger.info("SIGNAL_DECAY_MEASURED count=%d", len(_measured))
+    except Exception as _sd_err:  # noqa: BLE001
+        logger.warning("signal_decay measurement failed (non-fatal): %s", _sd_err)
+
+    # Phase-8 Session 6 (F3): composite strategy-health scorer. Writes
+    # runtime/strategy_health.json each cycle and feeds very-low-health
+    # strategies back to the edge_decay monitor as an additional halt
+    # signal. Non-fatal — a scoring error must not block trading.
+    try:
+        from chad.analytics import expectancy_tracker as _expectancy
+        from chad.analytics.slippage_tracker import get_default_tracker as _get_slippage_tracker
+        from chad.analytics.strategy_health import StrategyHealthScorer
+        from chad.analytics.regime_classifier import read_regime_state as _read_regime
+
+        regime_now = _read_regime().get("regime", "unknown")
+        expectancy_state = _expectancy.compute()
+        strategy_names = sorted((expectancy_state.get("strategies") or {}).keys())
+        if strategy_names:
+            scorer = StrategyHealthScorer()
+            health = scorer.compute_all(
+                strategy_names=strategy_names,
+                expectancy_tracker=expectancy_state,
+                slippage_tracker=_get_slippage_tracker(),
+                regime_state=str(regime_now),
+            )
+            low_health = [
+                s for s, v in health.items()
+                if isinstance(v, dict) and float(v.get("health_score") or 0.5) < 0.2
+            ]
+            if low_health:
+                logger.warning(
+                    "STRATEGY_HEALTH_LOW strategies=%s (scored=%d)",
+                    low_health, len(health),
+                )
+    except Exception as _sh_err:  # noqa: BLE001
+        logger.warning("strategy_health scorer failed (non-fatal): %s", _sh_err)
 
     _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
 

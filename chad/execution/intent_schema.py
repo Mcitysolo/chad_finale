@@ -59,6 +59,11 @@ INTENT_SCHEMA: Dict[str, Dict[str, Any]] = {
         "default": "unknown",
         "description": "Signal family tag for S1 voting: momentum|mean_reversion|volatility|trend|options|macro|sentiment|unknown",
     },
+    "order_urgency": {
+        "type": str,
+        "default": "normal",
+        "description": "Passive vs aggressive hint for E4 order-type selector: 'normal' → passive LMT at mid; 'high' → marketable LMT through market",
+    },
 }
 
 
