@@ -133,17 +133,25 @@ def _make_ib_contract(symbol: str, ib: Any = None) -> Any:
     Create an ib_insync contract for the given symbol.
 
     Auto-detects futures vs stock based on known futures set.
-    For futures, uses qualifyContracts() to resolve front-month expiry.
-    SIL maps to IBKR symbol SI (Silver futures).
+    For futures, sets tradingClass to disambiguate micro vs full-size
+    (SI vs SIL share root symbol but different tradingClass/multiplier),
+    then uses reqContractDetails to resolve the front-month expiry.
+    SIL maps to IBKR symbol SI (Silver futures) with tradingClass 'SIL'.
     """
     from ib_insync import Stock, Future
 
     sym = symbol.strip().upper()
 
     if _is_futures_symbol(sym):
-        # IBKR symbol mapping (SIL -> SI on IBKR)
+        # IBKR root-symbol mapping (SIL trades as SI + tradingClass=SIL)
         ibkr_sym_map = {
             "SIL": "SI",
+        }
+        # tradingClass prevents "ambiguous contract" (Error 200) when the
+        # root symbol covers multiple product sizes on the same exchange.
+        # Default: tradingClass == sym.
+        trading_class_map = {
+            "SIL": "SIL",
         }
         exchange_map = {
             "MES": "CME",
@@ -158,11 +166,39 @@ def _make_ib_contract(symbol: str, ib: Any = None) -> Any:
         }
         ibkr_sym = ibkr_sym_map.get(sym, sym)
         exchange = exchange_map.get(sym, "CME")
-        contract = Future(symbol=ibkr_sym, exchange=exchange, currency="USD")
+        trading_class = trading_class_map.get(sym, sym)
+        contract = Future(
+            symbol=ibkr_sym,
+            exchange=exchange,
+            currency="USD",
+            tradingClass=trading_class,
+        )
 
-        # Qualify to resolve front-month expiry
+        # Resolve front-month expiry via reqContractDetails.
+        # Even with tradingClass set, IBKR returns every listed expiry; we
+        # pick the earliest contract whose lastTradeDateOrContractMonth is
+        # today or later. Falls back to qualifyContracts on any error.
         if ib is not None:
             try:
+                details = ib.reqContractDetails(contract)
+                if details:
+                    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+                    future_contracts: List[tuple] = []
+                    for d in details:
+                        c = getattr(d, "contract", None)
+                        if c is None:
+                            continue
+                        ltd = str(getattr(c, "lastTradeDateOrContractMonth", "") or "")
+                        # ltd can be YYYYMMDD or YYYYMM; compare first 8/6 chars
+                        if not ltd:
+                            continue
+                        if len(ltd) >= 8 and ltd[:8] >= today_str:
+                            future_contracts.append((ltd, c))
+                        elif len(ltd) == 6 and ltd >= today_str[:6]:
+                            future_contracts.append((ltd, c))
+                    if future_contracts:
+                        future_contracts.sort(key=lambda x: x[0])
+                        return future_contracts[0][1]
                 qualified = ib.qualifyContracts(contract)
                 if qualified:
                     return qualified[0]

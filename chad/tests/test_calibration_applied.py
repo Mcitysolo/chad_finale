@@ -84,13 +84,18 @@ def test_regime_matrix_adverse_is_empty():
     assert cfg["regimes"]["adverse"] == []
 
 
-def test_regime_matrix_not_all_enabled_in_volatile():
-    """Volatile regime should narrow to vol-family strategies only."""
+def test_regime_matrix_volatile_includes_vol_and_momentum():
+    """Volatile regime must ship vol-family AND the momentum/trend strategies
+    that CHAD's classifier keeps calling 'volatile' when ADX>=25 (trending-
+    volatile tape). Narrowing to vol-only starved the book in 2026-04 — this
+    test locks in the 2026-04-22 Audit-O+P expansion."""
     cfg = json.loads((REPO_ROOT / "config" / "regime_activation_matrix.json").read_text())
     volatile = cfg["regimes"]["volatile"]
-    # After calibration: 3 strategies, not 16.
-    assert len(volatile) < 10
     assert "omega_vol" in volatile or "omega" in volatile
+    assert "alpha" in volatile
+    assert "alpha_futures" in volatile
+    assert "delta" in volatile
+    assert "beta" in volatile
 
 
 def test_regime_matrix_ranging_favors_mean_reversion():
