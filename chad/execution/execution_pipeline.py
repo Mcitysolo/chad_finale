@@ -1342,6 +1342,37 @@ def build_kraken_intents_from_routed_signals(
     return out
 
 
+# ============================================================================
+# Phase-8 Session 9 (A1): backward-compat re-exports
+# ----------------------------------------------------------------------------
+# The OMS and EMS Protocols moved to their own modules. Callers that
+# previously imported from chad.execution.execution_pipeline keep working
+# via these re-exports; new code should import from chad.execution.oms
+# and chad.execution.ems directly.
+# ============================================================================
+
+from chad.execution.ems import (  # noqa: E402,F401
+    EMSInterface,
+    IbkrEMS,
+    KrakenEMS,
+)
+from chad.execution.oms import (  # noqa: E402,F401
+    IbkrOMS,
+    KrakenOMS,
+    NullOMS,
+    OMSInterface,
+    OrderRequest,
+    OrderResult,
+    PRESERVED_STATUS_STRINGS,
+    STATUS_DRY_RUN,
+    STATUS_DUPLICATE_BLOCKED,
+    STATUS_ERROR,
+    STATUS_SUBMITTED,
+    STATUS_UNKNOWN,
+    STATUS_WHAT_IF,
+)
+
+
 __all__ = [
     "PlannedOrder",
     "ExecutionPlan",
@@ -1356,4 +1387,15 @@ __all__ = [
     "normalize_kraken_pair",
     "build_kraken_intents_from_routed_signals",
     "_build_kraken_intent_from_routed_signal",
+    # Session 9 re-exports
+    "EMSInterface",
+    "IbkrEMS",
+    "KrakenEMS",
+    "IbkrOMS",
+    "KrakenOMS",
+    "NullOMS",
+    "OMSInterface",
+    "OrderRequest",
+    "OrderResult",
+    "PRESERVED_STATUS_STRINGS",
 ]
