@@ -364,6 +364,234 @@ class NullOMS:
         return OrderResult(order_id=order_id, status=STATUS_UNKNOWN, venue=self.venue)
 
 
+# ---------------------------------------------------------------------------
+# SimulatedFillLedger + SimulatedOMS — Phase-8 Session 10 (A3 unification)
+# ---------------------------------------------------------------------------
+
+
+class SimulatedFillLedger:
+    """In-memory record of simulated fills from backtest/paper-shadow runs.
+
+    The ledger holds one dict per fill with the fields a backtest
+    report wants to see: symbol, side, quantity, fill_price, order_id,
+    timestamps, strategy, confidence, and the slippage model in use.
+
+    The ledger is intentionally simple — it is NOT a position store.
+    Backtest engines that want per-symbol P&L compute it from the
+    fills, not from the ledger's internal state.
+    """
+
+    def __init__(self, ledger_path: str = "") -> None:
+        self._fills: List[dict] = []
+        self._rejections: List[dict] = []
+        self.ledger_path = ledger_path
+
+    def record(self, request: "OrderRequest", result: "OrderResult") -> None:
+        """Append one fill record for a successfully-simulated order."""
+        intent = request.intent
+        self._fills.append(
+            {
+                "symbol": str(getattr(intent, "symbol", "") or getattr(intent, "pair", "")),
+                "side": str(getattr(intent, "side", "")),
+                "quantity": int(result.fill_quantity),
+                "fill_price": float(result.fill_price),
+                "order_id": result.order_id,
+                "submitted_at": result.submitted_at,
+                "filled_at": result.filled_at,
+                "strategy": str(getattr(intent, "strategy", "")),
+                "confidence": float(getattr(intent, "confidence", 0.0) or 0.0),
+                "venue": result.venue,
+                "slippage_bps_model": getattr(result, "_slippage_bps", None),
+            }
+        )
+
+    def record_rejection(self, request: "OrderRequest", reason: str) -> None:
+        """Append one rejection record (gate failure, size=0, etc.)."""
+        intent = request.intent
+        self._rejections.append(
+            {
+                "symbol": str(getattr(intent, "symbol", "") or getattr(intent, "pair", "")),
+                "side": str(getattr(intent, "side", "")),
+                "strategy": str(getattr(intent, "strategy", "")),
+                "reason": str(reason or ""),
+                "ts_utc": _utc_now_iso(),
+            }
+        )
+
+    def get_fills(self) -> List[dict]:
+        return list(self._fills)
+
+    def get_rejections(self) -> List[dict]:
+        return list(self._rejections)
+
+    def clear(self) -> None:
+        self._fills.clear()
+        self._rejections.clear()
+
+    @property
+    def fill_count(self) -> int:
+        return len(self._fills)
+
+    @property
+    def rejection_count(self) -> int:
+        return len(self._rejections)
+
+
+class SimulatedOMS:
+    """OMSInterface implementation for backtest + paper-shadow runs.
+
+    Accepts an ``OrderRequest`` the same way IbkrOMS / KrakenOMS do,
+    but fills it immediately against a simple slippage model and
+    records the fill into a :class:`SimulatedFillLedger`.
+
+    Slippage
+    --------
+
+    Side-aware bps model::
+
+        BUY:  fill_price = limit_price * (1 + slippage_bps/10_000)
+        SELL: fill_price = limit_price * (1 - slippage_bps/10_000)
+
+    A flat ``slippage_bps`` is the simplest calibratable knob that
+    still produces realistic fill distributions. Future sessions can
+    swap in a spread-based or ADV-based model without changing the
+    Protocol surface.
+
+    Status vocabulary
+    -----------------
+
+    Emits ``"submitted"`` on every fill so downstream code that expects
+    the IbkrOMS vocabulary continues to work. A zero-quantity or
+    non-positive-price request emits ``"error"`` with a descriptive
+    ``rejection_reason``.
+    """
+
+    venue = "simulated"
+
+    def __init__(
+        self,
+        ledger: Optional["SimulatedFillLedger"] = None,
+        slippage_bps: float = 5.0,
+    ) -> None:
+        self.ledger = ledger if ledger is not None else SimulatedFillLedger()
+        self.slippage_bps = float(max(0.0, slippage_bps))
+        self._order_counter = 0
+
+    def _next_order_id(self) -> str:
+        self._order_counter += 1
+        return f"SIM_{self._order_counter:06d}"
+
+    def submit(self, request: OrderRequest) -> OrderResult:
+        qty = int(max(0, request.quantity))
+        ref_price = float(request.limit_price or 0.0)
+        if qty <= 0 or ref_price <= 0.0:
+            result = OrderResult(
+                order_id="",
+                status=STATUS_ERROR,
+                rejection_reason="simulated_non_positive_qty_or_price",
+                venue=self.venue,
+                raw=None,
+            )
+            self.ledger.record_rejection(request, result.rejection_reason)
+            return result
+
+        side = str(getattr(request.intent, "side", "") or "").upper()
+        slip = ref_price * (self.slippage_bps / 10_000.0)
+        if side == "BUY":
+            fill_price = ref_price + slip
+        elif side in ("SELL", "SHORT"):
+            fill_price = ref_price - slip
+        else:
+            fill_price = ref_price  # unknown side — no slippage adjustment
+
+        now = _utc_now_iso()
+        result = OrderResult(
+            order_id=self._next_order_id(),
+            status=STATUS_SUBMITTED,
+            fill_price=round(fill_price, 6),
+            fill_quantity=qty,
+            submitted_at=now,
+            filled_at=now,
+            venue=self.venue,
+            raw=None,
+        )
+        # Carry the slippage model on the result for the ledger without
+        # widening OrderResult's public field surface.
+        result._slippage_bps = self.slippage_bps  # type: ignore[attr-defined]
+        self.ledger.record(request, result)
+        return result
+
+    def cancel(self, order_id: str) -> bool:
+        # Simulated orders fill instantly — cancel is always a no-op success.
+        return True
+
+    def get_status(self, order_id: str) -> OrderResult:
+        # No asynchronous state in the simulator; fills are immediate.
+        return OrderResult(
+            order_id=order_id,
+            status=STATUS_SUBMITTED,
+            venue=self.venue,
+        )
+
+
+def compare_backtest_to_paper(
+    backtest_fills: List[dict],
+    paper_fills: List[dict],
+) -> dict:
+    """Compare a backtest fill ledger to a paper fill ledger.
+
+    Returns a summary dict with:
+
+        n_backtest, n_paper               — fill counts
+        signal_overlap_pct                — fraction of backtest
+            (symbol, side) pairs that also appear in paper
+        mean_backtest_fill_price,
+        mean_paper_fill_price,
+        mean_fill_price_diff              — absolute difference in
+            mean fill price (positive: backtest paid more)
+        mean_slippage_diff_bps            — approximate slippage
+            difference as basis points of mean price
+
+    Consumed by operators validating that Session-10 routing did not
+    introduce a systematic fill bias between simulation and live.
+    """
+
+    def _avg(xs: List[float]) -> Optional[float]:
+        clean = [x for x in xs if isinstance(x, (int, float))]
+        if not clean:
+            return None
+        return sum(clean) / len(clean)
+
+    bt_prices = [f.get("fill_price") for f in backtest_fills]
+    pp_prices = [f.get("fill_price") for f in paper_fills]
+
+    bt_pairs = {(f.get("symbol"), f.get("side")) for f in backtest_fills}
+    pp_pairs = {(f.get("symbol"), f.get("side")) for f in paper_fills}
+
+    overlap = bt_pairs & pp_pairs
+    overlap_pct = (len(overlap) / len(bt_pairs)) if bt_pairs else 0.0
+
+    bt_mean = _avg(bt_prices)
+    pp_mean = _avg(pp_prices)
+    if bt_mean is None or pp_mean is None:
+        mean_diff: Optional[float] = None
+        slip_bps: Optional[float] = None
+    else:
+        mean_diff = bt_mean - pp_mean
+        base = pp_mean or bt_mean or 1.0
+        slip_bps = (mean_diff / base) * 10_000.0 if base else None
+
+    return {
+        "n_backtest": len(backtest_fills),
+        "n_paper": len(paper_fills),
+        "signal_overlap_pct": round(overlap_pct, 4),
+        "mean_backtest_fill_price": bt_mean,
+        "mean_paper_fill_price": pp_mean,
+        "mean_fill_price_diff": mean_diff,
+        "mean_slippage_diff_bps": slip_bps,
+    }
+
+
 __all__ = [
     "IbkrOMS",
     "KrakenOMS",
@@ -372,6 +600,8 @@ __all__ = [
     "OrderRequest",
     "OrderResult",
     "PRESERVED_STATUS_STRINGS",
+    "SimulatedFillLedger",
+    "SimulatedOMS",
     "STATUS_DRY_RUN",
     "STATUS_DUPLICATE_BLOCKED",
     "STATUS_ERROR",
@@ -379,4 +609,5 @@ __all__ = [
     "STATUS_SUBMITTED",
     "STATUS_UNKNOWN",
     "STATUS_WHAT_IF",
+    "compare_backtest_to_paper",
 ]

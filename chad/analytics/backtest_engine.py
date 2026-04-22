@@ -606,8 +606,171 @@ class BacktestEngine:
     No reimplementations. No lookahead bias.
     """
 
-    def __init__(self, bars_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        bars_dir: Optional[Path] = None,
+        *,
+        unified_execution: bool = True,
+        slippage_bps: float = 0.0,
+        simulated_oms: Optional[Any] = None,
+        simulated_ledger: Optional[Any] = None,
+    ) -> None:
+        """Backtest engine.
+
+        Parameters
+        ----------
+        bars_dir
+            Directory of 1d bars (defaults to data/bars/1d/).
+        unified_execution
+            Phase-8 Session 10 (A3): when True, signals flow through
+            IbkrEMS → routing_gates → SimulatedOMS so the backtest
+            exercises the same execution-layer logic as paper/live.
+            When False, falls back to the legacy SimulatedPortfolio
+            fill path (preserves pre-Session-10 numerical behaviour).
+            Default True — operators opt into the unified path.
+        slippage_bps
+            Slippage applied by the SimulatedOMS. Default 0.0 keeps
+            pre-Session-10 fills numerically identical; tune upward
+            to model real execution cost.
+        simulated_oms / simulated_ledger
+            Optional dependency injection for tests.
+        """
         self.bars_dir = bars_dir or BARS_DIR
+        self.unified_execution = bool(unified_execution)
+        self.slippage_bps = float(max(0.0, slippage_bps))
+        self._simulated_oms = simulated_oms
+        self._simulated_ledger = simulated_ledger
+
+    def _ensure_simulated_oms(self) -> Any:
+        if self._simulated_oms is not None:
+            return self._simulated_oms
+        from chad.execution.oms import SimulatedFillLedger, SimulatedOMS
+        if self._simulated_ledger is None:
+            self._simulated_ledger = SimulatedFillLedger()
+        self._simulated_oms = SimulatedOMS(
+            ledger=self._simulated_ledger,
+            slippage_bps=self.slippage_bps,
+        )
+        return self._simulated_oms
+
+    @property
+    def fill_ledger(self) -> Any:
+        """Expose the SimulatedFillLedger for test inspection / reports."""
+        return self._simulated_ledger
+
+    def _unified_execute_signal(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        price: float,
+        strategy_name: str,
+        bar_ts: datetime,
+        confidence: float,
+    ) -> Tuple[float, float, bool]:
+        """Route one signal through EMS → routing_gates → SimulatedOMS.
+
+        Returns ``(fill_price, fill_quantity, accepted)``. When any gate
+        rejects the signal the rejection is recorded on the ledger and
+        ``accepted`` is False — the caller skips the portfolio.fill_order
+        step for this bar.
+
+        Exceptions during the path fall back to ``(price, size, True)``
+        at the caller's try/except so a broken gate cannot silently kill
+        a full backtest run.
+        """
+        from dataclasses import dataclass as _dc
+
+        from chad.execution.ems import IbkrEMS
+        from chad.execution.routing_gates import run_all_gates
+
+        oms = self._ensure_simulated_oms()
+        ems = IbkrEMS()
+
+        # Synthesize a minimal StrategyTradeIntent-equivalent for the gate +
+        # EMS. The fields mirror IBKRStrategyTradeIntent's Session-8 surface
+        # so gates and the build_order_request path work identically to
+        # what the live pipeline would emit for the same signal.
+        @_dc
+        class _BacktestIntent:
+            strategy: str = ""
+            symbol: str = ""
+            sec_type: str = "STK"
+            exchange: str = "SMART"
+            currency: str = "USD"
+            side: str = "BUY"
+            order_type: str = "LMT"
+            quantity: float = 0.0
+            notional_estimate: float = 0.0
+            limit_price: Optional[float] = None
+            confidence: float = 0.5
+            entry_reason: str = ""
+            regime_state: str = "unknown"
+            expected_pnl: float = 0.0
+            created_at: str = ""
+            ttl_seconds: int = 300
+            expected_price: float = 0.0
+            signal_strength: float = 0.0
+            signal_family: str = "unknown"
+            order_urgency: str = "normal"
+            bar_timestamp: str = ""
+
+        # created_at uses wall-clock now so the Session-2 stale_intent (E2)
+        # gate does not reject every historical intent. bar_timestamp keeps
+        # the bar's historical timestamp for A4 (which we disable via the
+        # near-infinite max_bar_age_seconds below).
+        from chad.execution.intent_schema import utc_now_iso
+        intent = _BacktestIntent(
+            strategy=strategy_name,
+            symbol=symbol,
+            side=side,
+            quantity=max(1, int(size)),
+            notional_estimate=size * price,
+            limit_price=price,
+            confidence=float(confidence or 0.5),
+            created_at=utc_now_iso(),
+            expected_price=price,
+            bar_timestamp=bar_ts.isoformat() if isinstance(bar_ts, datetime) else "",
+        )
+
+        # Gates — with backtest-appropriate config. Freshness window is
+        # effectively unbounded because the backtest's "now" is the bar
+        # timestamp, and stale_intent compares against the wall clock.
+        # The operative gates for backtest are E5 (price drift) and S5
+        # (event risk) which compare using real data.
+        import os
+        import json
+        from pathlib import Path as _Path
+        gate_config = {
+            "max_bar_age_seconds": 10**9,
+            "price_tolerance_pct": 0.005,
+            "degraded_ttl_seconds": 10**9,
+            "estimated_commission": 0.0,
+            "estimated_spread": 0.0,
+            "min_edge": 0.0,
+        }
+        try:
+            passed, _reason = run_all_gates(
+                intent=intent,
+                bar_timestamp=None,  # backtest bars are by definition historical
+                current_price=price,
+                config=gate_config,
+                event_calendar=None,  # calendar-in-backtest is an operator opt-in; omit by default
+            )
+        except Exception:  # noqa: BLE001
+            passed = True
+        if not passed:
+            order_request = ems.build_order_request(intent)
+            oms.ledger.record_rejection(order_request, "gate_rejected")
+            return price, size, False
+
+        order_request = ems.build_order_request(intent)
+        result = oms.submit(order_request)
+        if result.status != "submitted":
+            oms.ledger.record_rejection(order_request, result.status)
+            return price, size, False
+        return float(result.fill_price or price), float(result.fill_quantity or size), True
 
     def run(
         self,
@@ -740,9 +903,33 @@ class BacktestEngine:
                 if "target_price" in meta:
                     target = _safe_float(meta["target_price"], None)
 
+                # Phase-8 Session 10 (A3): route through EMS → routing_gates
+                # → SimulatedOMS so Phase-8 sizing / order-type / event-risk
+                # logic applies to backtests. Legacy path preserved via the
+                # unified_execution=False escape hatch for numerical baselines.
+                fill_price_for_portfolio = price
+                size_for_portfolio = size
+                if self.unified_execution:
+                    try:
+                        uf_fill_px, uf_size, uf_accept = self._unified_execute_signal(
+                            symbol=sym,
+                            side=side,
+                            size=size,
+                            price=price,
+                            strategy_name=strategy_name,
+                            bar_ts=ts,
+                            confidence=confidence,
+                        )
+                    except Exception:  # noqa: BLE001
+                        uf_fill_px, uf_size, uf_accept = price, size, True
+                    if not uf_accept:
+                        continue
+                    fill_price_for_portfolio = uf_fill_px
+                    size_for_portfolio = uf_size
+
                 portfolio.fill_order(
-                    symbol=sym, side=side, quantity=size,
-                    fill_price=price, bar_idx=i,
+                    symbol=sym, side=side, quantity=size_for_portfolio,
+                    fill_price=fill_price_for_portfolio, bar_idx=i,
                     strategy=strategy_name,
                     stop_price=stop, target_price=target,
                     time_stop_bars=time_stop_bars,

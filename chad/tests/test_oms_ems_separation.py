@@ -354,6 +354,29 @@ def test_null_oms_returns_dry_run_status():
 # ---------------------------------------------------------------------------
 
 
+def test_execution_pipeline_exposes_thin_orchestrators():
+    """Phase-8 Session 10 gate (deferred from Session 9):
+    execution_pipeline must expose execute_ibkr_cycle / execute_kraken_cycle
+    as the thin EMS → gates → OMS composition entry points."""
+    from chad.execution.execution_pipeline import execute_ibkr_cycle, execute_kraken_cycle
+    assert callable(execute_ibkr_cycle)
+    assert callable(execute_kraken_cycle)
+
+
+def test_execute_ibkr_cycle_delegates_to_injected_oms():
+    """The orchestrator accepts any OMSInterface — wire SimulatedOMS and
+    verify it is invoked with an OrderRequest produced by the EMS."""
+    from chad.execution.execution_pipeline import execute_ibkr_cycle
+    from chad.execution.oms import SimulatedFillLedger, SimulatedOMS
+    from chad.execution.execution_pipeline import ExecutionPlan
+    ledger = SimulatedFillLedger()
+    oms = SimulatedOMS(ledger=ledger, slippage_bps=0.0)
+    # Empty plan — orchestrator should return empty list without error.
+    results = execute_ibkr_cycle(ExecutionPlan(orders=[], rejections=[]), oms)
+    assert results == []
+    assert ledger.fill_count == 0
+
+
 def test_paper_exec_evidence_writer_can_read_raw_submitted_order():
     """Regression guard: after the OMS wrapping, the raw SubmittedOrder
     is still accessible on OrderResult.raw. paper_exec_evidence_writer

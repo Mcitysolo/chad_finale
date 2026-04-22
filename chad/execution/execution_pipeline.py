@@ -1343,6 +1343,130 @@ def build_kraken_intents_from_routed_signals(
 
 
 # ============================================================================
+# Phase-8 Session 10 (A1 completion): thin orchestrator functions
+# ----------------------------------------------------------------------------
+# Compose EMS → routing_gates → vote_collector → OMS explicitly. These
+# are the recommended public entry points going forward — they replace
+# the pattern where build_ibkr_intents_from_plan called gates and the
+# vote collector inline. The old path is preserved for backward compat;
+# new callers (and Session-10's backtest re-routing) should use
+# execute_ibkr_cycle / execute_kraken_cycle.
+# ============================================================================
+
+
+def execute_ibkr_cycle(
+    plan: "ExecutionPlan",
+    oms: "Any",
+    *,
+    ems: "Any" = None,
+    run_gates: bool = True,
+    event_calendar: "Any" = None,
+    default_sec_type: str = "STK",
+    default_exchange: str = "SMART",
+    default_currency: str = "USD",
+) -> List["Any"]:
+    """Compose: IbkrEMS → routing_gates → OMS.submit. Returns OrderResults.
+
+    This is the thin orchestrator recommended by
+    reports/audit_n_execution_landscape_20260421.json. It replaces the
+    legacy pattern where ``build_ibkr_intents_from_plan`` embedded gates
+    and vote-collector calls internally; the builder still exists as an
+    implementation helper but callers should prefer this orchestrator.
+
+    Parameters
+    ----------
+    plan : ExecutionPlan
+        Output of ``build_execution_plan``.
+    oms : OMSInterface
+        Target OMS — IbkrOMS for live, SimulatedOMS for backtest.
+    ems : EMSInterface, optional
+        Defaults to a fresh IbkrEMS. Inject a custom instance for tests.
+    run_gates : bool
+        When True (default) every intent passes through the Session-2/7/8
+        routing gates before OMS.submit. Backtests may disable this to
+        observe the pre-gate fill distribution.
+    event_calendar : EventCalendar, optional
+        S5 event-risk calendar; falls back to the default singleton.
+    """
+    from chad.execution.ems import IbkrEMS
+    from chad.execution.oms import OrderResult
+    from chad.execution.routing_gates import run_all_gates
+
+    _ems = ems if ems is not None else IbkrEMS()
+    intents = _ems.build_intents_from_plan(
+        plan,
+        default_sec_type=default_sec_type,
+        default_exchange=default_exchange,
+        default_currency=default_currency,
+    )
+
+    results: List[OrderResult] = []
+    calendar = event_calendar if event_calendar is not None else _get_event_calendar()
+    for intent in intents:
+        if run_gates:
+            bar_ts = _parse_bar_timestamp(getattr(intent, "bar_timestamp", ""))
+            try:
+                current_price = float(getattr(intent, "expected_price", 0.0) or 0.0) or None
+            except (TypeError, ValueError):
+                current_price = None
+            passed, _reason = run_all_gates(
+                intent=intent,
+                bar_timestamp=bar_ts,
+                current_price=current_price,
+                config=_routing_gates_config,
+                event_calendar=calendar,
+            )
+            if not passed:
+                continue
+        order_request = _ems.build_order_request(intent)
+        results.append(oms.submit(order_request))
+    return results
+
+
+def execute_kraken_cycle(
+    routed_signals: Iterable[RoutedSignal],
+    prices: Mapping[str, float],
+    oms: "Any",
+    *,
+    ems: "Any" = None,
+    run_gates: bool = True,
+    event_calendar: "Any" = None,
+    dynamic_cap_for_crypto: Optional[float] = None,
+) -> List["Any"]:
+    """Compose: KrakenEMS → routing_gates → OMS.submit for crypto signals."""
+    from chad.execution.ems import KrakenEMS
+    from chad.execution.oms import OrderResult
+    from chad.execution.routing_gates import run_all_gates
+
+    _ems = ems if ems is not None else KrakenEMS()
+    intents = _ems.build_intents_from_signals(
+        routed_signals, prices, dynamic_cap_for_crypto=dynamic_cap_for_crypto
+    )
+
+    results: List[OrderResult] = []
+    calendar = event_calendar if event_calendar is not None else _get_event_calendar()
+    for intent in intents:
+        if run_gates:
+            bar_ts = _parse_bar_timestamp(getattr(intent, "bar_timestamp", ""))
+            try:
+                current_price = float(getattr(intent, "expected_price", 0.0) or 0.0) or None
+            except (TypeError, ValueError):
+                current_price = None
+            passed, _reason = run_all_gates(
+                intent=intent,
+                bar_timestamp=bar_ts,
+                current_price=current_price,
+                config=_routing_gates_config,
+                event_calendar=calendar,
+            )
+            if not passed:
+                continue
+        order_request = _ems.build_order_request(intent)
+        results.append(oms.submit(order_request))
+    return results
+
+
+# ============================================================================
 # Phase-8 Session 9 (A1): backward-compat re-exports
 # ----------------------------------------------------------------------------
 # The OMS and EMS Protocols moved to their own modules. Callers that
@@ -1387,6 +1511,9 @@ __all__ = [
     "normalize_kraken_pair",
     "build_kraken_intents_from_routed_signals",
     "_build_kraken_intent_from_routed_signal",
+    # Session 10 thin-orchestrator entry points
+    "execute_ibkr_cycle",
+    "execute_kraken_cycle",
     # Session 9 re-exports
     "EMSInterface",
     "IbkrEMS",
