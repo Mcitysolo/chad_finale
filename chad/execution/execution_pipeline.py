@@ -50,6 +50,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.execution.intent_schema import utc_now_iso
+from chad.execution.routing_gates import run_all_gates
 from chad.types import AssetClass, SignalSide, StrategyName
 from chad.utils.signal_router import RoutedSignal
 
@@ -67,6 +68,19 @@ _DEFAULT_FUTURES_CURRENCY = "USD"
 
 # Whole-unit instrument types on standard IBKR paths.
 _WHOLE_UNIT_SEC_TYPES = frozenset({"STK", "FUT", "OPT"})
+
+# Phase-8 Session 2: routing gate configuration. All four gates
+# (data_freshness/A4, stale_intent/E2, too_late_to_chase/E5, net_ev/R7) use
+# these defaults unless overridden by CHAD_ROUTING_GATES_* env vars. Zero-
+# config behavior: gates are active with sensible defaults.
+_routing_gates_config: Dict[str, float] = {
+    "max_bar_age_seconds": 300,
+    "price_tolerance_pct": 0.005,
+    "degraded_ttl_seconds": 60,
+    "estimated_commission": 1.0,
+    "estimated_spread": 0.0,
+    "min_edge": 0.0,
+}
 
 # Reason codes are intentionally short and machine-friendly.
 _REASON_UNSUPPORTED_ASSET_CLASS = "unsupported_asset_class"
@@ -581,6 +595,19 @@ def build_ibkr_intents_from_plan(
             expected_pnl=float(getattr(order, "expected_pnl", 0.0) or 0.0),
             created_at=utc_now_iso(),
         )
+
+        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Reject intents that
+        # fail any pre-OMS validation. current_price equals creation price at
+        # build time, so E5 operates in its degraded time-based mode here.
+        passed, _reason = run_all_gates(
+            intent=intent,
+            bar_timestamp=None,
+            current_price=float(order.price),
+            config=_routing_gates_config,
+        )
+        if not passed:
+            continue
+
         intents.append(intent)
 
     return intents
@@ -790,8 +817,21 @@ def build_kraken_intents_from_routed_signals(
         intent = _build_kraken_intent_from_routed_signal(
             rs, float(price), dynamic_cap_for_crypto=dynamic_cap_for_crypto
         )
-        if intent is not None:
-            out.append(intent)
+        if intent is None:
+            continue
+
+        # Routing gates (Phase-8 Session 2: A4/E2/E5/R7). Same gate set as the
+        # IBKR path — covers the Kraken execution lane before OMS submission.
+        passed, _reason = run_all_gates(
+            intent=intent,
+            bar_timestamp=None,
+            current_price=float(price),
+            config=_routing_gates_config,
+        )
+        if not passed:
+            continue
+
+        out.append(intent)
     return out
 
 
