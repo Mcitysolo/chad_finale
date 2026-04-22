@@ -61,9 +61,39 @@ LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 TRADES_GLOB = str(ROOT / "data" / "trades" / "trade_history_*.ndjson")
 ALLOCATIONS_PATH = ROOT / "runtime" / "strategy_allocations.json"
+CONFIG_PATH = ROOT / "config" / "edge_decay_config.json"
 
-DEFAULT_CONSECUTIVE_THRESHOLD: int = 10
+# Audit-O calibration (2026-04-22): consecutive_threshold default
+# lowered 10→5 to match observed max streak of 3. Loaded at module
+# import from config/edge_decay_config.json; falls back to the value
+# below if the file is missing or malformed.
+DEFAULT_CONSECUTIVE_THRESHOLD: int = 5
 DEFAULT_MIN_TRADES: int = 20
+
+
+def _load_config_values() -> tuple:
+    """Return (consecutive_threshold, min_trades) from JSON config.
+
+    Missing / malformed config returns the hardcoded defaults.
+    """
+    if not CONFIG_PATH.is_file():
+        return DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+    if not isinstance(data, dict):
+        return DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+    try:
+        ct = int(data.get("consecutive_threshold", DEFAULT_CONSECUTIVE_THRESHOLD))
+    except (TypeError, ValueError):
+        ct = DEFAULT_CONSECUTIVE_THRESHOLD
+    try:
+        mt = int(data.get("min_trades", DEFAULT_MIN_TRADES))
+    except (TypeError, ValueError):
+        mt = DEFAULT_MIN_TRADES
+    return ct, mt
+
 
 SCHEMA_VERSION = "strategy_allocations.v1"
 
@@ -260,6 +290,14 @@ def clear_strategy_halt(
 # ---------------------------------------------------------------------------
 
 
+def _config_consecutive_threshold() -> int:
+    return _load_config_values()[0]
+
+
+def _config_min_trades() -> int:
+    return _load_config_values()[1]
+
+
 @dataclass
 class EdgeDecayMonitor:
     """Per-strategy streak monitor.
@@ -271,10 +309,15 @@ class EdgeDecayMonitor:
         for strat, verdict in results.items():
             if verdict["halted"]:
                 logger.warning("strategy %s halted: %s", strat, verdict["reason"])
+
+    Audit-O note (2026-04-22): consecutive_threshold / min_trades now
+    default to values read from config/edge_decay_config.json via the
+    default_factory lambdas below. Callers can still override with
+    explicit kwargs.
     """
 
-    consecutive_threshold: int = DEFAULT_CONSECUTIVE_THRESHOLD
-    min_trades: int = DEFAULT_MIN_TRADES
+    consecutive_threshold: int = field(default_factory=_config_consecutive_threshold)
+    min_trades: int = field(default_factory=_config_min_trades)
     allocations_path: Path = ALLOCATIONS_PATH
     trades_glob: str = TRADES_GLOB
 

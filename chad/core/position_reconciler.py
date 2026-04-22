@@ -242,11 +242,24 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
             for order in submitted:
                 fill_price = _load_price(order.symbol)
                 try:
+                    # Calibration fix (2026-04-22 per Audit-O): thread
+                    # expected_price through reconciler close evidence too.
+                    # close intents may not carry limit_price; fall back to
+                    # the loaded fill_price so slippage is zero rather than
+                    # silently missing.
+                    _expected_px_close = float(getattr(intent_obj, "expected_price", 0.0) or 0.0)
+                    if _expected_px_close <= 0.0:
+                        _lp_close = getattr(intent_obj, "limit_price", None)
+                        try:
+                            _expected_px_close = float(_lp_close) if _lp_close is not None else fill_price
+                        except (TypeError, ValueError):
+                            _expected_px_close = fill_price
                     ev = PaperExecEvidence(
                         symbol=order.symbol,
                         side=order.side,
                         quantity=order.quantity,
                         fill_price=fill_price,
+                        expected_price=_expected_px_close,
                         strategy=close.get("strategy", "reconciler") or "reconciler",
                         source_strategies=[close.get("strategy", "reconciler") or "reconciler"],
                         broker="ibkr_paper",

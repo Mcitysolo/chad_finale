@@ -1,0 +1,14 @@
+{
+  "schema_version": "simulated_oms_config.v1",
+  "notes": "Phase-8 Session 10 (A3) SimulatedOMS slippage by symbol class. Values are MICROSTRUCTURE ESTIMATES — no observed slippage data exists yet (expected_price threading gap). Re-fit once Session-3 slippage tracker has ≥ 100 records per class. Classification: symbols ending in -USD are crypto; known futures roots (MCL, ES, GC, NQ and their micros MES/MNQ/MGC/M6E/ZB/ZN/SIL) are futures; everything else equity/ETF.",
+  "slippage_bps_by_class": {
+    "equity_etf": 3.0,
+    "futures": 1.5,
+    "crypto": 8.0
+  },
+  "default_slippage_bps": 3.0,
+  "futures_symbols": [
+    "MCL", "MES", "MNQ", "MGC", "M6E", "ZB", "ZN", "SIL",
+    "ES", "NQ", "CL", "GC"
+  ]
+}

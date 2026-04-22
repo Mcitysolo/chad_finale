@@ -210,6 +210,14 @@ class SignalDecayRecorder:
         self._ledger_dir = Path(ledger_dir)
         self._bars_dir = Path(bars_dir)
         self._horizons = tuple(int(h) for h in horizons_days if int(h) > 0)
+        # Calibration fix (2026-04-22 per Audit-O): ensure the ledger
+        # directory exists at recorder construction. _append_to_ledger
+        # creates it lazily, but analyzers that read before any write
+        # need the dir to be present so glob / is_dir checks work.
+        try:
+            self._ledger_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:  # pragma: no cover — filesystem error is non-fatal
+            pass
 
     def _path_for(self, strategy: str) -> Path:
         safe = (strategy or "unknown").replace("/", "_")

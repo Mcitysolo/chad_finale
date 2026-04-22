@@ -1,0 +1,6 @@
+{
+  "schema_version": "edge_decay_config.v1",
+  "notes": "Calibrated 2026-04-22 (Audit-O): consecutive_threshold lowered 10→5 to match observed max streak of 3 (alpha strategy, 6 streaks total). Threshold 5 is 1.7× the observed maximum, leaving room for normal variance while still halting genuine decay.",
+  "consecutive_threshold": 5,
+  "min_trades": 20
+}

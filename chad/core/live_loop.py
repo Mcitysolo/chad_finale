@@ -1055,11 +1055,24 @@ def run_once(logger: logging.Logger) -> None:
                     except Exception as pc_err:
                         logger.warning("PRICE_CACHE_READ_FAILED: %s — fill_price defaulting to 0.0", pc_err)
 
+                    # Calibration fix (2026-04-22 per Audit-O): thread the
+                    # intent's expected_price onto the PaperExecEvidence so
+                    # slippage_tracker.record_fill computes real slippage.
+                    # Pre-fix: every fill recorded expected_price=0.0 which
+                    # left slippage_per_share=None on the ledger.
+                    _expected_px = float(getattr(intent, "expected_price", 0.0) or 0.0)
+                    if _expected_px <= 0.0:
+                        _lp = getattr(intent, "limit_price", None)
+                        try:
+                            _expected_px = float(_lp) if _lp is not None else 0.0
+                        except (TypeError, ValueError):
+                            _expected_px = 0.0
                     ev = PaperExecEvidence(
                         symbol=order.symbol,
                         side=order.side,
                         quantity=order.quantity,
                         fill_price=_fill_price,
+                        expected_price=_expected_px,
                         strategy=getattr(intent, "strategy", "") or "",
                         source_strategies=[getattr(intent, "strategy", "") or ""],
                         broker="ibkr_paper",

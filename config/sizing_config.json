@@ -1,24 +1,24 @@
 {
   "schema_version": "sizing.v1",
-  "notes": "Phase-8 Session 7 sizing layer — R3 vol sizer + R5 composite cap + R6 correlation reducer. Operator-tuned.",
+  "notes": "Phase-8 Session 7 sizing layer — R3 vol sizer + R5 composite cap + R6 correlation reducer. Calibrated 2026-04-22 (Audit-O): target_daily_vol raised 0.01→0.015 to match 1.86% median realized vol; composite caps tightened to match observed order sizes; correlation threshold lowered 0.7→0.65 so R6 actually engages on a book averaging 0.654 pairwise correlation.",
 
   "vol_adjusted_sizer": {
-    "target_daily_vol": 0.01,
+    "target_daily_vol": 0.015,
     "lookback_days": 20,
     "floor_multiplier": 0.1,
     "ceiling_multiplier": 2.0
   },
 
   "composite_cap": {
-    "max_per_symbol": 1000,
+    "max_per_symbol": 300,
     "max_sector_exposure": 5000,
-    "max_adv_pct": 0.01,
-    "max_position_pct": 0.10,
+    "max_adv_pct": 0.005,
+    "max_position_pct": 0.05,
     "avg_price_assumption": 50.0
   },
 
   "correlation_monitor": {
-    "threshold": 0.7,
+    "threshold": 0.65,
     "lookback_days": 20,
     "floor_multiplier": 0.1
   }

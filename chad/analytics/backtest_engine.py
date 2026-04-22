@@ -647,9 +647,16 @@ class BacktestEngine:
         from chad.execution.oms import SimulatedFillLedger, SimulatedOMS
         if self._simulated_ledger is None:
             self._simulated_ledger = SimulatedFillLedger()
+        # Audit-O (2026-04-22) note: the backtest engine's slippage_bps
+        # kwarg is meant to control slippage for an entire run
+        # numerically, so we disable the per-symbol-class config
+        # overrides. Operators that want microstructure-accurate slippage
+        # should pass the appropriate value for their universe (3.0 for
+        # equity/ETF, 1.5 for futures, 8.0 for crypto).
         self._simulated_oms = SimulatedOMS(
             ledger=self._simulated_ledger,
             slippage_bps=self.slippage_bps,
+            use_config_overrides=False,
         )
         return self._simulated_oms
 

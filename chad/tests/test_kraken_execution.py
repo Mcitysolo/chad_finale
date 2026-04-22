@@ -143,17 +143,26 @@ def test_intent_builder_cap_clamps_notional() -> None:
 
 
 def test_build_kraken_intents_skips_non_crypto_and_missing_prices() -> None:
-    sigs = [
-        _mk_signal("AAPL", SignalSide.BUY, 10.0, AssetClass.EQUITY, StrategyName.ALPHA),
-        _mk_signal("BTC-USD", SignalSide.BUY, 0.01, AssetClass.CRYPTO),
-        _mk_signal("ETH-USD", SignalSide.BUY, 0.1, AssetClass.CRYPTO),
-    ]
-    intents = build_kraken_intents_from_routed_signals(
-        sigs, prices={"BTC-USD": 80000.0}, dynamic_cap_for_crypto=10000.0
-    )
-    # ETH skipped (no price), AAPL skipped (not CRYPTO)
-    assert len(intents) == 1
-    assert intents[0].pair == "XBT/USD"
+    # Audit-O calibration raised min_votes from 1 to 2 so a single
+    # intent no longer releases immediately. Force a fresh VoteCollector
+    # with min_votes=1 for this filtering test so it exercises the
+    # Kraken builder's own skip logic, not the voter.
+    from chad.analytics import vote_collector as _vc
+    _vc._DEFAULT = _vc.VoteCollector(min_votes=1, window_seconds=60)
+    try:
+        sigs = [
+            _mk_signal("AAPL", SignalSide.BUY, 10.0, AssetClass.EQUITY, StrategyName.ALPHA),
+            _mk_signal("BTC-USD", SignalSide.BUY, 0.01, AssetClass.CRYPTO),
+            _mk_signal("ETH-USD", SignalSide.BUY, 0.1, AssetClass.CRYPTO),
+        ]
+        intents = build_kraken_intents_from_routed_signals(
+            sigs, prices={"BTC-USD": 80000.0}, dynamic_cap_for_crypto=10000.0
+        )
+        # ETH skipped (no price), AAPL skipped (not CRYPTO)
+        assert len(intents) == 1
+        assert intents[0].pair == "XBT/USD"
+    finally:
+        _vc.reset_default_collector()
 
 
 # ---------------------------------------------------------------------------

@@ -58,7 +58,9 @@ def test_simulated_oms_satisfies_interface():
 
 
 def test_simulated_fill_applies_slippage_buy():
-    oms = SimulatedOMS(slippage_bps=10.0)  # 10bps
+    # Audit-O calibration: config overrides pick class-specific bps by
+    # symbol. Use use_config_overrides=False to test the explicit bps value.
+    oms = SimulatedOMS(slippage_bps=10.0, use_config_overrides=False)
     req = _mk_request(side="BUY", limit_price=100.0)
     result = oms.submit(req)
     # 10bps of 100 = 0.10; BUY pays up.
@@ -67,7 +69,7 @@ def test_simulated_fill_applies_slippage_buy():
 
 
 def test_simulated_fill_applies_slippage_sell():
-    oms = SimulatedOMS(slippage_bps=10.0)
+    oms = SimulatedOMS(slippage_bps=10.0, use_config_overrides=False)
     req = _mk_request(side="SELL", limit_price=100.0)
     result = oms.submit(req)
     # SELL gives up 10bps.
@@ -75,7 +77,7 @@ def test_simulated_fill_applies_slippage_sell():
 
 
 def test_simulated_fill_zero_slippage_is_limit_price():
-    oms = SimulatedOMS(slippage_bps=0.0)
+    oms = SimulatedOMS(slippage_bps=0.0, use_config_overrides=False)
     req = _mk_request(limit_price=250.0)
     result = oms.submit(req)
     assert result.fill_price == pytest.approx(250.0, abs=1e-9)

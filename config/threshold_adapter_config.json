@@ -1,0 +1,17 @@
+{
+  "schema_version": "threshold_adapter_config.v1",
+  "notes": "Phase-8 Session 5 (S4) regime-scaled entry thresholds. Calibrated 2026-04-22 (Audit-O) with a principled softening: ranging 0.8→0.9 (mean-reversion historically winning), volatile 1.5→1.3 (bar-based classification not always adverse), unknown 1.2→1.1 (boot cycles default here). adverse kept strict. Consumed by chad.analytics.threshold_adapter.adjust() / adjust_rsi().",
+  "regime_multipliers": {
+    "trending_bull": 1.0,
+    "trending_bear": 1.0,
+    "trending": 1.0,
+    "risk_on": 1.0,
+    "risk_off": 1.0,
+    "ranging": 0.9,
+    "volatile": 1.3,
+    "choppy": 1.3,
+    "unknown": 1.1,
+    "adverse": 2.0
+  },
+  "default_multiplier": 1.1
+}

@@ -117,16 +117,23 @@ def test_read_regime_state_missing_returns_default(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_g2_default_matrix_allows_all_strategies_in_all_regimes():
-    # Real config file ships with full allow-list in every regime.
+def test_g2_matrix_loads_with_calibrated_values():
+    # Audit-O calibrated the matrix per regime (2026-04-22):
+    # trending_bull/bear contain momentum+trend families; ranging has
+    # mean-reversion; volatile has vol-family; adverse is empty.
     mat = load_activation_matrix()
     assert mat  # file exists and parsed
-    for regime, strategies in mat.items():
-        if regime.startswith("_"):
-            continue
-        # Every default regime must contain at least the core families.
-        assert "alpha" in strategies
-        assert "gamma" in strategies
+    # trending regimes: momentum families are present.
+    assert "alpha" in mat["trending_bull"]
+    assert "delta" in mat["trending_bear"]
+    # ranging: mean-reversion families.
+    assert "delta_pairs" in mat["ranging"]
+    assert "gamma_reversion" in mat["ranging"]
+    # volatile: narrow to vol-family only.
+    assert "omega_vol" in mat["volatile"]
+    assert len(mat["volatile"]) < 10
+    # adverse: hard silence.
+    assert mat["adverse"] == []
 
 
 def test_g2_strategy_allowed_when_in_list():

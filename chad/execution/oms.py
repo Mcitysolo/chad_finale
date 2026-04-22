@@ -437,6 +437,52 @@ class SimulatedFillLedger:
         return len(self._rejections)
 
 
+import json as _json
+from pathlib import Path as _Path
+
+_SIMULATED_OMS_CONFIG_PATH = _Path(__file__).resolve().parents[2] / "config" / "simulated_oms_config.json"
+
+
+def _load_simulated_oms_config() -> dict:
+    """Load config/simulated_oms_config.json; return defaults on any error."""
+    defaults = {
+        "slippage_bps_by_class": {"equity_etf": 3.0, "futures": 1.5, "crypto": 8.0},
+        "default_slippage_bps": 3.0,
+        "futures_symbols": ["MCL", "MES", "MNQ", "MGC", "M6E", "ZB", "ZN", "SIL", "ES", "NQ", "CL", "GC"],
+    }
+    if not _SIMULATED_OMS_CONFIG_PATH.is_file():
+        return defaults
+    try:
+        data = _json.loads(_SIMULATED_OMS_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, _json.JSONDecodeError):
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    # Merge with defaults so partial configs still work.
+    merged = dict(defaults)
+    for key, val in data.items():
+        merged[key] = val
+    return merged
+
+
+def _classify_symbol(symbol: str, futures_symbols: list) -> str:
+    """Return 'crypto' / 'futures' / 'equity_etf' for a symbol.
+
+    Rules:
+      * Symbols ending in '-USD' (case-insensitive) → crypto.
+      * Symbols in the futures_symbols list → futures.
+      * Everything else → equity_etf.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return "equity_etf"
+    if sym.endswith("-USD"):
+        return "crypto"
+    if sym in {str(s).upper() for s in (futures_symbols or [])}:
+        return "futures"
+    return "equity_etf"
+
+
 class SimulatedOMS:
     """OMSInterface implementation for backtest + paper-shadow runs.
 
@@ -452,10 +498,13 @@ class SimulatedOMS:
         BUY:  fill_price = limit_price * (1 + slippage_bps/10_000)
         SELL: fill_price = limit_price * (1 - slippage_bps/10_000)
 
-    A flat ``slippage_bps`` is the simplest calibratable knob that
-    still produces realistic fill distributions. Future sessions can
-    swap in a spread-based or ADV-based model without changing the
-    Protocol surface.
+    The ``slippage_bps`` passed to the constructor sets the DEFAULT
+    rate. When the per-order asset class is detectable from the
+    symbol (crypto / futures / equity), the class-specific rate from
+    ``config/simulated_oms_config.json`` overrides the default. Pass
+    ``use_config_overrides=False`` to disable per-class lookup and use
+    the constructor value uniformly — useful for tests that want
+    deterministic bps regardless of symbol.
 
     Status vocabulary
     -----------------
@@ -472,10 +521,29 @@ class SimulatedOMS:
         self,
         ledger: Optional["SimulatedFillLedger"] = None,
         slippage_bps: float = 5.0,
+        *,
+        use_config_overrides: bool = True,
     ) -> None:
         self.ledger = ledger if ledger is not None else SimulatedFillLedger()
         self.slippage_bps = float(max(0.0, slippage_bps))
         self._order_counter = 0
+        self._use_config_overrides = bool(use_config_overrides)
+        cfg = _load_simulated_oms_config() if use_config_overrides else None
+        self._class_bps = dict(cfg.get("slippage_bps_by_class", {})) if cfg else {}
+        self._futures_symbols = list(cfg.get("futures_symbols", [])) if cfg else []
+        self._default_bps_from_config = (
+            float(cfg.get("default_slippage_bps", slippage_bps)) if cfg else slippage_bps
+        )
+
+    def _resolve_slippage_bps(self, symbol: str) -> float:
+        """Pick the slippage bps for this order based on symbol class."""
+        if not self._use_config_overrides or not self._class_bps:
+            return self.slippage_bps
+        klass = _classify_symbol(symbol, self._futures_symbols)
+        try:
+            return float(self._class_bps.get(klass, self._default_bps_from_config))
+        except (TypeError, ValueError):
+            return self.slippage_bps
 
     def _next_order_id(self) -> str:
         self._order_counter += 1
@@ -495,8 +563,10 @@ class SimulatedOMS:
             self.ledger.record_rejection(request, result.rejection_reason)
             return result
 
+        # Resolve per-order slippage from config by asset class.
+        effective_bps = self._resolve_slippage_bps(request.intent_symbol())
         side = str(getattr(request.intent, "side", "") or "").upper()
-        slip = ref_price * (self.slippage_bps / 10_000.0)
+        slip = ref_price * (effective_bps / 10_000.0)
         if side == "BUY":
             fill_price = ref_price + slip
         elif side in ("SELL", "SHORT"):
@@ -515,9 +585,9 @@ class SimulatedOMS:
             venue=self.venue,
             raw=None,
         )
-        # Carry the slippage model on the result for the ledger without
+        # Carry the effective bps on the result for the ledger without
         # widening OrderResult's public field surface.
-        result._slippage_bps = self.slippage_bps  # type: ignore[attr-defined]
+        result._slippage_bps = effective_bps  # type: ignore[attr-defined]
         self.ledger.record(request, result)
         return result
 
