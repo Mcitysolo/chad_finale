@@ -1128,33 +1128,38 @@ def split_signals_by_asset_class(
 
 # Kraken-side minimum order sizes (base currency). Conservative defaults that
 # satisfy Kraken's published minima as of 2026.
+# Keyed on Kraken's REST altname (e.g. "XBTUSD"), which is what the REST
+# AddOrder endpoint accepts. The wsname format ("XBT/USD") is for the
+# WebSocket API only and is rejected by REST with EQuery:Unknown asset pair.
 _KRAKEN_MIN_VOLUMES: Dict[str, Decimal] = {
-    "XBT/USD": Decimal("0.0001"),
-    "ETH/USD": Decimal("0.001"),
-    "SOL/USD": Decimal("0.05"),
-    "XBT/CAD": Decimal("0.0001"),
-    "ETH/CAD": Decimal("0.001"),
+    "XBTUSD": Decimal("0.0001"),
+    "ETHUSD": Decimal("0.001"),
+    "SOLUSD": Decimal("0.05"),
+    "XBTCAD": Decimal("0.0001"),
+    "ETHCAD": Decimal("0.001"),
 }
 
-# CHAD canonical symbol -> Kraken pair
+# CHAD canonical symbol -> Kraken REST altname
+# Kraken's /0/private/AddOrder expects altname (e.g. "XBTUSD") or the full
+# pair name (e.g. "XXBTZUSD"). wsname ("XBT/USD") is rejected by REST.
 _KRAKEN_SYMBOL_MAP: Dict[str, str] = {
     # USD-quoted
-    "BTC-USD": "XBT/USD",
-    "BTCUSD": "XBT/USD",
-    "XBT-USD": "XBT/USD",
-    "XBTUSD": "XBT/USD",
-    "ETH-USD": "ETH/USD",
-    "ETHUSD": "ETH/USD",
-    "SOL-USD": "SOL/USD",
-    "SOLUSD": "SOL/USD",
+    "BTC-USD": "XBTUSD",
+    "BTCUSD": "XBTUSD",
+    "XBT-USD": "XBTUSD",
+    "XBTUSD": "XBTUSD",
+    "ETH-USD": "ETHUSD",
+    "ETHUSD": "ETHUSD",
+    "SOL-USD": "SOLUSD",
+    "SOLUSD": "SOLUSD",
     # CAD-quoted alternates (used when USD buying power is empty and the
     # Kraken account holds ZCAD)
-    "BTC-CAD": "XBT/CAD",
-    "BTCCAD": "XBT/CAD",
-    "XBT-CAD": "XBT/CAD",
-    "XBTCAD": "XBT/CAD",
-    "ETH-CAD": "ETH/CAD",
-    "ETHCAD": "ETH/CAD",
+    "BTC-CAD": "XBTCAD",
+    "BTCCAD": "XBTCAD",
+    "XBT-CAD": "XBTCAD",
+    "XBTCAD": "XBTCAD",
+    "ETH-CAD": "ETHCAD",
+    "ETHCAD": "ETHCAD",
 }
 
 

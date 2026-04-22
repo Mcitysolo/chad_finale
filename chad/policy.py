@@ -594,9 +594,39 @@ def build_default_strategy_limits() -> Dict[StrategyName, StrategyRiskLimits]:
         enabled=False,
     )
 
-    # Delta Pairs: not yet built — kept disabled.
+    # Delta Pairs: ETF pairs-trading (market-neutral). Mirror gamma_reversion
+    # caps — ETF notional profile. Enabled 2026-04-22 to unblock signals that
+    # were being rejected as strategy_disabled despite being in the registry,
+    # ALWAYS-ACTIVE routing, and strategy_weights.json (weight=0.05).
     limits[StrategyName.DELTA_PAIRS] = StrategyRiskLimits(
-        enabled=False,
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=True,
+    )
+
+    # Alpha Intraday: intraday 1m-bar momentum sleeve. Mirror alpha caps.
+    # Added 2026-04-22 to unblock signals that were being rejected as
+    # strategy_limits_missing despite being in the registry.
+    limits[StrategyName.ALPHA_INTRADAY] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=10_000.0,
+        allow_short=False,
+    )
+
+    # Omega Momentum Options: intraday single-leg options momentum. Mirror
+    # alpha_options caps. Added 2026-04-22 to unblock signals that were
+    # being rejected as strategy_limits_missing despite being in the registry
+    # and strategy_weights.json (weight=0.03).
+    limits[StrategyName.OMEGA_MOMENTUM_OPTIONS] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=5_000.0,
+        allow_short=False,
     )
 
     return limits

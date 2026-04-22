@@ -81,9 +81,11 @@ def test_split_handles_empty() -> None:
 
 
 def test_kraken_pair_normalization() -> None:
-    assert normalize_kraken_pair("BTC-USD") == "XBT/USD"
-    assert normalize_kraken_pair("ETH-USD") == "ETH/USD"
-    assert normalize_kraken_pair("SOL-USD") == "SOL/USD"
+    # Kraken REST AddOrder expects altname (e.g. "XBTUSD"); wsname
+    # ("XBT/USD") is rejected by REST with EQuery:Unknown asset pair.
+    assert normalize_kraken_pair("BTC-USD") == "XBTUSD"
+    assert normalize_kraken_pair("ETH-USD") == "ETHUSD"
+    assert normalize_kraken_pair("SOL-USD") == "SOLUSD"
     assert normalize_kraken_pair("DOGE-USD") is None
     assert normalize_kraken_pair("") is None
 
@@ -97,7 +99,7 @@ def test_intent_builder_btc_basic() -> None:
     sig = _mk_signal("BTC-USD", SignalSide.BUY, 0.01, AssetClass.CRYPTO)
     intent = _build_kraken_intent_from_routed_signal(sig, current_price=80000.0)
     assert intent is not None
-    assert intent.pair == "XBT/USD"
+    assert intent.pair == "XBTUSD"
     assert intent.side == "buy"
     # Phase-8 Session 8 (E4 Kraken): ordertype is now "limit" when bar data
     # is available (BTC-USD has seeded 1d bars in the repo). Falls back to
@@ -160,7 +162,7 @@ def test_build_kraken_intents_skips_non_crypto_and_missing_prices() -> None:
         )
         # ETH skipped (no price), AAPL skipped (not CRYPTO)
         assert len(intents) == 1
-        assert intents[0].pair == "XBT/USD"
+        assert intents[0].pair == "XBTUSD"
     finally:
         _vc.reset_default_collector()
 
