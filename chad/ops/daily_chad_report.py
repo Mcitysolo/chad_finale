@@ -46,6 +46,17 @@ REPORTS_DIR = REPO_ROOT / "reports" / "ops"
 TRADE_FILE_GLOB = "trade_history_*.ndjson"
 FILLS_FILE_TEMPLATE = "FILLS_{ymd}.ndjson"
 
+# Live regime classifier labels (from runtime/regime_state.json).
+# Keep in sync with chad/analytics/regime_classifier.py.
+REGIME_LABELS: Dict[str, str] = {
+    "trending_bull":  "TRENDING (bullish)",
+    "trending_bear":  "TRENDING (bearish)",
+    "ranging":        "RANGING (mean-reversion favored)",
+    "volatile":       "VOLATILE (defensive posture)",
+    "unknown":        "UNKNOWN",
+    "adverse":        "ADVERSE (minimal exposure)",
+}
+
 # ---------------------------------------------------------------------------
 # Instrument translations — plain English
 # ---------------------------------------------------------------------------
@@ -475,6 +486,16 @@ def _get_vix() -> Optional[float]:
             if val is not None:
                 return _safe_float(val)
 
+    # 3. Fallback: most recent close from daily bar history
+    bar_data = _read_json(REPO_ROOT / "data" / "bars" / "1d" / "VIX.json")
+    if bar_data:
+        bars = bar_data.get("bars")
+        if isinstance(bars, list) and bars:
+            last_bar = bars[-1]
+            close = last_bar.get("close") or last_bar.get("c")
+            if close is not None:
+                return _safe_float(close)
+
     return None
 
 
@@ -536,6 +557,94 @@ def _get_spy_change() -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Intelligence feed helpers (trends / reddit / short interest)
+#
+# Used by both the morning brief and the end-of-day report. Each feed is
+# optional — a missing or stale file results in an empty highlight list, not
+# an error. Freshness is determined by _is_feed_fresh(); default is 6 hours.
+# ---------------------------------------------------------------------------
+
+def _is_feed_fresh(path: Path, max_age_hours: float = 6.0) -> bool:
+    """Return True if a runtime feed exists and is younger than max_age_hours."""
+    try:
+        if not path.is_file():
+            return False
+        age_s = (_utc_now() - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)).total_seconds()
+        return age_s < max_age_hours * 3600.0
+    except Exception:
+        return False
+
+
+def _gather_intelligence_highlights(runtime_dir: Path) -> List[str]:
+    """
+    Pull 0-3 concrete highlights from trends/reddit/short-interest feeds.
+    Returns [] when every feed is stale, missing, or unremarkable — never
+    raises. Used by both morning brief and end-of-day take.
+    """
+    highlights: List[str] = []
+
+    # Google Trends: rising/high search interest
+    trends_path = runtime_dir / "trends_state.json"
+    if _is_feed_fresh(trends_path):
+        try:
+            trends = _read_json(trends_path) or {}
+            for sym, v in (trends.get("signals") or {}).items():
+                if not isinstance(v, dict):
+                    continue
+                ratio = _safe_float(v.get("ratio"))
+                sig = str(v.get("signal", "")).upper()
+                if sig in ("RISING", "HIGH") or ratio >= 1.3:
+                    highlights.append(
+                        f"{sym} search interest surging ({ratio:.2f}x avg) — retail attention building"
+                    )
+                if len(highlights) >= 2:
+                    break
+        except Exception:
+            pass
+
+    # Reddit: heavy discussion or directional sentiment
+    reddit_path = runtime_dir / "reddit_sentiment.json"
+    if _is_feed_fresh(reddit_path):
+        try:
+            reddit = _read_json(reddit_path) or {}
+            for sym, v in (reddit.get("signals") or {}).items():
+                if not isinstance(v, dict):
+                    continue
+                mentions = int(_safe_float(v.get("mention_count")))
+                score = _safe_float(v.get("sentiment_score"))
+                sig = str(v.get("signal", "")).upper()
+                if mentions >= 20 or sig in ("BULLISH", "BEARISH", "HYPE"):
+                    tone = "bullish" if score > 0 else ("bearish" if score < 0 else "active")
+                    highlights.append(
+                        f"{sym} heavy Reddit discussion ({mentions} mentions, {tone}) — momentum catalyst"
+                    )
+                if len(highlights) >= 3:
+                    break
+        except Exception:
+            pass
+
+    # Short interest: squeeze candidates
+    shorts_path = runtime_dir / "short_interest.json"
+    if _is_feed_fresh(shorts_path):
+        try:
+            shorts = _read_json(shorts_path) or {}
+            for sym, v in (shorts.get("signals") or {}).items():
+                if not isinstance(v, dict):
+                    continue
+                sf = _safe_float(v.get("short_float_pct"))
+                if v.get("squeeze_risk") or sf >= 0.15:
+                    highlights.append(
+                        f"{sym} short float at {sf*100:.0f}% — squeeze risk on upside break"
+                    )
+                if len(highlights) >= 3:
+                    break
+        except Exception:
+            pass
+
+    return highlights[:3]
+
+
+# ---------------------------------------------------------------------------
 # CHAD's Take — AI-generated paragraph (best-effort)
 # ---------------------------------------------------------------------------
 
@@ -546,8 +655,15 @@ def _generate_chads_take(
     losses: int,
     vix: Optional[float],
     strategy_results: Dict[str, float],
+    *,
+    regime: Optional[str] = None,
+    scr_state: Optional[str] = None,
+    scr_sizing: Optional[float] = None,
+    open_positions: Optional[int] = None,
+    top_strategy: Optional[str] = None,
+    intelligence_highlights: Optional[List[str]] = None,
 ) -> str:
-    """Generate a 2-3 sentence plain English take using Claude Haiku."""
+    """Generate a 2-3 sentence elite-prodigy take for the end-of-day report."""
     try:
         from chad.intel.claude_client import ClaudeClient
 
@@ -558,27 +674,47 @@ def _generate_chads_take(
             for s, pnl in sorted(strategy_results.items())
         )
 
+        extras: List[str] = []
+        if regime:
+            extras.append(f"Regime: {regime}")
+        if scr_state:
+            sz = f" (sizing {scr_sizing:.2f}x)" if isinstance(scr_sizing, (int, float)) else ""
+            extras.append(f"SCR: {scr_state}{sz}")
+        if top_strategy:
+            extras.append(f"Top strategy today: {top_strategy}")
+        if open_positions is not None:
+            extras.append(f"Open positions: {open_positions}")
+        if intelligence_highlights:
+            extras.append(
+                "Intelligence highlights: " + "; ".join(intelligence_highlights[:3])
+            )
+
         prompt = (
             f"Today's results: {'made' if total_pnl >= 0 else 'lost'} {_format_money(abs(total_pnl))} total. "
-            f"{total_trades} trades, {wins} winners, {losses} losers, {max(0, total_trades - wins - losses)} scratches. "
+            f"{total_trades} trades, {wins} winners, {losses} losers, "
+            f"{max(0, total_trades - wins - losses)} scratches. "
             f"VIX (fear gauge): {vix if vix else 'unknown'}. "
             f"Strategy results: {strat_summary}. "
-            f"Write 2-3 sentences summarizing today for someone who knows nothing about trading. "
-            f"Use a sports analogy or everyday comparison. Be warm and encouraging."
+            + (" ".join(extras) + ". " if extras else "")
+            + "Write 2-3 sentences assessing today's trading. Reference the specific "
+            "P&L, positions, and market conditions above. Plain English only — no "
+            "jargon. Be honest about losses. Be direct."
         )
 
         text, _, _ = client._call_claude(
             prompt=prompt,
             system=(
-                "You are CHAD — an elite autonomous trading system with the precision "
-                "of Jim Simons, the macro vision of Ray Dalio, and the opportunistic "
-                "instincts of Stanley Druckenmiller. Analyze today's trading results "
-                "and provide a sharp, specific 2-3 sentence assessment. Reference "
-                "actual P&L, positions, and market conditions. Be honest about losses. "
-                "No generic advice, no jargon bloat — confident, data-driven, precise."
+                "You are CHAD — an elite autonomous trading system. You think with "
+                "the quantitative precision of Jim Simons, the macro vision of Ray "
+                "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
+                "You are speaking to a non-technical operator who does not need "
+                "jargon — use plain English only. Analyze today's trading results "
+                "and give a sharp, specific 2-3 sentence assessment. Reference "
+                "actual P&L, positions, and conditions. Be honest about losses. "
+                "Be direct. No generic advice."
             ),
             task_type="standard",
-            max_tokens=220,
+            max_tokens=260,
             temperature=0.6,
         )
         return text.strip()
@@ -1000,6 +1136,33 @@ class DailyCHADReport:
         # CHAD's Take (AI-generated, best-effort — always present)
         sections.append("═══ CHAD'S TAKE ═══")
         if total_trades > 0:
+            # Pull the richer context the elite-prodigy prompt can anchor to.
+            regime_label_eod = "UNKNOWN"
+            try:
+                regime_eod = _read_json(self._runtime_dir / "regime_state.json") or {}
+                live_regime_eod = str(regime_eod.get("regime", "unknown")).lower()
+                regime_label_eod = REGIME_LABELS.get(live_regime_eod, live_regime_eod.upper())
+            except Exception:
+                pass
+            scr_state_eod = str(scr_data.get("state", "UNKNOWN")) if scr_data else "UNKNOWN"
+            scr_sizing_eod_raw = scr_data.get("sizing_factor") if scr_data else None
+            scr_sizing_eod = (
+                float(scr_sizing_eod_raw)
+                if isinstance(scr_sizing_eod_raw, (int, float))
+                else None
+            )
+            top_strategy_eod: Optional[str] = None
+            if strategy_pnl:
+                _top_sym, _top_val = max(
+                    strategy_pnl.items(), key=lambda kv: kv[1]
+                )
+                top_strategy_eod = (
+                    f"{translate_strategy(_top_sym)} "
+                    f"({'+' if _top_val >= 0 else ''}{_format_money(_top_val)})"
+                )
+
+            highlights_eod = _gather_intelligence_highlights(self._runtime_dir)
+
             take = _generate_chads_take(
                 total_pnl=total_pnl,
                 total_trades=total_trades,
@@ -1007,6 +1170,12 @@ class DailyCHADReport:
                 losses=losses,
                 vix=vix,
                 strategy_results=strategy_pnl,
+                regime=regime_label_eod,
+                scr_state=scr_state_eod,
+                scr_sizing=scr_sizing_eod,
+                open_positions=len(open_positions),
+                top_strategy=top_strategy_eod,
+                intelligence_highlights=highlights_eod,
             )
         else:
             take = _generate_quiet_day_take()
@@ -1058,48 +1227,11 @@ class MorningBrief:
             return None
 
     def _gather_watch_items(self) -> List[str]:
-        """Pull 2-3 concrete watch items from intelligence feeds."""
-        runtime = self._root / "runtime"
-        items: List[str] = []
-
-        trends = self._load_fresh_feed(runtime / "trends_state.json") or {}
-        for sym, v in (trends.get("signals") or {}).items():
-            if not isinstance(v, dict):
-                continue
-            ratio = _safe_float(v.get("ratio"))
-            sig = str(v.get("signal", "")).upper()
-            if sig in ("RISING", "HIGH") or ratio >= 1.3:
-                items.append(f"{sym} search interest surging ({ratio:.2f}x avg) — retail attention building")
-            if len(items) >= 2:
-                break
-
-        reddit = self._load_fresh_feed(runtime / "reddit_sentiment.json") or {}
-        for sym, v in (reddit.get("signals") or {}).items():
-            if not isinstance(v, dict):
-                continue
-            mentions = int(_safe_float(v.get("mention_count")))
-            score = _safe_float(v.get("sentiment_score"))
-            sig = str(v.get("signal", "")).upper()
-            if mentions >= 20 or sig in ("BULLISH", "BEARISH"):
-                tone = "bullish" if score > 0 else ("bearish" if score < 0 else "active")
-                items.append(f"{sym} heavy Reddit discussion ({mentions} mentions, {tone}) — momentum catalyst")
-                if len(items) >= 3:
-                    break
-
-        shorts = self._load_fresh_feed(runtime / "short_interest.json") or {}
-        for sym, v in (shorts.get("signals") or {}).items():
-            if not isinstance(v, dict):
-                continue
-            sf = _safe_float(v.get("short_float_pct"))
-            if v.get("squeeze_risk") or sf >= 0.15:
-                items.append(f"{sym} short float at {sf*100:.0f}% — squeeze risk on upside break")
-                if len(items) >= 3:
-                    break
-
-        return items[:3]
+        """Pull 0-3 concrete watch items from intelligence feeds."""
+        return _gather_intelligence_highlights(self._root / "runtime")
 
     def _chads_take(self, context: Dict[str, Any]) -> Optional[str]:
-        """Elite prodigy take — Simons/Dalio/Druckenmiller voice."""
+        """Elite prodigy take — Simons/Dalio/Druckenmiller voice (morning brief)."""
         try:
             from chad.intel.claude_client import ClaudeClient
             client = ClaudeClient.load()
@@ -1110,12 +1242,15 @@ class MorningBrief:
                     + "\n\nReturn JSON {\"text\": \"2-3 sentence pre-market take\"}."
                 ),
                 system=(
-                    "You are CHAD — an elite autonomous trading system. Your knowledge "
-                    "spans quantitative finance, macro economics, and market microstructure. "
-                    "You think like Jim Simons on quant precision, Ray Dalio on macro, "
-                    "and Stanley Druckenmiller on opportunistic positioning. Be specific, "
-                    "data-driven, and confident. Reference the actual market data provided. "
-                    "Maximum 3 sentences. No generic advice. Wrap in JSON {text: ...}."
+                    "You are CHAD — an elite autonomous trading system. You think with "
+                    "the quantitative precision of Jim Simons, the macro vision of Ray "
+                    "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
+                    "You are speaking to a non-technical operator who does not need "
+                    "jargon — use plain English only. Analyze the pre-market conditions "
+                    "provided and give a sharp, specific 2-3 sentence assessment. "
+                    "Reference actual data. Be confident and direct. No generic "
+                    "statements like 'stay disciplined' or 'markets can be volatile'. "
+                    "Wrap your response in a JSON object with a single key 'text'."
                 ),
                 task_type="standard",
             )
@@ -1252,19 +1387,15 @@ class MorningBrief:
 
         # ═══ TODAY'S STRATEGY POSTURE ═══
         lines.append("\u2550\u2550\u2550 TODAY'S STRATEGY POSTURE \u2550\u2550\u2550")
-        regime_profiles = strat_intel.get("regime_profile") or []
-        regime_summary = "UNKNOWN"
-        if isinstance(regime_profiles, list) and regime_profiles:
-            profiles = [str(r.get("profile", "")).lower() for r in regime_profiles if isinstance(r, dict)]
-            if profiles:
-                if any(p == "conservative" for p in profiles):
-                    regime_summary = "CONSERVATIVE (risk-off bias)"
-                elif all(p == "aggressive" for p in profiles):
-                    regime_summary = "AGGRESSIVE (risk-on)"
-                elif all(p == "normal" for p in profiles):
-                    regime_summary = "NEUTRAL"
-                else:
-                    regime_summary = "MIXED"
+        # Regime read from the LIVE classifier (runtime/regime_state.json),
+        # not the 48-hour AI cache in strategy_intelligence.json which was
+        # collapsing every regime to NEUTRAL.
+        try:
+            regime_data = _read_json(runtime / "regime_state.json") or {}
+            live_regime = str(regime_data.get("regime", "unknown")).lower()
+            regime_summary = REGIME_LABELS.get(live_regime, live_regime.upper())
+        except Exception:
+            regime_summary = "UNKNOWN"
         lines.append(f"Regime: {regime_summary}")
 
         biases = strat_intel.get("confidence_bias") or []
@@ -1290,29 +1421,40 @@ class MorningBrief:
 
         # ═══ CHAD'S PERFORMANCE ═══
         lines.append("\u2550\u2550\u2550 CHAD'S PERFORMANCE \u2550\u2550\u2550")
-        try:
-            scr = _read_json(runtime / "scr_state.json") or {}
-            scr_state = scr.get("state", "UNKNOWN")
-            sizing = scr.get("sizing_factor")
-            if isinstance(sizing, (int, float)):
-                lines.append(f"SCR: {scr_state} (sizing {sizing:.2f}x)")
-            else:
-                lines.append(f"SCR: {scr_state}")
-        except Exception:
-            pass
+        scr = _read_json(runtime / "scr_state.json") or {}
+        scr_state = scr.get("state", "UNKNOWN")
+        scr_sizing = scr.get("sizing_factor")
+        if isinstance(scr_sizing, (int, float)):
+            lines.append(f"SCR: {scr_state} (sizing {scr_sizing:.2f}x)")
+        else:
+            lines.append(f"SCR: {scr_state}")
+
         top = expectancy.get("top_performer")
         strats = expectancy.get("strategies") or {}
+        top_strategy_summary: Optional[str] = None
         if top and isinstance(strats, dict) and top in strats:
             s = strats[top]
-            lines.append(
+            top_strategy_summary = (
                 f"Top strategy: {translate_strategy(str(top))} \u2014 "
                 f"win rate {_safe_float(s.get('win_rate'))*100:.0f}%, "
                 f"expectancy {_format_money(_safe_float(s.get('expectancy')))}"
             )
-        clean = expectancy.get("total_clean_trades")
-        if isinstance(clean, (int, float)):
-            lines.append(f"Clean trades logged: {int(clean)}")
+            lines.append(top_strategy_summary)
+        # Trade count clarity: BOTH fills-today (raw activity) AND SCR
+        # effective_trades (the number that actually gates SCR progress).
+        # Previously the brief only surfaced one of these and the operator
+        # could not tell raw session activity from real SCR progress.
+        fills_today = load_today_intents(self._root / "data" / "fills")
+        fills_today_n = len(fills_today)
+        scr_stats = scr.get("stats") if isinstance(scr.get("stats"), dict) else {}
+        effective_trades = int(_safe_float(scr_stats.get("effective_trades", 0)))
+        lines.append(
+            f"Fills today: {fills_today_n} | "
+            f"Clean trades toward next level: {effective_trades}/100"
+        )
+
         # Open positions
+        open_count = 0
         try:
             pg_path = runtime / "positions_snapshot.json"
             if pg_path.exists():
@@ -1341,7 +1483,12 @@ class MorningBrief:
             "watch_items": watch,
             "notable_biases": notable_biases,
             "top_performer": top,
-            "clean_trades": clean,
+            "top_strategy_summary": top_strategy_summary,
+            "scr_state": scr_state,
+            "scr_sizing": scr_sizing,
+            "fills_today": fills_today_n,
+            "effective_trades": effective_trades,
+            "open_positions": open_count,
         }
         take = self._chads_take(take_ctx)
         if take:
@@ -1416,9 +1563,219 @@ def run_morning_brief() -> str:
     return message
 
 
+# ---------------------------------------------------------------------------
+# Weekly Business Summary (Sundays 20:00 UTC)
+# ---------------------------------------------------------------------------
+
+class WeeklySummary:
+    """
+    Generate a Sunday-evening week-in-review for the non-technical operator.
+
+    Pulls fills from the last 7 days directly from data/fills/, sums realized
+    P&L where present, and includes SCR state, regime, beta allocation, and
+    a Claude-generated elite-prodigy "take" summarizing the week.
+    """
+
+    def __init__(self, repo_root: Optional[Path] = None) -> None:
+        self._root = repo_root or REPO_ROOT
+        self._fills_dir = self._root / "data" / "fills"
+        self._runtime_dir = self._root / "runtime"
+
+    def _load_weekly_fills(self) -> List[IntentRow]:
+        if not self._fills_dir.exists():
+            return []
+        cutoff = _utc_now().date() - timedelta(days=7)
+        rows: List[IntentRow] = []
+        for f in sorted(self._fills_dir.glob("FILLS_*.ndjson")):
+            try:
+                ymd = f.stem.split("_", 1)[1]
+                dt = datetime.strptime(ymd, "%Y%m%d").date()
+                if dt < cutoff:
+                    continue
+            except Exception:
+                continue
+            try:
+                for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    row = _extract_intent(obj)
+                    if row is not None:
+                        rows.append(row)
+            except Exception:
+                continue
+        return rows
+
+    def _load_weekly_realized_pnl(self) -> float:
+        """Sum realized_pnl from trade_history ledger files in the last 7 days."""
+        trades = load_week_trades(self._root / "data" / "trades")
+        return sum(t.pnl for t in trades)
+
+    def _weekly_take(self, context: Dict[str, Any]) -> Optional[str]:
+        """Claude Haiku elite-prodigy take summarizing the week."""
+        try:
+            from chad.intel.claude_client import ClaudeClient
+            client = ClaudeClient.load()
+            result = client.chat_json(
+                (
+                    "Week-in-review context:\n"
+                    + json.dumps(context, default=str)[:3000]
+                    + "\n\nReturn JSON {\"text\": \"2-3 sentence weekly take\"}."
+                ),
+                system=(
+                    "You are CHAD — an elite autonomous trading system. You think with "
+                    "the quantitative precision of Jim Simons, the macro vision of Ray "
+                    "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
+                    "You are speaking to a non-technical operator who does not need "
+                    "jargon — use plain English only. Analyze this past week's trading "
+                    "results and give a sharp, specific 2-3 sentence assessment. "
+                    "Reference actual P&L, regime, and top-performing strategy. "
+                    "Be honest about losses. Be direct. No generic advice. "
+                    "Wrap your response in a JSON object with a single key 'text'."
+                ),
+                task_type="standard",
+            )
+            text = str(result.get("text", "")).strip()
+            return text or None
+        except Exception:
+            return None
+
+    def generate(self) -> str:
+        now = _utc_now()
+        weekly_fills = self._load_weekly_fills()
+        weekly_fill_count = len(weekly_fills)
+        weekly_realized_pnl = self._load_weekly_realized_pnl()
+
+        scr = _read_json(self._runtime_dir / "scr_state.json") or {}
+        scr_state = str(scr.get("state", "UNKNOWN"))
+        scr_sizing = scr.get("sizing_factor")
+        scr_stats = scr.get("stats") if isinstance(scr.get("stats"), dict) else {}
+        effective_trades = int(_safe_float(scr_stats.get("effective_trades", 0)))
+
+        # Regime (live)
+        try:
+            regime_data = _read_json(self._runtime_dir / "regime_state.json") or {}
+            live_regime = str(regime_data.get("regime", "unknown")).lower()
+            regime_label = REGIME_LABELS.get(live_regime, live_regime.upper())
+        except Exception:
+            regime_label = "UNKNOWN"
+
+        # Expectancy / top strategy
+        expectancy = _read_json(self._runtime_dir / "expectancy_state.json") or {}
+        top = expectancy.get("top_performer")
+        strats = expectancy.get("strategies") or {}
+        top_line: Optional[str] = None
+        if top and isinstance(strats, dict) and top in strats:
+            s = strats[top]
+            top_line = (
+                f"{translate_strategy(str(top))} — "
+                f"{_safe_float(s.get('win_rate'))*100:.0f}% win rate, "
+                f"{_format_money(_safe_float(s.get('expectancy')))} expectancy"
+            )
+
+        # Beta allocation
+        routing = _read_json(self._runtime_dir / "profit_routing.json") or {}
+        totals = routing.get("totals") if isinstance(routing.get("totals"), dict) else {}
+        beta_total = _safe_float(totals.get("beta_allocation"))
+        # Beta accumulated THIS WEEK
+        beta_week = 0.0
+        decisions = routing.get("decisions") if isinstance(routing.get("decisions"), list) else []
+        cutoff = now - timedelta(days=7)
+        for d in decisions:
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("routing_timestamp") or d.get("ts_utc")
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if dt >= cutoff:
+                    beta_week += _safe_float(d.get("beta_allocation"))
+            except Exception:
+                continue
+
+        lines: List[str] = []
+        week_of = (now - timedelta(days=now.weekday() + 1)).strftime("%B %d, %Y")
+        lines.append(f"\U0001f4ca CHAD Week in Review — Week of {week_of}")
+        lines.append("")
+
+        lines.append("═══ PERFORMANCE ═══")
+        lines.append(f"Fills this week: {weekly_fill_count}")
+        sign = "+" if weekly_realized_pnl >= 0 else ""
+        lines.append(f"Realized P&L: {sign}{_format_money(weekly_realized_pnl)}")
+        lines.append(f"Clean trades (SCR): {effective_trades}/100 to CAUTIOUS")
+        lines.append("")
+
+        lines.append("═══ TOP BRAIN ═══")
+        if top_line:
+            lines.append(top_line)
+        else:
+            lines.append("No strategy has logged enough trades this week to rank.")
+        lines.append("")
+
+        lines.append("═══ BETA ALLOCATION ═══")
+        lines.append(f"Accumulated this week: {_format_money(beta_week)}")
+        lines.append(f"Total Beta earmarked: {_format_money(beta_total)}")
+        lines.append("")
+
+        lines.append("═══ SYSTEM HEALTH ═══")
+        if isinstance(scr_sizing, (int, float)):
+            lines.append(f"SCR: {scr_state} (sizing {scr_sizing:.2f}x)")
+        else:
+            lines.append(f"SCR: {scr_state}")
+        lines.append(f"Regime this week: {regime_label}")
+        lines.append("")
+
+        lines.append("═══ CHAD'S WEEKLY TAKE ═══")
+        take_ctx = {
+            "weekly_fills": weekly_fill_count,
+            "weekly_realized_pnl": weekly_realized_pnl,
+            "scr_state": scr_state,
+            "regime": regime_label,
+            "top_strategy": top_line,
+            "beta_accumulated_week": beta_week,
+            "beta_total": beta_total,
+            "effective_trades": effective_trades,
+        }
+        take = self._weekly_take(take_ctx)
+        if take:
+            lines.append(take)
+        else:
+            lines.append(
+                "Another week logged — the engine is compounding data, not ego. "
+                "The SCR gate is doing its job: gating size to evidence, not opinion."
+            )
+        lines.append("")
+        lines.append("— CHAD \U0001f91d")
+
+        return "\n".join(lines)
+
+    async def send_to_telegram(self) -> bool:
+        message = self.generate()
+        _send_telegram(message)
+        return True
+
+
+def run_weekly_summary() -> str:
+    summary = WeeklySummary()
+    message = summary.generate()
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = _utc_now().strftime("%Y%m%dT%H%M%SZ")
+    (REPORTS_DIR / f"WEEKLY_CHAD_REPORT_{ts}.txt").write_text(message, encoding="utf-8")
+    _send_telegram(message)
+    print(message)
+    return message
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "morning":
         run_morning_brief()
+    elif len(sys.argv) > 1 and sys.argv[1] == "weekly":
+        run_weekly_summary()
     else:
         run_daily_report()

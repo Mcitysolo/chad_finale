@@ -106,6 +106,22 @@ def main() -> int:
         _atomic_write_json(OUT_SCR, scr_payload)
         _atomic_write_json(OUT_SHADOW, shadow_payload)
 
+        # Fire Telegram alert on SCR state transitions (WARMUP → CAUTIOUS →
+        # CONFIDENT → PAUSED). Uses runtime/scr_last_notified_state.json as
+        # sentinel so we only fire on transitions, not every sync cycle.
+        try:
+            import sys
+            _REPO_ROOT = Path(__file__).resolve().parents[1]
+            if str(_REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(_REPO_ROOT))
+            from chad.utils.telegram_notify import check_and_send_scr_milestone
+            _scr_state_now = str(scr_payload.get("state", "") or "").upper()
+            _eff = int((scr_payload.get("stats") or {}).get("effective_trades") or 0)
+            if _scr_state_now:
+                check_and_send_scr_milestone(_scr_state_now, _eff)
+        except Exception:
+            pass
+
         print(
             json.dumps(
                 {"ok": True, "out_scr": str(OUT_SCR), "out_shadow": str(OUT_SHADOW), "ts_utc": ts},

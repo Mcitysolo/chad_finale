@@ -37,6 +37,7 @@ notify("IBKR DOWN: ...", severity="critical", dedupe_key="ibkr_down")
 """
 
 import json
+import logging
 import os
 import random
 import time
@@ -48,6 +49,8 @@ from typing import Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = ROOT / "runtime"
+
+_NOTIFY_LOGGER = logging.getLogger("chad.telegram_notify")
 
 
 @dataclass(frozen=True)
@@ -233,3 +236,173 @@ def notify(
         sleep_s = base + random.random() * 0.25
         time.sleep(min(5.0, float(sleep_s)))
         attempt += 1
+
+
+# =============================================================================
+# Specialized alert helpers
+#
+# These are the operator-facing push notifications that fire from the live
+# loop, risk subsystems, and scr-sync service. Each wraps `notify()` so the
+# existing retry/dedupe/config machinery applies. All helpers are fail-safe:
+# they never raise on transport failures — alerting is supplementary to
+# logging and must never block execution.
+# =============================================================================
+
+def _send_raw_telegram(text: str, *, dedupe_key: Optional[str] = None) -> bool:
+    """
+    Send a pre-formatted operator message without the "CHAD INFO:" prefix
+    that `notify()` injects for generic strings. The notifier already has
+    a bypass for messages starting with recognized severity emojis.
+    """
+    try:
+        msg = text.strip()
+        if not msg.startswith(("ℹ️", "⚠️", "\U0001f6a8")):
+            # Prefix with info-severity marker so notify() leaves it intact.
+            msg = "ℹ️ " + msg
+        return notify(msg, severity="info", dedupe_key=dedupe_key)
+    except Exception as exc:
+        _NOTIFY_LOGGER.warning("telegram_notify_failed err=%s", exc)
+        return False
+
+
+def send_trade_alert(
+    symbol: str,
+    side: str,
+    quantity: float,
+    price: float,
+    strategy: str,
+    notional: float,
+    is_live: bool,
+) -> bool:
+    """
+    Instant Telegram notification on every submitted order.
+
+    Never raises — alert failure must not block execution.
+    """
+    try:
+        mode = "\U0001f534 LIVE" if is_live else "\U0001f4cb PAPER"
+        side_norm = (side or "").upper()
+        side_emoji = "\U0001f4c8" if side_norm in ("BUY", "LONG") else "\U0001f4c9"
+        qty_display = f"{quantity:.4f}".rstrip("0").rstrip(".") or "0"
+        msg = (
+            f"{side_emoji} {mode}\n"
+            f"{side_norm} {qty_display} {symbol} @ ${price:,.2f}\n"
+            f"Strategy: {strategy or 'unknown'}\n"
+            f"Notional: ${notional:,.0f}"
+        )
+        return _send_raw_telegram(msg)
+    except Exception as exc:
+        _NOTIFY_LOGGER.warning("send_trade_alert_failed symbol=%s err=%s", symbol, exc)
+        return False
+
+
+_SCR_SENTINEL_PATH = RUNTIME_DIR / "scr_last_notified_state.json"
+
+
+def check_and_send_scr_milestone(current_state: str, effective_trades: int) -> bool:
+    """
+    Fires a Telegram alert when SCR transitions to a new state.
+
+    Uses runtime/scr_last_notified_state.json as a sentinel so the alert
+    only triggers on transitions, not every sync cycle. Transitions to
+    CAUTIOUS, CONFIDENT, and PAUSED are announced; other states (e.g.
+    WARMUP, UNKNOWN) are tracked silently.
+    """
+    try:
+        state_norm = str(current_state or "").strip().upper()
+        if not state_norm:
+            return False
+
+        last_state = "WARMUP"
+        try:
+            if _SCR_SENTINEL_PATH.is_file():
+                raw = json.loads(_SCR_SENTINEL_PATH.read_text(encoding="utf-8"))
+                last_state = str(raw.get("state", "WARMUP")).strip().upper() or "WARMUP"
+        except Exception:
+            last_state = "WARMUP"
+
+        sent = False
+        if state_norm != last_state:
+            milestones = {
+                "CAUTIOUS": (
+                    "⚡ SCR advanced to CAUTIOUS — sizing factor increased. "
+                    f"({effective_trades} clean trades logged)"
+                ),
+                "CONFIDENT": (
+                    "\U0001f680 SCR advanced to CONFIDENT — full sizing unlocked. "
+                    f"({effective_trades} clean trades logged)"
+                ),
+                "PAUSED": (
+                    "⏸️ SCR entered PAUSED — performance dropped below "
+                    "threshold. Sizing cut to minimum."
+                ),
+            }
+            msg = milestones.get(state_norm)
+            if msg:
+                sent = _send_raw_telegram(msg, dedupe_key=f"scr_milestone_{state_norm}")
+
+            try:
+                _SCR_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = _SCR_SENTINEL_PATH.with_suffix(".tmp")
+                tmp.write_text(
+                    json.dumps(
+                        {
+                            "state": state_norm,
+                            "effective_trades": int(effective_trades),
+                            "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                tmp.replace(_SCR_SENTINEL_PATH)
+            except Exception as exc:
+                _NOTIFY_LOGGER.warning("scr_sentinel_write_failed err=%s", exc)
+
+        return sent
+    except Exception as exc:
+        _NOTIFY_LOGGER.warning("scr_milestone_failed err=%s", exc)
+        return False
+
+
+def send_stop_bus_alert(reason: str) -> bool:
+    """Telegram alert when the STOP bus trips — all trading halted."""
+    try:
+        msg = (
+            "\U0001f6d1 STOP BUS TRIGGERED\n"
+            f"Reason: {reason or 'unspecified'}\n"
+            "All trading halted. Check runtime/stop_bus.json"
+        )
+        return _send_raw_telegram(msg, dedupe_key="stop_bus_triggered")
+    except Exception as exc:
+        _NOTIFY_LOGGER.warning("stop_bus_alert_failed err=%s", exc)
+        return False
+
+
+def send_edge_decay_alert(strategy: str, consecutive_losses: int) -> bool:
+    """Telegram alert when a strategy is halted by the edge-decay monitor."""
+    try:
+        msg = (
+            f"⚠️ EDGE DECAY — {strategy}\n"
+            f"{consecutive_losses} consecutive losses. "
+            "Strategy paused pending recovery."
+        )
+        return _send_raw_telegram(msg, dedupe_key=f"edge_decay_{strategy}")
+    except Exception as exc:
+        _NOTIFY_LOGGER.warning("edge_decay_alert_failed strategy=%s err=%s", strategy, exc)
+        return False
+
+
+def send_drawdown_alert(drawdown_pct: float, threshold_pct: float) -> bool:
+    """Telegram alert when current drawdown breaches its threshold."""
+    try:
+        msg = (
+            "\U0001f4c9 DRAWDOWN ALERT\n"
+            f"Current drawdown: {drawdown_pct:.1f}%\n"
+            f"Threshold: {threshold_pct:.1f}%"
+        )
+        return _send_raw_telegram(msg, dedupe_key="drawdown_threshold")
+    except Exception as exc:
+        _NOTIFY_LOGGER.warning("drawdown_alert_failed err=%s", exc)
+        return False

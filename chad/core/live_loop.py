@@ -656,6 +656,16 @@ def run_once(logger: logging.Logger) -> None:
                 sb_result.get("active_triggers", []),
                 sb_result.get("reason", ""),
             )
+            # Fire Telegram alert — dedupe key in telegram_notify suppresses
+            # repeat sends for the same STOP event within the TTL window.
+            try:
+                from chad.utils.telegram_notify import send_stop_bus_alert
+                _sb_reason = sb_result.get("reason") or ",".join(
+                    str(t) for t in (sb_result.get("active_triggers") or [])
+                )
+                send_stop_bus_alert(_sb_reason or "stop_bus_triggered")
+            except Exception:
+                pass
             return
     except Exception as _sbt_err:  # noqa: BLE001
         logger.warning("stop_bus evaluation failed (non-fatal): %s", _sbt_err)
@@ -814,6 +824,16 @@ def run_once(logger: logging.Logger) -> None:
                 "EDGE_DECAY_REPORT halted_strategies=%s (total_evaluated=%d)",
                 halted, len(decay_results),
             )
+            # Fire one Telegram alert per newly-halted strategy. The notify
+            # helper dedupes on strategy name so repeat cycles are suppressed.
+            try:
+                from chad.utils.telegram_notify import send_edge_decay_alert
+                for _strat in halted:
+                    _info = decay_results.get(_strat) or {}
+                    _losses = int(_info.get("consecutive_losses") or _info.get("streak") or 0)
+                    send_edge_decay_alert(str(_strat), _losses)
+            except Exception:
+                pass
     except Exception as _decay_err:  # noqa: BLE001
         logger.warning("edge_decay_monitor failed (non-fatal): %s", _decay_err)
 
@@ -1161,6 +1181,25 @@ def run_once(logger: logging.Logger) -> None:
                     )
                     paths = write_paper_exec_evidence(ev)
                     logger.info("EVIDENCE_WRITTEN fills=%s", paths.get("fills_path", ""))
+
+                    # Real-time Telegram trade alert — best effort only,
+                    # must never block execution or evidence persistence.
+                    try:
+                        from chad.utils.telegram_notify import send_trade_alert
+                        _alert_qty = float(order.quantity or 0.0)
+                        _alert_price = float(_fill_price or 0.0)
+                        _alert_notional = abs(_alert_qty) * _alert_price
+                        send_trade_alert(
+                            symbol=order.symbol,
+                            side=str(order.side or ""),
+                            quantity=_alert_qty,
+                            price=_alert_price,
+                            strategy=str(getattr(intent, "strategy", "") or ""),
+                            notional=_alert_notional,
+                            is_live=False,
+                        )
+                    except Exception:
+                        pass
                 except StrategyAttributionError as attr_err:
                     logger.warning("Evidence attribution failed (non-fatal): %s", attr_err)
                 except Exception as ev_err:

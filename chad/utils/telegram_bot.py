@@ -179,6 +179,16 @@ def safe_json_dumps(obj: Any, *, pretty: bool = False) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    """Read a runtime JSON file, returning None if missing/corrupt."""
+    try:
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def load_env_file(path: Path) -> None:
     if not path.is_file():
         return
@@ -1163,6 +1173,35 @@ def cmd_live_gate(update: Update, context: CallbackContext) -> None:
         send_message(update, context, "<b>LIVE GATE ERROR</b>\n\n" + escape_html(str(exc)))
 
 
+def cmd_shadow(update: Update, context: CallbackContext) -> None:
+    """SCR / shadow state — the sizing gate + effective trade progress."""
+    if not is_allowed(update):
+        return
+    try:
+        payload = _read_json_file(RUNTIME_DIR / "scr_state.json") or {}
+        stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+        lines = ["<b>SCR / SHADOW</b>", ""]
+        lines.append(escape_html(f"state: {payload.get('state', 'UNKNOWN')}"))
+        sizing = payload.get("sizing_factor")
+        if isinstance(sizing, (int, float)):
+            lines.append(escape_html(f"sizing_factor: {sizing}"))
+        eff = stats.get("effective_trades")
+        if eff is not None:
+            lines.append(escape_html(f"effective_trades: {eff}/100 to CAUTIOUS"))
+        for key in ("win_rate", "sharpe_like", "max_drawdown", "total_pnl", "total_trades"):
+            if key in stats:
+                lines.append(escape_html(f"{key}: {stats[key]}"))
+        reasons = payload.get("reasons") if isinstance(payload.get("reasons"), list) else []
+        if reasons:
+            lines.append("")
+            lines.append("<b>Reasons</b>")
+            for r in reasons[:6]:
+                lines.append(escape_html(f"• {r}"))
+        send_message(update, context, "\n".join(lines))
+    except Exception as exc:
+        send_message(update, context, "<b>SHADOW ERROR</b>\n\n" + escape_html(str(exc)))
+
+
 def cmd_portfolio_active(update: Update, context: CallbackContext) -> None:
     if not is_allowed(update):
         return
@@ -1422,6 +1461,7 @@ def build_updater() -> Updater:
     dp.add_handler(CommandHandler("risk", cmd_risk))
     dp.add_handler(CommandHandler("perf", cmd_perf))
     dp.add_handler(CommandHandler("live_gate", cmd_live_gate))
+    dp.add_handler(CommandHandler("shadow", cmd_shadow))
     dp.add_handler(CommandHandler("portfolio_active", cmd_portfolio_active))
     dp.add_handler(CommandHandler("portfolio_targets", cmd_portfolio_targets))
     dp.add_handler(CommandHandler("portfolio_rebalance", cmd_portfolio_rebalance))
