@@ -48,10 +48,10 @@ TARGET_FUNDS: Dict[str, str] = {
     "berkshire_hathaway": "0001067983",
     "bridgewater":        "0001350694",
     "renaissance":        "0001037389",
-    "citadel":            "0001423298",
+    "citadel":            "0001423053",
     "blackrock":          "0001364742",
     "vanguard":           "0000102909",
-    "appaloosa":          "0001001250",
+    "appaloosa":          "0001006438",
     "pershing_square":    "0001336528",
 }
 
