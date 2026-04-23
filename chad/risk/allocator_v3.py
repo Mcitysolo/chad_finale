@@ -370,7 +370,7 @@ def compute_allocator_v3(
         for s in regime_mult:
             if s in ("omega",):
                 regime_mult[s] = cfg.regime_on
-            elif s in ("beta",):
+            elif s in ("beta_trend",):
                 regime_mult[s] = 1.02
             else:
                 regime_mult[s] = cfg.regime_off

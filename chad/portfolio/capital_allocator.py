@@ -92,7 +92,7 @@ def get_strategy_weight(
 if __name__ == "__main__":
     demo = {
         "alpha_futures": 25.0,
-        "beta": 10.0,
+        "beta_trend": 10.0,
         "gamma": -5.0,
         "alpha_crypto": 5.0,
     }

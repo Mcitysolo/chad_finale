@@ -292,7 +292,7 @@ def summarize_ledger(path: Path) -> Tuple[Optional[LedgerSummary], Optional[str]
             strat = norm_strategy(p.get("strategy"))
             if strat == "alpha":
                 alpha += 1
-            elif strat == "beta":
+            elif strat == "beta_trend":
                 beta += 1
 
             # Canonical untrusted flag (your real schema)
@@ -515,7 +515,7 @@ def build_report() -> Tuple[Dict[str, Any], str]:
 
     md_lines.append("## Ledger (latest)")
     if ledger_sum:
-        md_lines.append(f"- records: `{ledger_sum.total_records}` (alpha `{ledger_sum.alpha_records}`, beta `{ledger_sum.beta_records}`)")
+        md_lines.append(f"- records: `{ledger_sum.total_records}` (alpha `{ledger_sum.alpha_records}`, beta_trend `{ledger_sum.beta_records}`)")
         md_lines.append(f"- pnl total (finite): `{ledger_sum.total_pnl}`")
         md_lines.append(f"- pnl_untrusted count: `{ledger_sum.untrusted_records}`")
         md_lines.append(f"- ledger_path: `{ledger_sum.ledger_path}`")

@@ -52,6 +52,7 @@ PREFERRED_ORDER: Sequence[str] = (
     "gamma_futures",
     "gamma_reversion",
     "beta",
+    "beta_trend",
     "omega",
     "omega_macro",
     "omega_vol",

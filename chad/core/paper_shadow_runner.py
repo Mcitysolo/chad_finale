@@ -337,7 +337,7 @@ class PlannedIntent:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "PlannedIntent":
         return PlannedIntent(
-            strategy=str(d.get("strategy") or "beta").strip().lower() or "beta",
+            strategy=str(d.get("strategy") or "beta_trend").strip().lower() or "beta_trend",
             symbol=str(d.get("symbol") or "").strip().upper(),
             side=str(d.get("side") or "BUY").strip().upper(),
             quantity=float(safe_float(d.get("quantity"), 0.0)),

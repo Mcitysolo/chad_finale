@@ -7,12 +7,12 @@
   "regimes": {
     "trending_bull": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "alpha_forex", "alpha_options", "beta", "delta",
+      "alpha_forex", "alpha_options", "beta_trend", "delta",
       "gamma_futures", "omega_macro", "omega_momentum_options"
     ],
     "trending_bear": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "alpha_forex", "alpha_options", "beta", "delta",
+      "alpha_forex", "alpha_options", "beta_trend", "delta",
       "gamma_futures", "omega_macro", "omega_momentum_options"
     ],
     "ranging": [
@@ -20,12 +20,12 @@
     ],
     "volatile": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "alpha_options", "beta", "delta", "gamma", "gamma_futures",
+      "alpha_options", "beta_trend", "delta", "gamma", "gamma_futures",
       "omega", "omega_vol", "omega_momentum_options", "omega_macro"
     ],
     "unknown": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "beta", "delta", "gamma", "gamma_futures",
+      "beta_trend", "delta", "gamma", "gamma_futures",
       "omega", "omega_vol", "omega_macro"
     ],
     "adverse": []

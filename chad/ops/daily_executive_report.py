@@ -183,7 +183,7 @@ def render_md(exec_payload: Dict[str, Any]) -> str:
             lines.append(
                 f"- Ledger today: total_records=`{_fmt(led.get('total_records'))}` "
                 f"alpha=`{_fmt(led.get('alpha_records'))}` "
-                f"beta=`{_fmt(led.get('beta_records'))}` "
+                f"beta_trend=`{_fmt(led.get('beta_records'))}` "
                 f"untrusted=`{_fmt(led.get('untrusted_records'))}` "
                 f"pnl_total=`{_fmt(led.get('total_pnl'))}`"
             )

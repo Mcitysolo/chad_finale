@@ -45,7 +45,8 @@ SESSIONS: dict[str, float] = {}
 
 STRATEGY_NAMES = {
     "alpha": "Stock Strategy",
-    "beta": "Trend Strategy",
+    "beta": "Institutional Compounder",
+    "beta_trend": "Trend Strategy",
     "gamma": "Swing Strategy",
     "delta": "Growth Strategy",
     "omega": "Hedge Strategy",

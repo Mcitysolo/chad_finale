@@ -14,7 +14,7 @@ OUT_PATH = RUNTIME / "dynamic_caps_dominance_overlay.json"
 
 FALLBACK = {
     "alpha": 0.10,
-    "beta": 0.30,
+    "beta_trend": 0.30,
     "gamma": 0.25,
     "delta": 0.20,
     "omega": 0.10,

@@ -49,6 +49,7 @@ import math
 class StrategyName(str, Enum):
     ALPHA = "alpha"
     BETA = "beta"
+    BETA_TREND = "beta_trend"
     GAMMA = "gamma"
     OMEGA = "omega"
     DELTA = "delta"

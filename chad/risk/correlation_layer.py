@@ -14,7 +14,7 @@ OUT_PATH = RUNTIME / "dynamic_caps_correlation.json"
 
 # group definitions — simple but practical first pass
 GROUPS = {
-    "tech_directional": {"alpha", "beta", "gamma"},
+    "tech_directional": {"alpha", "beta_trend", "gamma"},
     "broad_directional": {"delta", "omega"},
     "side_engines": {"crypto", "forex", "alpha_crypto", "alpha_forex"},
 }

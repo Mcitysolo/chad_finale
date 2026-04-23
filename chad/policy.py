@@ -491,8 +491,8 @@ def build_default_strategy_limits() -> Dict[StrategyName, StrategyRiskLimits]:
         allow_short=False,
     )
 
-    # Beta: slow legend allocator, smaller trade and symbol caps
-    limits[StrategyName.BETA] = StrategyRiskLimits(
+    # BetaTrend: slow legend allocator, smaller trade and symbol caps
+    limits[StrategyName.BETA_TREND] = StrategyRiskLimits(
         enabled=True,
         max_symbol_notional=40_000.0,
         max_total_notional=200_000.0,

@@ -76,6 +76,7 @@ GENESIS = "GENESIS"
 STRATEGY_ALIASES: Dict[str, str] = {
     "alpha": "alpha",
     "beta": "beta",
+    "beta_trend": "beta_trend",
     "gamma": "gamma",
     "omega": "omega",
     "delta": "delta",
@@ -90,6 +91,7 @@ STRATEGY_ALIASES: Dict[str, str] = {
 TAG_STRATEGY_CANDIDATES = {
     "alpha",
     "beta",
+    "beta_trend",
     "gamma",
     "omega",
     "delta",

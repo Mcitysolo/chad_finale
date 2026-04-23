@@ -95,7 +95,7 @@ def test_regime_matrix_volatile_includes_vol_and_momentum():
     assert "alpha" in volatile
     assert "alpha_futures" in volatile
     assert "delta" in volatile
-    assert "beta" in volatile
+    assert "beta_trend" in volatile
 
 
 def test_regime_matrix_ranging_favors_mean_reversion():
@@ -111,7 +111,7 @@ def test_regime_matrix_trending_favors_momentum():
         lst = cfg["regimes"][key]
         assert "alpha" in lst
         assert "delta" in lst
-        assert "beta" in lst
+        assert "beta_trend" in lst
 
 
 # ---------------------------------------------------------------------------

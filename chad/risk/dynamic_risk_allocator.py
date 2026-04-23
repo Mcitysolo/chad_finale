@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 DEFAULT_STRATEGY_WEIGHTS: Dict[str, float] = {
     "alpha": 0.16,
-    "beta": 0.25,
+    "beta_trend": 0.25,
     "gamma": 0.07,
     "gamma_reversion": 0.04,
     "alpha_futures": 0.09,
@@ -159,7 +159,7 @@ class StrategyAllocation:
 
         CHAD_STRATEGY_WEIGHTS env format:
 
-            CHAD_STRATEGY_WEIGHTS="alpha=0.35,beta=0.30,gamma=0.15,..."
+            CHAD_STRATEGY_WEIGHTS="alpha=0.35,beta_trend=0.30,gamma=0.15,..."
         """
         # --- Tier 1: environment variable override ---
         env_val = os.getenv("CHAD_STRATEGY_WEIGHTS")
@@ -393,7 +393,7 @@ ALPHA_STRATEGIES = frozenset({
     "alpha", "alpha_futures", "alpha_intraday", "alpha_options",
     "omega_momentum_options", "gamma", "gamma_futures", "gamma_reversion",
 })
-BETA_STRATEGIES = frozenset({"beta"})
+BETA_STRATEGIES = frozenset({"beta_trend"})
 ADAPTIVE_STRATEGIES = frozenset({
     "omega", "omega_macro", "omega_vol", "delta", "delta_pairs", "crypto",
 })
@@ -413,7 +413,7 @@ def enforce_chassis(weights: Dict[str, float]) -> Dict[str, float]:
     """
     Enforce the 50/30/20 sleeve allocation:
       - ALPHA sleeve (50%): alpha, alpha_futures, alpha_options, gamma, gamma_futures, gamma_reversion
-      - BETA sleeve (30%): beta — structural savings sleeve, protected
+      - BETA sleeve (30%): beta_trend — structural savings sleeve, protected
       - ADAPTIVE sleeve (20%): omega, omega_macro, omega_vol, delta, crypto
 
     Only fires when sleeve drift exceeds CHASSIS_TOLERANCE.

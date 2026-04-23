@@ -62,10 +62,10 @@ def _safe_gamma(ctx):
         return []
 
 
-def _safe_beta(ctx):
+def _safe_beta_trend(ctx):
     try:
-        from chad.strategies import beta_handler
-        return beta_handler(ctx) or []
+        from chad.strategies import beta_trend_handler
+        return beta_trend_handler(ctx) or []
     except Exception:
         return []
 
@@ -81,7 +81,7 @@ def build_routed_signals(logger: logging.Logger | None = None) -> RoutedBuildRes
         "alpha": _safe_alpha(ctx),
         "alpha_crypto": _safe_alpha_crypto(ctx),
         "gamma": _safe_gamma(ctx),
-        "beta": _safe_beta(ctx),
+        "beta_trend": _safe_beta_trend(ctx),
     }
 
     weights = load_allocation_weights()

@@ -30,7 +30,7 @@ def _sleeve_totals(w):
 DRIFTED = {
     "alpha": 0.30, "alpha_futures": 0.10, "alpha_options": 0.08,
     "gamma": 0.08, "gamma_futures": 0.06, "gamma_reversion": 0.05,
-    "beta": 0.10,
+    "beta_trend": 0.10,
     "omega": 0.07, "omega_macro": 0.05, "omega_vol": 0.06,
     "delta": 0.04, "crypto": 0.01,
 }
@@ -40,7 +40,7 @@ DRIFTED = {
 NEAR_TARGET = {
     "alpha": 0.22, "alpha_futures": 0.08, "alpha_options": 0.06,
     "gamma": 0.06, "gamma_futures": 0.04, "gamma_reversion": 0.03,
-    "beta": 0.28,
+    "beta_trend": 0.28,
     "omega": 0.07, "omega_macro": 0.05, "omega_vol": 0.04,
     "delta": 0.04, "crypto": 0.03,
 }
@@ -111,7 +111,7 @@ def test_beta_pushed_high():
     w = {
         "alpha": 0.10, "alpha_futures": 0.02, "alpha_options": 0.02,
         "gamma": 0.02, "gamma_futures": 0.01, "gamma_reversion": 0.01,
-        "beta": 0.55,
+        "beta_trend": 0.55,
         "omega": 0.05, "omega_macro": 0.05, "omega_vol": 0.05,
         "delta": 0.05, "crypto": 0.07,
     }

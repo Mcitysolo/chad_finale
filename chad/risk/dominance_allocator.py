@@ -16,7 +16,7 @@ PLACEHOLDERS = {"paper_exec", "unknown", "manual", ""}
 
 DEFAULT_BASE_WEIGHTS: Dict[str, float] = {
     "alpha": 0.10,
-    "beta": 0.30,
+    "beta_trend": 0.30,
     "gamma": 0.25,
     "delta": 0.20,
     "omega": 0.10,

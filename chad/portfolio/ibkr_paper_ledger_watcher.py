@@ -516,7 +516,7 @@ class StrategyAttributionService:
             tags = [tags]
         tag_candidates = [safe_str(t).strip().lower() for t in tags if safe_str(t)]
         for candidate in tag_candidates:
-            if candidate in {"alpha", "beta", "gamma", "delta", "omega", "alpha_crypto", "alpha_forex"}:
+            if candidate in {"alpha", "beta", "beta_trend", "gamma", "delta", "omega", "alpha_crypto", "alpha_forex"}:
                 return candidate, [candidate], "tags"
 
         # Final fallback

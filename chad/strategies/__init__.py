@@ -15,7 +15,8 @@ brains with the StrategyEngine. It is intentionally:
 Strategies Covered
 ------------------
 - ALPHA         – Intraday stocks/ETFs
-- BETA          – Long-term legend/ETF
+- BETA          – Institutional-consensus long-term compounder (SEC 13F)
+- BETA_TREND    – Legend-driven long-term ETF/equity allocator
 - GAMMA         – Swing / momentum
 - OMEGA         – Hedge / macro
 - DELTA         – Execution intelligence / meta-signals
@@ -40,7 +41,7 @@ from chad.engine import StrategyEngine
 from chad.types import StrategyConfig, StrategyName
 
 from .alpha import build_alpha_config, alpha_handler
-from .beta import build_beta_config, beta_handler
+from .beta_trend import build_beta_trend_config, beta_trend_handler
 from .gamma import build_gamma_config, gamma_handler
 from .omega import build_omega_config, omega_handler
 from .delta import build_delta_config, delta_handler
@@ -122,10 +123,10 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             build_config=build_alpha_config,
             handler=alpha_handler,
         ),
-        StrategyName.BETA: StrategyRegistration(
-            name=StrategyName.BETA,
-            build_config=build_beta_config,
-            handler=beta_handler,
+        StrategyName.BETA_TREND: StrategyRegistration(
+            name=StrategyName.BETA_TREND,
+            build_config=build_beta_trend_config,
+            handler=beta_trend_handler,
         ),
         StrategyName.GAMMA: StrategyRegistration(
             name=StrategyName.GAMMA,

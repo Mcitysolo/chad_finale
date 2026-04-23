@@ -514,7 +514,7 @@ def _apply_regime_tilt(strategy: str, mult: float, risk_label: str, cfg: SavageC
     Regime tilt is deliberately mild and bounded, and never overrides perf clamps.
 
     Default behavior:
-    - risk_off: slightly tilt down "alpha/gamma/delta/crypto/forex", tilt up "omega/beta"
+    - risk_off: slightly tilt down "alpha/gamma/delta/crypto/forex", tilt up "omega/beta_trend"
     - risk_on: slightly tilt up "alpha/gamma/delta/crypto/forex", tilt down "omega"
     - neutral/unknown: no change
     """
@@ -524,7 +524,7 @@ def _apply_regime_tilt(strategy: str, mult: float, risk_label: str, cfg: SavageC
     if risk_label == "risk_off":
         if s in ("omega",):
             m *= cfg.regime_tilt_on
-        elif s in ("beta",):
+        elif s in ("beta_trend",):
             m *= 1.02  # mild preference for base sleeve
         else:
             m *= cfg.regime_tilt_off

@@ -79,6 +79,7 @@ INSTRUMENT_NAMES: Dict[str, str] = {
 STRATEGY_NAMES: Dict[str, str] = {
     "alpha": "Momentum trading (riding trends)",
     "beta": "Long-term holds (the slow and steady bucket)",
+    "beta_trend": "Legend-driven ETF allocation (long-term trend follower)",
     "gamma": "Swing trading (medium-term moves)",
     "gamma_reversion": "Mean reversion (fading overreactions)",
     "alpha_futures": "Futures momentum (riding trends in commodities and indexes)",
@@ -842,7 +843,7 @@ class DailyCHADReport:
                 )
         else:
             all_strategies = [
-                "alpha", "beta", "gamma", "gamma_reversion",
+                "alpha", "beta", "beta_trend", "gamma", "gamma_reversion",
                 "alpha_futures", "gamma_futures",
                 "omega", "omega_macro", "omega_vol",
                 "alpha_options", "crypto", "alpha_crypto", "delta",

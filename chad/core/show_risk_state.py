@@ -11,7 +11,7 @@ This tool prints a unified snapshot of CHAD's current risk state:
         - total_equity
         - portfolio_risk_cap
         - daily_risk_fraction
-        - strategy_caps (alpha, beta, gamma, omega, delta, crypto, forex)
+        - strategy_caps (alpha, beta, beta_trend, gamma, omega, delta, crypto, forex)
 
     * Shadow Confidence State (SCR):
         - state (WARMUP / CONFIDENT / CAUTIOUS / PAUSED)

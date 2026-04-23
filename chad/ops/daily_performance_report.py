@@ -103,8 +103,8 @@ def norm_strategy(raw: Any) -> str:
         # normalize common labels
         if s in {"alpha", "alpha_stocks", "alpha_brain", "alpha_sniper"}:
             return "alpha"
-        if s in {"beta", "beta_portfolio", "beta_brain"}:
-            return "beta"
+        if s in {"beta_trend", "beta_portfolio", "beta_brain"}:
+            return "beta_trend"
         if s in {"gamma", "gamma_swing", "gamma_brain"}:
             return "gamma"
         if s in {"omega", "omega_hedge", "omega_brain"}:
