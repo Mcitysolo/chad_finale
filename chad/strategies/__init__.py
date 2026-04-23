@@ -41,6 +41,7 @@ from chad.engine import StrategyEngine
 from chad.types import StrategyConfig, StrategyName
 
 from .alpha import build_alpha_config, alpha_handler
+from .beta import build_beta_config, beta_handler
 from .beta_trend import build_beta_trend_config, beta_trend_handler
 from .gamma import build_gamma_config, gamma_handler
 from .omega import build_omega_config, omega_handler
@@ -122,6 +123,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.ALPHA,
             build_config=build_alpha_config,
             handler=alpha_handler,
+        ),
+        StrategyName.BETA: StrategyRegistration(
+            name=StrategyName.BETA,
+            build_config=build_beta_config,
+            handler=beta_handler,
         ),
         StrategyName.BETA_TREND: StrategyRegistration(
             name=StrategyName.BETA_TREND,

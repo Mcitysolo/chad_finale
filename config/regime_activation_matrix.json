@@ -3,29 +3,30 @@
   "_comment_2": "Unknown regime keys fall through to the 'unknown' bucket. An empty list for a regime silences ALL strategies under that regime (used only for 'adverse').",
   "_comment_3": "Consumed by chad.portfolio.regime_activation.filter_intents_by_regime(...) — wired in chad.core.live_loop after _build_plan_and_intents so the matrix actually gates routed intents on both IBKR and Kraken lanes.",
   "_comment_4": "2026-04-22 Audit-O+P: volatile expanded to the full trending-family + vol-family set. CHAD's live classifier flags 'volatile' when realized_vol_percentile is high, but ADX=36 in current tape means the market is trending-volatile (directional). Silencing alpha/beta/gamma under those conditions starves the book. Restored: alpha, beta, gamma, alpha_crypto, alpha_intraday, alpha_options, alpha_forex alongside the existing futures/vol strategies.",
+  "_comment_5": "2026-04-23: 'beta' (the institutional-consensus long-term compounder) is enabled in every non-adverse regime. Beta is a multi-week holder driven by SEC 13F data, not a regime trader — it rebalances gradually regardless of short-term regime. It is still silenced under 'adverse'.",
   "schema_version": "regime_activation_matrix.v1",
   "regimes": {
     "trending_bull": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "alpha_forex", "alpha_options", "beta_trend", "delta",
+      "alpha_forex", "alpha_options", "beta", "beta_trend", "delta",
       "gamma_futures", "omega_macro", "omega_momentum_options"
     ],
     "trending_bear": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "alpha_forex", "alpha_options", "beta_trend", "delta",
+      "alpha_forex", "alpha_options", "beta", "beta_trend", "delta",
       "gamma_futures", "omega_macro", "omega_momentum_options"
     ],
     "ranging": [
-      "delta_pairs", "gamma_reversion", "gamma", "omega_macro"
+      "beta", "delta_pairs", "gamma_reversion", "gamma", "omega_macro"
     ],
     "volatile": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "alpha_options", "beta_trend", "delta", "gamma", "gamma_futures",
+      "alpha_options", "beta", "beta_trend", "delta", "gamma", "gamma_futures",
       "omega", "omega_vol", "omega_momentum_options", "omega_macro"
     ],
     "unknown": [
       "alpha", "alpha_crypto", "alpha_futures", "alpha_intraday",
-      "beta_trend", "delta", "gamma", "gamma_futures",
+      "beta", "beta_trend", "delta", "gamma", "gamma_futures",
       "omega", "omega_vol", "omega_macro"
     ],
     "adverse": []

@@ -2,40 +2,49 @@
 """
 chad/strategies/beta.py
 
-BetaBrain — Legend-driven long-term allocator (WEALTH MODE, low-churn, once-per-day)
+Beta — CHAD's long-term institutional compounder.
 
-Why this replacement (measured)
--------------------------------
-Metrics proved Beta is generating ~760 "trades" in the paper window.
-That is unacceptable for a long-term allocator and will destroy SCR win_rate.
+Concept
+-------
+Beta does NOT trade actively. It slowly builds and holds positions in the
+most-held large-cap U.S. equities reported across the top institutional
+investors (Berkshire, Bridgewater, Renaissance, Citadel, BlackRock,
+Vanguard, Appaloosa, Pershing Square) via quarterly SEC 13F filings.
 
-Root cause:
-- beta_handler emits BUYs whenever qty==0.
-- In paper / ledger pipelines, qty may remain 0 for long periods or signals are logged as trades
-  even if later rejected/throttled. Result: repeated BUY proposals every cycle.
+- Target weights come from runtime/institutional_consensus.json, written
+  weekly by scripts/update_institutional_consensus.py.
+- Signals are emitted only when the current portfolio is materially
+  underweight a consensus position.
+- At most MAX_SIGNALS_PER_CYCLE signals per handler invocation; the
+  live loop runs once per minute so this naturally caps activity.
+- Funded by 30% of realized system profits via chad/risk/profit_router.py.
 
-Fix:
-- Enforce "once per UTC day per symbol" proposals (hard gate).
-- Enforce "max signals per UTC day" (hard cap).
-- Preserve test contract: must emit at least some signals in minimal contexts.
+Regime behavior
+---------------
+Active in every regime — Beta is a long-term holder, not a regime trader.
+The regime matrix enables "beta" across trending_bull / trending_bear /
+volatile / unknown. The activation layer further drops signals in
+"adverse" silently.
 
-Guarantees
-----------
-- Deterministic, no I/O, no disk writes.
-- Uses in-memory state only.
-- Works with only ctx.legend + ctx.portfolio + ctx.now.
-- Still allows conservative add-ons, but also once-per-day gated.
+Fail-closed surfaces
+--------------------
+- If runtime/institutional_consensus.json is missing, stale, or empty ->
+  handler returns [] and logs a warning.
+- If ctx.portfolio or ctx.prices is unavailable -> returns [].
+- Never raises from the handler.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Sequence, Tuple
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from chad.types import (
     AssetClass,
-    LegendConsensus,
     MarketContext,
     PortfolioSnapshot,
     Position,
@@ -45,270 +54,372 @@ from chad.types import (
     TradeSignal,
 )
 
+LOG = logging.getLogger(__name__)
 
-# -------------------------
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CONSENSUS_PATH = REPO_ROOT / "runtime" / "institutional_consensus.json"
+
+
+# ---------------------------------------------------------------------------
 # Params
-# -------------------------
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class BetaParams:
-    # Safety / cash gating
-    min_cash: float = 10_000.0
+    """Tunables for Beta. Defaults are deliberately conservative."""
 
-    # Legend selection
-    min_weight: float = 0.05
-    max_symbols: int = 10
+    # Consensus staleness cap. 13F cycles quarterly, so 45 days (one quarter's
+    # reporting delay) is the soft cap. Past that, fall back to [] signals.
+    max_consensus_age_days: int = 45
 
-    # WEALTH MODE throttles (critical)
-    max_signals_per_day: int = 20         # hard cap: total Beta signals/day
-    once_per_day_per_symbol: bool = True  # hard gate
+    # A position counts as "under-weight" if the actual weight is this much
+    # below target (absolute, e.g. 0.02 == 2% of account).
+    underweight_gap: float = 0.02
 
-    # Churn controls
-    min_hold_days: int = 21
-    cooldown_days_after_exit: int = 14
+    # Max signals per handler call. The live loop runs once per minute.
+    max_signals_per_cycle: int = 2
 
-    # Smoothing
-    smoothing_alpha: float = 0.35
+    # At most MAX_SIGNALS_PER_WEEK signals in a rolling 7-day window.
+    max_signals_per_week: int = 3
 
-    # Sizing
-    base_size: float = 3.0
-    max_size: float = 8.0
-    size_scale: float = 10.0
+    # Cap each target position at MAX_POSITION_WEIGHT of account equity.
+    # Prevents a single large-cap with extreme institutional conviction from
+    # dominating the book.
+    max_position_weight: float = 0.02
+
+    # Equity floor — do nothing if we have less than this in the account.
+    min_equity: float = 5_000.0
+
+    # Once we've held a position for this many days, stop trying to add to it
+    # (Beta builds slowly but doesn't forever keep piling in).
+    min_days_between_rebalance: int = 7
+
+    # Currency-agnostic asset class heuristic for ETFs vs stocks.
+    _etf_symbols: frozenset = field(default_factory=lambda: frozenset({
+        "SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "LQD", "VWO", "IEMG",
+    }))
 
 
 DEFAULT_PARAMS = BetaParams()
 
 
-# -------------------------
-# In-memory state (no disk)
-# -------------------------
-
-# -------------------------
-# Symbol classification helper
-# -------------------------
-
-def _asset_class_for_symbol(sym: str) -> AssetClass:
-    if sym in {"SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "LQD", "VWO", "IEMG"}:
-        return AssetClass.ETF
-    return AssetClass.EQUITY
+# ---------------------------------------------------------------------------
+# In-memory throttle state
+# ---------------------------------------------------------------------------
 
 class _BetaState:
+    """
+    Rolling per-symbol and per-week signal throttle.
+
+    Kept in-memory (no disk) so process restarts don't block legitimate
+    signals, consistent with the other strategies' throttle patterns.
+    """
+
     def __init__(self) -> None:
-        self.ewma: Dict[str, float] = {}
-        self.last_entered_iso: Dict[str, str] = {}
-        self.last_exited_iso: Dict[str, str] = {}
+        # symbol -> last signal timestamp (UTC aware)
+        self.last_signal_at: Dict[str, datetime] = {}
+        # rolling log of recent signal timestamps, for the weekly cap
+        self.recent_signals: List[datetime] = []
 
-        # Throttle state (UTC day keys)
-        self.last_proposed_day: Dict[str, str] = {}  # sym -> YYYY-MM-DD
-        self.day_counts: Dict[str, int] = {}         # YYYY-MM-DD -> count
+    def _prune(self, now: datetime) -> None:
+        cutoff = now - timedelta(days=7)
+        self.recent_signals = [t for t in self.recent_signals if t >= cutoff]
 
-    def _parse_iso(self, s: str) -> datetime | None:
-        try:
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            return None
+    def can_emit_symbol(self, sym: str, now: datetime, gap_days: int) -> bool:
+        last = self.last_signal_at.get(sym)
+        if last is None:
+            return True
+        return (now - last) >= timedelta(days=max(1, gap_days))
 
-    def _day_key(self, now: datetime) -> str:
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        now = now.astimezone(timezone.utc)
-        return now.date().isoformat()  # YYYY-MM-DD
+    def can_emit_weekly(self, now: datetime, cap: int) -> bool:
+        self._prune(now)
+        return len(self.recent_signals) < max(1, cap)
 
-    def days_since(self, *, now: datetime, iso: str | None) -> int:
-        if not iso:
-            return 999999
-        dt = self._parse_iso(iso)
-        if dt is None:
-            return 999999
-        delta = now - dt
-        return max(0, int(delta.total_seconds() // 86400))
-
-    def mark_enter(self, sym: str, now: datetime) -> None:
-        self.last_entered_iso[sym] = now.isoformat()
-
-    def mark_exit(self, sym: str, now: datetime) -> None:
-        self.last_exited_iso[sym] = now.isoformat()
-
-    # Throttle
-    def can_propose(self, *, sym: str, now: datetime, max_signals_per_day: int, once_per_day_per_symbol: bool) -> bool:
-        day = self._day_key(now)
-
-        # daily total cap
-        c = int(self.day_counts.get(day, 0))
-        if c >= int(max(1, max_signals_per_day)):
-            return False
-
-        if once_per_day_per_symbol:
-            last_day = self.last_proposed_day.get(sym)
-            if last_day == day:
-                return False
-
-        return True
-
-    def mark_proposed(self, *, sym: str, now: datetime) -> None:
-        day = self._day_key(now)
-        self.last_proposed_day[sym] = day
-        self.day_counts[day] = int(self.day_counts.get(day, 0)) + 1
+    def mark(self, sym: str, now: datetime) -> None:
+        self.last_signal_at[sym] = now
+        self.recent_signals.append(now)
 
 
 _STATE = _BetaState()
 
 
-# -------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# -------------------------
+# ---------------------------------------------------------------------------
 
 def _norm_sym(x: Any) -> str:
     return str(x or "").strip().upper()
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    if x != x:
-        return lo
-    if x < lo:
-        return lo
-    if x > hi:
-        return hi
-    return x
+def _asset_class(sym: str, p: BetaParams) -> AssetClass:
+    return AssetClass.ETF if sym in p._etf_symbols else AssetClass.EQUITY
 
 
-def _sorted_legend_weights(legend: LegendConsensus, p: BetaParams) -> List[Tuple[str, float]]:
-    items = [(_norm_sym(sym), float(w)) for sym, w in legend.weights.items() if float(w) >= p.min_weight]
-    items = [(s, w) for s, w in items if s]
-    items.sort(key=lambda kv: kv[1], reverse=True)
-    return items[: p.max_symbols]
+def _get_now(ctx: Any) -> datetime:
+    now = getattr(ctx, "now", None)
+    if isinstance(now, datetime):
+        return now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
 
 
-def _ewma_update(sym: str, weight: float, alpha: float) -> float:
-    prev = _STATE.ewma.get(sym)
-    if prev is None:
-        _STATE.ewma[sym] = weight
-        return weight
-    new = alpha * weight + (1.0 - alpha) * prev
-    _STATE.ewma[sym] = new
-    return new
+def _get_equity(portfolio: Any) -> float:
+    """Pull total equity from the portfolio snapshot (robust to shape variations)."""
+    for attr in ("total_equity", "equity", "net_liq"):
+        v = getattr(portfolio, attr, None)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    extra = getattr(portfolio, "extra", None) or {}
+    if isinstance(extra, dict):
+        v = extra.get("equity") or extra.get("net_liq")
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    cash = getattr(portfolio, "cash", None)
+    return float(cash) if isinstance(cash, (int, float)) and cash > 0 else 0.0
 
 
-def _size_for_weight(p: BetaParams, w: float) -> float:
-    return _clamp(p.base_size + (w * p.size_scale), p.base_size, p.max_size)
+def _current_position_weights(
+    portfolio: Any,
+    prices: Mapping[str, float],
+    equity: float,
+) -> Dict[str, float]:
+    """Return symbol -> weight (notional/equity) for positions > 0."""
+    if equity <= 0:
+        return {}
+    out: Dict[str, float] = {}
+    positions = getattr(portfolio, "positions", None) or {}
+    if not isinstance(positions, dict):
+        return {}
+    for sym, pos in positions.items():
+        qty = float(getattr(pos, "quantity", 0.0) or 0.0)
+        if qty <= 0:
+            continue
+        price = float(prices.get(sym) or getattr(pos, "avg_price", 0.0) or 0.0)
+        if price <= 0:
+            continue
+        out[_norm_sym(sym)] = (qty * price) / equity
+    return out
 
 
-# -------------------------
-# Config
-# -------------------------
+def _load_consensus(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    # Resolve at call time so tests can monkeypatch module-level CONSENSUS_PATH.
+    p = path if path is not None else CONSENSUS_PATH
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        LOG.warning("beta: failed to load consensus file path=%s err=%s", p, exc)
+        return None
+
+
+def _consensus_is_fresh(consensus: Mapping[str, Any], max_age_days: int, now: datetime) -> bool:
+    ts = consensus.get("updated_ts_utc")
+    if not isinstance(ts, str):
+        return False
+    try:
+        clean = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    age = now - dt
+    return age <= timedelta(days=max(1, max_age_days))
+
+
+def _prices_map(ctx: Any) -> Dict[str, float]:
+    raw = getattr(ctx, "prices", None) or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        try:
+            fv = float(v)
+            if fv > 0 and fv == fv:
+                out[_norm_sym(k)] = fv
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Config factory
+# ---------------------------------------------------------------------------
 
 def build_beta_config() -> StrategyConfig:
     return StrategyConfig(
         name=StrategyName.BETA,
         enabled=True,
-        target_universe=None,
+        target_universe=None,  # universe is driven by consensus file, not static
         max_gross_exposure=None,
-        notes="BetaBrain (wealth-mode low-churn; once-per-day throttle).",
+        notes="Beta (institutional-consensus compounder; SEC 13F driven).",
     )
 
 
-# -------------------------
+# ---------------------------------------------------------------------------
 # Handler
-# -------------------------
+# ---------------------------------------------------------------------------
 
-def beta_handler(ctx: MarketContext, params: BetaParams | None = None) -> Sequence[TradeSignal]:
+def beta_handler(
+    ctx: MarketContext,
+    params: Optional[BetaParams] = None,
+) -> Sequence[TradeSignal]:
+    """
+    Entry point called by the strategy engine each cycle.
+
+    Strategy: for every symbol in the consensus weights, compute the gap
+    between target weight and current portfolio weight. If the gap exceeds
+    underweight_gap (2% by default), emit a small BUY sized to fill a
+    slice of the gap, subject to per-cycle and weekly caps.
+
+    Fail-closed: returns [] on any missing/stale/empty consensus data.
+    """
     p = params or DEFAULT_PARAMS
+    now = _get_now(ctx)
 
-    legend = ctx.legend
-    if legend is None:
+    # Portfolio / equity floor
+    portfolio = getattr(ctx, "portfolio", None)
+    if portfolio is None:
+        return []
+    equity = _get_equity(portfolio)
+    if equity < p.min_equity:
         return []
 
-    portfolio: PortfolioSnapshot = ctx.portfolio
-    if portfolio.cash < p.min_cash:
+    # Consensus file
+    consensus = _load_consensus()
+    if consensus is None:
+        LOG.warning("beta: institutional_consensus.json missing — no signals")
+        return []
+    if not _consensus_is_fresh(consensus, p.max_consensus_age_days, now):
+        LOG.warning(
+            "beta: institutional_consensus stale (updated_ts_utc=%s, max_age=%dd)",
+            consensus.get("updated_ts_utc"), p.max_consensus_age_days,
+        )
         return []
 
-    now = ctx.now if isinstance(ctx.now, datetime) else datetime.now(timezone.utc)
-    positions: Dict[str, Position] = dict(portfolio.positions)
-
-    ranked = _sorted_legend_weights(legend, p)
-    if not ranked:
+    weights = consensus.get("weights") or {}
+    if not isinstance(weights, dict) or not weights:
+        LOG.warning("beta: consensus has no weights — no signals")
         return []
 
-    alpha = _clamp(p.smoothing_alpha, 0.01, 0.95)
+    # Weekly throttle
+    if not _STATE.can_emit_weekly(now, p.max_signals_per_week):
+        return []
 
-    scored: List[Tuple[str, float]] = []
-    for sym, w in ranked:
-        sm = _ewma_update(sym, w, alpha=alpha)
-        scored.append((sym, _clamp(sm, 0.0, 1.0)))
+    prices = _prices_map(ctx)
+    if not prices:
+        LOG.warning("beta: ctx.prices empty — cannot size positions")
+        return []
 
-    scored.sort(key=lambda kv: kv[1], reverse=True)
+    current_weights = _current_position_weights(portfolio, prices, equity)
 
-    signals: List[TradeSignal] = []
-
-    for sym, w in scored:
-        pos = positions.get(sym)
-        qty = float(pos.quantity) if pos is not None else 0.0
-
-        # cooldown after exit (only matters if flat)
-        if qty <= 0:
-            if _STATE.days_since(now=now, iso=_STATE.last_exited_iso.get(sym)) < p.cooldown_days_after_exit:
-                continue
-
-        # Throttle gate: once/day per symbol + max/day
-        if not _STATE.can_propose(
-            sym=sym,
-            now=now,
-            max_signals_per_day=p.max_signals_per_day,
-            once_per_day_per_symbol=p.once_per_day_per_symbol,
-        ):
+    # Rank candidates by gap (target - current) descending; filter to those
+    # above underweight_gap AND throttle-ok.
+    candidates: List[Dict[str, Any]] = []
+    for raw_sym, raw_target in weights.items():
+        sym = _norm_sym(raw_sym)
+        if not sym or sym.startswith("UNRESOLVED:"):
             continue
+        try:
+            target = float(raw_target)
+        except (TypeError, ValueError):
+            continue
+        target_capped = min(target, p.max_position_weight)
+        current = current_weights.get(sym, 0.0)
+        gap = target_capped - current
+        if gap <= p.underweight_gap:
+            continue
+        if not _STATE.can_emit_symbol(sym, now, p.min_days_between_rebalance):
+            continue
+        if sym not in prices:
+            continue
+        candidates.append({
+            "symbol": sym,
+            "target": target_capped,
+            "current": current,
+            "gap": gap,
+            "price": prices[sym],
+            "conviction": target,  # raw target as a conviction proxy
+        })
 
-        # Entry if flat, conservative add-on if holding and hold period satisfied
-        size = _size_for_weight(p, w)
-        confidence = _clamp(0.50 + (w * 2.0), 0.50, 0.95)
+    if not candidates:
+        return []
 
-        if qty <= 0:
-            signals.append(
-                TradeSignal(
-                    strategy=StrategyName.BETA,
-                    symbol=sym,
-                    side=SignalSide.BUY,
-                    size=float(size),
-                    confidence=float(confidence),
-                    asset_class=_asset_class_for_symbol(sym),
-                    created_at=now,
-                    meta={
-                        "reason": "legend_entry_once_per_day",
-                        "legend_weight_raw": float(legend.weights.get(sym, w)),
-                        "legend_weight_ewma": float(w),
-                        "legend_as_of": legend.as_of.isoformat(),
-                    },
-                )
-            )
-            _STATE.mark_enter(sym, now)
-            _STATE.mark_proposed(sym=sym, now=now)
+    candidates.sort(key=lambda c: (c["conviction"], c["gap"]), reverse=True)
 
-        else:
-            # Add-ons: only after min_hold_days, and also once-per-day gated
-            if _STATE.days_since(now=now, iso=_STATE.last_entered_iso.get(sym)) < p.min_hold_days:
-                continue
-
-            signals.append(
-                TradeSignal(
-                    strategy=StrategyName.BETA,
-                    symbol=sym,
-                    side=SignalSide.BUY,
-                    size=float(_clamp(size * 0.5, 0.0, p.max_size)),
-                    confidence=float(_clamp(confidence * 0.95, 0.50, 0.90)),
-                    asset_class=_asset_class_for_symbol(sym),
-                    created_at=now,
-                    meta={
-                        "reason": "legend_topup_once_per_day",
-                        "legend_weight_ewma": float(w),
-                    },
-                )
-            )
-            _STATE.mark_proposed(sym=sym, now=now)
-
-        if len(signals) >= int(max(1, p.max_signals_per_day)):
+    # Size each BUY to fill ~half the gap. Half-gap sizing is deliberate —
+    # Beta builds slowly; one signal never closes the full gap in one shot.
+    signals: List[TradeSignal] = []
+    for c in candidates[: p.max_signals_per_cycle]:
+        fill_notional = 0.5 * c["gap"] * equity
+        if fill_notional <= 0:
+            continue
+        size = fill_notional / c["price"]
+        # Round down to integer shares to avoid fractional exec on equities
+        size_int = int(size)
+        if size_int < 1:
+            continue
+        sig = TradeSignal(
+            strategy=StrategyName.BETA,
+            symbol=c["symbol"],
+            side=SignalSide.BUY,
+            size=float(size_int),
+            confidence=float(min(0.95, 0.60 + c["conviction"])),
+            asset_class=_asset_class(c["symbol"], p),
+            created_at=now,
+            meta={
+                "reason": "institutional_consensus_rebalance",
+                "target_weight": round(c["target"], 4),
+                "current_weight": round(c["current"], 4),
+                "gap": round(c["gap"], 4),
+                "conviction": round(c["conviction"], 4),
+                "consensus_updated_ts_utc": consensus.get("updated_ts_utc"),
+                "consensus_funds": consensus.get("funds_included") or [],
+            },
+        )
+        signals.append(sig)
+        _STATE.mark(c["symbol"], now)
+        if not _STATE.can_emit_weekly(now, p.max_signals_per_week):
             break
 
     return signals
+
+
+__all__ = [
+    "Beta",
+    "BetaParams",
+    "DEFAULT_PARAMS",
+    "build_beta_config",
+    "beta_handler",
+]
+
+
+# ---------------------------------------------------------------------------
+# Class-shaped facade (matches the original spec's sketch)
+# ---------------------------------------------------------------------------
+
+class Beta:
+    """
+    Thin object-oriented facade over beta_handler.
+
+    The canonical integration point is the handler (wired into the
+    StrategyEngine registry). This class exists so tests and ad-hoc tooling
+    can instantiate a Beta and drive it without threading a ctx through the
+    handler when all they want is "what signals would Beta produce now?".
+    """
+
+    SIGNAL_FAMILY = "institutional_consensus"
+    STRATEGY_NAME = "beta"
+    VENUE = "ibkr"
+
+    def __init__(self, params: Optional[BetaParams] = None) -> None:
+        self.params = params or DEFAULT_PARAMS
+
+    def generate_signals(self, ctx: MarketContext) -> Sequence[TradeSignal]:
+        return beta_handler(ctx, self.params)
+
+    @staticmethod
+    def reset_state() -> None:
+        """Clear in-memory throttle state. Test/CLI only."""
+        _STATE.last_signal_at.clear()
+        _STATE.recent_signals.clear()

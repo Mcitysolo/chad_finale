@@ -499,6 +499,15 @@ def build_default_strategy_limits() -> Dict[StrategyName, StrategyRiskLimits]:
         max_trade_notional=7_500.0,
         allow_short=False,
     )
+    # Beta: institutional-consensus long-term compounder. Small, deliberate
+    # sizing — never more than ~2% of account per position, 2-3 signals/week.
+    limits[StrategyName.BETA] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=25_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=5_000.0,
+        allow_short=False,
+    )
     # Alpha Futures: micro futures momentum sleeve
     limits[StrategyName.ALPHA_FUTURES] = StrategyRiskLimits(
         enabled=True,

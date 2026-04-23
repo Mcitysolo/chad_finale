@@ -417,18 +417,48 @@ class TradeCloser:
 
     # ---- entry points ---------------------------------------------------
 
+    def _route_profits(self, closed: List[ClosedTrade]) -> int:
+        """
+        Advisory 50/30/20 profit routing for each profitable close.
+
+        Writes to runtime/profit_routing.json as an accounting ledger —
+        does NOT transfer capital (single-account paper lane). Failures
+        are swallowed: this is ledger sugar on top of the hot path.
+        """
+        if not closed:
+            return 0
+        try:
+            from chad.risk.profit_router import ProfitRouter  # local to avoid import cycles
+            router = ProfitRouter()
+        except Exception:  # noqa: BLE001 — router must never break trade_closer
+            return 0
+        routed = 0
+        for ct in closed:
+            try:
+                if ct.pnl > 0:
+                    router.route_profit(
+                        realized_pnl=float(ct.pnl),
+                        closing_strategy=str(ct.strategy),
+                    )
+                    routed += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return routed
+
     def run_once(self, date_str: Optional[str] = None) -> Dict[str, Any]:
         if date_str is None:
             date_str = _dt.date.today().strftime("%Y%m%d")
         self.load_state()
         closed = self.process_fills(date_str)
         written = self.write_trade_history(closed, date_str)
+        routed = self._route_profits(closed)
         self.save_state()
         return {
             "date": date_str,
             "closed_count": len(closed),
             "written": written,
             "total_pnl": sum(c.pnl for c in closed),
+            "profits_routed": routed,
         }
 
     def get_summary(self, date_str: str) -> Dict[str, Any]:
