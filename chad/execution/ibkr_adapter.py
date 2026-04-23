@@ -397,6 +397,109 @@ def _asset_class_key(asset_class: Any) -> str:
     return _enum_value(asset_class)
 
 
+# Explicit symbol → asset_class lookup for the paper-execution evidence path,
+# where sec_type is often absent. Used as a fallback when sec_type is missing
+# or ambiguous so fills are never recorded with asset_class="unknown".
+_FUTURES_SYMBOLS = frozenset({
+    "MES", "MNQ", "ES", "NQ", "MGC", "MCL", "MCLK6",
+    "ZN", "ZB", "M6E", "SI", "SIL",
+    "GC", "CL", "RTY", "YM", "MYM",
+})
+_ETF_SYMBOLS = frozenset({
+    "GLD", "TLT", "VWO", "UVXY", "SVXY", "SIL", "PSQ", "SH",
+    "DIA", "IEMG",
+})
+_EQUITY_ETF_TICKERS = frozenset({"SPY", "QQQ", "IWM"})
+_EQUITY_SYMBOLS = frozenset({
+    "AAPL", "MSFT", "GOOGL", "GOOG", "NVDA", "AMZN", "META",
+    "TSLA", "NFLX", "AMD",
+})
+_CRYPTO_SYMBOLS = frozenset({
+    "BTC", "ETH", "SOL", "BTCUSD", "ETHUSD", "SOLUSD",
+    "XBTUSD", "XETHZUSD",
+})
+
+
+def resolve_asset_class(symbol: Any, sec_type: Any = "") -> str:
+    """Map a symbol (plus optional IBKR sec_type) to a canonical asset_class.
+
+    Returns one of: "equity", "etf", "futures", "forex", "crypto", "options".
+    Never returns "unknown" for a recognizable instrument. Falls back to
+    "equity" only as a last resort for a short alpha-only ticker.
+
+    Why this exists: the paper-executor path frequently lacks sec_type, which
+    caused fills to be written with asset_class="unknown" and SCR to exclude
+    them as untrusted (effective_trades stuck below the CAUTIOUS threshold).
+    Symbol pattern matching + explicit lists are authoritative here.
+    """
+    sym = ""
+    if symbol is not None:
+        sym = str(symbol).strip().upper()
+    stype = ""
+    if sec_type is not None:
+        stype = str(sec_type).strip().upper()
+
+    # Prefer sec_type when it's a clear IBKR code.
+    if stype == "FUT":
+        return "futures"
+    if stype == "CASH":
+        return "forex"
+    if stype == "OPT":
+        return "options"
+    if stype == "CRYPTO":
+        return "crypto"
+    # STK is ambiguous between equity and ETF — fall through to symbol lookup.
+
+    if not sym:
+        return "equity" if stype == "STK" else "unknown"
+
+    # Explicit lists (authoritative).
+    if sym in _FUTURES_SYMBOLS:
+        return "futures"
+    if sym in _ETF_SYMBOLS or sym in _EQUITY_ETF_TICKERS:
+        return "etf"
+    if sym in _EQUITY_SYMBOLS:
+        return "equity"
+    if sym in _CRYPTO_SYMBOLS:
+        return "crypto"
+
+    # Pattern matching.
+    # Futures root with month/year suffix, e.g. "MCLK6", "MESH6", "ESU5".
+    if len(sym) >= 3:
+        for root in _FUTURES_SYMBOLS:
+            if sym.startswith(root) and len(sym) <= len(root) + 3:
+                tail = sym[len(root):]
+                if tail and tail[0].isalpha():  # month code
+                    return "futures"
+
+    # FX pairs: 6 letters, either EURUSD-style or with slash.
+    compact = "".join(ch for ch in sym if ch.isalpha())
+    if "/" in sym and len(compact) == 6:
+        return "forex"
+    if len(sym) == 6 and sym.isalpha():
+        known_fx_bases = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+        if sym[:3] in known_fx_bases and sym[3:] in known_fx_bases:
+            return "forex"
+
+    # Crypto heuristic: anything ending in USD/USDT with BTC/ETH/SOL-like prefix.
+    if sym.endswith(("USD", "USDT", "USDC")):
+        prefix = sym[: -3 if sym.endswith("USD") else -4]
+        if prefix in _CRYPTO_SYMBOLS or prefix in {"BTC", "ETH", "SOL", "XBT", "XETH"}:
+            return "crypto"
+
+    # If IBKR already told us it's a stock, trust that.
+    if stype == "STK":
+        return "equity"
+
+    # Last resort: return "equity" rather than "unknown" so SCR doesn't
+    # silently drop the fill. Short alpha-only tickers are overwhelmingly
+    # equities in this codebase.
+    if sym.isalpha() and 1 <= len(sym) <= 5:
+        return "equity"
+
+    return "unknown"
+
+
 def _strategy_name(value: Any) -> str:
     if hasattr(value, "value"):
         return str(getattr(value, "value")).strip()
@@ -1217,16 +1320,7 @@ class IbkrAdapter:
         currency = _safe_upper(getattr(raw_intent, "currency", ""))
         strategy = _safe_str(getattr(raw_intent, "strategy", "unknown")) or "unknown"
 
-        if sec_type == "STK":
-            asset_class = "equity"
-        elif sec_type == "FUT":
-            asset_class = "futures"
-        elif sec_type == "CASH":
-            asset_class = "forex"
-        elif sec_type == "OPT":
-            asset_class = "options"
-        else:
-            asset_class = "unknown"
+        asset_class = resolve_asset_class(symbol, sec_type)
 
         limit_price_raw = getattr(raw_intent, "limit_price", None)
         limit_price = None if limit_price_raw is None else _safe_float(limit_price_raw, float("nan"))
@@ -1579,16 +1673,18 @@ class IbkrAdapter:
 
     def _build_error_result_from_trade_intent(self, raw_intent: "StrategyTradeIntent", exc: BaseException) -> SubmittedOrder:
         now = self._now_fn()
+        symbol = _safe_upper(getattr(raw_intent, "symbol", ""))
+        sec_type = _safe_upper(getattr(raw_intent, "sec_type", ""))
         return SubmittedOrder(
-            symbol=_safe_upper(getattr(raw_intent, "symbol", "")),
+            symbol=symbol,
             side=_safe_upper(getattr(raw_intent, "side", "")),
             quantity=_safe_float(getattr(raw_intent, "quantity", 0.0)),
             strategy=[_safe_str(getattr(raw_intent, "strategy", "unknown"))],
             dry_run=self._config.dry_run,
             submitted_at=now,
             status="error",
-            asset_class="unknown",
-            sec_type=_safe_upper(getattr(raw_intent, "sec_type", "")),
+            asset_class=resolve_asset_class(symbol, sec_type),
+            sec_type=sec_type,
             exchange=_safe_upper(getattr(raw_intent, "exchange", "")),
             currency=_safe_upper(getattr(raw_intent, "currency", "")),
             order_type=_safe_upper(getattr(raw_intent, "order_type", "MKT")),

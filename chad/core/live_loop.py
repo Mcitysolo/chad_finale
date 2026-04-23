@@ -75,12 +75,23 @@ from chad.core.live_execution_router import (
 from chad.core.ibkr_execution_runner import _build_plan_and_intents
 from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
-from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig, resolve_asset_class
 from chad.execution.paper_exec_evidence_writer import (
     PaperExecEvidence,
     StrategyAttributionError,
     write_paper_exec_evidence,
 )
+
+# Paper-mode fill statuses that indicate the order was submitted to IBKR paper
+# but no fill confirmation arrived synchronously. In paper mode the correct
+# action is to record a simulated fill at the last-known price — IBKR paper
+# fills are near-instantaneous and waiting indefinitely causes the fill to
+# be permanently recorded with status="PendingSubmit", which SCR excludes as
+# untrusted.
+_PAPER_PENDING_STATUSES = frozenset({
+    "pendingsubmit", "presubmitted", "submitted", "apipending",
+    "inactive", "unknown", "", "error",
+})
 from ib_insync import IB, util
 
 # ib_insync requires asyncio. patchAsyncio() applies nest_asyncio so the
@@ -1097,6 +1108,43 @@ def run_once(logger: logging.Logger) -> None:
                             _expected_px = float(_lp) if _lp is not None else 0.0
                         except (TypeError, ValueError):
                             _expected_px = 0.0
+                    # Problem 1 fix: ensure asset_class is never "unknown" for
+                    # a recognizable instrument. The adapter tries sec_type
+                    # first, but the paper path frequently lacks it.
+                    _resolved_asset_class = resolve_asset_class(
+                        order.symbol, getattr(order, "sec_type", "")
+                    )
+                    if _resolved_asset_class == "unknown":
+                        # Keep whatever the adapter produced rather than
+                        # silently blanking a real class.
+                        _resolved_asset_class = order.asset_class or "unknown"
+
+                    # Problem 2 fix: IBKR paper fills are near-instantaneous.
+                    # If the status is still a submit/pending state at evidence
+                    # write time, record a simulated fill at the last known
+                    # price rather than leaving the record stuck as
+                    # "PendingSubmit" (which SCR excludes as untrusted).
+                    _status_norm = (order.status or "").strip().lower()
+                    _record_status = order.status or ""
+                    if _status_norm in _PAPER_PENDING_STATUSES:
+                        _sim_price = _fill_price
+                        if _sim_price <= 0.0:
+                            _sim_price = _expected_px
+                        if _sim_price <= 0.0:
+                            _sim_price = float(getattr(intent, "limit_price", 0.0) or 0.0)
+                        if _sim_price > 0.0:
+                            _fill_price = _sim_price
+                            _record_status = "paper_fill"
+                            logger.info(
+                                "PAPER_FILL_SIMULATED symbol=%s status=%s->paper_fill price=%s",
+                                order.symbol, order.status, _sim_price,
+                            )
+                        else:
+                            logger.warning(
+                                "PAPER_FILL_SIM_SKIPPED symbol=%s status=%s no_price_available",
+                                order.symbol, order.status,
+                            )
+
                     ev = PaperExecEvidence(
                         symbol=order.symbol,
                         side=order.side,
@@ -1106,8 +1154,8 @@ def run_once(logger: logging.Logger) -> None:
                         strategy=getattr(intent, "strategy", "") or "",
                         source_strategies=[getattr(intent, "strategy", "") or ""],
                         broker="ibkr_paper",
-                        status=order.status,
-                        asset_class=order.asset_class,
+                        status=_record_status,
+                        asset_class=_resolved_asset_class,
                         is_live=False,
                         fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
                     )
