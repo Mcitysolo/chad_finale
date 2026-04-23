@@ -4,16 +4,20 @@ chad/market_data/ibkr_bar_provider.py
 
 IBKR Native Bar Provider for CHAD.
 
-Replaces Polygon WebSocket → NDJSON → bars_cache pipeline with direct
-IBKR reqHistoricalData + reqRealTimeBars. Provides:
+Polls reqHistoricalData on a fixed interval (default 60s) instead of
+subscribing to reqRealTimeBars — the latter requires paid market-data
+entitlements and fails with Error 420 on paper accounts, while
+reqHistoricalData works without subscriptions.
 
 - Persistent IB session (injected, not created internally)
 - Historical bar fetches via reqHistoricalData
-- Realtime 5-second bar subscriptions via reqRealTimeBars
+- Polling loop that refreshes 1-minute bars every cache_interval seconds
+- Per-symbol writes to data/bars/1m/{symbol}.json (consumer path)
+- Aggregate file-based cache export (runtime/ibkr_bars_cache.json)
 - In-memory LRU cache (deque per symbol, maxlen=500)
-- File-based cache export (runtime/ibkr_bars_cache.json) for polling consumers
 - Graceful fallback: cached bars returned on IBKR failure
 - Symbol normalization: STK vs FUT sec_type auto-detection
+- Auto-reconnect on IBKR disconnect
 - Thread-safe cache writes
 
 Bar Provider Modes (CHAD_BAR_PROVIDER env var):
@@ -48,12 +52,18 @@ LOGGER = logging.getLogger("chad.market_data.ibkr_bar_provider")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "runtime"
 CACHE_OUTPUT_PATH = RUNTIME_DIR / "ibkr_bars_cache.json"
+BARS_1M_DIR = REPO_ROOT / "data" / "bars" / "1m"
+UNIVERSE_CONFIG_PATH = REPO_ROOT / "config" / "universe.json"
 
 # Maximum bars per symbol in memory
 MAX_BARS_PER_SYMBOL = 500
 
-# Cache write interval (seconds)
-CACHE_WRITE_INTERVAL = 30.0
+# Polling interval (seconds) — reqHistoricalData every N seconds per symbol
+POLLING_INTERVAL_S = 60.0
+
+# Delay between per-symbol requests to respect IBKR rate limits
+# (50 requests per 10 seconds max)
+PER_SYMBOL_DELAY_S = 0.5
 
 # Known futures symbols -> contract specs
 FUTURES_SYMBOLS = {
@@ -61,13 +71,41 @@ FUTURES_SYMBOLS = {
     "ZN", "ZB", "M6E", "SIL",       # Omega Macro
 }
 
-# Full universe for bar subscriptions
+# Full universe for bar subscriptions (fallback when config/universe.json is missing)
 DEFAULT_UNIVERSE = [
     # Equities/ETFs
     "SPY", "QQQ", "IWM", "GLD", "TLT",
     # Futures
     "MES", "MNQ", "MCL", "MGC", "ZN", "ZB", "M6E", "SIL",
 ]
+
+
+def _load_universe_from_config() -> List[str]:
+    """Load the full trading universe (equities + futures) from config/universe.json.
+
+    Falls back to DEFAULT_UNIVERSE if the file is missing or unreadable.
+    """
+    try:
+        obj = json.loads(UNIVERSE_CONFIG_PATH.read_text(encoding="utf-8"))
+        syms: List[str] = []
+        for s in obj.get("symbols", []) or []:
+            if isinstance(s, str) and s.strip():
+                syms.append(s.strip().upper())
+        for entry in obj.get("futures", []) or []:
+            if isinstance(entry, dict):
+                sym = str(entry.get("symbol", "")).strip().upper()
+                if sym:
+                    syms.append(sym)
+        # Deduplicate, preserve order
+        seen = set()
+        out: List[str] = []
+        for s in syms:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out or list(DEFAULT_UNIVERSE)
+    except Exception:
+        return list(DEFAULT_UNIVERSE)
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +279,11 @@ class IBKRBarProvider:
         for sym in self._universe:
             self._cache[sym] = deque(maxlen=self._max_bars)
 
-        # Realtime subscription handles
-        self._rt_handles: Dict[str, Any] = {}
+        # Resolved IBKR contract cache: symbol -> ib_insync Contract
+        # Contract resolution (reqContractDetails for futures front-month)
+        # is expensive; cache after first lookup so polling cycles don't
+        # re-resolve every 60 seconds.
+        self._contracts: Dict[str, Any] = {}
 
     @property
     def universe(self) -> List[str]:
@@ -291,7 +332,7 @@ class IBKRBarProvider:
             Bars sorted by timestamp ascending.
         """
         sym = symbol.strip().upper()
-        contract = _make_ib_contract(sym, ib=self._ib)
+        contract = self._get_contract(sym)
 
         try:
             ib_bars = self._ib.reqHistoricalData(
@@ -345,90 +386,99 @@ class IBKRBarProvider:
             return self.get_latest_bars(sym)
 
     # --------------------------
-    # Realtime bar subscription
+    # Contract resolution (cached)
     # --------------------------
 
-    def subscribe_realtime_bars(
+    def _get_contract(self, symbol: str) -> Any:
+        """Resolve and cache an IBKR contract for the given symbol.
+
+        Contract lookups (reqContractDetails for futures front-month
+        resolution) are expensive; cache per symbol so polling does not
+        re-resolve every cycle.
+        """
+        sym = symbol.strip().upper()
+        contract = self._contracts.get(sym)
+        if contract is None:
+            contract = _make_ib_contract(sym, ib=self._ib)
+            self._contracts[sym] = contract
+        return contract
+
+    # --------------------------
+    # 1-minute bar file writer
+    # --------------------------
+
+    def write_1m_bars_file(
         self,
         symbol: str,
-        callback: Optional[Callable[[Bar], None]] = None,
-    ) -> Optional[Any]:
-        """
-        Subscribe to 5-second realtime bars for a symbol.
+        bars: List[Bar],
+        bars_1m_dir: Optional[Path] = None,
+    ) -> Path:
+        """Write bars to data/bars/1m/{symbol}.json atomically.
 
-        Bars are automatically added to the in-memory cache.
-        Optional callback is invoked with each new Bar.
-
-        Returns the subscription handle (reqRealTimeBars result).
+        Uses the same payload shape as ibkr_historical_provider so
+        context_builder.py can consume the files interchangeably.
         """
         sym = symbol.strip().upper()
+        out_dir = bars_1m_dir or BARS_1M_DIR
+        out_path = out_dir / f"{sym}.json"
+        payload = {
+            "bars": [b.to_dict() for b in bars],
+            "symbol": sym,
+            "source": "ibkr",
+            "timeframe": "1m",
+            "ts_utc": _utc_now_iso(),
+            "ttl_seconds": 3600,
+        }
+        _atomic_write_json(out_path, payload)
+        return out_path
 
-        if sym in self._rt_handles:
-            LOGGER.debug("ibkr_bar_provider.already_subscribed", extra={"symbol": sym})
-            return self._rt_handles[sym]
+    # --------------------------
+    # Polling loop
+    # --------------------------
 
-        contract = _make_ib_contract(sym, ib=self._ib)
+    def poll_once(
+        self,
+        duration: str = "3600 S",
+        bar_size: str = "1 min",
+        per_symbol_delay_s: float = PER_SYMBOL_DELAY_S,
+    ) -> Dict[str, int]:
+        """Fetch fresh bars for every symbol in the universe and write 1m files.
 
-        def _on_bar_update(bars: Any, has_new_bar: bool) -> None:
-            if not has_new_bar:
-                return
+        Errors for individual symbols are logged and skipped — never crash
+        the caller. Returns dict of symbol -> bar count written.
+        """
+        results: Dict[str, int] = {}
+        for sym in self._universe:
             try:
-                b = bars[-1]
-                ts = str(getattr(b, "date", getattr(b, "time", "")))
-                bar = Bar(
-                    ts_utc=ts,
-                    open=_safe_float(getattr(b, "open", 0)),
-                    high=_safe_float(getattr(b, "high", 0)),
-                    low=_safe_float(getattr(b, "low", 0)),
-                    close=_safe_float(getattr(b, "close", 0)),
-                    volume=_safe_float(getattr(b, "volume", 0)),
-                    symbol=sym,
-                    source="ibkr_rt",
+                bars = self.fetch_historical_bars(
+                    sym,
+                    duration=duration,
+                    bar_size=bar_size,
+                    what_to_show="TRADES",
+                    use_rth=False,
                 )
-                with self._lock:
-                    if sym not in self._cache:
-                        self._cache[sym] = deque(maxlen=self._max_bars)
-                    self._cache[sym].append(bar)
-
-                if callback:
-                    callback(bar)
+                if bars:
+                    try:
+                        self.write_1m_bars_file(sym, bars)
+                    except Exception as werr:
+                        LOGGER.warning(
+                            "ibkr_bar_provider.write_1m_failed",
+                            extra={"symbol": sym, "error": str(werr)},
+                        )
+                results[sym] = len(bars)
             except Exception as exc:
-                LOGGER.debug("ibkr_bar_provider.rt_bar_error", extra={"symbol": sym, "error": str(exc)})
-
-        try:
-            handle = self._ib.reqRealTimeBars(
-                contract,
-                barSize=5,
-                whatToShow="TRADES",
-                useRTH=False,
-            )
-            handle.updateEvent += _on_bar_update
-            self._rt_handles[sym] = handle
-
-            LOGGER.info("ibkr_bar_provider.rt_subscribed", extra={"symbol": sym})
-            return handle
-
-        except Exception as exc:
-            LOGGER.warning(
-                "ibkr_bar_provider.rt_subscribe_failed",
-                extra={"symbol": sym, "error": str(exc)},
-            )
-            return None
-
-    def unsubscribe_realtime_bars(self, symbol: str) -> None:
-        """Cancel realtime bar subscription for a symbol."""
-        sym = symbol.strip().upper()
-        handle = self._rt_handles.pop(sym, None)
-        if handle is not None:
-            try:
-                self._ib.cancelRealTimeBars(handle)
-            except Exception:
-                pass
-
-    def unsubscribe_all(self) -> None:
-        """Cancel all realtime bar subscriptions."""
-        for sym in list(self._rt_handles.keys()):
-            self.unsubscribe_realtime_bars(sym)
+                LOGGER.warning(
+                    "ibkr_bar_provider.poll_symbol_failed",
+                    extra={"symbol": sym, "error": str(exc)},
+                )
+                results[sym] = 0
+            # Stagger to respect IBKR pacing (50 req / 10s)
+            if per_symbol_delay_s > 0:
+                try:
+                    self._ib.sleep(per_symbol_delay_s)
+                except Exception:
+                    time.sleep(per_symbol_delay_s)
+        return results
 
     # --------------------------
     # Cache access
@@ -520,14 +570,6 @@ class IBKRBarProvider:
             time.sleep(0.5)
         return results
 
-    def subscribe_all_realtime(self) -> Dict[str, bool]:
-        """Subscribe to realtime bars for all universe symbols."""
-        results: Dict[str, bool] = {}
-        for sym in self._universe:
-            handle = self.subscribe_realtime_bars(sym)
-            results[sym] = handle is not None
-            time.sleep(0.2)  # Avoid pacing violations
-        return results
 
 
 # ---------------------------------------------------------------------------
@@ -564,67 +606,114 @@ def should_use_ibkr(symbol: str) -> bool:
 # Daemon mode
 # ---------------------------------------------------------------------------
 
+def _connect_ib(ib: Any, host: str, port: int, client_id: int) -> None:
+    """Connect an ib_insync IB instance, logging the attempt."""
+    LOGGER.info(
+        "ibkr_bar_provider.connecting",
+        extra={"host": host, "port": port, "client_id": client_id},
+    )
+    ib.connect(host, port, clientId=client_id, timeout=30)
+    LOGGER.info("ibkr_bar_provider.connected")
+
+
 def run_daemon(
     *,
     host: str = "127.0.0.1",
     port: int = 4002,
     client_id: int = 9021,
     universe: Optional[Sequence[str]] = None,
-    cache_interval: float = CACHE_WRITE_INTERVAL,
+    cache_interval: float = POLLING_INTERVAL_S,
 ) -> None:
     """
-    Run the IBKR bar provider as a persistent daemon.
+    Run the IBKR bar provider as a persistent polling daemon.
 
     1. Connect to IBKR Gateway
-    2. Fetch initial historical bars for all symbols
-    3. Subscribe to realtime 5-second bars
-    4. Write cache file every cache_interval seconds
+    2. Poll reqHistoricalData for every symbol every ``cache_interval`` seconds
+    3. Write per-symbol bars to data/bars/1m/{symbol}.json
+    4. Write aggregate cache file runtime/ibkr_bars_cache.json
+    5. Reconnect automatically on IBKR disconnect
+
+    reqHistoricalData works on paper accounts without market-data
+    subscriptions, unlike reqRealTimeBars which fails with Error 420.
     """
-    from ib_insync import IB, util
+    from ib_insync import IB
+
+    resolved_universe = list(universe) if universe else _load_universe_from_config()
 
     ib = IB()
-    provider = None
+    provider: Optional[IBKRBarProvider] = None
 
     try:
+        _connect_ib(ib, host, port, client_id)
+
+        provider = IBKRBarProvider(ib, universe=resolved_universe)
+
         LOGGER.info(
-            "ibkr_bar_provider.daemon_starting",
-            extra={"host": host, "port": port, "client_id": client_id},
+            "ibkr_bar_provider.daemon_running",
+            extra={
+                "cache_interval": cache_interval,
+                "universe_size": len(provider.universe),
+            },
         )
 
-        ib.connect(host, port, clientId=client_id, timeout=30)
-        LOGGER.info("ibkr_bar_provider.connected")
-
-        provider = IBKRBarProvider(ib, universe=universe)
-
-        # Phase 1: Fetch historical bars
-        LOGGER.info("ibkr_bar_provider.fetching_historical")
-        hist_results = provider.fetch_all_historical(duration="2 D", bar_size="1 min")
-        total_hist = sum(hist_results.values())
-        LOGGER.info(
-            "ibkr_bar_provider.historical_complete",
-            extra={"symbols": len(hist_results), "total_bars": total_hist},
-        )
-
-        # Phase 2: Subscribe to realtime bars
-        LOGGER.info("ibkr_bar_provider.subscribing_realtime")
-        rt_results = provider.subscribe_all_realtime()
-        rt_ok = sum(1 for v in rt_results.values() if v)
-        LOGGER.info(
-            "ibkr_bar_provider.realtime_subscribed",
-            extra={"subscribed": rt_ok, "failed": len(rt_results) - rt_ok},
-        )
-
-        # Phase 3: Periodic cache write loop
-        LOGGER.info("ibkr_bar_provider.daemon_running", extra={"cache_interval": cache_interval})
-
+        cycle = 0
         while True:
             try:
-                ib.sleep(cache_interval)
-                provider.write_cache_file()
+                if not ib.isConnected():
+                    LOGGER.warning("ibkr_bar_provider.disconnected_reconnecting")
+                    try:
+                        ib.disconnect()
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    try:
+                        _connect_ib(ib, host, port, client_id)
+                    except Exception as cerr:
+                        LOGGER.warning(
+                            "ibkr_bar_provider.reconnect_failed",
+                            extra={"error": str(cerr)},
+                        )
+                        ib.sleep(10)
+                        continue
+
+                cycle += 1
+                t0 = time.time()
+                results = provider.poll_once(
+                    duration="3600 S",
+                    bar_size="1 min",
+                    per_symbol_delay_s=PER_SYMBOL_DELAY_S,
+                )
+                ok_count = sum(1 for n in results.values() if n > 0)
+                fail_count = len(results) - ok_count
+                try:
+                    provider.write_cache_file()
+                except Exception as werr:
+                    LOGGER.warning(
+                        "ibkr_bar_provider.cache_write_error",
+                        extra={"error": str(werr)},
+                    )
+                elapsed = time.time() - t0
+                LOGGER.info(
+                    "ibkr_bar_provider.polling_cycle",
+                    extra={
+                        "cycle": cycle,
+                        "elapsed_s": round(elapsed, 2),
+                        "ok": ok_count,
+                        "failed": fail_count,
+                    },
+                )
+
+                remaining = cache_interval - elapsed
+                if remaining > 0:
+                    ib.sleep(remaining)
+
             except KeyboardInterrupt:
                 break
             except Exception as exc:
-                LOGGER.warning("ibkr_bar_provider.cache_write_error", extra={"error": str(exc)})
+                LOGGER.warning(
+                    "ibkr_bar_provider.poll_cycle_error",
+                    extra={"error": str(exc)},
+                )
                 time.sleep(5)
 
     except KeyboardInterrupt:
@@ -633,8 +722,6 @@ def run_daemon(
         LOGGER.error("ibkr_bar_provider.daemon_fatal", extra={"error": str(exc)})
         raise
     finally:
-        if provider:
-            provider.unsubscribe_all()
         try:
             ib.disconnect()
         except Exception:
@@ -651,7 +738,12 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1", help="IBKR Gateway host")
     parser.add_argument("--port", type=int, default=4002, help="IBKR Gateway port")
     parser.add_argument("--client-id", type=int, default=9021, help="IBKR client ID")
-    parser.add_argument("--cache-interval", type=float, default=CACHE_WRITE_INTERVAL)
+    parser.add_argument(
+        "--cache-interval",
+        type=float,
+        default=POLLING_INTERVAL_S,
+        help="Polling interval in seconds (reqHistoricalData per symbol). Default 60.",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
