@@ -49,6 +49,7 @@ NAME_TO_TICKER: Dict[str, str] = {
     "ALPHABET INC CL C": "GOOG",
     "ALPHABET INC COM CL A": "GOOGL",
     "ALPHABET INC COM CL C": "GOOG",
+    "GOOG": "GOOGL",                  # defensive: ticker-as-name folds into GOOGL
     "AMAZON COM INC": "AMZN",
     "AMAZON.COM INC": "AMZN",
     "META PLATFORMS INC": "META",
@@ -253,6 +254,31 @@ class InstitutionalConsensus:
                 avg_pct_portfolio=avg_pct,
                 conviction_score=conviction,
             ))
+
+        # Dedup by resolved symbol: different CUSIPs (e.g. GOOG/GOOGL share
+        # classes of ALPHABET INC) can resolve to the same ticker. Merge
+        # fund_holders (union), sum totals, keep the max conviction score
+        # and the labels from the higher-conviction entry.
+        by_symbol: Dict[str, ConsensusEntry] = {}
+        for e in entries:
+            existing = by_symbol.get(e.symbol)
+            if existing is None:
+                by_symbol[e.symbol] = e
+                continue
+            merged_holders = list(dict.fromkeys(existing.fund_holders + e.fund_holders))
+            keep = existing if existing.conviction_score >= e.conviction_score else e
+            by_symbol[e.symbol] = ConsensusEntry(
+                symbol=keep.symbol,
+                name_of_issuer=keep.name_of_issuer,
+                cusip=keep.cusip,
+                fund_count=len(merged_holders),
+                fund_holders=merged_holders,
+                total_value_usd=existing.total_value_usd + e.total_value_usd,
+                total_shares=existing.total_shares + e.total_shares,
+                avg_pct_portfolio=keep.avg_pct_portfolio,
+                conviction_score=max(existing.conviction_score, e.conviction_score),
+            )
+        entries = list(by_symbol.values())
 
         entries.sort(key=lambda e: e.conviction_score, reverse=True)
         return entries[:top_n]

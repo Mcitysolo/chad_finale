@@ -137,6 +137,35 @@ def test_empty_input_returns_empty() -> None:
     assert ic.get_consensus_weights([]) == {}
 
 
+def test_googl_goog_deduplication() -> None:
+    # Alphabet class A (CUSIP 02079K107) and class C (02079K305) are tracked
+    # under different CUSIPs but can resolve to the same ticker once the
+    # issuer name normalizes (both commonly labelled "ALPHABET INC").
+    # Expect a single GOOGL entry with fund_holders unioned and totals summed.
+    goog_a_cusip = "02079K107"
+    goog_c_cusip = "02079K305"
+    all_holdings = {
+        "fund_a": _fund_payload(
+            _h("ALPHABET INC", goog_a_cusip, 10_000_000, 100),
+        ),
+        "fund_b": _fund_payload(
+            _h("ALPHABET INC", goog_c_cusip, 6_000_000, 60),
+        ),
+        "fund_c": _fund_payload(
+            _h("ALPHABET INC", goog_a_cusip, 4_000_000, 40),
+            _h("ALPHABET INC", goog_c_cusip, 2_000_000, 20),
+        ),
+    }
+    entries = InstitutionalConsensus().compute_consensus(all_holdings)
+    googl = [e for e in entries if e.symbol == "GOOGL"]
+    assert len(googl) == 1, f"expected 1 GOOGL entry, got {len(googl)}"
+    e = googl[0]
+    assert set(e.fund_holders) == {"fund_a", "fund_b", "fund_c"}
+    assert e.fund_count == 3
+    assert e.total_value_usd == 22_000_000
+    assert e.total_shares == 220
+
+
 def test_unresolved_excluded_from_weights() -> None:
     all_holdings = {
         "fund_a": _fund_payload(
