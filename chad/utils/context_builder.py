@@ -154,6 +154,15 @@ class MarketContext:
     portfolio: Optional[object] = None
     legend: Optional[object] = None
     bars_1m: Dict[str, Any] = field(default_factory=dict)
+    # VIX surfaces — populated from data/bars/1d/VIX.json (CBOE nightly refresh).
+    # Strategies that probe these: omega (_vix_value), omega_vol
+    # (_extract_vix_current/_history), omega_macro (_vix_value),
+    # omega_momentum_options (prices["VIX"]). vol_index mirrors vix so the
+    # omega probe tuple ("vix", "vol_index", "volatility_index") resolves.
+    vix: Optional[float] = None
+    vix_history: Optional[List[float]] = None
+    vol_index: Optional[float] = None
+    market_data: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -422,6 +431,24 @@ class ContextBuilder:
         # Merge Kraken crypto spot prices (24/7 feed) — fail-closed if stale/missing
         kraken_evidence = self._merge_kraken_prices(prices)
 
+        # Extract VIX from bars["VIX"] (data/bars/1d/VIX.json, CBOE nightly refresh).
+        # Populates ctx.vix / ctx.vix_history / ctx.vol_index / prices["VIX"] /
+        # prices["^VIX"] / market_data["VIX"] — covers every probe path in
+        # omega / omega_vol / omega_macro / omega_momentum_options.
+        vix_spot, vix_history, vix_evidence = self._extract_vix_surfaces(bars)
+        market_data: Dict[str, Any] = {}
+        if vix_spot is not None:
+            prices["VIX"] = vix_spot
+            prices["^VIX"] = vix_spot
+            market_data["VIX"] = vix_spot
+        else:
+            self.logger.warning(
+                "vix_unwired: data/bars/1d/VIX.json missing or empty — "
+                "omega/omega_vol/omega_macro/omega_momentum_options will "
+                "fail-closed on VIX gate (reason=%s)",
+                vix_evidence.get("reason"),
+            )
+
         # Compute notionals
         current_symbol_notional: Dict[str, float] = {}
         for symbol, pos in current_positions.items():
@@ -471,6 +498,10 @@ class ContextBuilder:
             portfolio=portfolio,
             legend=legend_consensus,
             bars_1m=_bars_1m,
+            vix=vix_spot,
+            vix_history=vix_history,
+            vol_index=vix_spot,
+            market_data=market_data,
         )
 
         # Evidence for auditability
@@ -479,6 +510,7 @@ class ContextBuilder:
             "bars_found": {s: len(bars.get(s, [])) for s in universe},
             "ticks_found": {s: (s in ticks) for s in universe},
             "kraken_merge": kraken_evidence,
+            "vix_merge": vix_evidence,
             "legend_loaded": legend_consensus is not None,
             "legend_symbols_count": (
                 len(legend_consensus.weights) if legend_consensus is not None else 0
@@ -597,6 +629,74 @@ class ContextBuilder:
         if not merged:
             evidence["reason"] = "no_valid_symbols"
         return evidence
+
+    def _extract_vix_surfaces(
+        self,
+        bars: Dict[str, List[Mapping[str, float]]],
+    ) -> Tuple[Optional[float], Optional[List[float]], Dict[str, object]]:
+        """
+        Pull VIX spot + history from the bar cache.
+
+        The CBOE nightly refresh (chad/market_data/nightly_bars_refresh.py) writes
+        data/bars/1d/VIX.json every night. BarsProvider already globs that file
+        into the universe when its symbol is present, so bars["VIX"] is typically
+        populated by the time this runs. We just extract the latest close as the
+        spot level and the last N closes as the history.
+
+        Returns (vix_spot, vix_history, evidence). evidence always present.
+        """
+        evidence: Dict[str, object] = {
+            "source": None,
+            "bar_count": 0,
+            "spot": None,
+            "history_len": 0,
+            "last_ts_utc": None,
+            "reason": None,
+        }
+        series = bars.get("VIX") or []
+        if not series:
+            evidence["reason"] = "no_vix_bars"
+            return None, None, evidence
+
+        closes: List[float] = []
+        last_ts: Optional[str] = None
+        for bar in series:
+            try:
+                close = bar.get("close") if isinstance(bar, Mapping) else None
+            except Exception:
+                close = None
+            if close is None:
+                continue
+            try:
+                fc = float(close)
+            except (TypeError, ValueError):
+                continue
+            if fc <= 0 or fc != fc:  # reject zero/NaN
+                continue
+            closes.append(fc)
+            try:
+                ts = bar.get("ts_utc") if isinstance(bar, Mapping) else None
+                if isinstance(ts, str):
+                    last_ts = ts
+            except Exception:
+                pass
+
+        if not closes:
+            evidence["reason"] = "no_valid_closes"
+            evidence["bar_count"] = len(series)
+            return None, None, evidence
+
+        spot = closes[-1]
+        # omega_vol needs >= vix_zscore_period (20) bars for a zscore; keep a
+        # generous window but cap to avoid unbounded growth.
+        history = closes[-250:]
+
+        evidence["source"] = "bars_1d_vix"
+        evidence["bar_count"] = len(series)
+        evidence["spot"] = spot
+        evidence["history_len"] = len(history)
+        evidence["last_ts_utc"] = last_ts
+        return spot, history, evidence
 
     def _construct_portfolio_snapshot(
         self,

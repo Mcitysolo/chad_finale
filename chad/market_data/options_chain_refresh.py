@@ -38,7 +38,14 @@ IBKR_CLIENT_ID = 88
 CONNECT_TIMEOUT_SEC = 20
 CONTRACT_DETAILS_TIMEOUT_SEC = 30
 PRICE_PCT_WINDOW = 0.10
-MAX_EXPIRIES = 2
+# alpha_options.AlphaOptionsTuning targets DTE 21-45. With MAX_EXPIRIES=2 the
+# refresher only ever kept the two nearest (weekly/daily) expirations, which
+# never intersect the 21-45 window, so alpha_options could never build a spread.
+# 20 covers ~3 months of weeklies + quarterlies, comfortably straddling 21-45.
+MAX_EXPIRIES = 20
+# Ignore expirations more than ~90 days out — keeps the cache bounded and
+# excludes LEAPs that alpha_options will never select.
+MAX_EXPIRY_DTE = 90
 CACHE_TTL_SECONDS = 3600
 
 
@@ -184,7 +191,19 @@ def _fetch_chain_via_contract_details(
         if exp:
             all_expiries_set.add(str(exp))
 
-    nearest_expiries = sorted(all_expiries_set)[:MAX_EXPIRIES]
+    # Cap by DTE so the cache stays bounded even if IBKR returns LEAPs.
+    today = datetime.now(timezone.utc).date()
+    bounded: List[str] = []
+    for exp_str in sorted(all_expiries_set):
+        try:
+            exp_date = datetime.strptime(exp_str, "%Y%m%d").date()
+        except ValueError:
+            continue
+        dte = (exp_date - today).days
+        if dte < 0 or dte > MAX_EXPIRY_DTE:
+            continue
+        bounded.append(exp_str)
+    nearest_expiries = bounded[:MAX_EXPIRIES]
     nearest_set = set(nearest_expiries)
 
     strikes_set = set()
