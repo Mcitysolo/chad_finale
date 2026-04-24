@@ -4,9 +4,14 @@ chad/strategies/gamma_futures.py
 
 Production-grade Gamma Futures strategy for CHAD.
 
-Mean-reversion counterpart to Alpha Futures (momentum). Trades the same
-micro-futures universe (MES, MNQ, MCL, MGC) but fades overextension
-rather than chasing trend.
+Mean-reversion counterpart to Alpha Futures (momentum). The two
+strategies now trade DISJOINT symbol universes so opposite-side signals
+on the same symbol cannot net to zero in the execution planner:
+
+    alpha_futures: MES, MNQ, MGC          (equity-index + metals)
+    gamma_futures: MCL, MYM, M2K, ZN, ZB  (energy, Dow/Russell, bonds)
+
+Gamma fades overextension rather than chasing trend.
 
 Signal logic
 ------------
@@ -51,10 +56,14 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import logging
+
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
 
-# Shared infrastructure from alpha_futures — same instruments, same utilities
+# Shared infrastructure from alpha_futures — same spec registry, different
+# universe (disjoint subset to avoid same-symbol netting in the planner).
 from chad.strategies.alpha_futures import (
+    ALPHA_FUTURES_UNIVERSE,
     DEFAULT_SPECS,
     FuturesInstrumentSpec,
     _atr,
@@ -67,6 +76,48 @@ from chad.strategies.alpha_futures import (
     _extract_prices,
     _safe_div,
     _to_float,
+)
+
+logger = logging.getLogger(__name__)
+
+# gamma_futures owns the energy / Dow / Russell / bond-complex reversion
+# book. MCL is the primary symbol; MYM, M2K, ZN, ZB are used when bar data
+# is available. Explicitly disjoint from ALPHA_FUTURES_UNIVERSE.
+_GAMMA_FUTURES_PRIMARY: Tuple[str, ...] = ("MCL",)
+_GAMMA_FUTURES_EXTENDED: Tuple[str, ...] = ("MYM", "M2K", "ZN", "ZB")
+
+
+def _resolve_gamma_universe(ctx: object) -> Tuple[str, ...]:
+    """
+    Return the symbol list gamma_futures should evaluate this cycle.
+
+    Always includes MCL. Adds MYM / M2K when bar data exists; otherwise
+    falls back to ZN / ZB so the strategy retains at least one additional
+    symbol beyond the energy leg. Any symbol overlapping with
+    ALPHA_FUTURES_UNIVERSE is stripped defensively.
+    """
+    bars_map = getattr(ctx, "bars", None)
+    have_bars = bars_map if isinstance(bars_map, Mapping) else {}
+
+    selected: List[str] = list(_GAMMA_FUTURES_PRIMARY)
+    added_micro = False
+    for sym in ("MYM", "M2K"):
+        rows = have_bars.get(sym)
+        if isinstance(rows, Sequence) and len(rows) >= 10:
+            selected.append(sym)
+            added_micro = True
+    if not added_micro:
+        for sym in ("ZN", "ZB"):
+            rows = have_bars.get(sym)
+            if isinstance(rows, Sequence) and len(rows) >= 10:
+                selected.append(sym)
+
+    return tuple(s for s in selected if s not in ALPHA_FUTURES_UNIVERSE)
+
+
+GAMMA_FUTURES_UNIVERSE: Tuple[str, ...] = tuple(
+    s for s in (_GAMMA_FUTURES_PRIMARY + _GAMMA_FUTURES_EXTENDED)
+    if s not in ALPHA_FUTURES_UNIVERSE
 )
 
 
@@ -85,7 +136,7 @@ def build_gamma_futures_config() -> StrategyConfig:
         return StrategyConfig(
             name=StrategyName.GAMMA_FUTURES,
             enabled=True,
-            target_universe=["MES", "MNQ", "MCL", "MGC"],
+            target_universe=list(GAMMA_FUTURES_UNIVERSE),
             max_gross_exposure=0.20,
             notes="Futures mean-reversion engine (fallback config)",
         )
@@ -458,11 +509,19 @@ def build_gamma_futures_signals(
             os.getenv("CHAD_GAMMA_FUTURES_MIN_CONFIDENCE"), 0.65,
         ),
     )
+    universe = _resolve_gamma_universe(ctx)
+    if not universe:
+        logger.info("GAMMA_FUTURES_UNIVERSE_EMPTY no_symbols_available_this_cycle")
+        return []
+
     prices = _extract_prices(ctx)
-    bars_by_symbol = _extract_bars(ctx, DEFAULT_SPECS.keys())
+    bars_by_symbol = _extract_bars(ctx, universe)
     equity = _extract_equity(ctx, tuning)
     signals: List[TradeSignal] = []
-    for symbol, spec in DEFAULT_SPECS.items():
+    for symbol in universe:
+        spec = DEFAULT_SPECS.get(symbol)
+        if spec is None:
+            continue
         signal = _build_signal_for_symbol(
             symbol=symbol,
             bars=bars_by_symbol.get(symbol, []),
@@ -490,6 +549,7 @@ def gamma_futures_handler(
 
 
 __all__ = [
+    "GAMMA_FUTURES_UNIVERSE",
     "GammaFuturesTuning",
     "build_gamma_futures_config",
     "build_gamma_futures_signals",

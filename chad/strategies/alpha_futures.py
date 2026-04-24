@@ -3,8 +3,12 @@
 chad/strategies/alpha_futures.py
 
 Production-grade Alpha Futures strategy for CHAD.
-Generates deterministic futures TradeSignal objects for MES, MNQ, MCL, and MGC,
+Generates deterministic futures TradeSignal objects for MES, MNQ, and MGC,
 with dynamic sizing based on ATR and capital-allocation weights.
+
+Universe is deliberately non-overlapping with gamma_futures (MCL-led)
+so opposite-side signals on the same symbol cannot net to zero and
+silently drop in the execution planner.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ def build_alpha_futures_config() -> StrategyConfig:
         return StrategyConfig(
             name=StrategyName.ALPHA_FUTURES,
             enabled=True,
-            target_universe=["MES", "MNQ", "MCL", "MGC"],
+            target_universe=["MES", "MNQ", "MGC"],
             max_gross_exposure=0.25,
             notes="Futures momentum engine (fallback config)",
         )
@@ -73,13 +77,25 @@ class StrategyTuning:
     trend_exit_on_ema_slow: bool = True
     time_stop_bars: int = 20
 
-# Default spec definitions
+# Default spec definitions — shared across alpha_futures and gamma_futures.
+# Each strategy selects a DISJOINT subset via ALPHA_FUTURES_UNIVERSE /
+# GAMMA_FUTURES_UNIVERSE to prevent opposite-side cancellation in the
+# execution planner (alpha momentum BUY vs gamma reversion SELL on MES
+# historically netted to zero and dropped both signals every cycle).
 DEFAULT_SPECS: Dict[str, FuturesInstrumentSpec] = {
     "MES": FuturesInstrumentSpec("MES", "ES", "CME", 5.0, 0.25, max_contracts=5),
     "MNQ": FuturesInstrumentSpec("MNQ", "NQ", "CME", 2.0, 0.25, max_contracts=5),
     "MCL": FuturesInstrumentSpec("MCL", "CL", "NYMEX", 100.0, 0.01, max_contracts=2),
     "MGC": FuturesInstrumentSpec("MGC", "GC", "COMEX", 10.0, 0.1, max_contracts=5),
+    "MYM": FuturesInstrumentSpec("MYM", "YM", "CBOT", 0.5, 1.0, max_contracts=5),
+    "M2K": FuturesInstrumentSpec("M2K", "RTY", "CME", 5.0, 0.1, max_contracts=5),
+    "ZN": FuturesInstrumentSpec("ZN", "ZN", "CBOT", 1000.0, 0.015625, max_contracts=3),
+    "ZB": FuturesInstrumentSpec("ZB", "ZB", "CBOT", 1000.0, 0.03125, max_contracts=3),
 }
+
+# alpha_futures owns the equity-index momentum + metals leg. Explicitly
+# excludes MCL / MYM / M2K / bonds — those belong to gamma_futures.
+ALPHA_FUTURES_UNIVERSE: Tuple[str, ...] = ("MES", "MNQ", "MGC")
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -288,15 +304,18 @@ def _load_alpha_futures_open_positions() -> Dict[str, Dict[str, Any]]:
             last_err,
         )
         # Fail CLOSED — if we cannot read position state, assume positions exist
-        # for ALL symbols to prevent stacking on state-read failure.
+        # for every symbol this strategy trades to prevent stacking on a
+        # state-read failure.
         return {
             sym: {"side": "UNKNOWN", "quantity": 1, "fail_closed": True}
-            for sym in DEFAULT_SPECS.keys()
+            for sym in ALPHA_FUTURES_UNIVERSE
         }
     for entry in (data.get("queues") or []):
         if str(entry.get("strategy", "")).strip().lower() != "alpha_futures":
             continue
         symbol = str(entry.get("symbol", "")).strip().upper()
+        if symbol not in ALPHA_FUTURES_UNIVERSE:
+            continue
         lots = [
             lot for lot in (entry.get("lots") or [])
             if _to_float(lot.get("quantity"), 0.0) > 0
@@ -555,7 +574,7 @@ def build_alpha_futures_signals(
         min_confidence=_to_float(os.getenv("CHAD_ALPHA_FUTURES_MIN_CONFIDENCE"), 0.65),
     )
     prices = _extract_prices(ctx)
-    bars_by_symbol = _extract_bars(ctx, DEFAULT_SPECS.keys())
+    bars_by_symbol = _extract_bars(ctx, ALPHA_FUTURES_UNIVERSE)
     equity = _extract_equity(ctx, tuning)
     # Position-aware: prefer ctx.paper_positions if provided, otherwise read
     # the trade_closer ledger directly so the strategy can emit exit signals.
@@ -569,7 +588,10 @@ def build_alpha_futures_signals(
     else:
         open_positions = _load_alpha_futures_open_positions()
     signals: List[TradeSignal] = []
-    for symbol, spec in DEFAULT_SPECS.items():
+    for symbol in ALPHA_FUTURES_UNIVERSE:
+        spec = DEFAULT_SPECS.get(symbol)
+        if spec is None:
+            continue
         signal = _build_signal_for_symbol(
             symbol=symbol,
             bars=bars_by_symbol.get(symbol, []),
@@ -593,4 +615,9 @@ def alpha_futures_handler(ctx: object, params: Optional[Mapping[str, Any]] = Non
     except Exception:
         return []
 
-__all__ = ["build_alpha_futures_config", "build_alpha_futures_signals", "alpha_futures_handler"]
+__all__ = [
+    "ALPHA_FUTURES_UNIVERSE",
+    "build_alpha_futures_config",
+    "build_alpha_futures_signals",
+    "alpha_futures_handler",
+]

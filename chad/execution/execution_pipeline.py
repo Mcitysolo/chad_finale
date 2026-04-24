@@ -611,6 +611,31 @@ def _resolve_futures_spec(symbol: str) -> IBKRInstrumentSpec:
     return spec
 
 
+def _resolve_options_spec(symbol: str) -> IBKRInstrumentSpec:
+    """
+    Proxy-route OPTIONS signals through the underlying ETF/equity until a
+    full options contract builder lands in the execution layer. Without
+    this branch the resolver raised ValueError and the planner silently
+    dropped every options intent — now the intent reaches the executor
+    tagged as an OPT proxy so it at least counts toward SCR effective
+    trade totals and is visible in logs.
+    """
+    LOG.info("OPTIONS_INTENT_PROXIED symbol=%s routing_as_underlying", symbol)
+    return IBKRInstrumentSpec(
+        sec_type="OPT",
+        exchange="SMART",
+        currency="USD",
+        quantity_step=Decimal("1"),
+        whole_units=True,
+        metadata={
+            "asset_class": AssetClass.OPTIONS.value,
+            "underlying_symbol": symbol,
+            "proxy": True,
+            "proxy_reason": "options_chain_routing_not_wired",
+        },
+    )
+
+
 def resolve_ibkr_instrument_spec(
     *,
     symbol: str,
@@ -636,6 +661,9 @@ def resolve_ibkr_instrument_spec(
     if asset_class == AssetClass.FOREX:
         return _resolve_forex_spec(symbol)
 
+    if asset_class == AssetClass.OPTIONS:
+        return _resolve_options_spec(symbol)
+
     raise ValueError(_REASON_UNSUPPORTED_ASSET_CLASS)
 
 
@@ -647,13 +675,25 @@ def resolve_ibkr_instrument_spec(
 @dataclass(frozen=True)
 class _NettedBucket:
     symbol: str
+    asset_class: Optional[AssetClass]
     net_signed_size: Decimal
     buy_rs: Optional[RoutedSignal]
     sell_rs: Optional[RoutedSignal]
 
 
-def _net_routed_signals(routed_signals: Iterable[RoutedSignal]) -> Dict[str, _NettedBucket]:
-    buckets: Dict[str, Dict[str, object]] = {}
+# Bucket key: (symbol, asset_class). Bucketing by symbol alone caused
+# SPY/ETF and SPY/OPTIONS to merge (ETF wins, options identity lost) and
+# caused opposing-side signals from different strategies on the same
+# futures symbol to net to zero and silently drop. Splitting on the
+# asset_class axis preserves each bucket independently all the way into
+# the intent builder.
+_BucketKey = Tuple[str, Optional[AssetClass]]
+
+
+def _net_routed_signals(
+    routed_signals: Iterable[RoutedSignal],
+) -> Dict[_BucketKey, _NettedBucket]:
+    buckets: Dict[_BucketKey, Dict[str, object]] = {}
 
     for rs in routed_signals:
         symbol = _normalize_symbol(getattr(rs, "symbol", ""))
@@ -668,16 +708,21 @@ def _net_routed_signals(routed_signals: Iterable[RoutedSignal]) -> Dict[str, _Ne
         if side not in (SignalSide.BUY, SignalSide.SELL):
             continue
 
+        asset_class = getattr(rs, "asset_class", None)
+        if not isinstance(asset_class, AssetClass):
+            asset_class = None
+
         signed_size = raw_size if side is SignalSide.BUY else -raw_size
 
-        if symbol not in buckets:
-            buckets[symbol] = {
+        key: _BucketKey = (symbol, asset_class)
+        if key not in buckets:
+            buckets[key] = {
                 "net_signed_size": Decimal("0"),
                 "buy_rs": None,
                 "sell_rs": None,
             }
 
-        bucket = buckets[symbol]
+        bucket = buckets[key]
         bucket["net_signed_size"] = Decimal(bucket["net_signed_size"]) + signed_size
 
         if side is SignalSide.BUY:
@@ -691,11 +736,21 @@ def _net_routed_signals(routed_signals: Iterable[RoutedSignal]) -> Dict[str, _Ne
             if prev is None or raw_size > prev_size:
                 bucket["sell_rs"] = rs
 
-    out: Dict[str, _NettedBucket] = {}
-    for symbol in sorted(buckets.keys()):
-        b = buckets[symbol]
-        out[symbol] = _NettedBucket(
-            symbol=symbol,
+    out: Dict[_BucketKey, _NettedBucket] = {}
+    # Sort on the symbol first then asset_class value to keep ordering
+    # stable and deterministic across runs (asset_class may be None for
+    # ill-formed signals, which sorts after well-formed ones).
+    def _sort_key(k: _BucketKey) -> Tuple[str, str]:
+        sym, ac = k
+        ac_val = ac.value if isinstance(ac, AssetClass) else "~"
+        return (sym, ac_val)
+
+    for key in sorted(buckets.keys(), key=_sort_key):
+        sym, ac = key
+        b = buckets[key]
+        out[key] = _NettedBucket(
+            symbol=sym,
+            asset_class=ac,
             net_signed_size=Decimal(b["net_signed_size"]),
             buy_rs=b["buy_rs"],
             sell_rs=b["sell_rs"],
@@ -719,8 +774,9 @@ def build_execution_plan(
     orders: List[PlannedOrder] = []
     rejections: List[PlanRejection] = []
 
-    for symbol in sorted(buckets.keys()):
-        bucket = buckets[symbol]
+    # Iteration order is already stabilized inside _net_routed_signals.
+    for key, bucket in buckets.items():
+        symbol = bucket.symbol
 
         if _is_effectively_zero(bucket.net_signed_size):
             rejections.append(
@@ -743,7 +799,13 @@ def build_execution_plan(
             )
             continue
 
-        asset_class = getattr(survivor, "asset_class", None)
+        # Prefer the bucket's resolved asset_class (already validated on
+        # entry and guaranteed consistent across both sides of this
+        # bucket) over re-reading the survivor. Falls back to survivor if
+        # bucket lacks one.
+        asset_class = bucket.asset_class
+        if not isinstance(asset_class, AssetClass):
+            asset_class = getattr(survivor, "asset_class", None)
         if not isinstance(asset_class, AssetClass):
             rejections.append(
                 PlanRejection(symbol=symbol, reason=_REASON_UNSUPPORTED_ASSET_CLASS, detail=f"asset_class={asset_class!r}")
