@@ -223,6 +223,74 @@ section{margin-top:20px}
   .market-row{grid-template-columns:1fr 1fr}
   .hero .mode-name{font-size:22px}
 }
+
+/* ---- Chat panel (Ask CHAD) ---- */
+.chat-clear{
+  background:transparent;border:1px solid var(--border);color:var(--text-secondary);
+  font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  padding:4px 10px;border-radius:999px;cursor:pointer;transition:background .15s,color .15s;
+}
+.chat-clear:hover{background:var(--bg-secondary);color:var(--text-primary)}
+.chat-scroll{
+  min-height:300px;max-height:440px;overflow-y:auto;
+  padding:12px 4px;display:flex;flex-direction:column;gap:10px;
+  scroll-behavior:smooth;
+}
+.chat-msg{display:flex;gap:10px;max-width:88%;}
+.chat-msg.user{align-self:flex-end;flex-direction:row-reverse;}
+.chat-who{
+  font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--text-tertiary);margin-top:6px;flex-shrink:0;min-width:36px;
+}
+.chat-msg.user .chat-who{text-align:right}
+.chat-bubble{
+  padding:10px 14px;border-radius:14px;font-size:13px;line-height:1.5;
+  word-wrap:break-word;white-space:pre-wrap;
+}
+.chat-msg.chad .chat-bubble{
+  background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);
+  border-bottom-left-radius:4px;
+}
+.chat-msg.user .chat-bubble{
+  background:var(--navy);color:#fff;border-bottom-right-radius:4px;
+}
+.chat-typing{display:inline-flex;align-items:center;gap:2px;padding:10px 14px;}
+.chat-typing .tdot{
+  width:6px;height:6px;border-radius:50%;background:var(--text-tertiary);
+  animation:tblink 1.2s infinite ease-in-out;
+}
+.chat-typing .tdot:nth-child(2){animation-delay:.15s}
+.chat-typing .tdot:nth-child(3){animation-delay:.3s}
+@keyframes tblink{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}
+.chat-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}
+.chat-chip{
+  background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);
+  padding:6px 12px;border-radius:999px;font-size:12px;cursor:pointer;
+  transition:background .12s,border-color .12s,transform .12s;
+}
+.chat-chip:hover{background:#EEF0F4;border-color:var(--border-strong);transform:translateY(-1px);}
+.chat-input-row{
+  display:flex;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);
+}
+.chat-input{
+  flex:1;padding:12px 14px;border:1px solid var(--border);border-radius:10px;
+  font-size:14px;font-family:var(--font);outline:none;resize:none;
+  background:var(--bg-card);color:var(--text-primary);transition:border .15s,box-shadow .15s;
+  max-height:120px;min-height:44px;
+}
+.chat-input:focus{border-color:var(--text-primary);box-shadow:0 0 0 3px rgba(13,17,23,.08);}
+.chat-send{
+  padding:0 18px;border:0;border-radius:10px;background:var(--navy);color:#fff;
+  font-size:14px;font-weight:600;cursor:pointer;transition:opacity .12s;min-height:44px;
+}
+.chat-send:hover{opacity:.92}
+.chat-send:disabled,.chat-input:disabled{opacity:.5;cursor:not-allowed}
+@media (max-width: 720px){
+  .chat-scroll{min-height:260px;max-height:360px}
+  .chat-msg{max-width:94%}
+  .chat-who{min-width:32px;font-size:9px}
+  .chat-send{padding:0 14px}
+}
 </style>
 </head>
 <body>
@@ -329,6 +397,23 @@ section{margin-top:20px}
     </div>
     <div id="lbRows">
       <div class="empty">Loading…</div>
+    </div>
+  </section>
+
+  <section class="card" id="chatCard">
+    <div class="section-head">
+      <div>
+        <div class="section-title">💬 Ask CHAD</div>
+        <div class="section-sub">Ask anything — positions, regime, performance — in plain English</div>
+      </div>
+      <button class="chat-clear" id="chatClear" type="button">Clear</button>
+    </div>
+    <div class="chat-scroll" id="chatScroll"></div>
+    <div class="chat-chips" id="chatChips"></div>
+    <div class="chat-input-row">
+      <textarea class="chat-input" id="chatInput" rows="1"
+        placeholder="Type a question…" autocomplete="off"></textarea>
+      <button class="chat-send" id="chatSend" type="button">Ask →</button>
     </div>
   </section>
 
@@ -687,6 +772,167 @@ refreshLeaderboard();
 setInterval(refreshMarket, 60000);
 setInterval(refreshRecent, 30000);
 setInterval(refreshLeaderboard, 30000);
+
+// ---- Ask CHAD chat panel ----
+const CHAT_WELCOME = "Hey. I'm CHAD. Ask me anything about what the system is doing — positions, regime, performance, why something is or isn't trading. I'll explain it in plain English.";
+const CHAT_STARTERS = [
+  "How are we doing today?",
+  "What's the current regime?",
+  "Why aren't we trading more?",
+  "Explain our open positions"
+];
+const CHAT_HISTORY_MAX = 20;
+const CHAT_SEND_HISTORY = 6;
+const chatState = {
+  history: [],
+  sending: false,
+  chipsShown: true,
+};
+
+function chatScrollEl(){ return document.getElementById('chatScroll'); }
+
+function chatAppendBubble(role, text){
+  const host = chatScrollEl();
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-msg ' + (role === 'user' ? 'user' : 'chad');
+  const who = document.createElement('div');
+  who.className = 'chat-who';
+  who.textContent = role === 'user' ? 'You' : 'CHAD';
+  const bubble = document.createElement('div');
+  bubble.className = 'chat-bubble';
+  bubble.textContent = text;
+  wrap.appendChild(who);
+  wrap.appendChild(bubble);
+  host.appendChild(wrap);
+  host.scrollTop = host.scrollHeight;
+  return wrap;
+}
+
+function chatShowTyping(){
+  const host = chatScrollEl();
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-msg chad';
+  wrap.id = 'chatTyping';
+  const who = document.createElement('div');
+  who.className = 'chat-who';
+  who.textContent = 'CHAD';
+  const bubble = document.createElement('div');
+  bubble.className = 'chat-bubble chat-typing';
+  bubble.innerHTML = '<span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>';
+  wrap.appendChild(who);
+  wrap.appendChild(bubble);
+  host.appendChild(wrap);
+  host.scrollTop = host.scrollHeight;
+}
+function chatHideTyping(){
+  const t = document.getElementById('chatTyping');
+  if (t) t.remove();
+}
+
+function chatRenderChips(){
+  const chips = document.getElementById('chatChips');
+  chips.innerHTML = '';
+  if (!chatState.chipsShown) return;
+  CHAT_STARTERS.forEach(q => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chat-chip';
+    b.textContent = q;
+    b.addEventListener('click', () => chatSubmit(q));
+    chips.appendChild(b);
+  });
+}
+
+function chatHideChips(){
+  chatState.chipsShown = false;
+  document.getElementById('chatChips').innerHTML = '';
+}
+
+function chatTrimHistory(){
+  while (chatState.history.length > CHAT_HISTORY_MAX){
+    chatState.history.shift();
+  }
+}
+
+async function chatSubmit(rawMessage){
+  if (chatState.sending) return;
+  const message = (rawMessage || '').trim();
+  if (!message) return;
+  const input = document.getElementById('chatInput');
+  const send = document.getElementById('chatSend');
+  chatState.sending = true;
+  input.disabled = true;
+  send.disabled = true;
+  if (chatState.chipsShown) chatHideChips();
+
+  chatAppendBubble('user', message);
+  const sentHistory = chatState.history.slice(-CHAT_SEND_HISTORY);
+  chatState.history.push({role:'user', content: message});
+  chatTrimHistory();
+  input.value = '';
+  chatAutosize();
+
+  chatShowTyping();
+
+  let reply = 'CHAD is unavailable right now. Try again in a moment.';
+  try{
+    const r = await fetch('/api/chat', {
+      method:'POST',
+      credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message, history: sentHistory}),
+    });
+    if (r.status === 401){ location.href = '/login'; return; }
+    if (r.ok){
+      const j = await r.json();
+      if (j && typeof j.reply === 'string' && j.reply.trim()){
+        reply = j.reply.trim();
+      }
+    }
+  } catch(e){}
+
+  chatHideTyping();
+  chatAppendBubble('chad', reply);
+  chatState.history.push({role:'assistant', content: reply});
+  chatTrimHistory();
+
+  chatState.sending = false;
+  input.disabled = false;
+  send.disabled = false;
+  input.focus();
+}
+
+function chatAutosize(){
+  const input = document.getElementById('chatInput');
+  input.style.height = 'auto';
+  input.style.height = Math.min(120, input.scrollHeight) + 'px';
+}
+
+function chatReset(){
+  chatState.history = [];
+  chatState.chipsShown = true;
+  const host = chatScrollEl();
+  host.innerHTML = '';
+  chatAppendBubble('chad', CHAT_WELCOME);
+  chatRenderChips();
+}
+
+function chatInit(){
+  const input = document.getElementById('chatInput');
+  const send = document.getElementById('chatSend');
+  const clear = document.getElementById('chatClear');
+  send.addEventListener('click', () => chatSubmit(input.value));
+  clear.addEventListener('click', chatReset);
+  input.addEventListener('input', chatAutosize);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey){
+      e.preventDefault();
+      chatSubmit(input.value);
+    }
+  });
+  chatReset();
+}
+chatInit();
 </script>
 </body>
 </html>

@@ -7,12 +7,15 @@ files return sensible fallbacks rather than crashing.
 
 v2: adds password auth (HTTP Basic + session cookie) and new
 endpoints /api/recent-trades, /api/leaderboard, /api/market.
+v3: adds /api/chat — Claude-powered advisory chat panel
+(advisory only; no execution, no config mutation).
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -879,3 +882,234 @@ async def _startup() -> None:
             await asyncio.sleep(30)
 
     asyncio.create_task(_bg())
+
+
+# ------------------------- /api/chat -------------------------
+#
+# Claude-powered advisory chat. Reuses ClaudeClient for key loading
+# (reads /etc/chad/claude.env) and builds a condensed CHAD state
+# snapshot that is injected as a user turn before the operator's
+# question. The endpoint is strictly advisory: no execution, no
+# config mutation, no broker calls. Every failure mode returns a
+# graceful fallback reply — the UI never sees a 5xx or raw error.
+
+CHAT_SYSTEM_PROMPT = (
+    "You are CHAD — an elite autonomous trading system. You think with "
+    "the quantitative precision of Jim Simons, the macro vision of Ray "
+    "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
+    "You are speaking to your operator — a non-technical person who owns "
+    "and monitors this system. Use plain English only. No jargon. No "
+    "financial advice. No trade recommendations. You explain what the "
+    "system is doing, why, and what it means. You are confident, direct, "
+    "and specific. Reference actual data from the context provided. "
+    "Maximum 3-4 sentences per response unless a detailed explanation "
+    "is genuinely needed.\n\n"
+    "HARD RULES — never violate:\n"
+    "- Never say 'you should buy X' or 'sell X'\n"
+    "- Never recommend specific trades\n"
+    "- Never change any system configuration\n"
+    "- Never reference execution APIs\n"
+    "- Always explain in plain English what CHAD is doing\n"
+    "- If asked about something outside CHAD, redirect politely"
+)
+
+CHAT_MODEL = "claude-sonnet-4-6"
+CHAT_MAX_TOKENS = 400
+CHAT_TEMPERATURE = 0.3
+CHAT_HISTORY_MAX = 6  # last N messages accepted from client
+CHAT_FALLBACK_REPLY = "CHAD is thinking... try again in a moment."
+
+_chat_logger = logging.getLogger("chad.dashboard.chat")
+_anthropic_client: Any = None
+_anthropic_client_err: str | None = None
+
+
+def _get_anthropic_client() -> Any:
+    """Lazy-init anthropic client, reusing ClaudeClient's key loader."""
+    global _anthropic_client, _anthropic_client_err
+    if _anthropic_client is not None:
+        return _anthropic_client
+    try:
+        from chad.intel.claude_client import ClaudeClient
+        import anthropic
+        api_key = ClaudeClient.load_key()
+        _anthropic_client = anthropic.Anthropic(api_key=api_key, timeout=20.0)
+        return _anthropic_client
+    except Exception as exc:
+        _anthropic_client_err = f"{type(exc).__name__}: {exc}"
+        _chat_logger.warning("chat_client_init_failed err=%s", exc)
+        return None
+
+
+def _chat_context_snapshot() -> dict:
+    """Compact CHAD state for Claude (~400 tokens). Summarise, don't dump."""
+    scr = _load_json(RUNTIME / "scr_state.json")
+    regime = _load_json(RUNTIME / "regime_state.json")
+    pnl = _load_json(RUNTIME / "pnl_state.json")
+    caps = _load_json(RUNTIME / "dynamic_caps.json")
+    stop_bus = _load_json(RUNTIME / "stop_bus.json")
+    price_cache = _load_json(RUNTIME / "price_cache.json").get("prices") or {}
+
+    stats = scr.get("stats") or {}
+    scr_block = {
+        "state": scr.get("state"),
+        "sizing_factor": scr.get("sizing_factor"),
+        "effective_trades": stats.get("effective_trades"),
+        "win_rate": round(float(stats.get("win_rate") or 0.0), 3),
+        "sharpe_like": round(float(stats.get("sharpe_like") or 0.0), 3),
+        "reasons": (scr.get("reasons") or [])[:2],
+    }
+
+    regime_block = {
+        "regime": regime.get("regime"),
+        "confidence": round(float(regime.get("confidence") or 0.0), 3),
+    }
+
+    portfolio_block = {
+        "account_equity": pnl.get("account_equity"),
+        "realized_pnl_today": pnl.get("realized_pnl"),
+        "trade_count_today": pnl.get("trade_count"),
+    }
+
+    positions_raw = _load_json(RUNTIME / "position_guard.json")
+    open_positions: list[dict] = []
+    for key, rec in positions_raw.items():
+        if not isinstance(rec, dict) or not rec.get("open"):
+            continue
+        open_positions.append(
+            {
+                "symbol": rec.get("symbol") or key.split("|")[-1],
+                "side": rec.get("side"),
+                "quantity": rec.get("quantity"),
+                "strategy": rec.get("strategy"),
+            }
+        )
+    open_positions = open_positions[:3]
+
+    weights = caps.get("normalized_weights") or {}
+    active_strategies = sorted(
+        [(k, float(v or 0.0)) for k, v in weights.items() if float(v or 0.0) > 0.0],
+        key=lambda x: -x[1],
+    )[:5]
+    active_strategy_names = [STRATEGY_NAMES.get(k, k) for k, _ in active_strategies]
+
+    stop_block = {
+        "active": bool(stop_bus.get("active")),
+        "reason": stop_bus.get("reason") or "none",
+    }
+
+    vix = price_cache.get("VIX")
+    if vix is None:
+        try:
+            bars = _load_json(DATA / "bars" / "1d" / "VIX.json").get("bars") or []
+            if bars:
+                vix = bars[-1].get("close")
+        except Exception:
+            vix = None
+
+    return {
+        "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scr": scr_block,
+        "regime": regime_block,
+        "portfolio": portfolio_block,
+        "open_positions": open_positions,
+        "active_strategies": active_strategy_names,
+        "stop_bus": stop_block,
+        "vix": round(float(vix), 2) if isinstance(vix, (int, float)) else None,
+        "mode": "paper",
+    }
+
+
+def _sanitize_history(raw: Any) -> list[dict]:
+    """Accept only valid {role, content} dicts; cap to CHAT_HISTORY_MAX."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for item in raw[-CHAT_HISTORY_MAX:]:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        out.append({"role": role, "content": content[:2000]})
+    return out
+
+
+def _chat_call_claude(message: str, history: list[dict]) -> str:
+    """Call Claude with context + history + current message. Always returns a str."""
+    client = _get_anthropic_client()
+    if client is None:
+        _chat_logger.warning("chat_client_unavailable err=%s", _anthropic_client_err)
+        return CHAT_FALLBACK_REPLY
+
+    try:
+        context = _chat_context_snapshot()
+    except Exception as exc:
+        _chat_logger.warning("chat_context_build_failed err=%s", exc)
+        context = {"error": "context unavailable"}
+
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": (
+                "Current CHAD system state:\n"
+                + json.dumps(context, indent=2, default=str)
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "Understood. I have the current state. What would you like to know?",
+        },
+    ]
+    messages.extend(history)
+    messages.append({"role": "user", "content": message[:2000]})
+
+    try:
+        resp = client.messages.create(
+            model=CHAT_MODEL,
+            max_tokens=CHAT_MAX_TOKENS,
+            temperature=CHAT_TEMPERATURE,
+            system=CHAT_SYSTEM_PROMPT,
+            messages=messages,
+        )
+        parts = []
+        for block in resp.content:
+            if hasattr(block, "text"):
+                parts.append(block.text)
+        text = "\n".join(parts).strip()
+        return text or CHAT_FALLBACK_REPLY
+    except Exception as exc:
+        _chat_logger.warning("chat_api_call_failed err=%s", exc)
+        return CHAT_FALLBACK_REPLY
+
+
+@app.post("/api/chat")
+async def api_chat(request: Request) -> JSONResponse:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    message = (body.get("message") or "").strip() if isinstance(body, dict) else ""
+    history = _sanitize_history(body.get("history") if isinstance(body, dict) else None)
+
+    if not message:
+        return JSONResponse({"reply": "Ask me anything about the system.", "context_ts": ts})
+
+    loop = asyncio.get_running_loop()
+    try:
+        reply = await loop.run_in_executor(None, _chat_call_claude, message, history)
+    except Exception as exc:
+        _chat_logger.warning("chat_executor_failed err=%s", exc)
+        reply = CHAT_FALLBACK_REPLY
+
+    return JSONResponse({"reply": reply, "context_ts": ts})
+
+
+@app.get("/api/chat/clear")
+async def api_chat_clear() -> JSONResponse:
+    # Server is stateless per request — history lives client-side.
+    return JSONResponse({"ok": True})
