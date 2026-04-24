@@ -54,10 +54,18 @@ SCR derives win_rate and sharpe_like from the ledger. This module increases qual
 - reducing over-trading and FOMO entries
 """
 
+import json
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
+
+logger = logging.getLogger(__name__)
+
+_REGIME_STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/regime_state.json")
+_BARS_DIR = Path("/home/ubuntu/chad_finale/data/bars/1d")
 
 
 # -------------------------
@@ -541,293 +549,216 @@ def _make_signal(ctx: Any, payload: Dict[str, Any]) -> Any:
 # Core strategy logic
 # -------------------------
 
-def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List:
+def _read_regime(ctx: Any) -> str:
     """
-    AlphaCrypto handler — emits target exposure "signals" only.
-
-    Returns a list of signals. Each signal is either:
-      - a StrategySignal-like object (preferred), or
-      - a dict payload (fallback)
-
-    This handler is deterministic and side-effect free.
+    Read the current regime label. Prefer ctx.regime if present, else fall back
+    to the on-disk regime state written by live_loop's classifier. Returns
+    "unknown" on any failure so downstream gates fail-open to full strength.
     """
+    r = getattr(ctx, "regime", None)
+    if isinstance(r, str) and r:
+        return r.lower()
+    try:
+        d = json.loads(_REGIME_STATE_PATH.read_text(encoding="utf-8"))
+        v = d.get("regime")
+        if isinstance(v, str) and v:
+            return v.lower()
+    except Exception:
+        pass
+    return "unknown"
 
+
+def _load_bars_for_symbol(ctx: Any, symbol: str) -> List[Mapping[str, Any]]:
+    """
+    Pull the daily bar series for ``symbol`` from ctx.bars first (populated by
+    ContextBuilder from data/bars/1d/{symbol}.json) and fall back to reading
+    the JSON directly so the handler remains usable in smoke tests and any
+    caller that hands in a ctx without pre-loaded bars.
+
+    Returns [] on any error — the caller must tolerate missing history.
+    """
+    ctx_bars = getattr(ctx, "bars", None)
+    if isinstance(ctx_bars, Mapping):
+        v = ctx_bars.get(symbol)
+        if isinstance(v, (list, tuple)) and v:
+            return [b for b in v if isinstance(b, Mapping)]
+    try:
+        path = _BARS_DIR / f"{symbol}.json"
+        if path.is_file():
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            bars = doc.get("bars") or []
+            return [b for b in bars if isinstance(b, Mapping)]
+    except Exception:
+        return []
+    return []
+
+
+def _pct_change(closes: Sequence[float], period: int) -> float:
+    if len(closes) <= period:
+        return 0.0
+    a = closes[-1]
+    b = closes[-1 - period]
+    if b <= 0:
+        return 0.0
+    return (a - b) / b
+
+
+def _realized_vol(closes: Sequence[float], period: int) -> float:
+    """
+    Sample standard deviation of log-ish returns over the last ``period`` bars.
+    Returns 0.0 if history is too short. Uses simple returns (close/prev - 1)
+    which is close enough for the 5d/20d ratio comparison done downstream.
+    """
+    if len(closes) < period + 1:
+        return 0.0
+    rets: List[float] = []
+    for i in range(len(closes) - period, len(closes)):
+        prev = closes[i - 1]
+        cur = closes[i]
+        if prev > 0:
+            rets.append((cur - prev) / prev)
+    if len(rets) < 2:
+        return 0.0
+    m = sum(rets) / len(rets)
+    var = sum((r - m) ** 2 for r in rets) / len(rets)
+    return var ** 0.5
+
+
+def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List[TradeSignal]:
+    """
+    Emit long-only CRYPTO TradeSignals driven by three stacked filters:
+
+      1. 20-day SMA momentum breakout (price > SMA20, last close > prior, 3d > 1.5%)
+      2. 5d/20d realized-vol expansion (boost strong, skip on compression)
+      3. Regime gate (skip ranging/adverse, halve strength in trending_bear)
+
+    Deterministic for a given (ctx, params). Returns [] rather than raising on
+    missing bar data so a single bad symbol cannot silence the whole brain.
+    """
     if not params.enabled:
         return []
 
-    universe = params.actual_universe()
+    regime = _read_regime(ctx)
+    if regime in ("ranging", "adverse"):
+        logger.info("alpha_crypto: no signals this cycle (reason: regime_%s)", regime)
+        return []
+    regime_mult = 0.5 if regime == "trending_bear" else 1.0
 
-    # Extract context (best-effort)
-    prices = _extract_prices(ctx, universe)
-    vol_est = _extract_volatility(ctx, universe)
-    dv_map = _extract_dollar_volume(ctx, universe)
+    universe = [s for s in params.actual_universe() if s.endswith("-USD")]
+    prices_map = _get_mapping(ctx, "prices")
 
-    out: List[Any] = []
+    signals: List[TradeSignal] = []
+    skip_reasons: List[str] = []
 
     for symbol in universe:
-        # ------------------------------------------
-        # Build bar-based features if bars available
-        # ------------------------------------------
-        bars = _extract_bars(ctx, symbol)
-        closes: List[Number] = []
-        highs: List[Number] = []
-        lows: List[Number] = []
-        volumes: List[Number] = []
+        if len(signals) >= 2:
+            break
 
-        if bars is not None:
-            # bars may be list of dict/tuples. We take last N safely.
-            tail = list(bars)[-max(60, params.ema_slow + 10, params.breakout_lookback + 5) :]
-            for b in tail:
-                c = _bar_close(b)
-                h = _bar_high(b)
-                l = _bar_low(b)
-                v = _bar_volume(b)
-                if c <= 0 or h <= 0 or l <= 0:
-                    continue
-                # enforce h/l integrity
-                if h < l:
-                    continue
+        try:
+            bars = _load_bars_for_symbol(ctx, symbol)
+        except Exception as exc:
+            skip_reasons.append(f"{symbol}:bar_read_error({type(exc).__name__})")
+            continue
+
+        if not bars or len(bars) < 22:
+            skip_reasons.append(f"{symbol}:insufficient_history")
+            continue
+
+        closes: List[float] = []
+        for b in bars[-30:]:
+            c = _safe_float(b.get("close"), 0.0)
+            if c > 0:
                 closes.append(c)
-                highs.append(h)
-                lows.append(l)
-                volumes.append(v)
 
-        # Need minimum history to compute indicators
-        have_history = len(closes) >= max(params.ema_slow + 2, params.atr_period + 2, params.breakout_lookback + 2)
-
-        # Safe fallback: if no bars, we can only do ultra-conservative mode (no entries)
-        if not have_history:
-            # allow exits only if we have a position (state)
-            st = _STATE.get(symbol)
-            if st.get("exposure", 0.0) != 0.0:
-                # Without bars, fail-closed: flatten
-                out.append(
-                    TradeSignal(
-                        strategy=StrategyName.ALPHA_CRYPTO,
-                        symbol=str(symbol).upper(),
-                        side=SignalSide.SELL,
-                        size=abs(float(st.get("exposure", 0.0))),
-                        confidence=0.0,
-                        asset_class=AssetClass.CRYPTO,
-                        meta={
-                            "blocked_by": ["NO_HISTORY"],
-                            "reasons": ["No OHLCV history in ctx; fail-closed flatten"],
-                            "exit_reason": "NO_HISTORY",
-                            "diagnostics": {},
-                            "target_exposure": 0.0,
-                            "previous_exposure": float(st.get("exposure", 0.0)),
-                        },
-                    )
-                )
-                _STATE.set(symbol, {"exposure": 0.0, "entry_close": None, "bars_held": 0, "peak_favorable_close": None})
+        if len(closes) < 22:
+            skip_reasons.append(f"{symbol}:insufficient_closes")
             continue
 
-        # Compute indicators
-        ema_fast = _ema(closes, params.ema_fast)
-        ema_slow = _ema(closes, params.ema_slow)
-        a = _atr(highs, lows, closes, params.atr_period)
-        roll_high = _rolling_max(highs, params.breakout_lookback)
+        live_px = _safe_float(prices_map.get(symbol), 0.0)
+        price = live_px if live_px > 0 else closes[-1]
+        prior_close = closes[-2]
+        sma20 = sum(closes[-20:]) / 20.0
 
-        # Crypto trades 24/7 — use live Kraken spot for the current close
-        # when available; fall back to the last daily bar close. Indicators
-        # (EMA/ATR/rolling high) are still computed on bar history, which
-        # provides the historical window for regime/momentum evaluation.
-        _live_price = prices.get(symbol)
-        if _live_price is not None and _live_price > 0:
-            close = float(_live_price)
-        else:
-            close = closes[-1]
-        ef = ema_fast[-1]
-        es = ema_slow[-1]
-        atr_v = a[-1]
-        atr_pct = (atr_v / close) if close else 0.0
-        rng = highs[-1] - lows[-1]
-        range_atr = (rng / atr_v) if atr_v else 0.0
+        # Signal 1: momentum breakout — long-only, direction-confirmed,
+        # with a minimum 3-day run to filter noise and chop days.
+        if price <= sma20:
+            skip_reasons.append(f"{symbol}:below_sma20")
+            continue
+        if price <= prior_close:
+            skip_reasons.append(f"{symbol}:no_up_confirm")
+            continue
+        pct_3d = _pct_change(closes, 3)
+        if pct_3d < 0.015:
+            skip_reasons.append(f"{symbol}:3d_move<1.5%")
+            continue
 
-        # Load position state
-        st = _STATE.get(symbol)
-        pos = _safe_float(st.get("exposure", 0.0), 0.0)
-        entry_close = st.get("entry_close", None)
-        if entry_close is not None:
-            entry_close = _safe_float(entry_close, default=close)
-        bars_held = _safe_int(st.get("bars_held", 0), 0)
-        peak = st.get("peak_favorable_close", None)
-        if peak is not None:
-            peak = _safe_float(peak, default=close)
+        strength = _clamp((price - sma20) / sma20 * 10.0, 0.3, 1.0)
 
-        blocked_by: List[str] = []
-        reasons: List[str] = []
-        diagnostics: Dict[str, Any] = {
-            "atr_pct": float(atr_pct),
-            "range_atr": float(range_atr),
-            "ema_fast": float(ef),
-            "ema_slow": float(es),
-            "bars_held": int(bars_held),
-        }
-
-        # -------------------------
-        # EXIT ENGINE (deterministic)
-        # -------------------------
-        exit_reason: Optional[str] = None
-        if pos != 0.0:
-            # vol spike
-            if atr_pct > params.vol_spike_atr_pct:
-                exit_reason = "VOL_SPIKE"
-            # trend break
-            if exit_reason is None and not (ef > es):
-                exit_reason = "TREND_BREAK"
-            # time stop
-            if exit_reason is None and entry_close is not None and bars_held >= params.time_stop_bars:
-                favor_move = close - entry_close
-                diagnostics["favor_move"] = float(favor_move)
-                if favor_move < params.min_favor_move_atr * atr_v:
-                    exit_reason = "TIME_STOP"
-            # atr trail from peak
-            if exit_reason is None and peak is not None:
-                adverse = peak - close
-                diagnostics["adverse_from_peak"] = float(adverse)
-                if adverse > params.atr_trail_mult * atr_v:
-                    exit_reason = "ATR_TRAIL"
-
-            if exit_reason is not None:
-                out.append(
-                    TradeSignal(
-                        strategy=StrategyName.ALPHA_CRYPTO,
-                        symbol=str(symbol).upper(),
-                        side=SignalSide.SELL,
-                        size=abs(float(pos)),
-                        confidence=0.0,
-                        asset_class=AssetClass.CRYPTO,
-                        meta={
-                            "blocked_by": ["EXIT_ENGINE"],
-                            "reasons": [f"EXIT:{exit_reason}"],
-                            "exit_reason": exit_reason,
-                            "diagnostics": diagnostics,
-                            "target_exposure": 0.0,
-                            "previous_exposure": float(pos),
-                        },
-                    )
-                )
-                _STATE.set(symbol, {"exposure": 0.0, "entry_close": None, "bars_held": 0, "peak_favorable_close": None})
+        # Signal 2: volatility expansion — compression kills the trade,
+        # expansion boosts it. 20d baseline is required to have meaning.
+        vol5 = _realized_vol(closes, 5)
+        vol20 = _realized_vol(closes, 20)
+        vol_ratio = (vol5 / vol20) if vol20 > 0 else 0.0
+        if vol20 > 0 and vol5 > 0:
+            if vol_ratio < 0.7:
+                skip_reasons.append(f"{symbol}:vol_compression")
                 continue
+            if vol_ratio > 1.5:
+                strength *= 1.2
 
-        # -------------------------
-        # ENTRY QUALITY GATES
-        # -------------------------
+        # Signal 3: regime multiplier (filter applied earlier).
+        strength *= regime_mult
+        strength = min(strength, 1.0)
 
-        # Liquidity gate: requires dv_map presence for entries (fail-closed)
-        # Known-liquid symbols bypass the gate when dollar_volume is missing.
-        dv = dv_map.get(symbol)
-        if dv is None and symbol not in _KNOWN_LIQUID:
-            blocked_by.append("LIQUIDITY_UNKNOWN")
-            reasons.append("ctx missing dollar volume metrics; entries blocked (fail-closed)")
-        elif dv is not None:
-            diagnostics["dollar_volume"] = float(dv)
-            if dv < params.min_liquidity_usd:
-                blocked_by.append("LIQUIDITY")
-                reasons.append(f"dollar_volume {dv:.0f} < {params.min_liquidity_usd:.0f}")
-
-        # Volatility regime gate
-        if atr_pct < params.min_atr_pct:
-            blocked_by.append("VOL_LOW")
-            reasons.append(f"atr_pct {atr_pct:.4f} < {params.min_atr_pct:.4f}")
-        if atr_pct > params.max_atr_pct:
-            blocked_by.append("VOL_HIGH")
-            reasons.append(f"atr_pct {atr_pct:.4f} > {params.max_atr_pct:.4f}")
-
-        # Trend gate
-        if not (ef > es):
-            blocked_by.append("TREND")
-            reasons.append("ema_fast<=ema_slow")
-        if not (close > ef):
-            blocked_by.append("TREND")
-            reasons.append("close<=ema_fast")
-
-        # Anti-chase gate
-        if range_atr > params.anti_chase_range_atr:
-            blocked_by.append("ANTI_CHASE")
-            reasons.append(f"range/atr {range_atr:.2f} > {params.anti_chase_range_atr:.2f}")
-
-        # Momentum gate (ATR normalized)
-        mom = (close - ef) / atr_v if atr_v else 0.0
-        diagnostics["momentum_atr"] = float(mom)
-        if mom < params.momentum_atr:
-            blocked_by.append("MOMENTUM")
-            reasons.append(f"momentum_atr {mom:.2f} < {params.momentum_atr:.2f}")
-
-        # Optional legacy volatility estimate guard (if provided)
-        v_est = vol_est.get(symbol)
-        if v_est is not None and v_est > params.max_volatility:
-            blocked_by.append("VOL_EST")
-            reasons.append(f"ctx.volatility {v_est:.2f} > max_volatility {params.max_volatility:.2f}")
-
-        # Entry signal: conservative breakout confirmation
-        prev_roll_high = roll_high[-2]
-        breakout = close > prev_roll_high + 0.15 * atr_v
-        diagnostics["breakout"] = bool(breakout)
-
-        # Decide target exposure
-        target = pos  # default: hold if blocked
-        confidence = 0.2
-
-        if not blocked_by and breakout:
-            # target scaled by momentum, clipped
-            confidence = _clamp(0.35 + 0.18 * mom, 0.0, 0.95)
-            target = _clamp(params.max_abs_exposure * _clamp(0.55 + 0.25 * mom, 0.0, 1.0), 0.0, params.max_abs_exposure)
-            reasons.append("ENTER:BREAKOUT_TREND_MOM_OK")
-        else:
-            # If no entry but currently flat, stay flat
-            if pos == 0.0:
-                target = 0.0
-            # If blocked, reasons already show why
-
-        # Churn band (except when exiting, which we handled earlier)
-        delta = abs(target - pos)
-        diagnostics["delta_exposure"] = float(delta)
-        if delta < params.min_delta_exposure:
-            target = pos
-            blocked_by.append("CHURN_BAND")
-            reasons.append(f"delta {delta:.3f} < {params.min_delta_exposure:.3f}")
-
-        # Update state
-        if target == 0.0:
-            _STATE.set(symbol, {"exposure": 0.0, "entry_close": None, "bars_held": 0, "peak_favorable_close": None})
-        else:
-            if pos == 0.0:
-                # new position
-                _STATE.set(symbol, {"exposure": float(target), "entry_close": float(close), "bars_held": 1, "peak_favorable_close": float(close)})
-            else:
-                # holding
-                bars_held = bars_held + 1
-                peak = close if peak is None else max(peak, close)
-                _STATE.set(symbol, {"exposure": float(target), "entry_close": float(entry_close or close), "bars_held": int(bars_held), "peak_favorable_close": float(peak)})
-
-        meta = {
-            "blocked_by": blocked_by,
-            "reasons": reasons if reasons else ["NO_SIGNAL"],
-            "exit_reason": None,
-            "diagnostics": diagnostics,
-            "target_exposure": float(target),
-            "previous_exposure": float(pos),
-        }
-
-        delta_exposure = float(target) - float(pos)
-        if abs(delta_exposure) <= 1e-12:
+        if strength < 0.3:
+            skip_reasons.append(f"{symbol}:strength<0.3")
             continue
 
-        side = SignalSide.BUY if delta_exposure > 0 else SignalSide.SELL
-        size = abs(delta_exposure)
+        # Size in base-currency units: target notional $1500–$5000 scaled by
+        # strength, then divided by price. Downstream kraken_intents builder
+        # multiplies size*price back to notional and caps against
+        # dynamic_cap_for_crypto, so this sizing is a safe opening bid.
+        target_notional_usd = 1500.0 + (strength - 0.3) / 0.7 * 3500.0
+        size = target_notional_usd / price
+        if size <= 0:
+            continue
 
-        out.append(
+        side = SignalSide.BUY
+        confidence = _clamp(0.5 + 0.4 * strength, 0.0, 0.95)
+
+        logger.info(
+            "alpha_crypto signal: %s %s strength=%.3f",
+            symbol, side.value, strength,
+        )
+
+        signals.append(
             TradeSignal(
                 strategy=StrategyName.ALPHA_CRYPTO,
-                symbol=str(symbol).upper(),
+                symbol=symbol,
                 side=side,
                 size=float(size),
                 confidence=float(confidence),
                 asset_class=AssetClass.CRYPTO,
-                meta=meta,
+                meta={
+                    "engine": "alpha_crypto.momentum_v1",
+                    "regime": regime,
+                    "regime_mult": float(regime_mult),
+                    "price": float(price),
+                    "sma20": float(sma20),
+                    "prior_close": float(prior_close),
+                    "pct_3d": float(pct_3d),
+                    "vol5": float(vol5),
+                    "vol20": float(vol20),
+                    "vol_ratio": float(vol_ratio),
+                    "strength": float(strength),
+                    "target_notional_usd": float(target_notional_usd),
+                    "required_asset_class": "crypto",
+                },
             )
         )
 
-    return out
+    if not signals:
+        reason = ";".join(skip_reasons) if skip_reasons else "no_eligible_symbols"
+        logger.info("alpha_crypto: no signals this cycle (reason: %s)", reason)
+
+    return signals
