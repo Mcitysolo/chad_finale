@@ -147,9 +147,15 @@ def mark_position_open(intent) -> None:
     key = _position_key(strategy, symbol)
     broker_sync_key = _position_key("broker_sync", symbol)
     _reduce_or_close_broker_sync(state, broker_sync_key, strategy, side, quantity)
+    now_iso = _utc_now_iso()
+    prior = state.get(key) or {}
+    prior_opened = None
+    if prior.get("open") is True and str(prior.get("side")) == str(side):
+        prior_opened = prior.get("opened_at")
     state[key] = {
         "open": True,
-        "updated_at_utc": _utc_now_iso(),
+        "opened_at": prior_opened or now_iso,
+        "updated_at_utc": now_iso,
         "strategy": strategy,
         "symbol": symbol,
         "side": side,
@@ -183,9 +189,11 @@ def replace_position(intent) -> None:
     key = _position_key(strategy, symbol)
     broker_sync_key = _position_key("broker_sync", symbol)
     _reduce_or_close_broker_sync(state, broker_sync_key, strategy, side, quantity)
+    now_iso = _utc_now_iso()
     state[key] = {
         "open": True,
-        "updated_at_utc": _utc_now_iso(),
+        "opened_at": now_iso,
+        "updated_at_utc": now_iso,
         "strategy": strategy,
         "symbol": symbol,
         "side": side,

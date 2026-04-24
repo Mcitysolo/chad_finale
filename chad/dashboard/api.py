@@ -404,13 +404,27 @@ class StateBuilder:
         for svc in SERVICES_TO_CHECK:
             try:
                 r = subprocess.run(
-                    ["systemctl", "is-active", svc],
+                    ["systemctl", "show", svc,
+                     "--property=ActiveState,SubState,Type,Result"],
                     capture_output=True,
                     text=True,
                     timeout=3,
                 )
-                state = (r.stdout or "").strip()
-                if state in ("active", "activating"):
+                props = {}
+                for line in (r.stdout or "").splitlines():
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        props[k.strip()] = v.strip()
+                active = props.get("ActiveState", "")
+                sub = props.get("SubState", "")
+                svc_type = props.get("Type", "")
+                result = props.get("Result", "")
+                is_ok = (
+                    active in ("active", "activating", "reloading")
+                    or (svc_type == "oneshot" and result == "success")
+                    or (active == "inactive" and sub == "dead" and result in ("", "success"))
+                )
+                if is_ok:
                     ok += 1
                 else:
                     failed += 1
@@ -781,6 +795,7 @@ async def api_market() -> JSONResponse:
     trends = _load_json(RUNTIME / "trends_state.json").get("signals") or {}
     reddit = _load_json(RUNTIME / "reddit_sentiment.json").get("signals") or {}
     event_risk = _load_json(RUNTIME / "event_risk.json")
+    regime_state = _load_json(RUNTIME / "regime_state.json")
 
     vix = prices.get("VIX")
     if vix is None:
@@ -811,16 +826,15 @@ async def api_market() -> JSONResponse:
             except Exception:
                 btc_change = None
 
-    regime_raw = str(event_risk.get("regime") or event_risk.get("severity") or "NEUTRAL").upper()
     regime_map = {
-        "LOW": ("RISK ON", "green"),
-        "MEDIUM": ("NEUTRAL", "grey"),
-        "HIGH": ("RISK OFF", "red"),
-        "NEUTRAL": ("NEUTRAL", "grey"),
-        "RISK_ON": ("RISK ON", "green"),
-        "RISK_OFF": ("RISK OFF", "red"),
+        "trending_bull": ("TRENDING BULL", "green"),
+        "trending_bear": ("TRENDING BEAR", "red"),
+        "volatile":      ("VOLATILE",      "orange"),
+        "ranging":       ("RANGING",       "grey"),
+        "neutral":       ("NEUTRAL",       "grey"),
     }
-    regime_label, regime_color = regime_map.get(regime_raw, (regime_raw, "grey"))
+    regime_raw = str(regime_state.get("regime") or "neutral").lower()
+    regime_label, regime_color = regime_map.get(regime_raw, (regime_raw.upper(), "grey"))
 
     mentions = sorted(
         [(k, int(v.get("mention_count") or 0)) for k, v in reddit.items() if isinstance(v, dict)],

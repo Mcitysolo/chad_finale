@@ -44,7 +44,7 @@ DEFAULT_STRATEGY_WEIGHTS: Dict[str, float] = {
     "omega_vol": 0.05,
     "delta": 0.02,
     "delta_pairs": 0.05,
-    "crypto": 0.04,
+    "alpha_crypto": 0.04,
     "alpha_intraday": 0.03,
 }
 
@@ -393,9 +393,9 @@ ALPHA_STRATEGIES = frozenset({
     "alpha", "alpha_futures", "alpha_intraday", "alpha_options",
     "omega_momentum_options", "gamma", "gamma_futures", "gamma_reversion",
 })
-BETA_STRATEGIES = frozenset({"beta_trend"})
+BETA_STRATEGIES = frozenset({"beta", "beta_trend"})
 ADAPTIVE_STRATEGIES = frozenset({
-    "omega", "omega_macro", "omega_vol", "delta", "delta_pairs", "crypto",
+    "omega", "omega_macro", "omega_vol", "delta", "delta_pairs", "alpha_crypto",
 })
 
 ALPHA_TARGET = 0.50

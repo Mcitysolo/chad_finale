@@ -390,8 +390,13 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
                         bs_entry["quantity"] = residual
                         bs_entry["open"] = True
                         bs_entry["closed_by"] = "partial_attribution_residual"
+        prior = guard_state.get(key) or {}
+        prior_opened = None
+        if prior.get("open") is True and str(prior.get("side", "")).upper() == side:
+            prior_opened = prior.get("opened_at")
         guard_state[key] = {
             "open": True,
+            "opened_at": prior_opened or now_iso,
             "updated_at_utc": now_iso,
             "strategy": strategy,
             "symbol": symbol,

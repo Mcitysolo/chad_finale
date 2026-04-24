@@ -160,7 +160,7 @@ class IBKRHistoricalProvider:
     _EXPIRY_SCHEDULE: dict = {
         "MES":  ["202606", "202609", "202612", "202703", "202706"],
         "MNQ":  ["202606", "202609", "202612", "202703", "202706"],
-        "MCL":  ["202605", "202606", "202607", "202608", "202609", "202610", "202611", "202612"],
+        "MCL":  ["202606", "202607", "202608", "202609", "202610", "202611", "202612"],
         "MGC":  ["202604", "202606", "202608", "202610", "202612", "202702", "202704"],
         "ZN":   ["202606", "202609", "202612", "202703"],
         "ZB":   ["202606", "202609", "202612", "202703"],
@@ -176,7 +176,7 @@ class IBKRHistoricalProvider:
     _FUTURES_CONTRACT_SPECS: dict = {
         "MES":  {"ibkr_symbol": "MES", "multiplier": "5",     "exchange": "CME",   "currency": "USD"},
         "MNQ":  {"ibkr_symbol": "MNQ", "multiplier": "2",     "exchange": "CME",   "currency": "USD"},
-        "MCL":  {"ibkr_symbol": "MCL", "multiplier": "100",   "exchange": "NYMEX", "currency": "USD", "local_symbol": "MCLK6"},
+        "MCL":  {"ibkr_symbol": "MCL", "multiplier": "100",   "exchange": "NYMEX", "currency": "USD"},
         "MGC":  {"ibkr_symbol": "MGC", "multiplier": "10",    "exchange": "COMEX", "currency": "USD"},
         "ZN":   {"ibkr_symbol": "ZN",  "multiplier": "1000",  "exchange": "CBOT",  "currency": "USD"},
         "ZB":   {"ibkr_symbol": "ZB",  "multiplier": "1000",  "exchange": "CBOT",  "currency": "USD"},
