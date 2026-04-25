@@ -98,6 +98,28 @@ REAL_STRATEGIES = {
     "alpha_forex",
 }
 
+# IBKR paper-mode order statuses that mean "submitted but no synchronous fill".
+# In paper mode these MUST be translated to "paper_fill" before evidence is
+# persisted, otherwise SCR excludes the records as untrusted. Mirrors the set
+# used in chad/core/live_loop.py — kept here so normalize_paper_fill_evidence
+# is the single source of truth for paper-mode status normalization.
+_PAPER_PENDING_STATUSES = frozenset({
+    "pendingsubmit", "presubmitted", "submitted", "apipending",
+    "inactive", "unknown", "", "error",
+})
+
+# Known futures contract roots — used both for asset_class resolution and for
+# stripping contract-month suffixes (e.g. "MGCK6" → "MGC", "MES2606" → "MES")
+# when looking up the symbol in runtime/price_cache.json. Longest first so
+# prefix matching prefers "MES" over "ES" for "MES2606".
+_KNOWN_FUTURES_ROOTS = (
+    "MES", "MNQ", "MGC", "MCL", "MYM", "M6E", "M6A", "M6B",
+    "RTY", "ZB", "ZN", "ZF", "ZT", "ZC", "ZS", "ZW",
+    "ES", "NQ", "YM", "GC", "SI", "HG", "PL", "CL", "NG", "BZ",
+)
+
+PRICE_CACHE_PATH = RUNTIME_DIR / "price_cache.json"
+
 
 # =============================================================================
 # Helpers
@@ -812,6 +834,155 @@ class PaperExecutionEvidenceWriter:
 
 
 # =============================================================================
+# Paper-fill normalizer (single chokepoint for status / fill_price / asset_class)
+# =============================================================================
+
+def _strip_futures_month_code(symbol: str) -> str:
+    """Return the futures root for a contract-month-coded symbol.
+
+    Examples: "MGCK6" → "MGC", "MES2606" → "MES", "ZNH6" → "ZN".
+    Returns the input unchanged when no known root prefix matches.
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return ""
+    # Already a known root.
+    if sym in _KNOWN_FUTURES_ROOTS:
+        return sym
+    # Longest root first so "MES" wins over "ES" for "MES2606".
+    for root in sorted(_KNOWN_FUTURES_ROOTS, key=len, reverse=True):
+        if sym.startswith(root) and len(sym) > len(root):
+            return root
+    return sym
+
+
+def _lookup_paper_fill_price(symbol: str) -> float:
+    """Best-effort price lookup from runtime/price_cache.json.
+
+    Tries exact symbol first, then strips futures contract-month suffixes.
+    Returns 0.0 on any failure — callers must treat 0.0 as "no price".
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return 0.0
+    try:
+        if not PRICE_CACHE_PATH.exists():
+            return 0.0
+        raw = json.loads(PRICE_CACHE_PATH.read_text(encoding="utf-8"))
+        prices = raw.get("prices", {}) if isinstance(raw, dict) else {}
+        if not isinstance(prices, dict):
+            return 0.0
+    except Exception:
+        return 0.0
+
+    def _coerce(value: Any) -> float:
+        try:
+            v = float(value)
+            return v if v > 0 and math.isfinite(v) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    # 1) exact match
+    if sym in prices:
+        v = _coerce(prices[sym])
+        if v > 0:
+            return v
+    # 2) futures root prefix
+    root = _strip_futures_month_code(sym)
+    if root and root != sym and root in prices:
+        v = _coerce(prices[root])
+        if v > 0:
+            return v
+    return 0.0
+
+
+def _resolve_asset_class_safe(symbol: str, sec_type: str = "") -> str:
+    """Wrap ibkr_adapter.resolve_asset_class with a lazy import + fallback.
+
+    Lazy import avoids a circular-import risk if ibkr_adapter ever ends up
+    importing the writer transitively. Falls back to a small inline mapping
+    if the adapter is unavailable for any reason.
+    """
+    try:
+        from chad.execution.ibkr_adapter import resolve_asset_class
+        return resolve_asset_class(symbol, sec_type)
+    except Exception:
+        sym = (symbol or "").strip().upper()
+        stype = (sec_type or "").strip().upper()
+        if stype == "FUT":
+            return "futures"
+        if stype == "OPT":
+            return "options"
+        if stype == "CASH":
+            return "forex"
+        if not sym:
+            return "equity" if stype == "STK" else "unknown"
+        if _strip_futures_month_code(sym) in _KNOWN_FUTURES_ROOTS:
+            return "futures"
+        return "equity"
+
+
+def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence":
+    """Enforce paper-mode evidence invariants in place. Returns the same object.
+
+    Invariants (paper mode only — is_live=False):
+      1. asset_class is never blank/unknown when the symbol is recognizable.
+      2. fill_price > 0 when a price exists in runtime/price_cache.json
+         (with futures contract-month normalization, e.g. MGCK6 → MGC).
+         Falls back to expected_price when the cache cannot supply one.
+      3. status is "paper_fill" when the raw status is in
+         _PAPER_PENDING_STATUSES (PendingSubmit, error, etc.) and a
+         positive fill_price is available.
+      4. Raises ValueError if status would still be a pending/error value
+         after normalization in paper mode — the writer caller is missing
+         data we cannot synthesize and the record must not be persisted
+         as untrusted.
+
+    Live-mode records (is_live=True) are returned unchanged: the broker is
+    the source of truth and we must not rewrite its statuses or prices.
+    """
+    if not isinstance(ev, PaperExecEvidence):
+        return ev
+
+    # 1) asset_class — fix unknown/blank using symbol pattern matching.
+    current_ac = _safe_str(ev.asset_class, "").strip()
+    if not current_ac or current_ac.lower() == "unknown":
+        ev.asset_class = _resolve_asset_class_safe(ev.symbol, "")
+
+    if _safe_bool(ev.is_live, False):
+        return ev
+
+    # 2) fill_price — resolve from price cache with futures normalization.
+    if _safe_float(ev.fill_price, 0.0) <= 0.0:
+        cached = _lookup_paper_fill_price(ev.symbol)
+        if cached > 0.0:
+            ev.fill_price = cached
+        else:
+            expected = _safe_float(ev.expected_price, 0.0)
+            if expected > 0.0:
+                ev.fill_price = expected
+
+    # 3) status — translate pending/error → paper_fill if we have a price.
+    status_norm = _safe_str(ev.status, "").strip().lower()
+    if status_norm in _PAPER_PENDING_STATUSES:
+        if _safe_float(ev.fill_price, 0.0) > 0.0:
+            ev.status = "paper_fill"
+
+    # 4) hard invariant — never persist an untrusted record in paper mode.
+    final_norm = _safe_str(ev.status, "").strip().lower()
+    if final_norm in _PAPER_PENDING_STATUSES:
+        raise ValueError(
+            f"normalize_paper_fill_evidence: cannot persist paper-mode "
+            f"evidence for symbol={ev.symbol!r} side={ev.side!r} with "
+            f"status={ev.status!r} fill_price={ev.fill_price!r} — "
+            f"no positive fill price could be resolved from "
+            f"price_cache.json or expected_price"
+        )
+
+    return ev
+
+
+# =============================================================================
 # Public compatibility API
 # =============================================================================
 
@@ -820,4 +991,9 @@ _DEFAULT_WRITER = PaperExecutionEvidenceWriter()
 
 def write_paper_exec_evidence(ev: Any) -> Dict[str, str]:
     normalized = PaperExecEvidence.from_any(ev)
+    # Safety net: every write path is normalized here, so callers that
+    # bypass the explicit normalize_paper_fill_evidence() helper still get
+    # their pending/error statuses translated and unknown asset_classes
+    # resolved before the record is hash-chained to disk.
+    normalize_paper_fill_evidence(normalized)
     return _DEFAULT_WRITER.write(normalized)

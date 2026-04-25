@@ -79,6 +79,7 @@ from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig, resolve_asset_c
 from chad.execution.paper_exec_evidence_writer import (
     PaperExecEvidence,
     StrategyAttributionError,
+    normalize_paper_fill_evidence,
     write_paper_exec_evidence,
 )
 
@@ -1109,23 +1110,14 @@ def run_once(logger: logging.Logger) -> None:
                     order.quantity, order.status, order.dry_run,
                 )
                 try:
-                    # Inject real fill price from price cache
-                    _fill_price = 0.0
-                    try:
-                        _pc_path = Path("/home/ubuntu/chad_finale/runtime/price_cache.json")
-                        _pc = json.loads(_pc_path.read_text(encoding="utf-8"))
-                        _prices = _pc.get("prices", {})
-                        _fill_price = float(_prices.get(order.symbol, 0.0))
-                        if _fill_price == 0.0:
-                            logger.warning("PRICE_CACHE_MISS symbol=%s — fill_price defaulting to 0.0", order.symbol)
-                    except Exception as pc_err:
-                        logger.warning("PRICE_CACHE_READ_FAILED: %s — fill_price defaulting to 0.0", pc_err)
-
-                    # Calibration fix (2026-04-22 per Audit-O): thread the
-                    # intent's expected_price onto the PaperExecEvidence so
-                    # slippage_tracker.record_fill computes real slippage.
-                    # Pre-fix: every fill recorded expected_price=0.0 which
-                    # left slippage_per_share=None on the ledger.
+                    # Thread expected_price (limit_price fallback) so the
+                    # slippage tracker can compute real slippage. Asset_class,
+                    # fill_price, and status normalization are all delegated
+                    # to normalize_paper_fill_evidence — single chokepoint
+                    # that every paper-mode writer (live_loop, position
+                    # reconciler, timer-driven executor) shares so
+                    # PendingSubmit / error / unknown can never leak into
+                    # FILLS_*.ndjson.
                     _expected_px = float(getattr(intent, "expected_price", 0.0) or 0.0)
                     if _expected_px <= 0.0:
                         _lp = getattr(intent, "limit_price", None)
@@ -1133,66 +1125,35 @@ def run_once(logger: logging.Logger) -> None:
                             _expected_px = float(_lp) if _lp is not None else 0.0
                         except (TypeError, ValueError):
                             _expected_px = 0.0
-                    # Problem 1 fix: ensure asset_class is never "unknown" for
-                    # a recognizable instrument. The adapter tries sec_type
-                    # first, but the paper path frequently lacks it.
-                    _resolved_asset_class = resolve_asset_class(
-                        order.symbol, getattr(order, "sec_type", "")
-                    )
-                    if _resolved_asset_class == "unknown":
-                        # Keep whatever the adapter produced rather than
-                        # silently blanking a real class.
-                        _resolved_asset_class = order.asset_class or "unknown"
-
-                    # Problem 2 fix: IBKR paper fills are near-instantaneous.
-                    # If the status is still a submit/pending state at evidence
-                    # write time, record a simulated fill at the last known
-                    # price rather than leaving the record stuck as
-                    # "PendingSubmit" (which SCR excludes as untrusted).
-                    _status_norm = (order.status or "").strip().lower()
-                    _record_status = order.status or ""
-                    if _status_norm in _PAPER_PENDING_STATUSES:
-                        _sim_price = _fill_price
-                        if _sim_price <= 0.0:
-                            _sim_price = _expected_px
-                        if _sim_price <= 0.0:
-                            _sim_price = float(getattr(intent, "limit_price", 0.0) or 0.0)
-                        if _sim_price > 0.0:
-                            _fill_price = _sim_price
-                            _record_status = "paper_fill"
-                            logger.info(
-                                "PAPER_FILL_SIMULATED symbol=%s status=%s->paper_fill price=%s",
-                                order.symbol, order.status, _sim_price,
-                            )
-                        else:
-                            logger.warning(
-                                "PAPER_FILL_SIM_SKIPPED symbol=%s status=%s no_price_available",
-                                order.symbol, order.status,
-                            )
 
                     ev = PaperExecEvidence(
                         symbol=order.symbol,
                         side=order.side,
                         quantity=order.quantity,
-                        fill_price=_fill_price,
+                        fill_price=0.0,  # resolved by normalizer from price_cache
                         expected_price=_expected_px,
                         strategy=getattr(intent, "strategy", "") or "",
                         source_strategies=[getattr(intent, "strategy", "") or ""],
                         broker="ibkr_paper",
-                        status=_record_status,
-                        asset_class=_resolved_asset_class,
+                        status=order.status or "",
+                        asset_class=getattr(order, "asset_class", "") or "",
                         is_live=False,
                         fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
                     )
+                    normalize_paper_fill_evidence(ev)
                     paths = write_paper_exec_evidence(ev)
-                    logger.info("EVIDENCE_WRITTEN fills=%s", paths.get("fills_path", ""))
+                    logger.info(
+                        "EVIDENCE_WRITTEN symbol=%s status=%s price=%s ac=%s fills=%s",
+                        ev.symbol, ev.status, ev.fill_price, ev.asset_class,
+                        paths.get("fills_path", ""),
+                    )
 
                     # Real-time Telegram trade alert — best effort only,
                     # must never block execution or evidence persistence.
                     try:
                         from chad.utils.telegram_notify import send_trade_alert
                         _alert_qty = float(order.quantity or 0.0)
-                        _alert_price = float(_fill_price or 0.0)
+                        _alert_price = float(ev.fill_price or 0.0)
                         _alert_notional = abs(_alert_qty) * _alert_price
                         send_trade_alert(
                             symbol=order.symbol,

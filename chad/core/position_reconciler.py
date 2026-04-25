@@ -214,6 +214,7 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
     from chad.execution.paper_exec_evidence_writer import (
         PaperExecEvidence,
         StrategyAttributionError,
+        normalize_paper_fill_evidence,
         write_paper_exec_evidence,
     )
     from chad.types import AssetClass
@@ -272,9 +273,21 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
                             else datetime.now(timezone.utc).isoformat()
                         ),
                     )
+                    # Translate raw IBKR statuses (PendingSubmit/error) to
+                    # paper_fill, resolve asset_class, and back-fill fill_price
+                    # from price_cache.json with futures symbol normalization.
+                    # write_paper_exec_evidence runs the same normalizer as a
+                    # safety net; calling it here lets us catch and skip a
+                    # ValueError before the hash-chained write happens.
+                    normalize_paper_fill_evidence(ev)
                     write_paper_exec_evidence(ev)
                 except StrategyAttributionError as attr_err:
                     LOG.warning("reconciler evidence attribution failed: %s", attr_err)
+                except ValueError as norm_err:
+                    LOG.warning(
+                        "reconciler evidence normalization rejected fill "
+                        "(no resolvable price): %s", norm_err,
+                    )
                 except Exception as ev_err:  # noqa: BLE001
                     LOG.warning("reconciler evidence write failed: %s", ev_err)
 
