@@ -107,6 +107,7 @@ class SignalRouter:
                     "strategies": set(),  # type: ignore[var-annotated]
                     "size_by_strategy": {},  # type: ignore[var-annotated]
                     "created_at": sig.created_at,
+                    "meta_by_strategy": {},  # type: ignore[var-annotated]
                 }
 
             bucket = buckets[key]
@@ -122,6 +123,11 @@ class SignalRouter:
             strat_key = sig.strategy
             sbs = bucket["size_by_strategy"]  # type: ignore[assignment]
             sbs[strat_key] = float(sbs.get(strat_key, 0.0)) + size  # type: ignore[union-attr]
+
+            # Track meta from each strategy signal (primary strategy wins)
+            mbs = bucket["meta_by_strategy"]  # type: ignore[assignment]
+            if sig.meta:
+                mbs[strat_key] = sig.meta  # type: ignore[union-attr]
 
             # Track the most recent timestamp for the bucket
             if sig.created_at > bucket["created_at"]:  # type: ignore[operator]
@@ -170,7 +176,7 @@ class SignalRouter:
                     confidence=confidence,
                     asset_class=asset_class,
                     created_at=created_at,
-                    meta={},
+                    meta=data.get("meta_by_strategy", {}).get(primary) or {},
                 )
             )
 

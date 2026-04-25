@@ -63,7 +63,15 @@ def _utc_now_iso() -> str:
 
 
 def _load_guard_positions() -> Dict[str, float]:
-    """Aggregate open CHAD positions by symbol (signed quantity)."""
+    """Aggregate open CHAD positions by symbol (signed quantity).
+
+    In paper/DRY_RUN mode, only broker_sync positions are reconciled
+    against IBKR — strategy positions are never submitted to the broker
+    in paper mode and will always appear as mismatches if included.
+    """
+    import os
+    is_paper = os.environ.get("CHAD_EXECUTION_MODE", "dry_run").lower() != "live"
+
     if not GUARD_PATH.exists():
         return {}
     try:
@@ -77,7 +85,11 @@ def _load_guard_positions() -> Dict[str, float]:
         sym = entry.get("symbol")
         qty = entry.get("quantity", 0) or 0
         side = str(entry.get("side", "")).upper()
+        strategy = str(entry.get("strategy", "")).lower()
         if not sym:
+            continue
+        # In paper mode: only reconcile broker_sync (real IBKR positions)
+        if is_paper and strategy != "broker_sync":
             continue
         signed = -abs(float(qty)) if side in ("SELL", "SHORT") else abs(float(qty))
         agg[sym] += signed
@@ -97,6 +109,9 @@ def _load_guard_breakdown() -> Dict[str, Dict[str, float]]:
         raw = json.loads(GUARD_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    import os
+    is_paper = os.environ.get("CHAD_EXECUTION_MODE", "dry_run").lower() != "live"
+
     agg: Dict[str, Dict[str, float]] = {}
     for entry in raw.values():
         if not isinstance(entry, dict) or not entry.get("open"):
@@ -107,6 +122,10 @@ def _load_guard_breakdown() -> Dict[str, Dict[str, float]]:
         qty = entry.get("quantity", 0) or 0
         side = str(entry.get("side", "")).upper()
         strategy = str(entry.get("strategy", "")).lower()
+        # In paper mode: only include broker_sync in breakdown so
+        # broker_sync diffs are correctly classified as drift not mismatch
+        if is_paper and strategy != "broker_sync":
+            continue
         signed = -abs(float(qty)) if side in ("SELL", "SHORT") else abs(float(qty))
         bucket = agg.setdefault(sym, {"broker_sync": 0.0, "strategies": 0.0})
         if strategy == "broker_sync":
