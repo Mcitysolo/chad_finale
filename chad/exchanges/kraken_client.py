@@ -51,6 +51,31 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 
+
+def _assert_kraken_rest_pair(pair: str) -> None:
+    """
+    Enforce Kraken REST /0/private/AddOrder pair format at the border.
+
+    Valid:   altname ("XBTUSD") or full pair ("XXBTZUSD")
+    Invalid: wsname with slash ("XBT/USD"), CHAD canonical with dash ("BTC-USD")
+
+    REST rejects wsname with EQuery:Unknown asset pair and produces null-payload
+    fills in data/fills/kraken_fills_*. WebSocket streaming uses wsname; REST
+    does not. Convert via normalize_kraken_pair() in execution_pipeline.
+    """
+    if not pair or not isinstance(pair, str):
+        raise ValueError(
+            f"kraken_rest_pair_invalid: pair must be a non-empty string, got {pair!r}"
+        )
+    clean = pair.strip().upper()
+    if "/" in clean or "-" in clean:
+        raise ValueError(
+            f"kraken_rest_pair_invalid: pair {pair!r} uses wsname or canonical "
+            f"format. REST AddOrder requires altname (e.g. 'XBTUSD'). "
+            f"Use normalize_kraken_pair() from chad.execution.execution_pipeline."
+        )
+
+
 # ----------------------------
 # Exceptions
 # ----------------------------
@@ -326,6 +351,13 @@ class KrakenClient:
         validate_only=True -> validate order only (no execution)
         validate_only=False -> real order
         """
+        # REST border enforcement: Kraken /0/private/AddOrder rejects
+        # wsname format ("XBT/USD") with EQuery:Unknown asset pair.
+        # Only altname ("XBTUSD") or full pair name ("XXBTZUSD") accepted.
+        # Reject early rather than letting Kraken return cryptic rejection
+        # that produces orphan fill records.
+        _assert_kraken_rest_pair(pair)
+
         data: Dict[str, Any] = {
             "pair": pair,
             "type": side,

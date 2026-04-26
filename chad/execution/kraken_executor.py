@@ -36,6 +36,29 @@ from chad.portfolio.kraken_trade_result_logger import KrakenTradeEvent, log_krak
 from chad.risk.dynamic_caps import check_risk, load_dynamic_caps
 from chad.utils.runtime_defaults import default_dynamic_caps_path
 
+
+
+def _enforce_kraken_rest_pair(pair: str, *, strategy: str = "?", side: str = "?") -> str:
+    """
+    Pre-flight pair validation in the executor — fails fast with strategy
+    context before reaching the REST border. Defense in depth: kraken_client
+    has its own assert as the absolute backstop. This one provides better
+    diagnostics when an upstream stage emits a malformed pair.
+    """
+    if not pair or not isinstance(pair, str):
+        raise ValueError(
+            f"kraken_executor_pair_invalid: strategy={strategy} side={side} "
+            f"pair={pair!r} (must be non-empty string)"
+        )
+    clean = pair.strip().upper()
+    if "/" in clean or "-" in clean:
+        raise ValueError(
+            f"kraken_executor_pair_invalid: strategy={strategy} side={side} "
+            f"pair={pair!r} uses wsname or canonical format. "
+            f"Expected altname (e.g. 'XBTUSD'). Upstream normalization failed."
+        )
+    return clean
+
 LOGGER = logging.getLogger("chad.execution.kraken_executor")
 
 
@@ -290,8 +313,11 @@ class KrakenExecutor:
 
         # Validation-only mode: do NOT claim exec_state (no broker side effects)
         if not live:
+            validated_pair = _enforce_kraken_rest_pair(
+                intent.pair, strategy=str(intent.strategy), side=str(intent.side)
+            )
             req = TradeRequest(
-                pair=intent.pair,
+                pair=validated_pair,
                 side=intent.side,
                 ordertype=intent.ordertype,
                 volume=float(intent.volume),
@@ -335,8 +361,11 @@ class KrakenExecutor:
         # Submit (with attempt tracking; router/client handle low-level retry)
         submit_attempts = self._store.bump_submit_attempt(idempotency_key=idem_key)
         try:
+            validated_pair = _enforce_kraken_rest_pair(
+                intent.pair, strategy=str(intent.strategy), side=str(intent.side)
+            )
             req = TradeRequest(
-                pair=intent.pair,
+                pair=validated_pair,
                 side=intent.side,
                 ordertype=intent.ordertype,
                 volume=float(intent.volume),

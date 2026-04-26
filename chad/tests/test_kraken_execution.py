@@ -190,7 +190,7 @@ def test_executor_validate_only_does_not_call_live_router() -> None:
 
     intent = StrategyTradeIntent(
         strategy="alpha_crypto",
-        pair="XBT/USD",
+        pair="XBTUSD",
         side="buy",
         ordertype="market",
         volume=0.001,
@@ -226,7 +226,7 @@ def test_executor_blocks_intent_over_cap(tmp_path) -> None:
 
     intent = StrategyTradeIntent(
         strategy="alpha_crypto",
-        pair="XBT/USD",
+        pair="XBTUSD",
         side="buy",
         ordertype="market",
         volume=0.01,
@@ -272,7 +272,7 @@ def test_execute_kraken_intents_gate_denied(monkeypatch, caplog) -> None:
 
     monkeypatch.setattr(ke, "is_kraken_gate_enabled", lambda: False)
     fake_intent = MagicMock()
-    fake_intent.pair = "XBT/USD"
+    fake_intent.pair = "XBTUSD"
     logger = _logging.getLogger("test.kraken")
     with caplog.at_level(_logging.INFO, logger="test.kraken"):
         ke.execute_kraken_intents(logger, [fake_intent])
@@ -287,7 +287,7 @@ def test_execute_kraken_intents_mode_off(monkeypatch, caplog) -> None:
     monkeypatch.setattr(ke, "is_kraken_gate_enabled", lambda: True)
     monkeypatch.setattr(ke, "resolve_kraken_mode", lambda: "off")
     fake_intent = MagicMock()
-    fake_intent.pair = "XBT/USD"
+    fake_intent.pair = "XBTUSD"
     logger = _logging.getLogger("test.kraken2")
     with caplog.at_level(_logging.INFO, logger="test.kraken2"):
         ke.execute_kraken_intents(logger, [fake_intent])
