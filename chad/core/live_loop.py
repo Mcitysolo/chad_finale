@@ -477,30 +477,30 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
             entry["closed_by"] = "broker_truth_rebuild"
             corrections_closed += 1
 
-    # Add broker positions the guard doesn't know about
+    # Add or update broker_sync positions to reflect broker truth.
+    # broker_sync key always tracks IBKR position exactly. Other strategy
+    # keys (alpha|SPY, delta|SPY) track CHAD-initiated trades separately.
     for sym, bp in broker_positions.items():
         if abs(bp.quantity) < 1e-9:
             continue
-        # Guard keys are strategy|symbol — broker doesn't know strategy,
-        # so we check if ANY guard entry covers this symbol as open.
-        symbol_covered = any(
-            e.get("symbol") == sym and e.get("open")
-            for e in guard_state.values()
-        )
-        if not symbol_covered:
-            side = "BUY" if bp.quantity > 0 else "SELL"
-            fallback_key = f"broker_sync|{sym}"
-            guard_state[fallback_key] = {
-                "open": True,
-                "updated_at_utc": __import__("datetime").datetime.now(
-                    __import__("datetime").timezone.utc
-                ).isoformat(),
-                "strategy": "broker_sync",
-                "symbol": sym,
-                "side": side,
-                "quantity": abs(bp.quantity),
-                "source": "broker_truth_rebuild",
-            }
+        side = "BUY" if bp.quantity > 0 else "SELL"
+        fallback_key = f"broker_sync|{sym}"
+        now_iso = __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ).isoformat()
+        existing = guard_state.get(fallback_key, {})
+        prior_opened = existing.get("opened_at") if existing.get("open") else None
+        guard_state[fallback_key] = {
+            "open": True,
+            "opened_at": prior_opened or now_iso,
+            "updated_at_utc": now_iso,
+            "strategy": "broker_sync",
+            "symbol": sym,
+            "side": side,
+            "quantity": abs(bp.quantity),
+            "source": "broker_truth_rebuild",
+        }
+        if not existing.get("open") or float(existing.get("quantity", 0)) != abs(bp.quantity):
             corrections_opened += 1
 
     if corrections_closed or corrections_opened:
@@ -639,6 +639,14 @@ def run_once(logger: logging.Logger) -> None:
     try:
         if _is_paper_mode():
             _rebuild_guard_from_paper_ledger(logger)
+            # Also reconcile broker_sync entries against actual IBKR
+            # paper positions. Strategy positions live in the paper
+            # ledger; broker_sync entries must reflect IBKR truth so
+            # reconciliation reports accurate drift.
+            try:
+                _rebuild_guard_from_broker(logger)
+            except Exception as bexc:
+                logger.warning("Broker guard rebuild failed in paper mode (non-fatal): %s", bexc)
         else:
             _rebuild_guard_from_broker(logger)
     except Exception as exc:
