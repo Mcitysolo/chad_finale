@@ -1667,12 +1667,32 @@ class WeeklySummary:
             regime_label = "UNKNOWN"
 
         # Expectancy / top strategy
+        # broker_sync is bookkeeping for pre-existing IBKR positions, not a
+        # CHAD strategy — exclude it from "top brain" so the weekly report
+        # surfaces actual strategy performance, not passive market exposure.
         expectancy = _read_json(self._runtime_dir / "expectancy_state.json") or {}
-        top = expectancy.get("top_performer")
         strats = expectancy.get("strategies") or {}
         top_line: Optional[str] = None
-        if top and isinstance(strats, dict) and top in strats:
-            s = strats[top]
+
+        # Filter out broker_sync and any non-strategy bookkeeping keys
+        EXCLUDED_FROM_RANKING = {"broker_sync", "manual", "paper_exec", "unknown", ""}
+        ranked_strategies = {
+            name: data for name, data in strats.items()
+            if name not in EXCLUDED_FROM_RANKING
+            and isinstance(data, dict)
+            and _safe_float(data.get("trade_count", data.get("total_trades", 0))) >= 5
+        }
+
+        if ranked_strategies:
+            # Re-rank: prefer the original top_performer if it survived the filter,
+            # otherwise pick the strategy with highest expectancy
+            top = expectancy.get("top_performer")
+            if top not in ranked_strategies:
+                top = max(
+                    ranked_strategies.items(),
+                    key=lambda kv: _safe_float(kv[1].get("expectancy", 0)),
+                )[0]
+            s = ranked_strategies[top]
             top_line = (
                 f"{translate_strategy(str(top))} — "
                 f"{_safe_float(s.get('win_rate'))*100:.0f}% win rate, "
