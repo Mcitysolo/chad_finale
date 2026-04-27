@@ -1,0 +1,11 @@
+{
+  "schema_version": "regime_booster_policy.v1",
+  "_comment": "RegimeBooster policy. Multiplier starts at 1.0 and accumulates bonuses up to max_multiplier. Vetoes force back to 1.0.",
+  "max_multiplier": 1.50,
+  "min_confidence": 0.70,
+  "favorable_regimes": ["trending_bull", "trending_bear"],
+  "vix_calm_threshold": 18.0,
+  "vix_elevated_threshold": 25.0,
+  "event_risk_veto_severities": ["high", "extreme"],
+  "boost_per_factor": 0.10
+}

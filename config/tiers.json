@@ -1,4 +1,74 @@
 {
-  "schema_version": "tiers.v1",
-  "notes": "Bootstrap config created for SSOT parity audit. Replace with production values after dedicated tiers contract audit."
+  "schema_version": "tiers.v2",
+  "_comment": "Equity tier ladder. As account grows, more strategies unlock. TierManager reads runtime/portfolio_snapshot.json and writes runtime/tier_state.json. The live_loop reads tier_state.json to gate strategies.",
+  "_hysteresis_pct": "5% buffer prevents flapping between tiers when equity hovers near a threshold",
+  "tiers": [
+    {
+      "name": "MICRO",
+      "min_equity_usd": 0,
+      "max_equity_usd": 10000,
+      "description": "Crypto + equities only — no futures, no options",
+      "enabled_strategies": [
+        "alpha", "alpha_intraday", "alpha_crypto",
+        "delta", "gamma", "gamma_reversion",
+        "beta", "beta_trend"
+      ]
+    },
+    {
+      "name": "SMALL",
+      "min_equity_usd": 10000,
+      "max_equity_usd": 50000,
+      "description": "Adds defined-risk options spreads + ETF mean reversion + pairs",
+      "enabled_strategies": [
+        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
+        "delta", "delta_pairs",
+        "gamma", "gamma_reversion",
+        "beta", "beta_trend",
+        "omega_vol", "omega_momentum_options"
+      ]
+    },
+    {
+      "name": "MID",
+      "min_equity_usd": 50000,
+      "max_equity_usd": 160000,
+      "description": "Unlocks micro futures (MES, MNQ, MGC) and gamma futures",
+      "enabled_strategies": [
+        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
+        "alpha_futures",
+        "delta", "delta_pairs",
+        "gamma", "gamma_futures", "gamma_reversion",
+        "beta", "beta_trend",
+        "omega", "omega_vol", "omega_momentum_options"
+      ]
+    },
+    {
+      "name": "PRO",
+      "min_equity_usd": 160000,
+      "max_equity_usd": 1000000,
+      "description": "All 16 strategies firing at meaningful size",
+      "enabled_strategies": [
+        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
+        "alpha_futures",
+        "delta", "delta_pairs",
+        "gamma", "gamma_futures", "gamma_reversion",
+        "beta", "beta_trend",
+        "omega", "omega_vol", "omega_macro", "omega_momentum_options"
+      ]
+    },
+    {
+      "name": "INSTITUTIONAL",
+      "min_equity_usd": 1000000,
+      "max_equity_usd": null,
+      "description": "Full institutional sizing — macro futures (ZN, ZB) deploy meaningfully",
+      "enabled_strategies": [
+        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
+        "alpha_futures",
+        "delta", "delta_pairs",
+        "gamma", "gamma_futures", "gamma_reversion",
+        "beta", "beta_trend",
+        "omega", "omega_vol", "omega_macro", "omega_momentum_options"
+      ]
+    }
+  ],
+  "hysteresis_pct": 5.0
 }
