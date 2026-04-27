@@ -481,6 +481,49 @@ class StateBuilder:
             "market_regime": regime,
         }
 
+    def _business(self) -> dict:
+        """
+        CHAD-as-a-business framework state for the dashboard:
+        phase, tier, authorized salary, regime booster status.
+        """
+        biz = _load_json(RUNTIME / "business_phase.json") or {}
+        tier = _load_json(RUNTIME / "tier_state.json") or {}
+        wd = _load_json(RUNTIME / "withdrawal_authorization.json") or {}
+        booster = _load_json(RUNTIME / "regime_booster.json") or {}
+
+        try:
+            booster_mult = float(booster.get("multiplier", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            booster_mult = 1.0
+
+        try:
+            authorized = float(wd.get("authorized_withdrawal_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            authorized = 0.0
+
+        try:
+            hwm = float(wd.get("high_water_mark_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            hwm = 0.0
+
+        try:
+            growth = float(biz.get("growth_pct_from_seed", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            growth = 0.0
+
+        return {
+            "phase": str(biz.get("phase") or wd.get("phase") or "?"),
+            "phase_description": str(biz.get("phase_description") or ""),
+            "tier": str(tier.get("tier_name") or "?"),
+            "tier_strategies_enabled": len(tier.get("enabled_strategies") or []),
+            "authorized_salary_usd": round(authorized, 2),
+            "high_water_mark_usd": round(hwm, 2),
+            "growth_pct_from_seed": round(growth, 2),
+            "regime_booster_active": bool(booster.get("active", False)),
+            "regime_booster_multiplier": round(booster_mult, 3),
+            "next_phase_requirement": str(biz.get("next_phase_requirement") or ""),
+        }
+
     def build(self) -> dict[str, Any]:
         scr = _load_json(RUNTIME / "scr_state.json")
         connected = self._ibkr_connected
@@ -493,6 +536,7 @@ class StateBuilder:
             "strategies": self._strategies(),
             "system_health": self._system_health(),
             "intelligence": self._intelligence(),
+            "business": self._business(),
         }
 
     async def refresh_ibkr_async(self) -> None:
@@ -1039,6 +1083,25 @@ def _chat_context_snapshot() -> dict:
         except Exception:
             vix = None
 
+    # Business framework — phase / tier / salary so the chat can answer
+    # "what phase are we in", "when do I get paid", "how many strategies
+    # are active right now" without the operator having to dig.
+    biz = _load_json(RUNTIME / "business_phase.json") or {}
+    tier = _load_json(RUNTIME / "tier_state.json") or {}
+    wd = _load_json(RUNTIME / "withdrawal_authorization.json") or {}
+    booster = _load_json(RUNTIME / "regime_booster.json") or {}
+    business_block = {
+        "phase": biz.get("phase") or wd.get("phase"),
+        "phase_description": biz.get("phase_description"),
+        "tier": tier.get("tier_name"),
+        "tier_strategies_enabled": len(tier.get("enabled_strategies") or []),
+        "authorized_salary_usd": wd.get("authorized_withdrawal_usd"),
+        "growth_pct_from_seed": biz.get("growth_pct_from_seed"),
+        "next_phase_requirement": biz.get("next_phase_requirement"),
+        "regime_booster_multiplier": booster.get("multiplier"),
+        "regime_booster_active": booster.get("active"),
+    }
+
     return {
         "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scr": scr_block,
@@ -1048,6 +1111,7 @@ def _chat_context_snapshot() -> dict:
         "active_strategies": active_strategy_names,
         "stop_bus": stop_block,
         "vix": round(float(vix), 2) if isinstance(vix, (int, float)) else None,
+        "business": business_block,
         "mode": "paper",
     }
 

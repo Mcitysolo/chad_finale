@@ -1471,6 +1471,39 @@ class MorningBrief:
             pass
         lines.append("")
 
+        # ═══ BUSINESS STATUS ═══
+        # Surfaces phase / tier / authorized salary so the operator sees
+        # the business framework state on every morning brief.
+        try:
+            biz = _read_json(runtime / "business_phase.json") or {}
+            tier_doc = _read_json(runtime / "tier_state.json") or {}
+            wd = _read_json(runtime / "withdrawal_authorization.json") or {}
+            if biz or tier_doc or wd:
+                lines.append("═══ BUSINESS STATUS ═══")
+                phase = biz.get("phase") or wd.get("phase") or "?"
+                phase_desc = biz.get("phase_description") or ""
+                growth = _safe_float(biz.get("growth_pct_from_seed", 0.0))
+                cur_eq = _safe_float(
+                    biz.get("current_equity_usd")
+                    or wd.get("current_equity_usd", 0.0)
+                )
+                tier_name = tier_doc.get("tier_name", "?")
+                n_strategies = len(tier_doc.get("enabled_strategies") or [])
+                authorized = _safe_float(wd.get("authorized_withdrawal_usd", 0.0))
+                if phase_desc:
+                    lines.append(f"Phase: {phase} ({phase_desc})")
+                else:
+                    lines.append(f"Phase: {phase}")
+                lines.append(
+                    f"Account: ${cur_eq:,.0f}  ({'+' if growth >= 0 else ''}"
+                    f"{growth:.1f}% from seed)"
+                )
+                lines.append(f"Tier: {tier_name} — {n_strategies}/16 strategies active")
+                lines.append(f"Salary: ${authorized:,.0f}/mo authorized")
+                lines.append("")
+        except Exception:
+            pass
+
         # ═══ CHAD'S TAKE ═══
         lines.append("\u2550\u2550\u2550 CHAD'S TAKE \u2550\u2550\u2550")
         take_ctx: Dict[str, Any] = {
@@ -1749,6 +1782,28 @@ class WeeklySummary:
             lines.append(f"SCR: {scr_state}")
         lines.append(f"Regime this week: {regime_label}")
         lines.append("")
+
+        # ═══ BUSINESS PHASE ═══
+        try:
+            biz = _read_json(RUNTIME_DIR / "business_phase.json") or {}
+            if biz:
+                lines.append("═══ BUSINESS PHASE ═══")
+                phase = biz.get("phase", "?")
+                days_in_phase = int(biz.get("days_in_phase", 0))
+                next_req = biz.get("next_phase_requirement", "")
+                metrics = biz.get("compound_metrics", {}) or {}
+                total_return = float(metrics.get("total_return_pct", 0.0))
+                hwm = float(metrics.get("high_water_mark_usd", 0.0))
+                lines.append(f"Phase: {phase}")
+                lines.append(f"Days in phase: {days_in_phase}")
+                if next_req:
+                    lines.append(f"Next milestone: {next_req}")
+                sign = "+" if total_return >= 0 else ""
+                lines.append(f"Total return: {sign}{total_return:.1f}%")
+                lines.append(f"HWM: ${hwm:,.0f}")
+                lines.append("")
+        except Exception:
+            pass
 
         lines.append("═══ CHAD'S WEEKLY TAKE ═══")
         take_ctx = {

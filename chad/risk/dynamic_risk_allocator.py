@@ -303,50 +303,99 @@ class DynamicRiskAllocator:
 
     def compute_caps(self, *, snapshot: PortfolioSnapshot) -> Dict[str, float]:
         """
-        Compute dollar caps per strategy based on current equity.
+        Compute dollar caps per strategy. The cap chain is:
+
+          base_weight (from config/strategy_weights.json)
+            -> correlation_overlay (applied upstream by orchestrator)
+            -> chassis_enforcement (50/30/20, applied upstream)
+            -> tier_filter      (zero out strategies not in current tier)
+            -> winner_scaling   (per-strategy performance multiplier)
+            -> regime_booster   (global multiplier on top)
+            -> SCR sizing_factor (applied separately at execution)
+
+        The tier/winner/regime overlays are read from runtime/. If any
+        file is missing or stale (>10 minutes) the corresponding overlay
+        falls back to neutral.
+        """
+        details = self._compute_caps_with_overlays(snapshot=snapshot)
+        return details["caps"]
+
+    def _compute_caps_with_overlays(
+        self, *, snapshot: PortfolioSnapshot,
+    ) -> Dict[str, object]:
+        """
+        Internal — returns caps plus the overlay context so build_payload
+        can surface the multipliers without recomputing.
         """
         total_equity = snapshot.total_equity
         if total_equity < 0.0:
-            # This should never happen given clamping in PortfolioSnapshot,
-            # but we keep the guard as a hard assertion.
             raise ValueError("total_equity must be >= 0")
 
         norm = self.strategy_allocation.normalized()
         portfolio_risk_cap = total_equity * self.daily_risk_fraction
-        # --- PROFIT LOCK INTEGRATION (SYSTEM-LEVEL CONTROL) ---
+
+        # --- PROFIT LOCK (system-level sizing kill switch) ---
         try:
-            import json
-            from pathlib import Path
-
-            profit_lock_path = Path(__file__).resolve().parents[2] / "runtime" / "profit_lock_state.json"
-
+            profit_lock_path = (
+                Path(__file__).resolve().parents[2]
+                / "runtime"
+                / "profit_lock_state.json"
+            )
             if profit_lock_path.is_file():
                 with profit_lock_path.open("r", encoding="utf-8") as f:
                     pl = json.load(f)
-
                 sizing_factor = float(pl.get("sizing_factor", 1.0))
                 stop_new_entries = bool(pl.get("stop_new_entries", False))
-
                 portfolio_risk_cap *= max(0.0, min(1.0, sizing_factor))
-
                 if stop_new_entries:
                     portfolio_risk_cap = 0.0
-
         except Exception:
             pass  # Fail-safe: never break allocator
 
+        # --- BUSINESS OVERLAYS (tier / winner / regime) ---
+        tier_set = load_tier_filter()
+        winner_mults = load_winner_multipliers()
+        regime_mult = load_regime_booster_multiplier()
+        # Clamp regime multiplier to the documented 1.0..1.5 band.
+        regime_mult = max(1.0, min(1.5, float(regime_mult)))
+
         caps: Dict[str, float] = {}
+        applied_overlays: Dict[str, Dict[str, float]] = {}
         for name, frac in norm.items():
-            caps[name] = portfolio_risk_cap * frac
+            base_cap = portfolio_risk_cap * frac
+            tier_factor = 1.0
+            if tier_set is not None and name.lower() not in tier_set:
+                tier_factor = 0.0
+            winner_factor = float(winner_mults.get(name.lower(), 1.0))
+            cap = base_cap * tier_factor * winner_factor * regime_mult
+            caps[name] = cap
+            applied_overlays[name] = {
+                "base_cap": base_cap,
+                "tier_factor": tier_factor,
+                "winner_factor": winner_factor,
+                "regime_factor": regime_mult,
+                "final_cap": cap,
+            }
 
         logger.info(
             "DynamicRiskAllocator: total_equity=%.2f daily_risk_fraction=%.3f "
-            "portfolio_risk_cap=%.2f",
+            "portfolio_risk_cap=%.2f tier_filter=%s winners=%d regime_mult=%.3f",
             total_equity,
             self.daily_risk_fraction,
             portfolio_risk_cap,
+            "active" if tier_set is not None else "neutral",
+            len(winner_mults),
+            regime_mult,
         )
-        return caps
+        return {
+            "caps": caps,
+            "portfolio_risk_cap_after_profit_lock": portfolio_risk_cap,
+            "tier_filter_active": tier_set is not None,
+            "tier_enabled_strategies": sorted(tier_set) if tier_set else [],
+            "winner_multipliers_applied": winner_mults,
+            "regime_booster_multiplier": regime_mult,
+            "per_strategy_overlay": applied_overlays,
+        }
 
     def build_payload(self, *, snapshot: PortfolioSnapshot) -> Dict[str, object]:
         """
@@ -355,7 +404,9 @@ class DynamicRiskAllocator:
         total_equity = snapshot.total_equity
         raw = dict(self.strategy_allocation.weights)
         norm = self.strategy_allocation.normalized()
-        caps = self.compute_caps(snapshot=snapshot)
+        details = self._compute_caps_with_overlays(snapshot=snapshot)
+        caps = details["caps"]
+        per_overlay = details["per_strategy_overlay"]
 
         portfolio_risk_cap = total_equity * self.daily_risk_fraction
         sum_raw = self.strategy_allocation.raw_sum()
@@ -363,11 +414,16 @@ class DynamicRiskAllocator:
 
         per_strategy: Dict[str, Dict[str, float]] = {}
         for name in sorted(norm.keys()):
+            ov = per_overlay.get(name, {})
             per_strategy[name] = {
                 "raw_weight": float(raw[name]),
                 "normalized_weight": float(norm[name]),
                 "fraction_of_total_equity": float(norm[name] * self.daily_risk_fraction),
                 "dollar_cap": float(caps[name]),
+                "tier_factor": float(ov.get("tier_factor", 1.0)),
+                "winner_factor": float(ov.get("winner_factor", 1.0)),
+                "regime_factor": float(ov.get("regime_factor", 1.0)),
+                "base_cap_pre_overlay": float(ov.get("base_cap", 0.0)),
             }
 
         return {
@@ -382,6 +438,12 @@ class DynamicRiskAllocator:
             "normalized_weights": norm,
             "strategy_caps": caps,
             "strategies": per_strategy,
+            "business_overlays": {
+                "tier_filter_active": bool(details["tier_filter_active"]),
+                "tier_enabled_strategies": list(details["tier_enabled_strategies"]),
+                "winner_multipliers": dict(details["winner_multipliers_applied"]),
+                "regime_booster_multiplier": float(details["regime_booster_multiplier"]),
+            },
         }
 
 
@@ -491,8 +553,95 @@ def enforce_chassis(weights: Dict[str, float]) -> Dict[str, float]:
 
 DYNAMIC_CAPS_TTL_SECONDS = 300  # 5 minutes (caps should be refreshed frequently)
 
+# Business-framework runtime files consumed by the cap chain. If any file
+# is missing or older than BUSINESS_OVERLAY_STALE_SECONDS, that overlay
+# falls back to neutral (no filtering, multiplier 1.0).
+BUSINESS_OVERLAY_STALE_SECONDS = 600  # 10 minutes
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _read_business_runtime(path: Path) -> Dict[str, object] | None:
+    """
+    Read a business-overlay runtime JSON file. Returns None if the file
+    is missing, unreadable, or its ts_utc is older than the stale window.
+    """
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("business_overlay_unreadable path=%s err=%s", path, exc)
+        return None
+    if not isinstance(doc, dict):
+        return None
+    ts_raw = str(doc.get("ts_utc") or "").strip()
+    if not ts_raw:
+        # No timestamp: accept the doc but log.
+        logger.info("business_overlay_no_ts path=%s — accepting", path)
+        return doc
+    try:
+        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except Exception:
+        return doc
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    if age > BUSINESS_OVERLAY_STALE_SECONDS:
+        logger.warning(
+            "business_overlay_stale path=%s age_s=%.0f threshold=%d",
+            path, age, BUSINESS_OVERLAY_STALE_SECONDS,
+        )
+        return None
+    return doc
+
+
+def _runtime_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "runtime"
+
+
+def load_tier_filter() -> set[str] | None:
+    """
+    Return the set of enabled strategy names per the current tier, or
+    None to disable filtering (file missing or stale).
+    """
+    doc = _read_business_runtime(_runtime_dir() / "tier_state.json")
+    if not doc:
+        return None
+    enabled = doc.get("enabled_strategies")
+    if not isinstance(enabled, list) or not enabled:
+        return None
+    return {str(s).strip().lower() for s in enabled if isinstance(s, str)}
+
+
+def load_winner_multipliers() -> Dict[str, float]:
+    """Per-strategy multipliers from runtime/winner_scaling.json (empty if stale)."""
+    doc = _read_business_runtime(_runtime_dir() / "winner_scaling.json")
+    if not doc:
+        return {}
+    raw = doc.get("multipliers")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            out[k.strip().lower()] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def load_regime_booster_multiplier() -> float:
+    """Global regime boost. Returns 1.0 when missing/stale."""
+    doc = _read_business_runtime(_runtime_dir() / "regime_booster.json")
+    if not doc:
+        return 1.0
+    try:
+        return float(doc.get("multiplier", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 

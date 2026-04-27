@@ -1,0 +1,7 @@
+{
+  "schema_version": "winner_scaling_policy.v1",
+  "min_trades_for_scaling": 5,
+  "max_multiplier": 1.50,
+  "min_multiplier": 0.50,
+  "exclude_strategies": ["broker_sync", "manual", "paper_exec", "unknown"]
+}
