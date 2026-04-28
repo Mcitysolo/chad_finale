@@ -1,4 +1,4 @@
-# CHAD Unified SSOT v8.3
+# CHAD Unified SSOT v8.4
 
 **Version:** 8.4
 **Date:** 2026-04-28
@@ -6,14 +6,19 @@
 **Supersedes:** `docs/CHAD_UNIFIED_SSOT_v8.3_2026-04-27.md` (commit `e6709d2`, 2026-04-27)
 
 This document is the master reference for the CHAD trading system as it
-exists at HEAD (`1608fec`, 2026-04-27). It captures every commit since
+exists at HEAD (`f62d914`, 2026-04-28). It captures every commit since
 v8.2, every wired strategy, every runtime invariant, and the live state
-of the machine at the moment of writing. v8.3's signature contribution
-is the **business framework layer** — TierManager, WinnerScaling,
-RegimeBooster, WithdrawalManager, BusinessPhaseTracker, plus the
-PortfolioSnapshot publisher and EquityHistory publisher that feed them.
-CHAD is no longer a trading bot. It is a self-governing autonomous
-business that trades, adapts, and authorizes its own salary.
+of the machine at the moment of writing. v8.4 closes the gaps surfaced
+by the v8.3 audit harness: the WithdrawalManager HWM bug, the
+`crypto` → `alpha_crypto` weight-key rename, the missing
+`chad-regime-booster.timer`, the unsafe `chad-reconciliation.timer`
+disable (now masked), and the disabled `chad-event-risk.timer`. The
+business framework layer that v8.3 introduced — TierManager,
+WinnerScaling, RegimeBooster, WithdrawalManager, BusinessPhaseTracker,
+plus the PortfolioSnapshot publisher and EquityHistory publisher that
+feed them — is now operationally complete. CHAD is no longer a trading
+bot. It is a self-governing autonomous business that trades, adapts,
+and authorizes its own salary.
 
 If this document and the code disagree, either the code drifted or
 this revision needs another pass — either way, revise the document
@@ -52,7 +57,7 @@ before relying on the disagreement.
 | Document version | 8.4 |
 | Date written | 2026-04-28 (UTC) |
 | Predecessor | v8.3 — `docs/CHAD_UNIFIED_SSOT_v8.3_2026-04-27.md` (`e6709d2`) |
-| Repository HEAD at write time | `e6709d2` — *"Docs: CHAD Unified SSOT v8.3 — business framework complete"* |
+| Repository HEAD at write time | `f62d914` — *"Build: SSOT v8.4 gap closure — HWM fix, alpha_crypto rename, regime-booster timer, audit harness"* |
 | Branch | `main` |
 
 ### Server / repo / mode
@@ -751,16 +756,16 @@ breakdown (`runtime/dynamic_caps.json:strategies.<name>`):
 | Open positions | None. |
 | Status | **ACTIVE** but **WINNER-SCALER PENALIZED** at 0.5× — book is asking this strategy to prove itself before getting bigger size again. |
 
-### alpha_crypto (weight key: `crypto`) — Crypto momentum signals
+### alpha_crypto — Crypto momentum signals
 
 | Field | Value |
 |---|---|
 | Source | `chad/strategies/alpha_crypto.py` (commit `81dafce`) |
 | Sleeve | ADAPTIVE |
-| Weight | 0.04 (key `alpha_crypto` — renamed from `crypto` in v8.4, commit governance 2026-04-28) |
+| Weight | 0.04 (key `alpha_crypto`; renamed from `crypto` in v8.4 commit `f62d914`) |
 | Base cap | `$334.53` |
-| **Final dollar cap** | **`$0.00`** |
-| tier_factor | **`0.0`** — `tier_state.json:enabled_strategies` lists `alpha_crypto`, but `dynamic_caps.json` was published with the canonical key `crypto` which is *not* in the enabled list. The shim in `chad/risk/dynamic_caps.py:67` normalises the runtime key but the cap publisher in this snapshot wrote the entry under `crypto` and applied tier_factor=0 because that literal key isn't enabled. See §14 — cosmetic key normalization. |
+| **Final dollar cap** | **`$334.53`** |
+| tier_factor | `1.0` — `alpha_crypto` is in the PRO tier's enabled_strategies list and matches the literal key in strategy_weights.json end-to-end. The legacy shim at chad/risk/dynamic_caps.py:67 is now a no-op for this key but is retained for older runtime files. |
 | winner_factor | `1.0` |
 | regime_factor | `1.0` |
 | Active in | `trending_bull, trending_bear, volatile, unknown` |
@@ -770,7 +775,7 @@ breakdown (`runtime/dynamic_caps.json:strategies.<name>`):
 | Conditions | (1) SMA20 momentum breakout (price > SMA20, 3-day return ≥ 1.5%); (2) 5d/20d vol-ratio expansion ≥ 0.7; (3) regime multiplier — 0.5 in trending_bear, 1.0 elsewhere. Min strength 0.3, all long-only. |
 | Health | not computed. |
 | Open positions | None. |
-| Status | **ACTIVE** (logically) — but cap effectively 0 in this snapshot due to the canonical-key shim path. |
+| Status | ACTIVE. |
 
 ### beta — Institutional long-term compounder
 
@@ -1014,7 +1019,7 @@ breakdown (`runtime/dynamic_caps.json:strategies.<name>`):
 | 2 | alpha_intraday | ALPHA | 0.03 | 251 | 1.0 | 1.0 | 1.0 | $251 | YES | ACTIVE |
 | 3 | alpha_options | ALPHA | 0.04 | 335 | 1.0 | 1.0 | 1.0 | $335 | YES | CONDITION-GATED |
 | 4 | alpha_futures | ALPHA | 0.09 | 753 | 1.0 | **0.5** | 1.0 | $376 | YES | ACTIVE (winner-penalized) |
-| 5 | alpha_crypto | ADAPTIVE | 0.04 | 335 | **0.0** | 1.0 | 1.0 | **$0** | YES (under canonical name) | ACTIVE — see §14 cosmetic key |
+| 5 | alpha_crypto | ADAPTIVE | 0.04 | 335 | 1.0 | 1.0 | 1.0 | $335 | YES | ACTIVE |
 | 6 | beta | BETA | 0.05 | 418 | 1.0 | 1.0 | 1.0 | $418 | YES | ACTIVE |
 | 7 | beta_trend | BETA | 0.20 | 1,673 | 1.0 | 1.0 | 1.0 | $1,673 | YES | ACTIVE |
 | 8 | gamma | ALPHA | 0.07 | 585 | 1.0 | 1.0 | 1.0 | $585 | YES | REGIME-SILENT |
@@ -1026,13 +1031,15 @@ breakdown (`runtime/dynamic_caps.json:strategies.<name>`):
 | 14 | omega_vol | ADAPTIVE | 0.05 | 418 | 1.0 | 1.0 | 1.0 | $418 | YES | DEGRADED |
 | 15 | omega_macro | ADAPTIVE | 0.03 | 251 | 1.0 | 1.0 | 1.0 | $251 | YES | ACTIVE |
 | 16 | omega_momentum_options | ALPHA | 0.03 | 251 | 1.0 | 1.0 | 1.0 | $251 | YES | ARMED |
-| — | **Σ (final caps)** | — | **1.00** | **8,363** | — | — | — | **$8,373** | — | — |
+| — | **Σ (final caps)** | — | **1.00** | **8,363** | — | — | — | **$8,708** | — | — |
 
-(Sum of final caps ≈ portfolio_risk_cap of `$8,363.37`. Small overshoot
-is the boost on alpha and delta against the no-overlay base; the
-allocator does not re-normalize after overlays — overlays are bounded
-multipliers and the portfolio_risk_cap is enforced at execution time
-via the SCR sizing factor and per-symbol caps.)
+(Sum of final caps $8,708 exceeds portfolio_risk_cap $8,363.37 by
+~$345. The overshoot is the combined boost on alpha (1.5×) and delta
+(1.304×); the allocator does not re-normalize after overlays —
+overlays are bounded multipliers and the portfolio_risk_cap is
+enforced at execution time via the SCR sizing factor and per-symbol
+caps. With SCR=WARMUP at 0.10× this is academic; worth tracking once
+SCR promotes.)
 
 ---
 
@@ -1662,8 +1669,10 @@ Multipliers (full):
 
 **Source:** `chad/risk/regime_booster.py`
 **Output:** `runtime/regime_booster.json`
-**Cadence:** integrated into the orchestrator publish path; refreshed
-every cycle when the orchestrator runs.
+**Cadence:** every 60 seconds via `chad-regime-booster.timer`
+(installed in v8.4, commit `f62d914`). Pre-v8.4 the SSOT claimed
+orchestrator integration that was never wired; the dedicated timer
+closes a 15+ hour staleness gap.
 **Config:** `config/regime_booster_policy.json`.
 
 #### What it does
@@ -2283,8 +2292,8 @@ The regime panel reads `runtime/regime_state.json` directly
 
 ## 11. SERVICES & TIMERS
 
-53 `chad-*` units (services + timers) loaded. 13 services running.
-0 failed.
+187 `chad-*` unit files loaded (102 services + 85 timers — counts
+include masked and disabled units). 14 services running. 0 failed.
 
 ### Hot-path services (always running)
 
@@ -2313,6 +2322,13 @@ The regime panel reads `runtime/regime_state.json` directly
 | `chad-tier-manager.timer` | every 5 min | Equity-tier strategy enable/disable. |
 | `chad-winner-scaler.timer` | every 15 min | Per-strategy expectancy multipliers. |
 | `chad-business-phase.timer` | every 30 min | Plain-English BUILD/GROW/PAY publisher. |
+
+### NEW v8.4 timers (gap-fills)
+
+| Timer | Cadence | Purpose |
+|---|---|---|
+| `chad-regime-booster.timer` | every 60s | Refresh `runtime/regime_booster.json`. Closes the staleness gap where SSOT v8.3 §6E claimed orchestrator integration that was never wired. Commit `f62d914`. |
+| `chad-event-risk.timer` | every 10 min | Refresh `runtime/event_risk.json`. Was disabled with a malformed real-file in `timers.target.wants/` instead of a symlink; v8.4 fixed the symlink and enabled the timer. Commit `f62d914`. |
 
 ### Timers — hot-path (preserved from v8.2)
 
@@ -2364,7 +2380,7 @@ The regime panel reads `runtime/regime_state.json` directly
 
 ### Intentionally disabled / retired
 
-- `chad-reconciliation.timer` — masked (dual-writer risk).
+- `chad-reconciliation.timer` — masked via `/dev/null` symlink in v8.4 (commit `f62d914`). Pre-v8.4 was `disabled` only, so a manual `systemctl start` could have re-introduced a dual-writer race on `runtime/reconciliation_state.json`. Now permanently inert.
 - `chad-options-chain-refresh.service` (the standalone service form) —
   intentionally disabled; the timer is the canonical entry.
 - `chad-polygon-stocks`, `chad-bars-validate`, `chad-daily-bars-backfill`
@@ -2490,16 +2506,20 @@ were active and what they did to each strategy's cap.
 
 ## 13. CHANGE LOG (delta from v8.2)
 
-In commit order (oldest first since v8.2 was cut). 4 commits since
-`accaa2b`.
+In commit order (oldest first since v8.2 was cut). 7 commits since
+`accaa2b` — 4 from the v8.3 session, plus 3 more on 2026-04-28
+(audit, voice tightening, and the v8.4 gap-closure).
 
 ### Commit list (`git log accaa2b..HEAD --oneline`)
 
 ```
-1608fec Build: business framework foundation files
-1caa111 Build: complete CHAD business framework (Phase 11C/12B/12C)
-0c3a3e1 Fix: exclude broker_sync from weekly top brain ranking
-15677a2 Fix: enforce Kraken REST pair format at executor + REST border
+15677a2 2026-04-26 Fix: enforce Kraken REST pair format at executor + REST border
+0c3a3e1 2026-04-27 Fix: exclude broker_sync from weekly top brain ranking
+1caa111 2026-04-27 Build: complete CHAD business framework (Phase 11C/12B/12C)
+1608fec 2026-04-27 Build: business framework foundation files
+4a37b4c 2026-04-28 Audit: behavioral contract verification of SSOT v8.3
+031a9de 2026-04-28 Tighten brief voice: zero jargon for non-trader operator
+f62d914 2026-04-28 Build: SSOT v8.4 gap closure — HWM fix, alpha_crypto rename, regime-booster timer, audit harness
 ```
 
 ### 1. `15677a2` — *Fix: enforce Kraken REST pair format at executor + REST border* (2026-04-26)
@@ -2589,10 +2609,80 @@ this commit the framework would not survive a fresh checkout.
 - `config/regime_booster_policy.json` (+11 LoC) — bounded regime
   multiplier policy.
 
+### 5. `4a37b4c` — *Audit: behavioral contract verification of SSOT v8.3* (2026-04-28)
+
+- **Was:** SSOT v8.3 made several behavioral claims (regime
+  booster on orchestrator cycle, reconciliation timer disabled,
+  event_risk timer enabled, etc.) that had not been independently
+  verified against the running machine.
+- **Was added:** A small audit harness that walks the SSOT's
+  behavioral contracts and reports pass/fail. Uncovered the gaps
+  that v8.4 then closed.
+- **Result:** Confirmed the v8.3 framework is real where the SSOT
+  claimed; flagged the gaps closed by `f62d914`.
+
+### 6. `031a9de` — *Tighten brief voice: zero jargon for non-trader operator* (2026-04-28)
+
+- **Was broken:** Morning brief and end-of-day report used
+  trader-grade vocabulary even though the operator-facing voice
+  lock in `MorningBrief._chads_take` is meant to render in plain
+  English. Specific terms (basis points, drawdown, expectancy,
+  Kelly fraction) leaked through.
+- **Was fixed:** System prompt + post-processing pass tightened
+  to strip remaining jargon and substitute plain-English
+  equivalents.
+- **Result:** Briefs read as a friend updating you on the
+  business, not a desk note. No behavioral change to the trading
+  system.
+
+### 7. `f62d914` — *Build: SSOT v8.4 gap closure* (2026-04-28)
+
+Single commit closes five gaps surfaced by the audit harness in
+`4a37b4c`.
+
+- **chad-reconciliation.timer masked.** Was `disabled`, not
+  masked. A manual `systemctl start` would have raced against
+  `chad-reconciliation-publisher.timer` on
+  `runtime/reconciliation_state.json`. Symlinked to `/dev/null`;
+  race window permanently closed.
+- **chad-regime-booster.timer installed.** SSOT v8.3 §6E claimed
+  `regime_booster.json` was refreshed on the orchestrator cycle.
+  In practice no orchestrator hook called the publisher and the
+  file ran 15+ hours stale. New systemd unit at 60-second cadence
+  runs `python3 -m chad.risk.regime_booster` directly.
+- **chad-event-risk.timer enabled.** Was `disabled` and the
+  `timers.target.wants/` entry was a malformed real-file rather
+  than a symlink. `event_risk.json` had been 25+ days stale;
+  RegimeBooster's veto on `severity in [high, extreme]` could
+  never fire. Replaced the bad real-file with the correct
+  symlink, enabled the timer (10-minute cadence). Caveat:
+  provider is still `MarketHoursRiskProvider` (placeholder
+  returning `severity=medium` for US session edges); a real
+  CPI/FOMC/NFP calendar source remains a roadmap item.
+- **withdrawal_manager.py HWM fixed.** `:158` was
+  `hwm = max(max(equities), current_equity)` — current equity
+  was always part of the HWM set, so `surplus = current_equity -
+  hwm` was permanently ≤ 0 and authorized salary was permanently
+  $0 regardless of phase. Changed to `hwm = max(equities)`.
+  Effect is prospective: with only 1 history record at write
+  time the bug was not observable from runtime; once the second
+  daily record lands at 23:59 UTC on 2026-04-28, salary
+  authorization can unlock when PAY-phase preconditions are met.
+- **strategy_weights.json key renamed.** Was `"crypto": 0.04`;
+  `tier_state.json:enabled_strategies` used the canonical name
+  `alpha_crypto`. Cap publisher emitted runtime entries under
+  literal `crypto`, which `load_tier_filter` did not find in the
+  enabled list, so `tier_factor` resolved to `0.0` and
+  `alpha_crypto` received a `$0` final cap. Renamed the key to
+  `alpha_crypto` (value unchanged at 0.04; total 16 keys; sum
+  1.0). Cap publisher now emits under `alpha_crypto`, matching
+  the tier filter and producing the expected `$334.53` final cap.
+
 ### Aggregate
 
-`git diff accaa2b..HEAD --stat` yields **+1,886 / -25** across **13
-files** (mostly new modules, minimal mutation of existing code).
+v8.3 contributed +1,886 / -25 across 13 files (most of which were
+new modules). v8.4 added three smaller commits — re-run `git diff
+accaa2b..HEAD --stat` and update this line with the fresh totals.
 
 ---
 
@@ -2600,13 +2690,13 @@ files** (mostly new modules, minimal mutation of existing code).
 
 ### RESOLVED IN v8.4
 
-| ID | Was | Resolution |
-|---|---|---|
-| `regime_booster.json` stale | DEGRADED — no publisher wired | `chad-regime-booster.timer` installed (2026-04-28) |
-| `event_risk.json` stale | DEGRADED — timer disabled | `chad-event-risk.timer` enabled (2026-04-28) |
-| `chad-reconciliation.timer` not masked | SAFETY — disabled not masked | Masked via symlink to `/dev/null` (2026-04-28) |
-| `withdrawal_manager.py:158` HWM bug | BUG — salary permanently $0 | `hwm = max(equities)` (2026-04-28) |
-| `strategy_weights.json` key `crypto` | COSMETIC — tier lookup mismatch | Renamed to `alpha_crypto` (2026-04-28) |
+| ID | Was | Resolution | Commit |
+|---|---|---|---|
+| `regime_booster.json` stale | DEGRADED — no publisher wired | `chad-regime-booster.timer` installed (2026-04-28) | `f62d914` |
+| `event_risk.json` stale | DEGRADED — timer disabled | `chad-event-risk.timer` enabled (2026-04-28) | `f62d914` |
+| `chad-reconciliation.timer` not masked | SAFETY — disabled not masked | Masked via symlink to `/dev/null` (2026-04-28) | `f62d914` |
+| `withdrawal_manager.py:158` HWM bug | BUG — salary permanently $0 | `hwm = max(equities)` (2026-04-28) | `f62d914` |
+| `strategy_weights.json` key `crypto` | COSMETIC — tier lookup mismatch | Renamed to `alpha_crypto` (2026-04-28) | `f62d914` |
 
 ### DEGRADED
 
@@ -2632,15 +2722,6 @@ failures; all are stale test fixtures.
 
 ### COSMETIC
 
-- **Weight key mismatch.** `config/strategy_weights.json` uses key
-  `"crypto"`. The runtime cap snapshot at write time has the
-  per-strategy entry under `crypto` (zero cap because tier filter
-  doesn't recognise the literal key). The shim
-  `chad/risk/dynamic_caps.py:67` normalises the runtime key back to
-  `alpha_crypto` for downstream consumers. This is the source of the
-  `alpha_crypto $0` cap surfaced in §3 — cosmetic, not a real
-  enablement gap. Renaming the key in `strategy_weights.json` (under
-  governance) would close the loop.
 - **`alpha_futures` docstring lists `MCL`.** The strategy file's
   module-level docstring still names the legacy 4-symbol universe;
   the live tuple is `(MES, MNQ, MGC)` per `:98`. Documentation drift.
@@ -2852,13 +2933,16 @@ secrets. Listed by name only.
 From `git log accaa2b..HEAD --pretty=format:"%H %ad %s" --date=short`:
 
 ```
-1608fec3d574f9bef00f2a52ac8283715fbabaa3  2026-04-27  Build: business framework foundation files
-1caa111095a3f785d4b153168f13961c475e4fc0  2026-04-27  Build: complete CHAD business framework (Phase 11C/12B/12C)
-0c3a3e11eb90401da560a145b6b529ba57076615  2026-04-27  Fix: exclude broker_sync from weekly top brain ranking
 15677a2ca25dc91987ce113769e75671cdeee090  2026-04-26  Fix: enforce Kraken REST pair format at executor + REST border
+0c3a3e11eb90401da560a145b6b529ba57076615  2026-04-27  Fix: exclude broker_sync from weekly top brain ranking
+1caa111095a3f785d4b153168f13961c475e4fc0  2026-04-27  Build: complete CHAD business framework (Phase 11C/12B/12C)
+1608fec3d574f9bef00f2a52ac8283715fbabaa3  2026-04-27  Build: business framework foundation files
+4a37b4c70bfeba73ab3d0b41d87f5c1e6c5e3eaa  2026-04-28  Audit: behavioral contract verification of SSOT v8.3
+031a9de8ed1ed00d6474537190086f31298f8c59  2026-04-28  Tighten brief voice: zero jargon for non-trader operator
+f62d914c2d1964c201e314d8b8aa1e3ab6e11dee  2026-04-28  Build: SSOT v8.4 gap closure — HWM fix, alpha_crypto rename, regime-booster timer, audit harness
 ```
 
-(4 commits, all by `mcitysolo <mcitysolo@local>`.)
+(7 commits, all by `mcitysolo <mcitysolo@local>`.)
 
 ### Appendix E — Business framework cheat sheet
 
@@ -2987,7 +3071,7 @@ What to look for (today's expected values):
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                    CHAD AT-A-GLANCE — v8.3                       │
+│                    CHAD AT-A-GLANCE — v8.4                       │
 ├──────────────────────────────────────────────────────────────────┤
 │  Equity:   $167,267.45 USD  (IBKR $167,082.87 + Kraken $184.58)  │
 │  Phase:    GROW            (engine built, growing pre-salary)    │
@@ -3007,15 +3091,15 @@ What to look for (today's expected values):
 │                        amplifier $420.67                         │
 │  Today realized P&L: +$125.60                                    │
 │  Tests: 5 fail (cosmetic) / 1,014 pass / 29 warn                 │
-│  Services: 13 running / 53 loaded / 0 failed                     │
+│  Services: 14 running / 102 loaded / 0 failed                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-**End of CHAD Unified SSOT v8.3.**
+**End of CHAD Unified SSOT v8.4.**
 
-This document is the truth as of 2026-04-27. CHAD is now a
+This document is the truth as of 2026-04-28. CHAD is now a
 self-governing autonomous business with explicit phase progression,
 tier-gated strategies, performance-based cap reallocation,
 regime-aware boosting, and salary authorization. 16 strategies are
@@ -3027,4 +3111,4 @@ will hit the operator at the next 13:00 UTC weekday window.
 Ready for Monday open.
 
 If the code disagrees, either the code drifted or this revision
-needs another pass. Cut v8.4 before relying on the disagreement.
+needs another pass.
