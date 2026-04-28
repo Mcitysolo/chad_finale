@@ -57,6 +57,73 @@ REGIME_LABELS: Dict[str, str] = {
     "adverse":        "ADVERSE (minimal exposure)",
 }
 
+# Plain-English version for the operator-facing brief — owner is non-technical
+# and the trader-facing labels above use jargon (regime, defensive posture).
+REGIME_PLAIN: Dict[str, str] = {
+    "trending_bull":  "Markets going up right now",
+    "trending_bear":  "Markets going down right now",
+    "ranging":        "Markets sideways — no clear direction",
+    "volatile":       "Markets are jumpy — being extra careful",
+    "unknown":        "Mixed picture — keeping things steady",
+    "adverse":        "Tough conditions — staying mostly on the sidelines",
+}
+
+# Plain-English version of the System Confidence Rating state for the brief.
+SCR_PLAIN: Dict[str, str] = {
+    "WARMUP":    "Still in practice mode — only using small amounts",
+    "CAUTIOUS":  "Being careful — using small amounts while we build confidence",
+    "CONFIDENT": "System is dialed in — using normal amounts",
+}
+
+# CHAD's Take system prompt — single source of truth for morning, end-of-day,
+# and weekly summaries. The owner is non-technical (a "smart friend", not a
+# trader); the prompt forbids finance jargon and gives explicit translations.
+CHADS_TAKE_SYSTEM_PROMPT = (
+    "You are CHAD — explaining today's trading to your owner. "
+    "Your owner is NOT a trader. They have never used a stock "
+    "trading app. Imagine you are explaining to a smart friend "
+    "who wants to know: 'Did we make money? Is everything okay? "
+    "What's happening?'\n\n"
+    "STRICT RULES — NEVER BREAK:\n"
+    "- NO percentages. Use 'about 6 out of 10' not '60%'\n"
+    "- NO finance terms EVER. Banned words include:\n"
+    "  momentum, bullish, bearish, regime, volatility, VIX,\n"
+    "  complacency, expectancy, win rate, conviction, sizing,\n"
+    "  notional, basis points, alpha, beta, intraday, drawdown,\n"
+    "  posture, exposure, allocation, signals, setups, entries,\n"
+    "  fills, positions, trends, breakout\n"
+    "- PLAIN TRANSLATIONS (use these):\n"
+    "  'momentum' \u2192 'going up'\n"
+    "  'bullish trend' \u2192 'markets are going up right now'\n"
+    "  'bearish trend' \u2192 'markets are going down right now'\n"
+    "  'volatility' \u2192 'market is jumpy'\n"
+    "  'low VIX' \u2192 'markets feel calm'\n"
+    "  'high VIX' \u2192 'markets feel scared'\n"
+    "  'fills' \u2192 'trades made'\n"
+    "  'win rate' \u2192 'how often we made money'\n"
+    "  'expectancy' \u2192 'average profit per trade'\n"
+    "  'trending' \u2192 'moving in one direction'\n"
+    "  'cautious' \u2192 'being careful'\n"
+    "  'warmup phase' \u2192 'still in practice mode'\n"
+    "  'positions' \u2192 'trades we still have open'\n"
+    "  'effective trades' \u2192 'clean practice runs'\n"
+    "  'signals' \u2192 'opportunities we found'\n"
+    "- Maximum 3 sentences\n"
+    "- Be warm and direct like a smart friend texting an update\n"
+    "- Talk about money in dollars only (never percentages)\n"
+    "- If asked something complex, say 'in plain words: ...'\n\n"
+    "STRUCTURE: open with what happened, then why, then what's next.\n"
+    "Example good response:\n"
+    "  'We made $250 today across 12 trades. Markets were calm\n"
+    "  and going up, which is the kind of day we like. Tomorrow\n"
+    "  we keep doing the same thing while the system builds its\n"
+    "  track record.'\n\n"
+    "Example BAD response (too technical):\n"
+    "  'VIX at 18 signals complacency in a bullish regime. The\n"
+    "  system is selectively cautious on momentum trades.'\n\n"
+    "Be the smart friend, not the analyst."
+)
+
 # ---------------------------------------------------------------------------
 # Instrument translations — plain English
 # ---------------------------------------------------------------------------
@@ -88,21 +155,52 @@ INSTRUMENT_NAMES: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 STRATEGY_NAMES: Dict[str, str] = {
-    "alpha": "Momentum trading (riding trends)",
+    "alpha": "Going with stocks that are moving up",
     "beta": "Long-term holds (the slow and steady bucket)",
-    "beta_trend": "Legend-driven ETF allocation (long-term trend follower)",
-    "gamma": "Swing trading (medium-term moves)",
-    "gamma_reversion": "Mean reversion (fading overreactions)",
-    "alpha_futures": "Futures momentum (riding trends in commodities and indexes)",
-    "gamma_futures": "Futures reversion (fading overreactions in commodities)",
+    "beta_trend": "Big-money ETF picks (long-term holds tracking what large institutions buy)",
+    "gamma": "Medium-term swing trades",
+    "gamma_reversion": "Buying things that look oversold",
+    "alpha_futures": "Going with commodities and indexes that are moving up",
+    "gamma_futures": "Buying commodities that look oversold",
     "omega": "Crash protection (our insurance policy)",
     "omega_macro": "Macro bets (bonds, currencies, metals)",
-    "omega_vol": "Volatility plays (betting on market fear/calm)",
+    "omega_vol": "Jumpy-market plays (using market fear and calm)",
     "alpha_options": "Options plays (defined-risk bets on SPY)",
     "crypto": "Crypto trades (Bitcoin, Ethereum, Solana)",
     "alpha_crypto": "Crypto trades (Bitcoin, Ethereum, Solana)",
-    "delta": "Execution optimizer (makes our trades smarter)",
+    "delta": "Execution helper (makes our trades smarter)",
 }
+
+# ---------------------------------------------------------------------------
+# Top-strategy ranking exclusions
+# ---------------------------------------------------------------------------
+# broker_sync is bookkeeping for pre-existing IBKR positions, not a CHAD
+# strategy — exclude from "top strategy" rankings everywhere (morning, eod,
+# weekly) so the brief surfaces actual strategy performance, not passive
+# market exposure. Companion to commit 0c3a3e1 which fixed only the weekly
+# path.
+EXCLUDED_FROM_RANKING = {"broker_sync", "manual", "paper_exec", "unknown", ""}
+MIN_RANKING_TRADES = 5
+
+
+def _filter_for_ranking(
+    items: Dict[str, Any],
+    *,
+    require_min_trades: bool = False,
+) -> Dict[str, Any]:
+    """Drop bookkeeping/stub keys (and optionally low-sample strategies)
+    before computing a "top" rank."""
+    out: Dict[str, Any] = {}
+    for name, data in items.items():
+        if name in EXCLUDED_FROM_RANKING:
+            continue
+        if require_min_trades and isinstance(data, dict):
+            n = _safe_float(data.get("trade_count", data.get("total_trades", 0)))
+            if n < MIN_RANKING_TRADES:
+                continue
+        out[name] = data
+    return out
+
 
 # ---------------------------------------------------------------------------
 # VIX translations
@@ -676,43 +774,33 @@ def _generate_chads_take(
 
         extras: List[str] = []
         if regime:
-            extras.append(f"Regime: {regime}")
+            extras.append(f"Market mood: {regime}")
         if scr_state:
-            sz = f" (sizing {scr_sizing:.2f}x)" if isinstance(scr_sizing, (int, float)) else ""
-            extras.append(f"SCR: {scr_state}{sz}")
+            extras.append(f"System state: {scr_state}")
         if top_strategy:
-            extras.append(f"Top strategy today: {top_strategy}")
+            extras.append(f"Best approach today: {top_strategy}")
         if open_positions is not None:
-            extras.append(f"Open positions: {open_positions}")
+            extras.append(f"Open trades: {open_positions}")
         if intelligence_highlights:
             extras.append(
-                "Intelligence highlights: " + "; ".join(intelligence_highlights[:3])
+                "Notable today: " + "; ".join(intelligence_highlights[:3])
             )
 
+        vix_text = vix_description(vix) if vix else "unknown"
         prompt = (
             f"Today's results: {'made' if total_pnl >= 0 else 'lost'} {_format_money(abs(total_pnl))} total. "
             f"{total_trades} trades, {wins} winners, {losses} losers, "
             f"{max(0, total_trades - wins - losses)} scratches. "
-            f"VIX (fear gauge): {vix if vix else 'unknown'}. "
-            f"Strategy results: {strat_summary}. "
+            f"Market mood: {vix_text}. "
+            f"Per-approach results: {strat_summary}. "
             + (" ".join(extras) + ". " if extras else "")
-            + "Write 2-3 sentences assessing today's trading. Reference the specific "
-            "P&L, positions, and market conditions above. Plain English only — no "
-            "jargon. Be honest about losses. Be direct."
+            + "Write 2-3 sentences explaining today to the owner. Use plain English "
+            "only — no finance words. Be honest about losses. Be warm and direct."
         )
 
         text, _, _ = client._call_claude(
             prompt=prompt,
-            system=(
-                "You are CHAD — an elite autonomous trading system. You think with "
-                "the quantitative precision of Jim Simons, the macro vision of Ray "
-                "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
-                "You are speaking to a non-technical operator who does not need "
-                "jargon — use plain English only. Analyze today's trading results "
-                "and give a sharp, specific 2-3 sentence assessment. Reference "
-                "actual P&L, positions, and conditions. Be honest about losses. "
-                "Be direct. No generic advice."
-            ),
+            system=CHADS_TAKE_SYSTEM_PROMPT,
             task_type="standard",
             max_tokens=260,
             temperature=0.6,
@@ -857,17 +945,17 @@ class DailyCHADReport:
                 # about $0 closed P&L without claiming "no trades today".
                 sections.append("$0 in closed profit/loss today ⚪")
                 sections.append(
-                    "We submitted trades today but no positions have closed yet — "
-                    "open positions don't count as profit or loss until they're closed out. "
+                    "We placed trades today but none have closed yet — "
+                    "open trades don't count as profit or loss until they're closed out. "
                     "See WHAT DID WE DO TODAY below."
                 )
             elif open_positions:
                 n_open = len(open_positions)
-                pos_word = "position" if n_open == 1 else "positions"
+                pos_word = "trade" if n_open == 1 else "trades"
                 sections.append(f"$0 in closed profit/loss today ⚪")
                 sections.append(
                     f"{n_open} {pos_word} still open — results pending when CHAD closes them. "
-                    f"Open positions don't count as profit or loss until they're closed out."
+                    f"Open trades don't count as profit or loss until they're closed out."
                 )
             else:
                 sections.append("Quiet day — no trades today ⚪")
@@ -875,7 +963,7 @@ class DailyCHADReport:
                 if day_of_week >= 5:
                     sections.append("Markets are closed on weekends — we'll be back when they reopen!")
                 else:
-                    sections.append("No clear signals today, so we sat on the sidelines. Sometimes the smartest move is no move at all.")
+                    sections.append("No clear opportunities today, so we sat on the sidelines. Sometimes the smartest move is no move at all.")
         elif total_pnl > 0:
             sections.append(f"Yes — we made {_format_money(total_pnl)} on paper today 🟢")
             sections.append(f"That's like finding {_format_money(total_pnl)} in your pocket. Not real money yet, but the approach is working.")
@@ -912,7 +1000,7 @@ class DailyCHADReport:
             strat_counts: Dict[str, int] = {}
             for r in today_intents:
                 strat_counts[r.strategy] = strat_counts.get(r.strategy, 0) + 1
-            top_strategy, top_count = max(strat_counts.items(), key=lambda kv: kv[1])
+            ranked_counts = _filter_for_ranking(strat_counts)
 
             display_symbols = uniq_symbols[:8]
             sym_text = ", ".join(display_symbols)
@@ -920,15 +1008,19 @@ class DailyCHADReport:
                 sym_text += f" (+{len(uniq_symbols) - 8} more)"
 
             trade_word = "trade" if n_intents == 1 else "trades"
-            top_word = "trade" if top_count == 1 else "trades"
 
             sections.append("═══ WHAT DID WE DO TODAY ═══")
             sections.append(f"We submitted {n_intents} {trade_word} across {sym_text} today.")
+            if ranked_counts:
+                top_strategy, top_count = max(
+                    ranked_counts.items(), key=lambda kv: kv[1]
+                )
+                top_word = "trade" if top_count == 1 else "trades"
+                sections.append(
+                    f"Most active: {translate_strategy(top_strategy)} with {top_count} {top_word}."
+                )
             sections.append(
-                f"Most active: {translate_strategy(top_strategy)} with {top_count} {top_word}."
-            )
-            sections.append(
-                "Note: These are practice trades — real profit/loss shows once positions close."
+                "Note: These are practice trades — real profit/loss shows once each trade closes."
             )
             sections.append("")
 
@@ -962,20 +1054,20 @@ class DailyCHADReport:
                 if len(uniq_pos_symbols) > 8:
                     preview += f" (+{len(uniq_pos_symbols) - 8} more)"
                 n_open = len(open_positions)
-                pos_word = "position" if n_open == 1 else "positions"
+                pos_word = "trade" if n_open == 1 else "trades"
                 sections.append(
                     f"CHAD has {n_open} open {pos_word} right now ({preview})."
                 )
                 if today_intents:
                     n_intents = len(today_intents)
                     trade_word = "trade" if n_intents == 1 else "trades"
-                    sections.append(f"{n_intents} {trade_word} executed today.")
+                    sections.append(f"{n_intents} {trade_word} placed today.")
                 sections.append(
-                    f"{strategy_count} strategies loaded and monitoring markets."
+                    f"{strategy_count} approaches loaded and watching markets."
                 )
             else:
                 sections.append(
-                    f"All {strategy_count} strategies are loaded and ready."
+                    f"All {strategy_count} approaches are loaded and ready."
                 )
         else:
             all_strategies = [
@@ -1009,12 +1101,18 @@ class DailyCHADReport:
         # 7. MARKET TEMPERATURE — only show when we have data
         if vix is not None or spy_change is not None or btc_price is not None:
             sections.append("═══ MARKET TEMPERATURE ═══")
-            sections.append("(The \"fear gauge\" tells us how nervous investors are)")
+            sections.append("(How the market felt today)")
             if vix is not None:
-                sections.append(f"  Fear gauge (VIX): {vix:.1f} — {vix_description(vix)}")
+                sections.append(f"  Market mood: {vix_description(vix)}")
             if spy_change is not None:
-                direction = "up" if spy_change >= 0 else "down"
-                sections.append(f"  Stock market was {direction} {abs(spy_change):.1f}% today")
+                if abs(spy_change) < 0.25:
+                    sections.append("  Stock market: barely moved today")
+                elif abs(spy_change) < 1.0:
+                    direction = "up a little" if spy_change >= 0 else "down a little"
+                    sections.append(f"  Stock market: {direction} today")
+                else:
+                    direction = "up" if spy_change >= 0 else "down"
+                    sections.append(f"  Stock market: {direction} a noticeable amount today")
             if btc_price is not None:
                 sections.append(f"  Bitcoin: {_format_money(btc_price)}")
             # News headlines (Yahoo Finance — no API key needed)
@@ -1077,13 +1175,16 @@ class DailyCHADReport:
         ready = readiness.get("ready_for_live", False)
         sections.append("  Mode: Practice mode (not using real money yet)")
         if overall_win_rate > 0:
+            wr_out_of_10 = max(0, min(10, round(overall_win_rate / 10.0)))
             above_below = "above" if overall_win_rate >= 55 else "below"
             emoji = " 🎯" if overall_win_rate >= 55 else ""
-            sections.append(f"  Win rate: {overall_win_rate:.0f}% — {above_below} our 55% target{emoji}")
+            sections.append(
+                f"  How often we made money: about {wr_out_of_10} out of 10 — {above_below} our target of 6 out of 10{emoji}"
+            )
         else:
-            sections.append("  Win rate: not enough data yet")
+            sections.append("  Track record: not enough trades yet")
         if not ready:
-            sections.append("  System is in practice mode — we're testing the strategies before using real money.")
+            sections.append("  System is in practice mode — we're testing the approaches before using real money.")
         sections.append("")
 
         # 9. YOUR PAPER ACCOUNT
@@ -1152,9 +1253,10 @@ class DailyCHADReport:
                 else None
             )
             top_strategy_eod: Optional[str] = None
-            if strategy_pnl:
+            ranked_pnl = _filter_for_ranking(strategy_pnl)
+            if ranked_pnl:
                 _top_sym, _top_val = max(
-                    strategy_pnl.items(), key=lambda kv: kv[1]
+                    ranked_pnl.items(), key=lambda kv: kv[1]
                 )
                 top_strategy_eod = (
                     f"{translate_strategy(_top_sym)} "
@@ -1242,15 +1344,8 @@ class MorningBrief:
                     + "\n\nReturn JSON {\"text\": \"2-3 sentence pre-market take\"}."
                 ),
                 system=(
-                    "You are CHAD — an elite autonomous trading system. You think with "
-                    "the quantitative precision of Jim Simons, the macro vision of Ray "
-                    "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
-                    "You are speaking to a non-technical operator who does not need "
-                    "jargon — use plain English only. Analyze the pre-market conditions "
-                    "provided and give a sharp, specific 2-3 sentence assessment. "
-                    "Reference actual data. Be confident and direct. No generic "
-                    "statements like 'stay disciplined' or 'markets can be volatile'. "
-                    "Wrap your response in a JSON object with a single key 'text'."
+                    CHADS_TAKE_SYSTEM_PROMPT
+                    + "\n\nWrap your response in a JSON object with a single key 'text'."
                 ),
                 task_type="standard",
             )
@@ -1361,42 +1456,58 @@ class MorningBrief:
         # ═══ OVERNIGHT ═══
         lines.append("\u2550\u2550\u2550 OVERNIGHT \u2550\u2550\u2550")
         if vix is not None:
-            lines.append(f"Fear gauge (VIX): {vix:.1f} \u2014 {vix_description(vix)}")
+            lines.append(f"Market mood: {vix_description(vix)}")
         if spy_price is not None:
             if spy_change is not None:
-                direction = "up" if spy_change >= 0 else "down"
-                lines.append(f"SPY: {_format_money(spy_price)} ({direction} {abs(spy_change):.2f}% overnight)")
+                if abs(spy_change) < 0.25:
+                    move = "barely moved"
+                elif spy_change >= 0:
+                    move = "up a little" if spy_change < 1.0 else "up a noticeable amount"
+                else:
+                    move = "down a little" if abs(spy_change) < 1.0 else "down a noticeable amount"
+                lines.append(f"Stock market (SPY): {_format_money(spy_price)} — {move} overnight")
             else:
-                lines.append(f"SPY: {_format_money(spy_price)}")
+                lines.append(f"Stock market (SPY): {_format_money(spy_price)}")
         if btc_price is not None:
             if btc_chg_pct is not None:
-                lines.append(f"BTC: {_format_money(btc_price)} ({btc_chg_pct:+.2f}% 24h)")
+                if abs(btc_chg_pct) < 0.5:
+                    move = "barely moved"
+                elif btc_chg_pct >= 0:
+                    move = "up a little" if btc_chg_pct < 2.0 else "up a noticeable amount"
+                else:
+                    move = "down a little" if abs(btc_chg_pct) < 2.0 else "down a noticeable amount"
+                lines.append(f"Bitcoin: {_format_money(btc_price)} — {move} in the last day")
             else:
-                lines.append(f"BTC: {_format_money(btc_price)}")
+                lines.append(f"Bitcoin: {_format_money(btc_price)}")
         lines.append("")
 
         # ═══ WHAT CHAD IS WATCHING ═══
         lines.append("\u2550\u2550\u2550 WHAT CHAD IS WATCHING \u2550\u2550\u2550")
         watch = self._gather_watch_items()
         if watch:
+            lines.append("Notable today:")
             for w in watch:
                 lines.append(f"\u2022 {w}")
         else:
-            lines.append("\u2022 No elevated signals across trends/reddit/shorts — baseline watch only")
+            lines.append(
+                "Nothing unusual on the radar today — normal day to keep practicing."
+            )
         lines.append("")
 
-        # ═══ TODAY'S STRATEGY POSTURE ═══
-        lines.append("\u2550\u2550\u2550 TODAY'S STRATEGY POSTURE \u2550\u2550\u2550")
-        # Regime read from the LIVE classifier (runtime/regime_state.json),
-        # not the 48-hour AI cache in strategy_intelligence.json which was
-        # collapsing every regime to NEUTRAL.
+        # ═══ WHAT WE'RE DOING TODAY ═══  (renamed from TODAY'S STRATEGY POSTURE)
+        # Plain-English regime + per-symbol leans for the non-trader operator.
+        lines.append("\u2550\u2550\u2550 WHAT WE'RE DOING TODAY \u2550\u2550\u2550")
         try:
             regime_data = _read_json(runtime / "regime_state.json") or {}
             live_regime = str(regime_data.get("regime", "unknown")).lower()
             regime_summary = REGIME_LABELS.get(live_regime, live_regime.upper())
+            regime_plain = REGIME_PLAIN.get(
+                live_regime, "Mixed picture — keeping things steady"
+            )
         except Exception:
             regime_summary = "UNKNOWN"
-        lines.append(f"Regime: {regime_summary}")
+            regime_plain = "Mixed picture — keeping things steady"
+        lines.append(regime_plain)
 
         biases = strat_intel.get("confidence_bias") or []
         notable_biases: List[str] = []
@@ -1407,99 +1518,152 @@ class MorningBrief:
                 adj = _safe_float(b.get("adjustment"))
                 if abs(adj) >= 0.05:
                     sym = b.get("symbol", "?")
-                    strat = translate_strategy(str(b.get("strategy", "")))
-                    tone = "cautious" if adj < 0 else "confident"
-                    notable_biases.append(f"{strat} {tone} on {sym} ({adj:+.2f})")
+                    if adj < 0:
+                        notable_biases.append(
+                            f"Being careful with {sym} today — it looks weak"
+                        )
+                    else:
+                        notable_biases.append(f"Liking the look of {sym} today")
                 if len(notable_biases) >= 3:
                     break
         if notable_biases:
             for nb in notable_biases:
                 lines.append(f"\u2022 {nb}")
         else:
-            lines.append("\u2022 Confidence biases neutral across strategies")
+            lines.append(
+                "\u2022 Treating each name about the same today — no strong leans"
+            )
         lines.append("")
 
-        # ═══ CHAD'S PERFORMANCE ═══
-        lines.append("\u2550\u2550\u2550 CHAD'S PERFORMANCE \u2550\u2550\u2550")
+        # ═══ HOW WE'RE DOING ═══  (renamed from CHAD'S PERFORMANCE)
+        lines.append("\u2550\u2550\u2550 HOW WE\u2019RE DOING \u2550\u2550\u2550")
         scr = _read_json(runtime / "scr_state.json") or {}
         scr_state = scr.get("state", "UNKNOWN")
         scr_sizing = scr.get("sizing_factor")
-        if isinstance(scr_sizing, (int, float)):
-            lines.append(f"SCR: {scr_state} (sizing {scr_sizing:.2f}x)")
-        else:
-            lines.append(f"SCR: {scr_state}")
+        scr_plain = SCR_PLAIN.get(str(scr_state).upper(), str(scr_state))
+        lines.append(scr_plain)
 
+        # Top strategy: filter out broker_sync (companion to commit 0c3a3e1
+        # which fixed only the weekly path) and require min trade count.
         top = expectancy.get("top_performer")
         strats = expectancy.get("strategies") or {}
+        ranked_strats = (
+            _filter_for_ranking(strats, require_min_trades=True)
+            if isinstance(strats, dict)
+            else {}
+        )
+        if top not in ranked_strats and ranked_strats:
+            top = max(
+                ranked_strats.items(),
+                key=lambda kv: (
+                    _safe_float(kv[1].get("expectancy", 0))
+                    if isinstance(kv[1], dict)
+                    else 0
+                ),
+            )[0]
         top_strategy_summary: Optional[str] = None
-        if top and isinstance(strats, dict) and top in strats:
-            s = strats[top]
+        if top and top in ranked_strats:
+            s = ranked_strats[top]
+            wr_frac = _safe_float(s.get("win_rate"))
+            wr_out_of_10 = max(0, min(10, round(wr_frac * 10)))
+            exp_dollars = _format_money(_safe_float(s.get("expectancy")))
             top_strategy_summary = (
-                f"Top strategy: {translate_strategy(str(top))} \u2014 "
-                f"win rate {_safe_float(s.get('win_rate'))*100:.0f}%, "
-                f"expectancy {_format_money(_safe_float(s.get('expectancy')))}"
+                f"Best approach today: {translate_strategy(str(top))} — "
+                f"making about {exp_dollars} per trade, "
+                f"winning about {wr_out_of_10} out of 10"
             )
             lines.append(top_strategy_summary)
-        # Trade count clarity: BOTH fills-today (raw activity) AND SCR
-        # effective_trades (the number that actually gates SCR progress).
-        # Previously the brief only surfaced one of these and the operator
-        # could not tell raw session activity from real SCR progress.
+
         fills_today = load_today_intents(self._root / "data" / "fills")
         fills_today_n = len(fills_today)
         scr_stats = scr.get("stats") if isinstance(scr.get("stats"), dict) else {}
         effective_trades = int(_safe_float(scr_stats.get("effective_trades", 0)))
-        lines.append(
-            f"Fills today: {fills_today_n} | "
-            f"Clean trades toward next level: {effective_trades}/100"
-        )
+        if fills_today_n > 0:
+            lines.append(
+                f"Made {fills_today_n} trades today, {effective_trades} of them "
+                f"counting toward next level (need 100)"
+            )
+        else:
+            lines.append(
+                f"{effective_trades} clean practice runs banked toward next level (need 100)"
+            )
 
-        # Open positions
         open_count = 0
         try:
             pg_path = runtime / "positions_snapshot.json"
             if pg_path.exists():
                 snap = json.loads(pg_path.read_text(encoding="utf-8"))
-                positions = snap.get("positions", [])
-                if isinstance(positions, list):
+                positions_list = snap.get("positions", [])
+                if isinstance(positions_list, list):
                     open_count = sum(
-                        1 for p in positions
+                        1 for p in positions_list
                         if isinstance(p, dict) and abs(_safe_float(p.get("position", 0))) > 0
                     )
                     if open_count > 0:
-                        lines.append(f"Open positions: {open_count}")
+                        word = "trade" if open_count == 1 else "trades"
+                        lines.append(f"{open_count} {word} still going right now")
         except Exception:
             pass
         lines.append("")
 
         # ═══ BUSINESS STATUS ═══
-        # Surfaces phase / tier / authorized salary so the operator sees
-        # the business framework state on every morning brief.
+        # Plain-English version of the business framework state.
         try:
             biz = _read_json(runtime / "business_phase.json") or {}
             tier_doc = _read_json(runtime / "tier_state.json") or {}
             wd = _read_json(runtime / "withdrawal_authorization.json") or {}
             if biz or tier_doc or wd:
                 lines.append("═══ BUSINESS STATUS ═══")
-                phase = biz.get("phase") or wd.get("phase") or "?"
-                phase_desc = biz.get("phase_description") or ""
-                growth = _safe_float(biz.get("growth_pct_from_seed", 0.0))
+                phase = str(biz.get("phase") or wd.get("phase") or "?").upper()
                 cur_eq = _safe_float(
                     biz.get("current_equity_usd")
                     or wd.get("current_equity_usd", 0.0)
                 )
-                tier_name = tier_doc.get("tier_name", "?")
+                seed = _safe_float(biz.get("seed_capital_usd", 50000.0))
+                growth_dollars = cur_eq - seed
+                tier_name = str(tier_doc.get("tier_name", "?"))
                 n_strategies = len(tier_doc.get("enabled_strategies") or [])
                 authorized = _safe_float(wd.get("authorized_withdrawal_usd", 0.0))
-                if phase_desc:
-                    lines.append(f"Phase: {phase} ({phase_desc})")
+
+                if phase == "GROW":
+                    lines.append(
+                        "We're in growing mode — building the account before "
+                        "paying out anything. Once the system proves itself, salary kicks in."
+                    )
+                elif phase == "BUILD":
+                    lines.append(
+                        "We're in build mode — getting the account up to a "
+                        "healthy size before anything else."
+                    )
+                elif phase == "PAY":
+                    lines.append(
+                        "We're in payout mode — system has earned its stripes "
+                        "and salary is approved."
+                    )
                 else:
-                    lines.append(f"Phase: {phase}")
+                    lines.append(f"Mode: {phase}")
+
+                grow_sign = "+" if growth_dollars >= 0 else "-"
                 lines.append(
-                    f"Account: ${cur_eq:,.0f}  ({'+' if growth >= 0 else ''}"
-                    f"{growth:.1f}% from seed)"
+                    f"Account: ${cur_eq:,.0f}  ({grow_sign}${abs(growth_dollars):,.0f} "
+                    f"from where we started)"
                 )
-                lines.append(f"Tier: {tier_name} — {n_strategies}/16 strategies active")
-                lines.append(f"Salary: ${authorized:,.0f}/mo authorized")
+
+                if tier_name.upper() == "PRO":
+                    lines.append(
+                        f"Top tier — using all {n_strategies} of our 16 approaches"
+                    )
+                else:
+                    lines.append(
+                        f"{tier_name} tier — using {n_strategies} of our 16 approaches"
+                    )
+
+                if authorized <= 0:
+                    lines.append(
+                        "No salary yet — still building the track record first"
+                    )
+                else:
+                    lines.append(f"Salary approved: ${authorized:,.0f} this month")
                 lines.append("")
         except Exception:
             pass
@@ -1662,15 +1826,8 @@ class WeeklySummary:
                     + "\n\nReturn JSON {\"text\": \"2-3 sentence weekly take\"}."
                 ),
                 system=(
-                    "You are CHAD — an elite autonomous trading system. You think with "
-                    "the quantitative precision of Jim Simons, the macro vision of Ray "
-                    "Dalio, and the opportunistic instincts of Stanley Druckenmiller. "
-                    "You are speaking to a non-technical operator who does not need "
-                    "jargon — use plain English only. Analyze this past week's trading "
-                    "results and give a sharp, specific 2-3 sentence assessment. "
-                    "Reference actual P&L, regime, and top-performing strategy. "
-                    "Be honest about losses. Be direct. No generic advice. "
-                    "Wrap your response in a JSON object with a single key 'text'."
+                    CHADS_TAKE_SYSTEM_PROMPT
+                    + "\n\nWrap your response in a JSON object with a single key 'text'."
                 ),
                 task_type="standard",
             )
@@ -1726,10 +1883,13 @@ class WeeklySummary:
                     key=lambda kv: _safe_float(kv[1].get("expectancy", 0)),
                 )[0]
             s = ranked_strategies[top]
+            wr_frac = _safe_float(s.get("win_rate"))
+            wr_out_of_10 = max(0, min(10, round(wr_frac * 10)))
+            exp_dollars = _format_money(_safe_float(s.get("expectancy")))
             top_line = (
                 f"{translate_strategy(str(top))} — "
-                f"{_safe_float(s.get('win_rate'))*100:.0f}% win rate, "
-                f"{_format_money(_safe_float(s.get('expectancy')))} expectancy"
+                f"making about {exp_dollars} per trade, "
+                f"winning about {wr_out_of_10} out of 10"
             )
 
         # Beta allocation
@@ -1756,58 +1916,90 @@ class WeeklySummary:
         lines.append(f"\U0001f4ca CHAD Week in Review — Week of {week_of}")
         lines.append("")
 
-        lines.append("═══ PERFORMANCE ═══")
-        lines.append(f"Fills this week: {weekly_fill_count}")
+        lines.append("═══ HOW WE DID THIS WEEK ═══")
+        lines.append(f"Trades placed: {weekly_fill_count}")
         sign = "+" if weekly_realized_pnl >= 0 else ""
-        lines.append(f"Realized P&L: {sign}{_format_money(weekly_realized_pnl)}")
-        lines.append(f"Clean trades (SCR): {effective_trades}/100 to CAUTIOUS")
+        lines.append(f"Money made/lost (closed): {sign}{_format_money(weekly_realized_pnl)}")
+        lines.append(
+            f"Clean practice runs banked: {effective_trades}/100 toward next level"
+        )
         lines.append("")
 
-        lines.append("═══ TOP BRAIN ═══")
+        lines.append("═══ BEST APPROACH THIS WEEK ═══")
         if top_line:
             lines.append(top_line)
         else:
-            lines.append("No strategy has logged enough trades this week to rank.")
+            lines.append("No approach has done enough trades this week to rank yet.")
         lines.append("")
 
-        lines.append("═══ BETA ALLOCATION ═══")
-        lines.append(f"Accumulated this week: {_format_money(beta_week)}")
-        lines.append(f"Total Beta earmarked: {_format_money(beta_total)}")
+        lines.append("═══ LONG-TERM BUCKET ═══")
+        lines.append(f"Added this week: {_format_money(beta_week)}")
+        lines.append(f"Total set aside: {_format_money(beta_total)}")
         lines.append("")
 
-        lines.append("═══ SYSTEM HEALTH ═══")
-        if isinstance(scr_sizing, (int, float)):
-            lines.append(f"SCR: {scr_state} (sizing {scr_sizing:.2f}x)")
-        else:
-            lines.append(f"SCR: {scr_state}")
-        lines.append(f"Regime this week: {regime_label}")
+        lines.append("═══ SYSTEM STATUS ═══")
+        scr_plain = SCR_PLAIN.get(str(scr_state).upper(), str(scr_state))
+        lines.append(scr_plain)
+        regime_plain_weekly = REGIME_PLAIN.get(
+            str(regime_label).split()[0].lower() if regime_label else "unknown",
+            "Mixed picture this week",
+        )
+        # `regime_label` is the trader-facing label; map back via the
+        # underlying live regime if available.
+        try:
+            regime_data_w = _read_json(self._runtime_dir / "regime_state.json") or {}
+            live_regime_w = str(regime_data_w.get("regime", "unknown")).lower()
+            regime_plain_weekly = REGIME_PLAIN.get(
+                live_regime_w, "Mixed picture this week"
+            )
+        except Exception:
+            pass
+        lines.append(f"Markets this week: {regime_plain_weekly}")
         lines.append("")
 
-        # ═══ BUSINESS PHASE ═══
+        # ═══ BUSINESS STATUS ═══
         try:
             biz = _read_json(RUNTIME_DIR / "business_phase.json") or {}
             if biz:
-                lines.append("═══ BUSINESS PHASE ═══")
-                phase = biz.get("phase", "?")
+                lines.append("═══ BUSINESS STATUS ═══")
+                phase = str(biz.get("phase", "?")).upper()
                 days_in_phase = int(biz.get("days_in_phase", 0))
                 next_req = biz.get("next_phase_requirement", "")
                 metrics = biz.get("compound_metrics", {}) or {}
-                total_return = float(metrics.get("total_return_pct", 0.0))
                 hwm = float(metrics.get("high_water_mark_usd", 0.0))
-                lines.append(f"Phase: {phase}")
-                lines.append(f"Days in phase: {days_in_phase}")
+                cur_eq_w = _safe_float(biz.get("current_equity_usd", 0.0))
+                seed_w = _safe_float(biz.get("seed_capital_usd", 50000.0))
+                growth_dollars_w = cur_eq_w - seed_w
+
+                if phase == "GROW":
+                    lines.append(
+                        "Mode: growing — building the account before paying out anything."
+                    )
+                elif phase == "BUILD":
+                    lines.append(
+                        "Mode: building — getting the account up to a healthy size."
+                    )
+                elif phase == "PAY":
+                    lines.append(
+                        "Mode: payout — system has earned its stripes; salary approved."
+                    )
+                else:
+                    lines.append(f"Mode: {phase}")
+                lines.append(f"Days in this mode: {days_in_phase}")
                 if next_req:
-                    lines.append(f"Next milestone: {next_req}")
-                sign = "+" if total_return >= 0 else ""
-                lines.append(f"Total return: {sign}{total_return:.1f}%")
-                lines.append(f"HWM: ${hwm:,.0f}")
+                    lines.append(f"What's next: {next_req}")
+                grow_sign_w = "+" if growth_dollars_w >= 0 else "-"
+                lines.append(
+                    f"Money made since starting: {grow_sign_w}${abs(growth_dollars_w):,.0f}"
+                )
+                lines.append(f"Best account value reached: ${hwm:,.0f}")
                 lines.append("")
         except Exception:
             pass
 
         lines.append("═══ CHAD'S WEEKLY TAKE ═══")
         take_ctx = {
-            "weekly_fills": weekly_fill_count,
+            "weekly_trades": weekly_fill_count,
             "weekly_realized_pnl": weekly_realized_pnl,
             "scr_state": scr_state,
             "regime": regime_label,
@@ -1821,8 +2013,9 @@ class WeeklySummary:
             lines.append(take)
         else:
             lines.append(
-                "Another week logged — the engine is compounding data, not ego. "
-                "The SCR gate is doing its job: gating size to evidence, not opinion."
+                "Another week in the books — we're building a track record one clean "
+                "trade at a time. The system stays small until the numbers prove "
+                "we can size up safely."
             )
         lines.append("")
         lines.append("— CHAD \U0001f91d")

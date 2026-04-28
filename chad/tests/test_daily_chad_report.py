@@ -87,22 +87,22 @@ class TestInstrumentTranslation:
 
 class TestStrategyTranslation:
     def test_alpha(self):
-        assert "Momentum" in translate_strategy("alpha")
+        assert "moving up" in translate_strategy("alpha")
 
     def test_beta(self):
         assert "Long-term" in translate_strategy("beta")
 
     def test_gamma(self):
-        assert "Swing" in translate_strategy("gamma")
+        assert "swing trades" in translate_strategy("gamma").lower()
 
     def test_omega(self):
         assert "Crash protection" in translate_strategy("omega")
 
     def test_delta(self):
-        assert "Execution optimizer" in translate_strategy("delta")
+        assert "Execution helper" in translate_strategy("delta")
 
     def test_alpha_futures(self):
-        assert "Futures momentum" in translate_strategy("alpha_futures")
+        assert "moving up" in translate_strategy("alpha_futures")
 
     def test_crypto(self):
         assert "Crypto" in translate_strategy("crypto")
@@ -353,7 +353,7 @@ class TestDailyCHADReport:
         assert "Quiet day" in msg or "no trades" in msg.lower()
         assert "Practice mode" in msg
         # Fix 1: quiet days show condensed strategy line, not full breakdown
-        assert "strategies are loaded and ready" in msg
+        assert "approaches are loaded and ready" in msg
         # Day reference removed from the strategy line (AI take may still mention it)
         assert "ready for Monday" not in msg
         assert "😴 No trades today" not in msg
@@ -396,8 +396,8 @@ class TestDailyCHADReport:
             {"strategy": "alpha", "symbol": "GLD", "side": "BUY", "pnl": 100.0, "is_live": False},
             {"strategy": "alpha", "symbol": "TLT", "side": "SELL", "pnl": -50.0, "is_live": False},
         ])
-        # 75% win rate > 55% target
-        assert "above our 55% target" in msg
+        # 75% win rate (about 8/10) > 6/10 target
+        assert "above our target" in msg
 
     def test_win_rate_below_target(self, tmp_path):
         trades_dir = tmp_path / "trades"
@@ -408,8 +408,8 @@ class TestDailyCHADReport:
             {"strategy": "alpha", "symbol": "GLD", "side": "BUY", "pnl": -50.0, "is_live": False},
             {"strategy": "alpha", "symbol": "TLT", "side": "SELL", "pnl": -50.0, "is_live": False},
         ])
-        # 25% win rate < 55% target
-        assert "below our 55% target" in msg
+        # 25% win rate (about 3/10) < 6/10 target
+        assert "below our target" in msg
 
     def test_strategy_section_present(self, tmp_path):
         trades_dir = tmp_path / "trades"
@@ -418,7 +418,7 @@ class TestDailyCHADReport:
             {"strategy": "alpha", "symbol": "SPY", "side": "BUY", "pnl": 100.0, "is_live": False},
         ])
         assert "WHAT'S WORKING" in msg
-        assert "Momentum trading" in msg
+        assert "Going with stocks that are moving up" in msg
 
     def test_instrument_in_best_move(self, tmp_path):
         trades_dir = tmp_path / "trades"
@@ -455,8 +455,9 @@ class TestDailyCHADReport:
 
         report = DailyCHADReport(repo_root=tmp_path, trades_dir=trades_dir)
         msg = report.generate()
-        assert "Win rate: 58%" in msg
-        assert "above our 55% target" in msg
+        # 58% rounds to 6 out of 10
+        assert "How often we made money: about 6 out of 10" in msg
+        assert "above our target" in msg
         assert "🎯" in msg
 
     def test_vix_omitted_when_unavailable(self, tmp_path):
@@ -531,11 +532,11 @@ class TestDailyCHADReport:
         # Symbols listed
         assert "MES" in msg and "MNQ" in msg and "MCL" in msg
         # Top strategy translated to plain English
-        assert "Futures momentum" in msg
+        assert "Going with commodities and indexes that are moving up" in msg
         assert "with 3 trades" in msg
         # Disclaimer present
         assert "practice trades" in msg.lower()
-        assert "positions close" in msg
+        assert "each trade closes" in msg
 
     def test_intents_section_replaces_quiet_day_message(self, tmp_path):
         """When fills exist but no closed trades, DID WE MAKE MONEY should not say 'Quiet day'."""
@@ -544,7 +545,7 @@ class TestDailyCHADReport:
              "quantity": 1.0, "fill_price": 6663.5, "is_live": False},
         ])
         assert "$0 in closed profit/loss" in msg
-        assert "open positions don't count" in msg
+        assert "open trades don't count" in msg
         assert "Quiet day — no trades today" not in msg
 
     def test_quiet_day_message_kept_when_no_fills(self, tmp_path):
@@ -610,7 +611,7 @@ class TestMorningBrief:
         msg = brief.generate()
         assert "CHAD Pre-Market Brief" in msg
         assert "WHAT CHAD IS WATCHING" in msg
-        assert "STRATEGY POSTURE" in msg
-        assert "CHAD'S PERFORMANCE" in msg
+        assert "WHAT WE'RE DOING TODAY" in msg
+        assert "HOW WE" in msg and "RE DOING" in msg
         # VIX line is omitted when data is unavailable (no "waiting for data")
         assert "waiting for data" not in msg
