@@ -155,7 +155,7 @@ def compute_authorization(
     # Compute high water mark from history
     if history:
         equities = [float(r.get("total_equity_usd", 0.0)) for r in history]
-        hwm = max(max(equities), current_equity)
+        hwm = max(equities)
     else:
         hwm = current_equity
 
