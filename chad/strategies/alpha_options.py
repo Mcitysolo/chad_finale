@@ -80,7 +80,7 @@ class AlphaOptionsTuning:
 
     # Strike selection
     otm_offset_pct: float = 0.02
-    spread_width_pct: float = 0.05
+    spread_width_pct: float = 0.01
 
     # Risk sizing
     max_risk_per_trade_pct: float = 0.005  # 0.5% of equity per spread

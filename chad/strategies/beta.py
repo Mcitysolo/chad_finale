@@ -327,7 +327,7 @@ def beta_handler(
         target_capped = min(target, p.max_position_weight)
         current = current_weights.get(sym, 0.0)
         gap = target_capped - current
-        if gap <= p.underweight_gap:
+        if gap < p.underweight_gap:
             continue
         if not _STATE.can_emit_symbol(sym, now, p.min_days_between_rebalance):
             continue
