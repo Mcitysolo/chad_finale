@@ -67,6 +67,14 @@ class SCRConfig:
     cautious_min_sharpe: float = 0.10
     cautious_max_drawdown: float = -15000.0
 
+    # Minimum effective-trade sample size per band (above warmup floor)
+    cautious_min_trades: int = 100
+    confident_min_trades: int = 133
+
+    # PAUSED → CAUTIOUS/CONFIDENT hysteresis: number of consecutive
+    # qualifying ticks required before PAUSED can lift.
+    paused_min_consecutive_good_ticks: int = 3
+
     # Sizing factors per band
     warmup_sizing_factor: float = 0.10
     confident_sizing_factor: float = 1.00
@@ -131,6 +139,21 @@ def load_scr_config(path: Path = SCR_CONFIG_PATH) -> SCRConfig:
             cautious_min_sharpe=_safe_float(raw.get("cautious_min_sharpe", base.cautious_min_sharpe), base.cautious_min_sharpe),
             cautious_max_drawdown=_safe_float(raw.get("cautious_max_drawdown", base.cautious_max_drawdown), base.cautious_max_drawdown),
 
+            cautious_min_trades=_safe_int(
+                raw.get("cautious_min_trades", base.cautious_min_trades),
+                base.cautious_min_trades,
+            ),
+            confident_min_trades=_safe_int(
+                raw.get("confident_min_trades", base.confident_min_trades),
+                base.confident_min_trades,
+            ),
+
+            paused_min_consecutive_good_ticks=_safe_int(
+                raw.get("paused_min_consecutive_good_ticks",
+                        base.paused_min_consecutive_good_ticks),
+                base.paused_min_consecutive_good_ticks,
+            ),
+
             warmup_sizing_factor=_safe_float(raw.get("warmup_sizing_factor", base.warmup_sizing_factor), base.warmup_sizing_factor),
             confident_sizing_factor=_safe_float(raw.get("confident_sizing_factor", base.confident_sizing_factor), base.confident_sizing_factor),
             cautious_sizing_factor=_safe_float(raw.get("cautious_sizing_factor", base.cautious_sizing_factor), base.cautious_sizing_factor),
@@ -178,6 +201,15 @@ def evaluate_confidence(stats: Dict[str, Any], config: Optional[SCRConfig] = Non
     max_drawdown = _extract_metric(stats, "max_drawdown", 0.0)
     total_pnl = _extract_metric(stats, "total_pnl", 0.0)
 
+    # Hysteresis: prev_state and consecutive-good-ticks counter flow in
+    # via stats from the caller. When prev_state == "PAUSED" the lift to
+    # CAUTIOUS/CONFIDENT must be sustained for paused_min_consecutive_good_ticks
+    # qualifying evaluations before it is allowed. Counter is mutated in
+    # place on stats so the caller persists it across cycles.
+    prev_state = str(stats.get("prev_state", "") or "").upper()
+    paused_recovery_ticks = _extract_int(stats, "paused_recovery_ticks", 0)
+    lifting_from_paused = (prev_state == "PAUSED")
+
     # ---- WARMUP band (effective sample too small) ---------------------------
     if effective_trades < config.warmup_min_trades:
         if effective_trades == 0:
@@ -196,6 +228,7 @@ def evaluate_confidence(stats: Dict[str, Any], config: Optional[SCRConfig] = Non
         sizing = config.warmup_sizing_factor
         paper_only = not config.warmup_allow_live
 
+        stats["paused_recovery_ticks"] = 0
         return ShadowState(
             state="WARMUP",
             sizing_factor=sizing,
@@ -229,19 +262,49 @@ def evaluate_confidence(stats: Dict[str, Any], config: Optional[SCRConfig] = Non
         )
 
     if len(confident_conditions) == 3:
-        reasons.append(
-            "CONFIDENT: win_rate, sharpe, and drawdown all within confident band."
-        )
-        return ShadowState(
-            state="CONFIDENT",
-            sizing_factor=config.confident_sizing_factor,
-            paper_only=False,
-            reasons=reasons,
-            stats=stats,
-        )
+        if effective_trades >= config.confident_min_trades:
+            new_ticks = paused_recovery_ticks + 1
+            if lifting_from_paused and new_ticks < config.paused_min_consecutive_good_ticks:
+                stats["paused_recovery_ticks"] = new_ticks
+                reasons.append(
+                    f"PAUSED hysteresis: would qualify CONFIDENT, but only "
+                    f"{new_ticks}/{config.paused_min_consecutive_good_ticks} "
+                    f"consecutive good ticks since PAUSED."
+                )
+                return ShadowState(
+                    state="PAUSED",
+                    sizing_factor=config.paused_sizing_factor,
+                    paper_only=True,
+                    reasons=reasons,
+                    stats=stats,
+                )
+            stats["paused_recovery_ticks"] = 0
+            reasons.append(
+                "CONFIDENT: win_rate, sharpe, and drawdown all within "
+                "confident band."
+            )
+            return ShadowState(
+                state="CONFIDENT",
+                sizing_factor=config.confident_sizing_factor,
+                paper_only=False,
+                reasons=reasons,
+                stats=stats,
+            )
+        else:
+            reasons.append(
+                f"CONFIDENT blocked: effective_trades={effective_trades} "
+                f"< confident_min_trades={config.confident_min_trades}"
+            )
 
     # ---- CAUTIOUS band ------------------------------------------------------
     cautious_ok = True
+
+    if effective_trades < config.cautious_min_trades:
+        cautious_ok = False
+        reasons.append(
+            f"CAUTIOUS blocked: effective_trades={effective_trades} "
+            f"< cautious_min_trades={config.cautious_min_trades}"
+        )
 
     if win_rate < config.cautious_min_win_rate:
         cautious_ok = False
@@ -262,6 +325,22 @@ def evaluate_confidence(stats: Dict[str, Any], config: Optional[SCRConfig] = Non
         )
 
     if cautious_ok:
+        new_ticks = paused_recovery_ticks + 1
+        if lifting_from_paused and new_ticks < config.paused_min_consecutive_good_ticks:
+            stats["paused_recovery_ticks"] = new_ticks
+            reasons.append(
+                f"PAUSED hysteresis: would qualify CAUTIOUS, but only "
+                f"{new_ticks}/{config.paused_min_consecutive_good_ticks} "
+                f"consecutive good ticks since PAUSED."
+            )
+            return ShadowState(
+                state="PAUSED",
+                sizing_factor=config.paused_sizing_factor,
+                paper_only=True,
+                reasons=reasons,
+                stats=stats,
+            )
+        stats["paused_recovery_ticks"] = 0
         reasons.append(
             "CAUTIOUS: stats not strong enough for CONFIDENT, but above cautious thresholds."
         )
@@ -283,6 +362,7 @@ def evaluate_confidence(stats: Dict[str, Any], config: Optional[SCRConfig] = Non
         f"max_drawdown={max_drawdown:.2f}, total_pnl={total_pnl:.2f}"
     )
 
+    stats["paused_recovery_ticks"] = 0
     return ShadowState(
         state="PAUSED",
         sizing_factor=config.paused_sizing_factor,
