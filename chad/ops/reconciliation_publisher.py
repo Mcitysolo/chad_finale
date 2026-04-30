@@ -203,6 +203,15 @@ def main() -> int:
             "mismatches": [],
             "notes": ["ibkr_unavailable"],
         })
+        try:
+            from chad.utils.telegram_notify import notify
+            notify(
+                f"🚨 Reconciliation RED — IBKR unavailable: {exc}",
+                severity="critical",
+                dedupe_key="reconciliation_red",
+            )
+        except Exception:
+            pass
         return 0
 
     breakdown = _load_guard_breakdown()
@@ -250,6 +259,16 @@ def main() -> int:
         status = "YELLOW"
     else:
         status = "RED"
+        try:
+            from chad.utils.telegram_notify import notify
+            _red_reason = f"worst_diff={worst:.2f} mismatches={len(mismatches)}"
+            notify(
+                f"🚨 Reconciliation RED — {_red_reason}",
+                severity="critical",
+                dedupe_key="reconciliation_red",
+            )
+        except Exception:
+            pass
 
     _write({
         "status": status,

@@ -917,6 +917,19 @@ def run_once(logger: logging.Logger) -> None:
         intents = []
         kraken_intents = []
 
+    try:
+        from chad.utils.telegram_notify import send_drawdown_alert
+        _portfolio = getattr(_ctx, 'portfolio', None) if '_ctx' in locals() else None
+        _equity = float(getattr(_portfolio, 'equity', 0.0) or 0.0)
+        _extra = getattr(_portfolio, 'extra', {}) or {}
+        _peak = float(_extra.get('equity_peak', _equity) or _equity)
+        if _peak > 0 and _equity < _peak:
+            _dd_pct = (_equity - _peak) / _peak * 100
+            if _dd_pct <= -5.0:
+                send_drawdown_alert(_dd_pct, 5.0)
+    except Exception:
+        pass
+
     # 2026-04-22 Audit-O fix: gate intents through the regime activation
     # matrix. Fail-open on any error — if the matrix is missing/malformed
     # or the regime label unknown, all intents pass through (current
@@ -1330,6 +1343,15 @@ def run_loop() -> None:
             run_once(logger)
         except Exception as exc:
             logger.exception("Loop error: %s", exc)
+            try:
+                from chad.utils.telegram_notify import notify
+                notify(
+                    f"🚨 LIVE LOOP EXCEPTION — cycle crashed\n{type(exc).__name__}: {exc}",
+                    severity="critical",
+                    dedupe_key="live_loop_exception",
+                )
+            except Exception:
+                pass
 
         time.sleep(LOOP_INTERVAL_SECONDS)
 

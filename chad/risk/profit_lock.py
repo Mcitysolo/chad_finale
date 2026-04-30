@@ -680,12 +680,36 @@ class ProfitLockEngine:
 
         Returns the state dictionary for convenience.
         """
+        _previous_mode = ""
+        try:
+            if out_path.is_file():
+                _prev_raw = json.loads(out_path.read_text(encoding="utf-8"))
+                _previous_mode = str(_prev_raw.get("mode") or "")
+        except Exception:
+            _previous_mode = ""
+
         state = await self.build_state(days=days)
         # ensure directory exists
         out_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = out_path.with_name(out_path.name + ".tmp")
         # write to tmp file in thread to avoid blocking event loop
         await asyncio.to_thread(self._atomic_write_json, tmp_path, out_path, state)
+
+        try:
+            new_mode = str(state.get("mode") or "")
+            if new_mode and _previous_mode and new_mode != _previous_mode:
+                from chad.utils.telegram_notify import notify
+                _daily_pnl = float(state.get("daily_loss_today", 0.0) or 0.0)
+                _loss_limit = float(state.get("daily_loss_limit_dollars") or 0.0)
+                _severity = "critical" if new_mode == "HARD_STOP" else "warning"
+                notify(
+                    f"⚠️ PROFIT LOCK — {new_mode}\n"
+                    f"Daily P&L: ${_daily_pnl:.2f} / Limit: ${_loss_limit:.2f}",
+                    severity=_severity,
+                    dedupe_key=f"profit_lock_{new_mode}",
+                )
+        except Exception:
+            pass
 
         # Side-write canonical pnl_state.json from the same computation
         inputs = state.get("inputs", {})

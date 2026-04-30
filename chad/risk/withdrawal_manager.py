@@ -232,6 +232,17 @@ def compute_authorization(
                 f"payout rate = ${authorized:,.0f} authorized (capped at "
                 f"${max_salary:,.0f}/month)."
             )
+            if authorized > 0 and phase == "PAY":
+                try:
+                    from chad.utils.telegram_notify import notify
+                    notify(
+                        f"💰 SALARY AUTHORIZED — ${authorized:.2f}/month\n"
+                        f"Equity: ${current_equity:,.2f} | HWM: ${hwm:,.2f}",
+                        severity="info",
+                        dedupe_key="salary_authorized",
+                    )
+                except Exception:
+                    pass
 
     return WithdrawalAuthorization(
         phase=phase,

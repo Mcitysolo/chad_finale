@@ -290,7 +290,7 @@ def send_trade_alert(
             f"Strategy: {strategy or 'unknown'}\n"
             f"Notional: ${notional:,.0f}"
         )
-        return _send_raw_telegram(msg)
+        return _send_raw_telegram(msg, dedupe_key=f"trade_{symbol}_{strategy}_{side}")
     except Exception as exc:
         _NOTIFY_LOGGER.warning("send_trade_alert_failed symbol=%s err=%s", symbol, exc)
         return False
@@ -336,10 +336,25 @@ def check_and_send_scr_milestone(current_state: str, effective_trades: int) -> b
                     "⏸️ SCR entered PAUSED — performance dropped below "
                     "threshold. Sizing cut to minimum."
                 ),
+                "WARMUP": (
+                    "📉 SCR DEGRADED → WARMUP\n"
+                    "System has dropped below CAUTIOUS thresholds. "
+                    "Sizing reduced to 10%."
+                ),
+                "CAUTIOUS_RECOVERY": None,  # handled below
             }
             msg = milestones.get(state_norm)
             if msg:
                 sent = _send_raw_telegram(msg, dedupe_key=f"scr_milestone_{state_norm}")
+
+            if last_state == "PAUSED" and state_norm in ("CAUTIOUS", "CONFIDENT"):
+                _recovery_msg = (
+                    f"✅ SCR RECOVERED from PAUSED → {state_norm}\n"
+                    f"Sizing restored to "
+                    f"{'25%' if state_norm == 'CAUTIOUS' else '100%'}."
+                )
+                notify(_recovery_msg, severity="info",
+                       dedupe_key=f"scr_recovery_{state_norm}")
 
             try:
                 _SCR_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
