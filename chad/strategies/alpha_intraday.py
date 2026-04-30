@@ -16,6 +16,7 @@ Fail-closed: any exception or missing data returns [].
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -27,6 +28,8 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+
+LOG = logging.getLogger(__name__)
 
 UNIVERSE: List[str] = [
     "SPY", "QQQ", "AAPL", "NVDA", "MSFT", "GOOGL", "BAC",
@@ -333,8 +336,17 @@ def alpha_intraday_handler(ctx: MarketContext, *_args, **_kwargs) -> List[TradeS
                 if sig is not None:
                     signals.append(sig)
                     _LAST_SIGNAL[sym] = now
-            except Exception:
+            except Exception as _exc:
+                LOG.warning("alpha_intraday: symbol=%s exception=%s", sym, _exc)
                 continue
     except Exception:
         return []
+    if not signals:
+        LOG.info(
+            "alpha_intraday: zero signals this cycle — "
+            "conditions not met on all %d universe symbols "
+            "(vol_mult/momentum/BB+RSI gates; regime=%s vix=%.2f)",
+            len(UNIVERSE), getattr(ctx, "regime", "?"),
+            getattr(ctx, "vix", 0.0),
+        )
     return signals

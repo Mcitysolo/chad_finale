@@ -42,6 +42,7 @@ Design
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -58,6 +59,9 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +408,11 @@ def _build_signal_for_symbol(
         side = SignalSide.BUY
 
     if side is None:
+        LOG.debug(
+            "gamma_reversion: sym=%s no 3/3 confluence "
+            "(rsi=%.1f z=%.2f roc=%.4f) — no signal",
+            symbol, rsi_v, zs_v, roc_v,
+        )
         return None
 
     confidence = _compute_confidence(rsi_v, zs_v, side, tuning)
@@ -517,6 +526,15 @@ def build_gamma_reversion_signals(
         if signal is not None:
             signals.append(signal)
 
+    if not signals:
+        LOG.info(
+            "gamma_reversion: zero signals — "
+            "no 3/3 confluence on any of %d universe symbols "
+            "(regime=%s vix=%.2f)",
+            len(universe),
+            getattr(ctx, "regime", "?"),
+            getattr(ctx, "vix", 0.0),
+        )
     return signals
 
 

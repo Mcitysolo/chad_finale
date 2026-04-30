@@ -38,6 +38,7 @@ Design
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import uuid
@@ -61,6 +62,8 @@ from chad.options.strike_selector import SpreadSpec, select_vertical_spread
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+LOG = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "runtime"
@@ -195,7 +198,8 @@ def _load_chain_from_cache(symbol: str) -> Optional[OptionsChain]:
         if not isinstance(chain_data, dict):
             return None
         return OptionsChain.from_dict(chain_data)
-    except Exception:
+    except Exception as _exc:
+        LOG.warning("alpha_options: chain_cache_load_failed exc=%s", _exc)
         return None
 
 
@@ -449,6 +453,11 @@ def build_alpha_options_signals(
         if dir_signal is None:
             dir_signal = _extract_directional_from_bars(ctx, sym, tuning)
         if dir_signal is None:
+            LOG.debug(
+                "alpha_options: sym=%s no directional signal "
+                "(strategy_signals empty or EMA confidence < %.2f)",
+                sym, tuning.min_confidence,
+            )
             continue
 
         # Load chain from file cache
@@ -483,6 +492,13 @@ def build_alpha_options_signals(
         )
         signals.extend(spread_signals)
 
+    if not signals:
+        LOG.info(
+            "alpha_options: zero signals — "
+            "chain_miss or no_directional or spread_sizing_fail "
+            "(regime=%s)",
+            getattr(ctx, "regime", "?"),
+        )
     return signals
 
 
