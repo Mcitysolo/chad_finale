@@ -105,7 +105,7 @@ REAL_STRATEGIES = {
 # is the single source of truth for paper-mode status normalization.
 _PAPER_PENDING_STATUSES = frozenset({
     "pendingsubmit", "presubmitted", "submitted", "apipending",
-    "inactive", "unknown", "",
+    "inactive", "unknown", "", "error",
 })
 
 # Known futures contract roots — used both for asset_class resolution and for

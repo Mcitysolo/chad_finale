@@ -91,7 +91,7 @@ from chad.execution.paper_exec_evidence_writer import (
 # untrusted.
 _PAPER_PENDING_STATUSES = frozenset({
     "pendingsubmit", "presubmitted", "submitted", "apipending",
-    "inactive", "unknown", "",
+    "inactive", "unknown", "", "error",
 })
 from ib_insync import IB, util
 
@@ -1177,6 +1177,15 @@ def run_once(logger: logging.Logger) -> None:
                             fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
                         )
                         normalize_paper_fill_evidence(ev)
+                        if str(getattr(order, 'status', '') or '').strip().lower() == 'error':
+                            logger.warning(
+                                "SUBMIT_FAILED_SKIP_EVIDENCE symbol=%s strategy=%s "
+                                "status=%s — order not placed; skipping fill record",
+                                getattr(order, 'symbol', '?'),
+                                getattr(intent, 'strategy', '?'),
+                                order.status,
+                            )
+                            continue
                         paths = write_paper_exec_evidence(ev)
                         logger.info(
                             "EVIDENCE_WRITTEN symbol=%s status=%s price=%s ac=%s fills=%s",
