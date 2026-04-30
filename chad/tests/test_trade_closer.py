@@ -64,6 +64,7 @@ def _make_closer(tmp_path: pathlib.Path) -> TradeCloser:
         fills_dir=tmp_path / "fills",
         trades_dir=tmp_path / "trades",
         state_path=tmp_path / "state.json",
+        routing_path=tmp_path / "profit_routing.json",
     )
 
 

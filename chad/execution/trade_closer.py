@@ -187,16 +187,21 @@ def _extract_fill(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # TradeCloser
 # ---------------------------------------------------------------------------
 
+EXCLUDED_FROM_ROUTING = {"broker_sync", "manual", "paper_exec", "unknown", ""}
+
+
 class TradeCloser:
     def __init__(
         self,
         fills_dir: pathlib.Path,
         trades_dir: pathlib.Path,
         state_path: pathlib.Path,
+        routing_path: Optional[pathlib.Path] = None,
     ) -> None:
         self.fills_dir = pathlib.Path(fills_dir)
         self.trades_dir = pathlib.Path(trades_dir)
         self.state_path = pathlib.Path(state_path)
+        self._routing_path = pathlib.Path(routing_path) if routing_path is not None else None
         # queues[(strategy, symbol)] = deque of open lots
         # each lot: {fill_id, side, quantity, fill_price, ts_utc}
         self.queues: Dict[Tuple[str, str], Deque[Dict[str, Any]]] = defaultdict(deque)
@@ -429,12 +434,14 @@ class TradeCloser:
             return 0
         try:
             from chad.risk.profit_router import ProfitRouter  # local to avoid import cycles
-            router = ProfitRouter()
+            router = ProfitRouter(routing_path=self._routing_path)
         except Exception:  # noqa: BLE001 — router must never break trade_closer
             return 0
         routed = 0
         for ct in closed:
             try:
+                if str(ct.strategy or "").lower() in EXCLUDED_FROM_ROUTING:
+                    continue  # skip non-strategy bookkeeping labels
                 if ct.pnl > 0:
                     router.route_profit(
                         realized_pnl=float(ct.pnl),
