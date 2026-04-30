@@ -91,7 +91,7 @@ from chad.execution.paper_exec_evidence_writer import (
 # untrusted.
 _PAPER_PENDING_STATUSES = frozenset({
     "pendingsubmit", "presubmitted", "submitted", "apipending",
-    "inactive", "unknown", "", "error",
+    "inactive", "unknown", "",
 })
 from ib_insync import IB, util
 
@@ -550,7 +550,11 @@ def _apply_intelligence_bias(intents: list, logger: logging.Logger) -> list:
         confidence_cache = cache_data.get("confidence", {})
         if not confidence_cache:
             return intents
-    except Exception:
+    except Exception as _bias_exc:
+        logger.warning(
+            "live_loop_intelligence_bias_failed err=%s — proceeding without bias",
+            _bias_exc,
+        )
         return intents
 
     from datetime import datetime, timezone
@@ -693,52 +697,60 @@ def run_once(logger: logging.Logger) -> None:
         "guard_rejections": [],
     }
 
-    if is_always_active_routing():
-        all_result = build_all_live_signals(logger)
-        routed_signals = all_result.all_signals
-        routed_signal_map = _build_router_signal_map(list(routed_signals or []))
-        decision = all_result.decision
-        strategy_detail["available_strategies"] = decision.available_counts
-        strategy_detail["rejected_strategies"] = decision.rejected_strategies
-        strategy_detail["selected_strategy"] = decision.primary_strategy
-        strategy_detail["selected_strategy_reason"] = decision.reason
-        _write_route_decision(strategy_detail)
+    try:
+        if is_always_active_routing():
+            all_result = build_all_live_signals(logger)
+            routed_signals = all_result.all_signals
+            routed_signal_map = _build_router_signal_map(list(routed_signals or []))
+            decision = all_result.decision
+            strategy_detail["available_strategies"] = decision.available_counts
+            strategy_detail["rejected_strategies"] = decision.rejected_strategies
+            strategy_detail["selected_strategy"] = decision.primary_strategy
+            strategy_detail["selected_strategy_reason"] = decision.reason
+            _write_route_decision(strategy_detail)
 
-        if not routed_signals:
-            logger.info(
-                "CYCLE_IDLE suppression=%s strategies_checked=%s",
-                SuppressionReason.NO_SIGNAL.value,
-                strategy_detail["available_strategies"],
-                extra={
-                    "suppression_reason": SuppressionReason.NO_SIGNAL.value,
-                    "routing_mode": "always_active",
-                    "strategies_checked": strategy_detail["available_strategies"],
-                },
-            )
-            return
-    else:
-        result = build_live_signals(logger)
-        routed_signals = result.signals
-        routed_signal_map = _build_router_signal_map(list(routed_signals or []))
-        decision = result.decision
-        strategy_detail["available_strategies"] = decision.available_counts
-        strategy_detail["rejected_strategies"] = decision.rejected_strategies or {}
-        strategy_detail["selected_strategy"] = decision.selected_strategy
-        strategy_detail["selected_strategy_reason"] = decision.reason
-        _write_route_decision(strategy_detail)
+            if not routed_signals:
+                logger.info(
+                    "CYCLE_IDLE suppression=%s strategies_checked=%s",
+                    SuppressionReason.NO_SIGNAL.value,
+                    strategy_detail["available_strategies"],
+                    extra={
+                        "suppression_reason": SuppressionReason.NO_SIGNAL.value,
+                        "routing_mode": "always_active",
+                        "strategies_checked": strategy_detail["available_strategies"],
+                    },
+                )
+                return
+        else:
+            result = build_live_signals(logger)
+            routed_signals = result.signals
+            routed_signal_map = _build_router_signal_map(list(routed_signals or []))
+            decision = result.decision
+            strategy_detail["available_strategies"] = decision.available_counts
+            strategy_detail["rejected_strategies"] = decision.rejected_strategies or {}
+            strategy_detail["selected_strategy"] = decision.selected_strategy
+            strategy_detail["selected_strategy_reason"] = decision.reason
+            _write_route_decision(strategy_detail)
 
-        if not routed_signals:
-            logger.info(
-                "CYCLE_IDLE suppression=%s strategies_checked=%s",
-                SuppressionReason.NO_SIGNAL.value,
-                strategy_detail["available_strategies"],
-                extra={
-                    "suppression_reason": SuppressionReason.NO_SIGNAL.value,
-                    "routing_mode": "single_winner",
-                    "strategies_checked": strategy_detail["available_strategies"],
-                },
-            )
-            return
+            if not routed_signals:
+                logger.info(
+                    "CYCLE_IDLE suppression=%s strategies_checked=%s",
+                    SuppressionReason.NO_SIGNAL.value,
+                    strategy_detail["available_strategies"],
+                    extra={
+                        "suppression_reason": SuppressionReason.NO_SIGNAL.value,
+                        "routing_mode": "single_winner",
+                        "strategies_checked": strategy_detail["available_strategies"],
+                    },
+                )
+                return
+    except Exception as _stage4_exc:
+        logger.error(
+            "live_loop_stage4_failed cycle=%s err=%s — skipping execution",
+            '?',
+            _stage4_exc,
+        )
+        return []
 
     # ------------------------------------------------------------------
     # Position reconciler — close open positions when the net strategy
@@ -804,7 +816,7 @@ def run_once(logger: logging.Logger) -> None:
             trend_slope=_load_optional_metric("trend_slope"),
             market_breadth=_load_optional_metric("market_breadth"),
         )
-        new_state = write_regime_state(regime_result, source="live_loop.run_once")
+        new_state = write_regime_state(regime_result, source="live_loop.run_once", ttl_seconds=120)
         logger.info(
             "REGIME_CLASSIFIED regime=%s confidence=%.2f inputs=%s previous=%s",
             new_state.get("regime"),
@@ -895,7 +907,15 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as _sh_err:  # noqa: BLE001
         logger.warning("strategy_health scorer failed (non-fatal): %s", _sh_err)
 
-    _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
+    try:
+        _ctx, _plan, intents, kraken_intents = _build_plan_and_intents(logger)
+    except Exception as _stage11_exc:
+        logger.error(
+            "live_loop_stage11_failed err=%s — returning zero intents",
+            _stage11_exc,
+        )
+        intents = []
+        kraken_intents = []
 
     # 2026-04-22 Audit-O fix: gate intents through the regime activation
     # matrix. Fail-open on any error — if the matrix is missing/malformed
@@ -971,222 +991,238 @@ def run_once(logger: logging.Logger) -> None:
     emitted = 0
 
     for intent in intents:
-        _attach_strategy_to_intent(intent, routed_signal_map)
-
-        # --- SCR gate (P3-1: hard-block on PAUSED before any state mutation) ---
         try:
-            _scr_path = Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
-            _scr_raw = json.loads(_scr_path.read_text(encoding="utf-8"))
-            _scr_state_val = str(_scr_raw.get("state", "")).upper()
-            _scr_sizing = float(_scr_raw.get("sizing_factor", 0.0) or 0.0)
-            _scr_reasons = list(_scr_raw.get("reasons") or [])[:3]
-            if _scr_state_val == "PAUSED":
-                # P3-3: EXIT bypass — flip intents close existing positions and
-                # must always pass through regardless of SCR state.
-                # A flip signal reverses an open position — it is a closing trade.
-                _is_exit_intent = is_flip_signal(intent)
-                if _is_exit_intent:
-                    logger.info(
-                        "SCR_EXIT_BYPASS state=PAUSED symbol=%s side=%s qty=%s strategy=%s — exit allowed",
-                        getattr(intent, "symbol", None),
-                        getattr(intent, "side", None),
-                        getattr(intent, "quantity", None),
-                        getattr(intent, "strategy", None),
-                    )
-                else:
-                    logger.warning(
-                        "SCR_HARD_BLOCK state=PAUSED sizing_factor=%.3f symbol=%s side=%s qty=%s strategy=%s reasons=%s",
-                        _scr_sizing,
-                        getattr(intent, "symbol", None),
-                        getattr(intent, "side", None),
-                        getattr(intent, "quantity", None),
-                        getattr(intent, "strategy", None),
-                        _scr_reasons,
-                    )
-                    continue
-        except Exception as _scr_err:
-            logger.warning("SCR_GATE_READ_FAILED (fail-open): %s", _scr_err)
-        # --- end SCR gate ---
+            _attach_strategy_to_intent(intent, routed_signal_map)
 
-        # P3-2: CAUTIOUS scaling — apply sizing_factor to quantity when SCR
-        # is CAUTIOUS. Respects minimum quantity per market type.
-        # Futures: minimum 1 contract (no fractional). Equities: minimum 1 share.
-        try:
-            if _scr_state_val == "CAUTIOUS" and _scr_sizing > 0.0:
-                _raw_qty = float(getattr(intent, "quantity", 0.0) or 0.0)
-                _sec_type = str(getattr(intent, "sec_type", "") or "").upper()
-                _scaled_qty: float
-                if _sec_type == "FUT":
-                    # Futures: round to nearest whole contract, minimum 1
-                    _scaled_qty = max(1.0, round(_raw_qty * _scr_sizing))
-                else:
-                    # Equities and other: floor to whole shares, minimum 1
-                    import math as _math
-                    _scaled_qty = max(1.0, float(_math.floor(_raw_qty * _scr_sizing)))
-                if _scaled_qty != _raw_qty:
-                    logger.info(
-                        "SCR_CAUTIOUS_SCALE symbol=%s raw_qty=%.2f sizing_factor=%.3f scaled_qty=%.2f",
-                        getattr(intent, "symbol", None),
-                        _raw_qty,
-                        _scr_sizing,
-                        _scaled_qty,
-                    )
-                    try:
-                        object.__setattr__(intent, "quantity", _scaled_qty)
-                    except (AttributeError, TypeError):
-                        intent.quantity = _scaled_qty
-        except Exception as _p3_err:
-            logger.warning("SCR_CAUTIOUS_SCALE_FAILED (skipped): %s", _p3_err)
-        # --- end P3-2 ---
+            # --- SCR gate (P3-1: hard-block on PAUSED before any state mutation) ---
+            try:
+                _scr_path = Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
+                _scr_raw = json.loads(_scr_path.read_text(encoding="utf-8"))
+                _scr_state_val = str(_scr_raw.get("state", "")).upper()
+                _scr_sizing = float(_scr_raw.get("sizing_factor", 0.0) or 0.0)
+                _scr_reasons = list(_scr_raw.get("reasons") or [])[:3]
+                if _scr_state_val == "PAUSED":
+                    # P3-3: EXIT bypass — flip intents close existing positions and
+                    # must always pass through regardless of SCR state.
+                    # A flip signal reverses an open position — it is a closing trade.
+                    _is_exit_intent = is_flip_signal(intent)
+                    if _is_exit_intent:
+                        logger.info(
+                            "SCR_EXIT_BYPASS state=PAUSED symbol=%s side=%s qty=%s strategy=%s — exit allowed",
+                            getattr(intent, "symbol", None),
+                            getattr(intent, "side", None),
+                            getattr(intent, "quantity", None),
+                            getattr(intent, "strategy", None),
+                        )
+                    else:
+                        logger.warning(
+                            "SCR_HARD_BLOCK state=PAUSED sizing_factor=%.3f symbol=%s side=%s qty=%s strategy=%s reasons=%s",
+                            _scr_sizing,
+                            getattr(intent, "symbol", None),
+                            getattr(intent, "side", None),
+                            getattr(intent, "quantity", None),
+                            getattr(intent, "strategy", None),
+                            _scr_reasons,
+                        )
+                        continue
+            except Exception as _scr_err:
+                logger.warning("SCR_GATE_READ_FAILED (fail-open): %s", _scr_err)
+            # --- end SCR gate ---
 
-        class _IntentSignalAdapter:
-            def __init__(self, obj: object) -> None:
-                self.strategy = getattr(obj, "strategy", None)
-                self.symbol = getattr(obj, "symbol", None)
-                self.side = getattr(obj, "side", None)
-                self.size = float(getattr(obj, "quantity", 0.0) or 0.0)
+            # P3-2: CAUTIOUS scaling — apply sizing_factor to quantity when SCR
+            # is CAUTIOUS. Respects minimum quantity per market type.
+            # Futures: minimum 1 contract (no fractional). Equities: minimum 1 share.
+            try:
+                if _scr_state_val == "CAUTIOUS" and _scr_sizing > 0.0:
+                    _raw_qty = float(getattr(intent, "quantity", 0.0) or 0.0)
+                    _sec_type = str(getattr(intent, "sec_type", "") or "").upper()
+                    _scaled_qty: float
+                    if _sec_type == "FUT":
+                        # Futures: round to nearest whole contract, minimum 1
+                        _scaled_qty = max(1.0, round(_raw_qty * _scr_sizing))
+                    else:
+                        # Equities and other: floor to whole shares, minimum 1
+                        import math as _math
+                        _scaled_qty = max(1.0, float(_math.floor(_raw_qty * _scr_sizing)))
+                    if _scaled_qty != _raw_qty:
+                        logger.info(
+                            "SCR_CAUTIOUS_SCALE symbol=%s raw_qty=%.2f sizing_factor=%.3f scaled_qty=%.2f",
+                            getattr(intent, "symbol", None),
+                            _raw_qty,
+                            _scr_sizing,
+                            _scaled_qty,
+                        )
+                        try:
+                            object.__setattr__(intent, "quantity", _scaled_qty)
+                        except (AttributeError, TypeError):
+                            intent.quantity = _scaled_qty
+            except Exception as _p3_err:
+                logger.warning("SCR_CAUTIOUS_SCALE_FAILED (skipped): %s", _p3_err)
+            # --- end P3-2 ---
 
-        adapted = _IntentSignalAdapter(intent)
+            class _IntentSignalAdapter:
+                def __init__(self, obj: object) -> None:
+                    self.strategy = getattr(obj, "strategy", None)
+                    self.symbol = getattr(obj, "symbol", None)
+                    self.side = getattr(obj, "side", None)
+                    self.size = float(getattr(obj, "quantity", 0.0) or 0.0)
 
-        if is_same_side_open(intent):
-            logger.info(
-                "SKIP suppression=%s → %s %s %s qty=%s",
-                SuppressionReason.SAME_SIDE_POSITION_OPEN.value,
-                getattr(intent, "symbol", None),
-                getattr(intent, "sec_type", None),
-                getattr(intent, "side", None),
-                getattr(intent, "quantity", None),
-                extra={"suppression_reason": SuppressionReason.SAME_SIDE_POSITION_OPEN.value},
-            )
-            continue
+            adapted = _IntentSignalAdapter(intent)
 
-        # Per-symbol performance blocker — suppress new entries on symbols
-        # with 3 consecutive losses. Flip (exit-and-reverse) and explicit
-        # EXIT/CLOSE intents always pass through. Fail-open.
-        _side_str = str(getattr(intent, "side", "") or "").upper()
-        _is_exit_intent = is_flip_signal(intent) or _side_str in {"EXIT", "CLOSE"}
-        if not _is_exit_intent and is_symbol_blocked(getattr(intent, "symbol", "") or ""):
-            logger.info(
-                "SKIP suppression=symbol_performance_blocked → %s %s",
-                getattr(intent, "symbol", None),
-                getattr(intent, "side", None),
-            )
-            continue
-
-        if not is_flip_signal(intent):
-            if not should_emit_signal(adapted):
+            if is_same_side_open(intent):
                 logger.info(
                     "SKIP suppression=%s → %s %s %s qty=%s",
-                    SuppressionReason.COOLDOWN_ACTIVE.value,
+                    SuppressionReason.SAME_SIDE_POSITION_OPEN.value,
                     getattr(intent, "symbol", None),
                     getattr(intent, "sec_type", None),
                     getattr(intent, "side", None),
                     getattr(intent, "quantity", None),
-                    extra={"suppression_reason": SuppressionReason.COOLDOWN_ACTIVE.value},
+                    extra={"suppression_reason": SuppressionReason.SAME_SIDE_POSITION_OPEN.value},
                 )
                 continue
 
-        emitted += 1
-
-        if is_flip_signal(intent):
-            logger.info(
-                "FLIP intent → %s %s %s qty=%s",
-                getattr(intent, "symbol", None),
-                getattr(intent, "sec_type", None),
-                getattr(intent, "side", None),
-                getattr(intent, "quantity", None),
-            )
-            replace_position(intent)
-        else:
-            logger.info(
-                "INTENT → %s %s %s qty=%s",
-                getattr(intent, "symbol", None),
-                getattr(intent, "sec_type", None),
-                getattr(intent, "side", None),
-                getattr(intent, "quantity", None),
-            )
-            mark_position_open(intent)
-
-        # --- Submit to IBKR adapter and record paper evidence ---
-        try:
-            _ensure_thread_event_loop()
-            submitted = _paper_adapter.submit_strategy_trade_intents([intent])
-            for order in submitted:
+            # Per-symbol performance blocker — suppress new entries on symbols
+            # with 3 consecutive losses. Flip (exit-and-reverse) and explicit
+            # EXIT/CLOSE intents always pass through. Fail-open.
+            _side_str = str(getattr(intent, "side", "") or "").upper()
+            _is_exit_intent = is_flip_signal(intent) or _side_str in {"EXIT", "CLOSE"}
+            if not _is_exit_intent and is_symbol_blocked(getattr(intent, "symbol", "") or ""):
                 logger.info(
-                    "SUBMITTED %s %s %s qty=%s status=%s dry_run=%s",
-                    order.symbol, order.side, order.sec_type,
-                    order.quantity, order.status, order.dry_run,
+                    "SKIP suppression=symbol_performance_blocked → %s %s",
+                    getattr(intent, "symbol", None),
+                    getattr(intent, "side", None),
                 )
-                try:
-                    # Thread expected_price (limit_price fallback) so the
-                    # slippage tracker can compute real slippage. Asset_class,
-                    # fill_price, and status normalization are all delegated
-                    # to normalize_paper_fill_evidence — single chokepoint
-                    # that every paper-mode writer (live_loop, position
-                    # reconciler, timer-driven executor) shares so
-                    # PendingSubmit / error / unknown can never leak into
-                    # FILLS_*.ndjson.
-                    _expected_px = float(getattr(intent, "expected_price", 0.0) or 0.0)
-                    if _expected_px <= 0.0:
-                        _lp = getattr(intent, "limit_price", None)
-                        try:
-                            _expected_px = float(_lp) if _lp is not None else 0.0
-                        except (TypeError, ValueError):
-                            _expected_px = 0.0
+                continue
 
-                    ev = PaperExecEvidence(
-                        symbol=order.symbol,
-                        side=order.side,
-                        quantity=order.quantity,
-                        fill_price=0.0,  # resolved by normalizer from price_cache
-                        expected_price=_expected_px,
-                        strategy=getattr(intent, "strategy", "") or "",
-                        source_strategies=[getattr(intent, "strategy", "") or ""],
-                        broker="ibkr_paper",
-                        status=order.status or "",
-                        asset_class=getattr(order, "asset_class", "") or "",
-                        is_live=False,
-                        fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
-                    )
-                    normalize_paper_fill_evidence(ev)
-                    paths = write_paper_exec_evidence(ev)
+            if not is_flip_signal(intent):
+                if not should_emit_signal(adapted):
                     logger.info(
-                        "EVIDENCE_WRITTEN symbol=%s status=%s price=%s ac=%s fills=%s",
-                        ev.symbol, ev.status, ev.fill_price, ev.asset_class,
-                        paths.get("fills_path", ""),
+                        "SKIP suppression=%s → %s %s %s qty=%s",
+                        SuppressionReason.COOLDOWN_ACTIVE.value,
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "sec_type", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "quantity", None),
+                        extra={"suppression_reason": SuppressionReason.COOLDOWN_ACTIVE.value},
                     )
+                    continue
 
-                    # Real-time Telegram trade alert — best effort only,
-                    # must never block execution or evidence persistence.
-                    try:
-                        from chad.utils.telegram_notify import send_trade_alert
-                        _alert_qty = float(order.quantity or 0.0)
-                        _alert_price = float(ev.fill_price or 0.0)
-                        _alert_notional = abs(_alert_qty) * _alert_price
-                        send_trade_alert(
-                            symbol=order.symbol,
-                            side=str(order.side or ""),
-                            quantity=_alert_qty,
-                            price=_alert_price,
-                            strategy=str(getattr(intent, "strategy", "") or ""),
-                            notional=_alert_notional,
-                            is_live=False,
+            emitted += 1
+
+            if is_flip_signal(intent):
+                logger.info(
+                    "FLIP intent → %s %s %s qty=%s",
+                    getattr(intent, "symbol", None),
+                    getattr(intent, "sec_type", None),
+                    getattr(intent, "side", None),
+                    getattr(intent, "quantity", None),
+                )
+                replace_position(intent)
+            else:
+                logger.info(
+                    "INTENT → %s %s %s qty=%s",
+                    getattr(intent, "symbol", None),
+                    getattr(intent, "sec_type", None),
+                    getattr(intent, "side", None),
+                    getattr(intent, "quantity", None),
+                )
+                mark_position_open(intent)
+
+            # --- Submit to IBKR adapter and record paper evidence ---
+            try:
+                _ensure_thread_event_loop()
+                submitted = _paper_adapter.submit_strategy_trade_intents([intent])
+                for order in submitted:
+                    if str(order.status or "").strip().lower() in {"error", "failed", "rejected"}:
+                        logger.warning(
+                            "SUBMIT_FAILED %s %s %s qty=%s status=%s dry_run=%s",
+                            order.symbol, order.side, order.sec_type,
+                            order.quantity, order.status, order.dry_run,
                         )
-                    except Exception:
-                        pass
-                except StrategyAttributionError as attr_err:
-                    logger.warning("Evidence attribution failed (non-fatal): %s", attr_err)
-                except Exception as ev_err:
-                    logger.warning("Evidence write failed (non-fatal): %s", ev_err)
-        except Exception as submit_err:
-            logger.error(
-                "SUBMIT_FAILED %s %s qty=%s: %s",
-                getattr(intent, "symbol", None),
-                getattr(intent, "side", None),
-                getattr(intent, "quantity", None),
-                submit_err,
-            )
+                    else:
+                        logger.info(
+                            "SUBMITTED %s %s %s qty=%s status=%s dry_run=%s",
+                            order.symbol, order.side, order.sec_type,
+                            order.quantity, order.status, order.dry_run,
+                        )
+                    try:
+                        # Thread expected_price (limit_price fallback) so the
+                        # slippage tracker can compute real slippage. Asset_class,
+                        # fill_price, and status normalization are all delegated
+                        # to normalize_paper_fill_evidence — single chokepoint
+                        # that every paper-mode writer (live_loop, position
+                        # reconciler, timer-driven executor) shares so
+                        # PendingSubmit / error / unknown can never leak into
+                        # FILLS_*.ndjson.
+                        _expected_px = float(getattr(intent, "expected_price", 0.0) or 0.0)
+                        if _expected_px <= 0.0:
+                            _lp = getattr(intent, "limit_price", None)
+                            try:
+                                _expected_px = float(_lp) if _lp is not None else 0.0
+                            except (TypeError, ValueError):
+                                _expected_px = 0.0
 
+                        ev = PaperExecEvidence(
+                            symbol=order.symbol,
+                            side=order.side,
+                            quantity=order.quantity,
+                            fill_price=0.0,  # resolved by normalizer from price_cache
+                            expected_price=_expected_px,
+                            strategy=getattr(intent, "strategy", "") or "",
+                            source_strategies=[getattr(intent, "strategy", "") or ""],
+                            broker="ibkr_paper",
+                            status=order.status or "",
+                            asset_class=getattr(order, "asset_class", "") or "",
+                            is_live=False,
+                            fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
+                        )
+                        normalize_paper_fill_evidence(ev)
+                        paths = write_paper_exec_evidence(ev)
+                        logger.info(
+                            "EVIDENCE_WRITTEN symbol=%s status=%s price=%s ac=%s fills=%s",
+                            ev.symbol, ev.status, ev.fill_price, ev.asset_class,
+                            paths.get("fills_path", ""),
+                        )
+
+                        # Real-time Telegram trade alert — best effort only,
+                        # must never block execution or evidence persistence.
+                        try:
+                            from chad.utils.telegram_notify import send_trade_alert
+                            _alert_qty = float(order.quantity or 0.0)
+                            _alert_price = float(ev.fill_price or 0.0)
+                            _alert_notional = abs(_alert_qty) * _alert_price
+                            send_trade_alert(
+                                symbol=order.symbol,
+                                side=str(order.side or ""),
+                                quantity=_alert_qty,
+                                price=_alert_price,
+                                strategy=str(getattr(intent, "strategy", "") or ""),
+                                notional=_alert_notional,
+                                is_live=False,
+                            )
+                        except Exception:
+                            pass
+                    except StrategyAttributionError as attr_err:
+                        logger.warning("Evidence attribution failed (non-fatal): %s", attr_err)
+                    except Exception as ev_err:
+                        logger.warning("Evidence write failed (non-fatal): %s", ev_err)
+            except Exception as submit_err:
+                logger.error(
+                    "SUBMIT_FAILED %s %s qty=%s: %s",
+                    getattr(intent, "symbol", None),
+                    getattr(intent, "side", None),
+                    getattr(intent, "quantity", None),
+                    submit_err,
+                )
+
+        except Exception as _intent_exc:
+            logger.exception(
+                "live_loop_intent_failed symbol=%s strategy=%s err=%s — skipping intent",
+                getattr(intent, 'symbol', '?'),
+                getattr(intent, 'strategy', '?'),
+                _intent_exc,
+            )
+            continue
     if emitted == 0:
         logger.info("All intents skipped by signal/position guard.")
 
