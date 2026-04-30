@@ -33,7 +33,7 @@ IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4002
 IBKR_CLIENT_ID = 83
 IBKR_TIMEOUT_SEC = 15
-TTL_SECONDS = 300
+TTL_SECONDS = 360
 
 # Pre-existing paper account positions not opened by CHAD. Excluded
 # from the mismatch check so they do not flip status to RED.
@@ -55,7 +55,7 @@ KNOWN_NON_CHAD_SYMBOLS = _RECONCILER_NON_CHAD | _BROKER_PREEXISTING
 # futures contract-resolution path is complete. MCL surfaced in retry-3
 # as chad=2 vs broker=0 (ghost position from ContractResolutionError in
 # ibkr_adapter). Do not flip status RED for futures-reconciliation gaps.
-KNOWN_FUTURES_SYMBOLS = frozenset({"MCL", "ES", "NQ", "CL", "GC", "RTY", "MES", "MNQ"})
+KNOWN_FUTURES_SYMBOLS = frozenset({"MCL", "ES", "NQ", "CL", "GC", "RTY", "MES", "MNQ", "MYM", "M2K"})
 
 
 def _utc_now_iso() -> str:
