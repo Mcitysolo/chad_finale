@@ -35,12 +35,38 @@ def main() -> int:
     )
     parser.add_argument("--strategy", required=True, help="Strategy identifier to un-halt.")
     parser.add_argument("--by", default="operator", help="Who is clearing the halt (cleared_by).")
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt (non-interactive mode).",
+    )
     args = parser.parse_args()
 
     before = read_allocations()
-    previous = before.get("allocations", {}).get(args.strategy)
+    allocations = (before or {}).get("allocations", {}) or {}
+    previous = allocations.get(args.strategy)
+    if previous is None:
+        print(
+            f"ERROR: strategy '{args.strategy}' not found in allocations."
+        )
+        return 1
+    if not previous.get("halted"):
+        print(
+            f"INFO: strategy '{args.strategy}' is not currently halted; nothing to clear."
+        )
+        return 0
+
     print("previous_entry:")
-    print(json.dumps(previous or {}, indent=2, sort_keys=True))
+    print(json.dumps(previous, indent=2, sort_keys=True))
+
+    if not args.yes:
+        try:
+            confirm = input(f"Clear halt for '{args.strategy}'? [yes/no]: ")
+        except EOFError:
+            confirm = ""
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return 0
 
     after = clear_strategy_halt(strategy=args.strategy, cleared_by=args.by)
     updated = after.get("allocations", {}).get(args.strategy)

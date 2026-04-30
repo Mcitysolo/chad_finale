@@ -142,6 +142,11 @@ _redis_dynamic_caps: Optional[Dict] = None
 # Redis live_gate — last received timestamp for latency monitoring
 _redis_live_gate_ts: Optional[str] = None
 
+# Edge-decay edge-trigger tracking — strategies that already received
+# a Telegram halt alert this process lifetime. Cleared when a strategy
+# leaves the halted set so re-halts after a clear can re-alert.
+_EDGE_DECAY_ALERTED: set = set()
+
 
 from chad.core.kraken_execution import execute_kraken_intents as _execute_kraken_intents
 from chad.risk.symbol_performance_blocker import is_symbol_blocked
@@ -697,10 +702,84 @@ def run_once(logger: logging.Logger) -> None:
         "guard_rejections": [],
     }
 
+    # Phase-8 Session 5 (F4): edge decay monitor — halt strategies whose
+    # recent trades show a run of consecutive losses. Writes
+    # runtime/strategy_allocations.json atomically. Non-fatal — a broken
+    # monitor must not stop the cycle. Runs BEFORE stage-4 signal
+    # building so the halt set can filter newly-emitted signals
+    # (FINDING-2 fix).
+    _halted_strategies: set = set()
+    try:
+        from chad.risk.edge_decay_monitor import EdgeDecayMonitor, read_allocations as _edm_read
+        decay_results = EdgeDecayMonitor().check_all()
+        halted = [s for s, v in decay_results.items() if v.get("halted")]
+        # Refresh halted set from the persisted file so previously-halted
+        # strategies (written in earlier cycles, no new trade since) are
+        # still enforced this cycle.
+        try:
+            _edm_state = _edm_read()
+            for _k, _v in (_edm_state.get("allocations") or {}).items():
+                if isinstance(_v, dict) and _v.get("halted"):
+                    halted_set_member = str(_k).strip().lower()
+                    if halted_set_member:
+                        _halted_strategies.add(halted_set_member)
+        except Exception:
+            pass
+        for _h in halted:
+            _halted_strategies.add(str(_h).strip().lower())
+        if halted:
+            logger.warning(
+                "EDGE_DECAY_REPORT halted_strategies=%s (total_evaluated=%d)",
+                halted, len(decay_results),
+            )
+            # Edge-trigger-only Telegram alerts (FINDING-4 fix): only
+            # fire on strategies not already alerted this process
+            # lifetime. The notify helper still dedupes by strategy
+            # name as a second line of defence.
+            try:
+                from chad.utils.telegram_notify import send_edge_decay_alert
+                for _strat in halted:
+                    _info = decay_results.get(_strat) or {}
+                    _losses = int(
+                        _info.get("consecutive_neg")
+                        or _info.get("consecutive_losses")
+                        or _info.get("streak")
+                        or 0
+                    )
+                    if _strat not in _EDGE_DECAY_ALERTED:
+                        send_edge_decay_alert(str(_strat), _losses)
+                        _EDGE_DECAY_ALERTED.add(_strat)
+            except Exception:
+                pass
+        # Clear alert-tracking entries for strategies that are no longer
+        # halted (operator cleared via scripts/clear_edge_decay.py),
+        # so subsequent re-halts can re-alert.
+        _currently_halted = set(halted)
+        _EDGE_DECAY_ALERTED -= (set(_EDGE_DECAY_ALERTED) - _currently_halted)
+    except Exception as _decay_err:  # noqa: BLE001
+        logger.warning("edge_decay_monitor failed (non-fatal): %s", _decay_err)
+
+    def _signal_strategy_name(sig) -> str:
+        v = getattr(sig, "strategy", None)
+        v = getattr(v, "value", v)
+        return str(v or "").strip().lower()
+
     try:
         if is_always_active_routing():
             all_result = build_all_live_signals(logger)
             routed_signals = all_result.all_signals
+            if _halted_strategies and routed_signals:
+                _before_count = len(routed_signals)
+                routed_signals = [
+                    s for s in routed_signals
+                    if _signal_strategy_name(s) not in _halted_strategies
+                ]
+                _dropped = _before_count - len(routed_signals)
+                if _dropped:
+                    logger.warning(
+                        "EDGE_DECAY_FILTERED dropped=%d halted=%s",
+                        _dropped, sorted(_halted_strategies),
+                    )
             routed_signal_map = _build_router_signal_map(list(routed_signals or []))
             decision = all_result.decision
             strategy_detail["available_strategies"] = decision.available_counts
@@ -724,6 +803,18 @@ def run_once(logger: logging.Logger) -> None:
         else:
             result = build_live_signals(logger)
             routed_signals = result.signals
+            if _halted_strategies and routed_signals:
+                _before_count = len(routed_signals)
+                routed_signals = [
+                    s for s in routed_signals
+                    if _signal_strategy_name(s) not in _halted_strategies
+                ]
+                _dropped = _before_count - len(routed_signals)
+                if _dropped:
+                    logger.warning(
+                        "EDGE_DECAY_FILTERED dropped=%d halted=%s",
+                        _dropped, sorted(_halted_strategies),
+                    )
             routed_signal_map = _build_router_signal_map(list(routed_signals or []))
             decision = result.decision
             strategy_detail["available_strategies"] = decision.available_counts
@@ -837,31 +928,7 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as _reg_err:  # noqa: BLE001
         logger.warning("regime classifier/reduction failed (non-fatal): %s", _reg_err)
 
-    # Phase-8 Session 5 (F4): edge decay monitor — halt strategies whose
-    # recent trades show a run of consecutive losses. Writes
-    # runtime/strategy_allocations.json atomically. Non-fatal — a broken
-    # monitor must not stop the cycle.
-    try:
-        from chad.risk.edge_decay_monitor import EdgeDecayMonitor
-        decay_results = EdgeDecayMonitor().check_all()
-        halted = [s for s, v in decay_results.items() if v.get("halted")]
-        if halted:
-            logger.warning(
-                "EDGE_DECAY_REPORT halted_strategies=%s (total_evaluated=%d)",
-                halted, len(decay_results),
-            )
-            # Fire one Telegram alert per newly-halted strategy. The notify
-            # helper dedupes on strategy name so repeat cycles are suppressed.
-            try:
-                from chad.utils.telegram_notify import send_edge_decay_alert
-                for _strat in halted:
-                    _info = decay_results.get(_strat) or {}
-                    _losses = int(_info.get("consecutive_losses") or _info.get("streak") or 0)
-                    send_edge_decay_alert(str(_strat), _losses)
-            except Exception:
-                pass
-    except Exception as _decay_err:  # noqa: BLE001
-        logger.warning("edge_decay_monitor failed (non-fatal): %s", _decay_err)
+    # Edge decay check moved before stage-4 signal building (FINDING-2 fix)
 
     # Phase-8 Session 6 (F2): compute retrospective signal decay for any
     # pending entries whose bars are now on disk. Lightweight — only
