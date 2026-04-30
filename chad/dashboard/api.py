@@ -46,6 +46,10 @@ SESSION_COOKIE = "chad_session"
 SESSION_TTL_SECONDS = 24 * 3600
 SESSIONS: dict[str, float] = {}
 
+_LOGIN_FAILURES: dict = {}  # ip -> (fail_count, lockout_until_ts)
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_LOCKOUT_SECONDS = 300  # 5 minutes
+
 STRATEGY_NAMES = {
     "alpha": "Stock Strategy",
     "beta": "Institutional Compounder",
@@ -84,6 +88,28 @@ def _load_json(path: Path) -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+def _get_mtime(path: Path):
+    try:
+        return datetime.fromtimestamp(
+            path.stat().st_mtime, tz=timezone.utc
+        ).isoformat()
+    except Exception:
+        return None
+
+
+def _load_json_with_mtime(path: Path) -> tuple:
+    """Load JSON and return (data_dict, mtime_iso_str).
+    Returns ({}, None) on any error."""
+    try:
+        if not path.is_file():
+            return {}, None
+        mtime = path.stat().st_mtime
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data, datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    except Exception:
+        return {}, None
 
 
 def _fmt_money(x: float | int | None) -> str:
@@ -527,8 +553,19 @@ class StateBuilder:
     def build(self) -> dict[str, Any]:
         scr = _load_json(RUNTIME / "scr_state.json")
         connected = self._ibkr_connected
+        _source_mtimes = [
+            m for m in [
+                _get_mtime(RUNTIME / "scr_state.json"),
+                _get_mtime(RUNTIME / "dynamic_caps.json"),
+                _get_mtime(RUNTIME / "regime_state.json"),
+                _get_mtime(RUNTIME / "price_cache.json"),
+                _get_mtime(RUNTIME / "reconciliation_state.json"),
+            ] if m is not None
+        ]
+        oldest_source_mtime_utc = min(_source_mtimes) if _source_mtimes else None
         return {
             "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "oldest_source_mtime_utc": oldest_source_mtime_utc,
             "ibkr_connected": connected,
             "chad_status": self._chad_status(scr),
             "portfolio": self._portfolio(),
@@ -606,6 +643,14 @@ async def login_get(request: Request) -> HTMLResponse:
 
 @app.post("/login")
 async def login_post(request: Request) -> Response:
+    _now = time.time()
+    _client_ip = request.client.host if request.client else "unknown"
+    _fail_entry = _LOGIN_FAILURES.get(_client_ip, (0, 0.0))
+    if _fail_entry[1] > _now:
+        return JSONResponse(
+            {"error": "Too many failed attempts. Try again later."},
+            status_code=429
+        )
     body = await request.body()
     try:
         form = parse_qs(body.decode("utf-8", "replace"))
@@ -614,7 +659,11 @@ async def login_post(request: Request) -> Response:
     pw_list = form.get("password") or [""]
     pw = pw_list[0] if pw_list else ""
     if not secrets.compare_digest(pw, DASHBOARD_PASSWORD):
+        _count = _LOGIN_FAILURES.get(_client_ip, (0, 0.0))[0] + 1
+        _lockout = _now + _LOGIN_LOCKOUT_SECONDS if _count >= _LOGIN_MAX_ATTEMPTS else 0.0
+        _LOGIN_FAILURES[_client_ip] = (_count, _lockout)
         return _login_page("Incorrect password")
+    _LOGIN_FAILURES.pop(_client_ip, None)
     tok = _new_session_token()
     resp = Response(status_code=302, headers={"Location": "/"})
     resp.set_cookie(
