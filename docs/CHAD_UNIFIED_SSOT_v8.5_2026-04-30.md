@@ -3179,18 +3179,17 @@ What to look for (today's expected values):
 
 ---
 
-**End of CHAD Unified SSOT v8.4.**
+**End of CHAD Unified SSOT v8.5.**
 
-This document is the truth as of 2026-04-28. CHAD is now a
+This document is the truth as of 2026-04-30. CHAD is now a
 self-governing autonomous business with explicit phase progression,
 tier-gated strategies, performance-based cap reallocation,
 regime-aware boosting, and salary authorization. 16 strategies are
 wired with the full risk chain. Reconciliation is GREEN.
 PaperExecEvidence parity is at 100%. The cap chain is documented
-end-to-end for the first time. The Telegram BUSINESS STATUS section
-will hit the operator at the next 13:00 UTC weekday window.
-
-Ready for Monday open.
+end-to-end. All 16 strategies confirmed producing signals or failing
+for documented expected reasons via live invocation audit. Signal
+emission is fully observable — no silent zero-signal returns remain.
 
 If the code disagrees, either the code drifted or this revision
-needs another pass.
+needs another pass. Cut v8.6 before relying on the disagreement.
