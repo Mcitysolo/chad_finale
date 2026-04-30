@@ -172,6 +172,21 @@ def main() -> int:
 
     chad_side = _load_guard_positions()
 
+    # Count open strategy-attribution entries (non-broker_sync) for visibility
+    # alongside chad_open. In paper mode chad_open intentionally filters to
+    # broker_sync; this exposes the strategy layer that is otherwise hidden.
+    try:
+        _raw_guard = (
+            json.loads(GUARD_PATH.read_text(encoding="utf-8"))
+            if GUARD_PATH.exists() else {}
+        )
+        chad_strategy_open = sum(
+            1 for k, v in (_raw_guard or {}).items()
+            if isinstance(v, dict) and v.get("open") and not k.startswith("broker_sync|")
+        )
+    except Exception:
+        chad_strategy_open = 0
+
     try:
         broker_side = _load_broker_positions()
     except Exception as exc:
@@ -180,7 +195,11 @@ def main() -> int:
             "status": "RED",
             "broker_source": f"unavailable:{exc}",
             "chad_state_source": "position_guard.json",
-            "counts": {"chad_open": len(chad_side), "broker_positions": 0},
+            "counts": {
+                "chad_open": len(chad_side),
+                "chad_strategy_open": chad_strategy_open,
+                "broker_positions": 0,
+            },
             "mismatches": [],
             "notes": ["ibkr_unavailable"],
         })
@@ -236,7 +255,11 @@ def main() -> int:
         "status": status,
         "broker_source": f"ibkr:clientId={IBKR_CLIENT_ID}",
         "chad_state_source": "position_guard.json",
-        "counts": {"chad_open": len(chad_side), "broker_positions": len(broker_side)},
+        "counts": {
+            "chad_open": len(chad_side),
+            "chad_strategy_open": chad_strategy_open,
+            "broker_positions": len(broker_side),
+        },
         "worst_diff": worst,
         "mismatches": mismatches,
         "drifts": drifts,

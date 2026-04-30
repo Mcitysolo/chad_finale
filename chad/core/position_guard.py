@@ -47,8 +47,12 @@ def _load_state() -> Dict[str, dict]:
 
 
 def _save_state(state: Dict[str, dict]) -> None:
+    import os as _os
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    _tmp = STATE_PATH.with_suffix('.json.tmp')
+    _tmp.write_text(json.dumps(state, indent=2, default=str),
+                    encoding='utf-8')
+    _os.replace(str(_tmp), str(STATE_PATH))
 
 
 def _intent_strategy(intent) -> str:
