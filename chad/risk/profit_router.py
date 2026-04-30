@@ -149,22 +149,96 @@ class ProfitRouter:
                     continue
         return totals
 
+    def get_beta_remaining(self) -> float:
+        """Net beta budget available: accumulated minus already consumed.
+        Floored at 0.0 — consumed can never exceed allocated.
+        """
+        try:
+            data = self._read_state()
+            allocated = float(
+                data.get("totals", {}).get("beta_allocation", 0.0) or 0.0
+            )
+            consumed = float(data.get("consumed_beta_usd", 0.0) or 0.0)
+            return max(0.0, allocated - consumed)
+        except Exception:
+            return 0.0
+
+    def get_amplifier_remaining(self) -> float:
+        """Net amplifier budget available: accumulated minus consumed.
+        Floored at 0.0.
+        """
+        try:
+            data = self._read_state()
+            allocated = float(
+                data.get("totals", {}).get("amplifier_allocation", 0.0) or 0.0
+            )
+            consumed = float(data.get("consumed_amplifier_usd", 0.0) or 0.0)
+            return max(0.0, allocated - consumed)
+        except Exception:
+            return 0.0
+
+    def mark_beta_consumed(self, amount_usd: float) -> bool:
+        """Record that beta_allocation budget was consumed.
+        Uses read-modify-write with atomic tmp+replace.
+        Returns True on success, False on failure.
+        """
+        try:
+            data = self._read_state()
+            prior = float(data.get("consumed_beta_usd", 0.0) or 0.0)
+            data["consumed_beta_usd"] = round(prior + float(amount_usd), 10)
+            self._write_state(data)
+            return True
+        except Exception:
+            return False
+
+    def mark_amplifier_consumed(self, amount_usd: float) -> bool:
+        """Record that amplifier_allocation budget was consumed.
+        Uses read-modify-write with atomic tmp+replace.
+        Returns True on success, False on failure.
+        """
+        try:
+            data = self._read_state()
+            prior = float(data.get("consumed_amplifier_usd", 0.0) or 0.0)
+            data["consumed_amplifier_usd"] = round(
+                prior + float(amount_usd), 10)
+            self._write_state(data)
+            return True
+        except Exception:
+            return False
+
     # ---- Persistence ----------------------------------------------------
 
     def _read_state(self) -> Dict[str, Any]:
+        empty = {
+            "schema_version": SCHEMA_VERSION,
+            "decisions": [],
+            "consumed_beta_usd": 0.0,
+            "consumed_amplifier_usd": 0.0,
+        }
         if not self.routing_path.is_file():
-            return {"schema_version": SCHEMA_VERSION, "decisions": []}
+            return dict(empty)
         try:
             data = json.loads(self.routing_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             self.log.warning("profit_router: read failed path=%s err=%s", self.routing_path, exc)
-            return {"schema_version": SCHEMA_VERSION, "decisions": []}
+            return dict(empty)
         if not isinstance(data, dict):
-            return {"schema_version": SCHEMA_VERSION, "decisions": []}
+            return dict(empty)
         data.setdefault("decisions", [])
         if not isinstance(data["decisions"], list):
             data["decisions"] = []
+        data.setdefault("consumed_beta_usd", 0.0)
+        data.setdefault("consumed_amplifier_usd", 0.0)
         return data
+
+    def _write_state(self, state: Dict[str, Any]) -> None:
+        """Atomic tmp+replace write. Raises OSError on failure so the
+        caller can log/handle (mirrors the inline pattern used by
+        _append_decision)."""
+        self.routing_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.routing_path.with_suffix(self.routing_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(self.routing_path)
 
     def _append_decision(
         self,
@@ -195,12 +269,13 @@ class ProfitRouter:
             "decisions": decisions,
             "totals": totals,
         })
+        # consumed_* fields are loaded by _read_state and must survive the
+        # update() above untouched. setdefault is a belt-and-braces guard.
+        state.setdefault("consumed_beta_usd", 0.0)
+        state.setdefault("consumed_amplifier_usd", 0.0)
 
         try:
-            self.routing_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.routing_path.with_suffix(self.routing_path.suffix + ".tmp")
-            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-            tmp.replace(self.routing_path)
+            self._write_state(state)
         except OSError as exc:
             self.log.warning(
                 "profit_router: write failed path=%s err=%s",

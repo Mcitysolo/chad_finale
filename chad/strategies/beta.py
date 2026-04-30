@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -277,6 +278,14 @@ def beta_handler(
     p = params or DEFAULT_PARAMS
     now = _get_now(ctx)
 
+    # CHAD_PROFIT_ROUTER_BETA_INJECTION (default OFF): when enabled, beta's
+    # per-signal fill_notional is capped at the net-remaining beta budget
+    # tracked by ProfitRouter (allocated 30% of realized PnL minus already
+    # consumed). When OFF, no new code paths execute below.
+    _BETA_INJECTION_ENABLED = os.environ.get(
+        "CHAD_PROFIT_ROUTER_BETA_INJECTION", ""
+    ).lower() in ("1", "true", "yes")
+
     # Portfolio / equity floor
     portfolio = getattr(ctx, "portfolio", None)
     if portfolio is None:
@@ -347,11 +356,37 @@ def beta_handler(
 
     candidates.sort(key=lambda c: (c["conviction"], c["gap"]), reverse=True)
 
+    # ProfitRouter beta-budget injection (gated by CHAD_PROFIT_ROUTER_BETA_INJECTION).
+    # When enabled: cap each fill_notional at the net-remaining beta budget,
+    # break the loop when the budget is exhausted, and decrement on emission.
+    # The accumulator can only TIGHTEN sizing (upper guard at 2%-of-equity
+    # below); it can never raise sizing above what beta's own gap-fill rule
+    # already permits.
+    _beta_remaining = 0.0
+    _beta_router = None
+    if _BETA_INJECTION_ENABLED:
+        try:
+            from chad.risk.profit_router import ProfitRouter as _PR
+            _beta_router = _PR()
+            _beta_remaining = _beta_router.get_beta_remaining()
+        except Exception:
+            pass
+        # Upper guard: cap remaining at 2% (max_position_weight) of equity so
+        # a runaway accumulator can never bypass beta's intrinsic ceiling.
+        _max_allowed = (
+            getattr(p, "max_position_weight", 0.02) * equity
+        )
+        _beta_remaining = min(_beta_remaining, _max_allowed)
+
     # Size each BUY to fill ~half the gap. Half-gap sizing is deliberate —
     # Beta builds slowly; one signal never closes the full gap in one shot.
     signals: List[TradeSignal] = []
     for c in candidates[: p.max_signals_per_cycle]:
         fill_notional = 0.5 * c["gap"] * equity
+        if _BETA_INJECTION_ENABLED and _beta_remaining > 0:
+            fill_notional = min(fill_notional, _beta_remaining)
+        elif _BETA_INJECTION_ENABLED and _beta_remaining <= 0:
+            break  # budget exhausted — no more beta signals this cycle
         if fill_notional <= 0:
             continue
         size = fill_notional / c["price"]
@@ -379,6 +414,12 @@ def beta_handler(
         )
         signals.append(sig)
         _STATE.mark(c["symbol"], now)
+        if _BETA_INJECTION_ENABLED and _beta_router is not None:
+            try:
+                _beta_router.mark_beta_consumed(fill_notional)
+                _beta_remaining = max(0.0, _beta_remaining - fill_notional)
+            except Exception:
+                pass
         if not _STATE.can_emit_weekly(now, p.max_signals_per_week):
             break
 
