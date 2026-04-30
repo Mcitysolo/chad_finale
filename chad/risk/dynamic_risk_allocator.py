@@ -563,7 +563,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _read_business_runtime(path: Path) -> Dict[str, object] | None:
+def _read_business_runtime(path: Path, stale_seconds: int = 600) -> Dict[str, object] | None:
     """
     Read a business-overlay runtime JSON file. Returns None if the file
     is missing, unreadable, or its ts_utc is older than the stale window.
@@ -587,10 +587,10 @@ def _read_business_runtime(path: Path) -> Dict[str, object] | None:
     except Exception:
         return doc
     age = (datetime.now(timezone.utc) - ts).total_seconds()
-    if age > BUSINESS_OVERLAY_STALE_SECONDS:
+    if age > stale_seconds:
         logger.warning(
             "business_overlay_stale path=%s age_s=%.0f threshold=%d",
-            path, age, BUSINESS_OVERLAY_STALE_SECONDS,
+            path, age, stale_seconds,
         )
         return None
     return doc
@@ -605,7 +605,7 @@ def load_tier_filter() -> set[str] | None:
     Return the set of enabled strategy names per the current tier, or
     None to disable filtering (file missing or stale).
     """
-    doc = _read_business_runtime(_runtime_dir() / "tier_state.json")
+    doc = _read_business_runtime(_runtime_dir() / "tier_state.json", stale_seconds=600)
     if not doc:
         return None
     enabled = doc.get("enabled_strategies")
@@ -616,7 +616,7 @@ def load_tier_filter() -> set[str] | None:
 
 def load_winner_multipliers() -> Dict[str, float]:
     """Per-strategy multipliers from runtime/winner_scaling.json (empty if stale)."""
-    doc = _read_business_runtime(_runtime_dir() / "winner_scaling.json")
+    doc = _read_business_runtime(_runtime_dir() / "winner_scaling.json", stale_seconds=1800)
     if not doc:
         return {}
     raw = doc.get("multipliers")
@@ -635,7 +635,7 @@ def load_winner_multipliers() -> Dict[str, float]:
 
 def load_regime_booster_multiplier() -> float:
     """Global regime boost. Returns 1.0 when missing/stale."""
-    doc = _read_business_runtime(_runtime_dir() / "regime_booster.json")
+    doc = _read_business_runtime(_runtime_dir() / "regime_booster.json", stale_seconds=120)
     if not doc:
         return 1.0
     try:

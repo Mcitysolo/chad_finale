@@ -16,7 +16,27 @@
     "UVXY",
     "VIXY",
     "IWM",
-    "TLT"
+    "TLT",
+    "AMZN",
+    "META",
+    "V",
+    "MA",
+    "UNH",
+    "KO",
+    "AVGO",
+    "LLY",
+    "JNJ",
+    "WMT",
+    "CVX",
+    "NFLX",
+    "AMD",
+    "ORCL",
+    "CRM",
+    "QCOM",
+    "PEP",
+    "ADBE",
+    "MCD",
+    "INTC"
   ],
   "futures": [
     {
@@ -73,6 +93,20 @@
       "exchange": "COMEX",
       "currency": "USD",
       "tradingClass": "SIL",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "MYM",
+      "exchange": "CBOT",
+      "currency": "USD",
+      "tradingClass": "MYM",
+      "sec_type": "FUT"
+    },
+    {
+      "symbol": "M2K",
+      "exchange": "CME",
+      "currency": "USD",
+      "tradingClass": "M2K",
       "sec_type": "FUT"
     }
   ]

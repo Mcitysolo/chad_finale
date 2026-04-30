@@ -154,6 +154,20 @@ def compute_multipliers(
         multipliers[name] = round(scaled, 3)
         n_scaled += 1
 
+    # Ensure all 16 canonical strategies appear explicitly in the output.
+    # Strategies not in the scoring pool (too few trades or excluded) get
+    # an explicit 1.0 rather than being absent — makes the contract between
+    # winner_scaler and dynamic_risk_allocator explicit not implicit.
+    _CANONICAL_STRATEGIES = {
+        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
+        "alpha_futures", "beta", "beta_trend", "gamma", "gamma_futures",
+        "gamma_reversion", "delta", "delta_pairs", "omega", "omega_vol",
+        "omega_macro", "omega_momentum_options",
+    }
+    for _s in _CANONICAL_STRATEGIES:
+        if _s not in multipliers:
+            multipliers[_s] = 1.0
+
     return {
         "schema_version": "winner_scaling.v1",
         "multipliers": multipliers,

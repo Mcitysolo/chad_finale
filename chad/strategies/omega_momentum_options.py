@@ -168,7 +168,7 @@ def _load_chain_cache() -> Optional[Dict]:
         if not CHAINS_CACHE_PATH.exists():
             return None
         data = json.loads(CHAINS_CACHE_PATH.read_text())
-        updated = data.get("updated_ts_utc", "")
+        updated = data.get("ts_utc", "")
         if updated:
             cache_time = datetime.fromisoformat(updated.replace("Z", "+00:00"))
             age = (_now_utc() - cache_time).total_seconds()
@@ -183,48 +183,11 @@ def _contract_from_cache(
     cache: Dict, symbol: str, direction: str, spot: float
 ) -> Optional[Dict]:
     """Try to extract a matching contract from the chain cache."""
-    try:
-        chains = cache.get("chains", {})
-        chain = chains.get(symbol)
-        if not chain:
-            return None
-
-        right = "C" if direction == "BUY_CALL" else "P"
-        contracts = chain.get("contracts", [])
-        if not contracts:
-            return None
-
-        # Find nearest OTM contract
-        otm_pct = 0.02
-        target_strike = spot * (1.0 + otm_pct) if right == "C" else spot * (1.0 - otm_pct)
-
-        best = None
-        best_dist = float("inf")
-        for c in contracts:
-            if c.get("right") != right:
-                continue
-            strike = float(c.get("strike", 0))
-            if strike <= 0:
-                continue
-            dist = abs(strike - target_strike)
-            if dist < best_dist:
-                best_dist = dist
-                best = c
-
-        if best is None:
-            return None
-
-        return {
-            "strike": float(best["strike"]),
-            "expiry": best.get("expiry", ""),
-            "right": right,
-            "estimated_price": float(best.get("last", best.get("mid", 1.0))),
-            "iv": float(best.get("iv", 0.20)),
-            "delta": float(best.get("delta", 0.40 if right == "C" else -0.40)),
-            "synthetic": False,
-        }
-    except Exception:
-        return None
+    # Cache schema does not store per-strike contract objects (only
+    # 'expirations' and 'strikes' arrays). Always returns None — caller
+    # falls through to estimate_contract_price() synthetic pricing.
+    # Simplified in v8.4 (FINDING-3 fix).
+    return None
 
 
 # ---------------------------------------------------------------------------

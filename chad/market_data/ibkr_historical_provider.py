@@ -166,6 +166,8 @@ class IBKRHistoricalProvider:
         "ZB":   ["202606", "202609", "202612", "202703"],
         "M6E":  ["202606", "202609", "202612", "202703"],
         "SIL":  ["202605", "202606", "202607", "202608", "202609", "202610", "202611", "202612"],
+        "MYM":  ["202606", "202609", "202612", "202703", "202706"],
+        "M2K":  ["202606", "202609", "202612", "202703", "202706"],
     }
 
     # Per-symbol contract specs for explicit futures resolution.
@@ -182,6 +184,8 @@ class IBKRHistoricalProvider:
         "ZB":   {"ibkr_symbol": "ZB",  "multiplier": "1000",  "exchange": "CBOT",  "currency": "USD"},
         "M6E":  {"ibkr_symbol": "M6E", "multiplier": "12500", "exchange": "CME",   "currency": "USD"},
         "SIL":  {"ibkr_symbol": "SI",  "multiplier": "1000",  "exchange": "COMEX", "currency": "USD"},
+        "MYM":  {"ibkr_symbol": "MYM", "multiplier": "0.5",   "exchange": "CBOT",  "currency": "USD"},
+        "M2K":  {"ibkr_symbol": "M2K", "multiplier": "5",     "exchange": "CME",   "currency": "USD"},
     }
 
     @staticmethod

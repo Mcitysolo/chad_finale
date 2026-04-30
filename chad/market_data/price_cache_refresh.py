@@ -277,6 +277,25 @@ def _refresh_ibkr(runtime_dir: Path, ttl_seconds: int) -> int:
                 if px > 0:
                     prices[sym] = px
 
+        # --- VIX injection (CBOE Index — not fetchable via IBKR STK/FUT path) ---
+        # Read the latest VIX close from the daily bar file maintained by
+        # chad-ibkr-bar-provider.service. This satisfies omega_momentum_options
+        # and omega_vol which require ctx.prices['VIX'].
+        # NOTE: data/bars/1d/VIX.json wraps bars in {"bars": [...]}; we handle
+        # both that shape and a bare list defensively.
+        try:
+            _vix_bar_path = Path("/home/ubuntu/chad_finale/data/bars/1d/VIX.json")
+            if _vix_bar_path.exists():
+                _vix_doc = json.loads(_vix_bar_path.read_text(encoding="utf-8"))
+                _vix_bars = _vix_doc.get("bars", []) if isinstance(_vix_doc, dict) else _vix_doc
+                if isinstance(_vix_bars, list) and _vix_bars:
+                    _vix_close = float(_vix_bars[-1].get("close", 0.0))
+                    if _vix_close > 0:
+                        prices["VIX"] = _vix_close
+        except Exception:
+            pass  # VIX injection is best-effort; never block the price cache write
+        # --- end VIX injection ---
+
         payload = {
             "prices": dict(sorted(prices.items())),
             "ts_utc": utc_now_iso(),

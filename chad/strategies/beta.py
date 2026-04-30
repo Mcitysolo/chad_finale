@@ -73,8 +73,8 @@ class BetaParams:
     max_consensus_age_days: int = 45
 
     # A position counts as "under-weight" if the actual weight is this much
-    # below target (absolute, e.g. 0.02 == 2% of account).
-    underweight_gap: float = 0.02
+    # below target (absolute, e.g. 0.005 == 0.5% of account).
+    underweight_gap: float = 0.005
 
     # Max signals per handler call. The live loop runs once per minute.
     max_signals_per_cycle: int = 2
@@ -269,7 +269,7 @@ def beta_handler(
 
     Strategy: for every symbol in the consensus weights, compute the gap
     between target weight and current portfolio weight. If the gap exceeds
-    underweight_gap (2% by default), emit a small BUY sized to fill a
+    underweight_gap (0.5% by default — lowered from 2% in v8.4 to allow rebalance on partially-held positions), emit a small BUY sized to fill a
     slice of the gap, subject to per-cycle and weekly caps.
 
     Fail-closed: returns [] on any missing/stale/empty consensus data.
