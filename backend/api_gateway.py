@@ -191,6 +191,7 @@ class ShadowStats(BaseModel):
     total_pnl: float
     max_drawdown: float
     sharpe_like: float
+    paused_recovery_ticks: int = 0
 
 
 class ShadowSnapshot(BaseModel):
@@ -260,6 +261,14 @@ def _build_mode_snapshot() -> ModeSnapshot:
 
 def _build_shadow_snapshot() -> ShadowSnapshot:
     stats_raw = load_and_compute(max_trades=5000, days_back=60, include_paper=True, include_live=True)
+
+    # Hysteresis carry-over: feed prior tick's state and recovery-tick counter into
+    # the router so the PAUSED -> CAUTIOUS/CONFIDENT lift gate actually fires.
+    _scr_prev = _read_runtime_json(SCR_STATE_PATH)
+    _prev_stats = _scr_prev.get("stats") if isinstance(_scr_prev.get("stats"), dict) else {}
+    stats_raw["prev_state"] = str(_scr_prev.get("state", "") or "")
+    stats_raw["paused_recovery_ticks"] = int(_prev_stats.get("paused_recovery_ticks", 0) or 0)
+
     shadow_state: ShadowState = evaluate_confidence(stats_raw)
 
     stats_model = ShadowStats(
@@ -274,6 +283,7 @@ def _build_shadow_snapshot() -> ShadowSnapshot:
         total_pnl=float(stats_raw.get("total_pnl", 0.0)),
         max_drawdown=float(stats_raw.get("max_drawdown", 0.0)),
         sharpe_like=float(stats_raw.get("sharpe_like", 0.0)),
+        paused_recovery_ticks=int(stats_raw.get("paused_recovery_ticks", 0) or 0),
     )
 
     return ShadowSnapshot(
@@ -349,6 +359,7 @@ def _evaluate_live_gate() -> LiveGateSnapshot:
             total_pnl=float(stats_raw.get("total_pnl", 0.0)),
             max_drawdown=float(stats_raw.get("max_drawdown", 0.0)),
             sharpe_like=float(stats_raw.get("sharpe_like", 0.0)),
+            paused_recovery_ticks=int(stats_raw.get("paused_recovery_ticks", 0) or 0),
         ),
     )
 
