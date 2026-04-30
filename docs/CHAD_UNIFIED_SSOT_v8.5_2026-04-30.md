@@ -6,19 +6,18 @@
 **Supersedes:** `docs/CHAD_UNIFIED_SSOT_v8.4_2026-04-28.md` (commit `f62d914`, 2026-04-28)
 
 This document is the master reference for the CHAD trading system as it
-exists at HEAD (`f62d914`, 2026-04-28). It captures every commit since
+exists at HEAD (`9f55688`, 2026-04-30). It captures every commit since
 v8.2, every wired strategy, every runtime invariant, and the live state
-of the machine at the moment of writing. v8.4 closes the gaps surfaced
-by the v8.3 audit harness: the WithdrawalManager HWM bug, the
-`crypto` → `alpha_crypto` weight-key rename, the missing
-`chad-regime-booster.timer`, the unsafe `chad-reconciliation.timer`
-disable (now masked), and the disabled `chad-event-risk.timer`. The
-business framework layer that v8.3 introduced — TierManager,
-WinnerScaling, RegimeBooster, WithdrawalManager, BusinessPhaseTracker,
-plus the PortfolioSnapshot publisher and EquityHistory publisher that
-feed them — is now operationally complete. CHAD is no longer a trading
-bot. It is a self-governing autonomous business that trades, adapts,
-and authorizes its own salary.
+of the machine at the moment of writing. v8.5's signature contribution
+is the **signal emission audit** — a two-part forensic verification
+(Part 1: schema contract audit across all 16 strategies; Part 2: live
+signal invocation against real context) that identified and closed 12 of
+13 findings. Every strategy now produces signals or fails for a documented
+expected reason. No more silent zero-signal returns. The business framework
+layer introduced in v8.3 and hardened in v8.4 is now fully verified
+end-to-end: schema contracts clean, data flows confirmed, VIX in price
+cache, MYM/M2K bars live, beta rebalance firing, omega_momentum_options
+unblocked.
 
 If this document and the code disagree, either the code drifted or
 this revision needs another pass — either way, revise the document
@@ -56,7 +55,7 @@ before relying on the disagreement.
 |---|---|
 | Document version | 8.5 |
 | Date written | 2026-04-30 (UTC) |
-| Predecessor | v8.3 — `docs/CHAD_UNIFIED_SSOT_v8.3_2026-04-27.md` (`e6709d2`) |
+| Predecessor | v8.4 — `docs/CHAD_UNIFIED_SSOT_v8.4_2026-04-28.md` (`f62d914`) |
 | Repository HEAD at write time | `9f55688` — *"Fix: add diagnostic logging to alpha_intraday, alpha_options, gamma_reversion — no silent zero-signal returns"* |
 | Branch | `main` |
 
@@ -66,13 +65,13 @@ before relying on the disagreement.
 - **Repo root:** `/home/ubuntu/chad_finale`.
 - **Python:** `python3` via `/home/ubuntu/chad_finale/venv` (governance
   rule in `CLAUDE.md` — never invoke `python`).
-- **IBKR paper account:** Canadian-domiciled, `$167,082.87 USD` net
+- **IBKR paper account:** Canadian-domiciled, `$183,315.47 USD` net
   liquidation (source: `runtime/portfolio_snapshot.json:ibkr_equity` at
-  `2026-04-27T22:04:50Z` after IBKR FX-quoted CAD→USD conversion).
+  `2026-04-30T02:03:01Z` after IBKR FX-quoted CAD→USD conversion).
 - **Kraken paper:** connected — 0.0012 BTC + 252.8538 CAD ≈ `$184.58 USD`
-  (source: `runtime/kraken_balances.json` at `2026-04-27T22:06:25Z`).
-- **Total equity (USD):** `$167,267.45` =
-  `ibkr_equity ($167,082.87) + kraken_equity ($184.58)`.
+  (source: `runtime/kraken_balances.json` at `2026-04-30T02:03:01Z`).
+- **Total equity (USD):** `$183,500.05` =
+  `ibkr_equity ($183,315.47) + kraken_equity ($184.58)`.
 - **Execution posture:** PAPER — `CHAD_EXECUTION_MODE=paper`. The
   systemd unit ships `dry_run` (`/etc/systemd/system/chad-live-loop.service`)
   but `chad/core/live_loop.py:_is_paper_mode` treats both `paper` and
@@ -82,7 +81,7 @@ before relying on the disagreement.
 
 ### This session's commit chain (7 commits since v8.2)
 
-In topological order (oldest → newest):
+In topological order (newest → oldest):
 
 1. **`9f55688`** — *Fix: add diagnostic logging to alpha_intraday, alpha_options,
    gamma_reversion — no silent zero-signal returns* (2026-04-30). Three strategy
