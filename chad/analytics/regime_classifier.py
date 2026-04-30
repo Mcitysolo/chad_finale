@@ -209,7 +209,33 @@ def read_regime_state(path: Path = REGIME_STATE_PATH) -> Dict[str, Any]:
             "previous_regime": None,
             "notes": "",
         }
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict):
+        _ttl = int(data.get("ttl_seconds", 120) or 120)
+        _ts = data.get("ts_utc", "") or ""
+        if _ts:
+            try:
+                _age = (
+                    datetime.now(timezone.utc)
+                    - datetime.fromisoformat(str(_ts).replace("Z", "+00:00"))
+                ).total_seconds()
+                if _age > _ttl:
+                    return {
+                        "schema_version": SCHEMA_VERSION,
+                        "ts_utc": _ts,
+                        "ttl_seconds": _ttl,
+                        "ok": False,
+                        "regime": "unknown",
+                        "confidence": 0.0,
+                        "source": "stale",
+                        "inputs_used": [],
+                        "previous_regime": data.get("regime"),
+                        "notes": "",
+                        "stale_age_seconds": int(_age),
+                    }
+            except Exception:
+                pass
+        return data
+    return {}
 
 
 def write_regime_state(
