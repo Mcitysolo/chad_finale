@@ -555,6 +555,7 @@ def load_and_compute(
     # Performance metrics used for trust/SCR are based on effective trades only.
     # Exclude PnL=0 trades: these are open positions or unmatched entry fills,
     # not closed trades. Counting them dilutes win_rate (they look like losses).
+    excluded_pnl_zero = sum(1 for t in effective if float(t.pnl) == 0.0)
     pnls = [float(t.pnl) for t in effective if float(t.pnl) != 0.0]
     effective_trades = len(pnls)
 
@@ -578,6 +579,7 @@ def load_and_compute(
         "excluded_manual": int(excluded_manual),
         "excluded_untrusted": int(excluded_untrusted),
         "excluded_nonfinite": int(excluded_nonfinite),
+        "excluded_pnl_zero": int(excluded_pnl_zero),
         "live_trades": int(live_trades),
         "paper_trades": int(paper_trades),
         "win_rate": float(win_rate),
