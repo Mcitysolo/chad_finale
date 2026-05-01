@@ -291,18 +291,42 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
                 except Exception as ev_err:  # noqa: BLE001
                     LOG.warning("reconciler evidence write failed: %s", ev_err)
 
-            try:
-                from chad.core.position_guard import _load_state, _save_state  # type: ignore
-                state = _load_state()
-                pk = close.get("position_key")
-                if pk and pk in state:
-                    state[pk]["open"] = False
-                    state[pk]["last_state"] = "CLOSED"
-                    state[pk]["closed_by"] = "position_reconciler"
-                    state[pk]["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-                    _save_state(state)
-            except Exception as gs_err:  # noqa: BLE001
-                LOG.warning("reconciler guard update failed: %s", gs_err)
+            # ISSUE-29 fix: do NOT mutate the position guard until we
+            # have evidence the broker accepted the close. The earlier
+            # behavior set state[pk]["open"] = False as soon as
+            # submit_strategy_trade_intents returned, even when the
+            # adapter had appended an error/cancelled SubmittedOrder.
+            # That created phantom-closed positions that the next
+            # reconciler cycle could not re-detect.
+            _broker_rejected = False
+            _reject_status = ""
+            for _ord in submitted:
+                _status = str(getattr(_ord, "status", "") or "").lower()
+                if _status in ("error", "cancelled", "inactive", "reject", "rejected"):
+                    _broker_rejected = True
+                    _reject_status = _status
+                    break
+
+            pk = close.get("position_key")
+            if _broker_rejected:
+                LOG.warning(
+                    "ISSUE29_GUARD_SKIP: broker rejected close intent for "
+                    "position_key=%s status=%s — guard NOT mutated to "
+                    "avoid phantom close",
+                    pk, _reject_status,
+                )
+            else:
+                try:
+                    from chad.core.position_guard import _load_state, _save_state  # type: ignore
+                    state = _load_state()
+                    if pk and pk in state:
+                        state[pk]["open"] = False
+                        state[pk]["last_state"] = "CLOSED"
+                        state[pk]["closed_by"] = "position_reconciler"
+                        state[pk]["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+                        _save_state(state)
+                except Exception as gs_err:  # noqa: BLE001
+                    LOG.warning("reconciler guard update failed: %s", gs_err)
 
         except Exception as exc:  # noqa: BLE001
             LOG.error(

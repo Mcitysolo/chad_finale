@@ -110,7 +110,13 @@ ib = IB()
 import ib_insync.ib as _ib_module
 async def _noop_executions(self, *a, **kw): return []
 _ib_module.IB.reqExecutionsAsync = _noop_executions
-ib.connect("127.0.0.1", 4002, clientId=99, timeout=120)
+# ISSUE-29 / test-import safety: tests that import this module must NOT
+# attempt to claim clientId=99 — the running live_loop process holds it
+# and the connect would TimeoutError (Error 326). CHAD_SKIP_IB_CONNECT=1
+# in the pytest environment skips the connect; the live runner leaves it
+# unset and connects normally.
+if os.environ.get("CHAD_SKIP_IB_CONNECT", "").strip().lower() not in ("1", "true", "yes"):
+    ib.connect("127.0.0.1", 4002, clientId=99, timeout=120)
 
 
 def _ensure_thread_event_loop() -> None:

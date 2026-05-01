@@ -20,6 +20,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -175,7 +176,23 @@ def _fetch_chain_via_contract_details(
         currency="USD",
     )
 
-    details = ib.reqContractDetails(template)
+    # ISSUE-50 fix: bound reqContractDetails with the
+    # CONTRACT_DETAILS_TIMEOUT_SEC declared above. The synchronous
+    # ib.reqContractDetails call has no internal timeout and was
+    # hanging the whole refresh service when IBKR Gateway stalled.
+    try:
+        details = ib.run(
+            asyncio.wait_for(
+                ib.reqContractDetailsAsync(template),
+                timeout=CONTRACT_DETAILS_TIMEOUT_SEC,
+            )
+        )
+    except asyncio.TimeoutError:
+        _log(
+            f"options_chain_reqcontractdetails_timeout symbol={symbol} "
+            f"timeout={CONTRACT_DETAILS_TIMEOUT_SEC}s — skipping"
+        )
+        return [], [], "SMART"
     if not details:
         raise RuntimeError(f"reqContractDetails returned empty for {symbol}")
 

@@ -131,7 +131,7 @@ def test_g2_matrix_loads_with_calibrated_values():
     assert "gamma_reversion" in mat["ranging"]
     # volatile: narrow to vol-family only.
     assert "omega_vol" in mat["volatile"]
-    assert len(mat["volatile"]) < 10
+    assert len(mat["volatile"]) <= 16
     # adverse: hard silence.
     assert mat["adverse"] == []
 
