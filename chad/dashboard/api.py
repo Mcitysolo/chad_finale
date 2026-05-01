@@ -20,6 +20,7 @@ import os
 import secrets
 import subprocess
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -715,8 +716,18 @@ async def api_state() -> JSONResponse:
 
 # ------------------------- /api/recent-trades -------------------------
 
+_RECENT_TRADES_MAX_LINES_PER_FILE = 500
+
+
 def _iter_recent_closed_trades(limit: int) -> list[dict]:
-    """Prefer closed-trade history (has pnl); fall back to fills."""
+    """Prefer closed-trade history (has pnl); fall back to fills.
+
+    D7: each history file is read with a per-file line cap
+    (_RECENT_TRADES_MAX_LINES_PER_FILE = 500). Files larger than the cap
+    are tail-read via deque(maxlen=500) — newest 500 lines retained,
+    older lines discarded. Bounds memory at ~100KB per file regardless
+    of history size.
+    """
     trades_dir = DATA / "trades"
     fills_dir = DATA / "fills"
     out: list[dict] = []
@@ -731,18 +742,22 @@ def _iter_recent_closed_trades(limit: int) -> list[dict]:
     for f in files[:5]:
         try:
             with open(f, "r") as fh:
+                _tail: deque = deque(maxlen=_RECENT_TRADES_MAX_LINES_PER_FILE)
                 for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    p = obj.get("payload") or obj
-                    if not isinstance(p, dict):
-                        continue
-                    records.append(p)
+                    _tail.append(line)
+                lines_to_process = list(_tail)
+            for line in lines_to_process:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                p = obj.get("payload") or obj
+                if not isinstance(p, dict):
+                    continue
+                records.append(p)
         except Exception:
             continue
 
@@ -789,20 +804,24 @@ def _iter_recent_closed_trades(limit: int) -> list[dict]:
         for f in files[:3]:
             try:
                 with open(f, "r") as fh:
+                    _tail: deque = deque(maxlen=_RECENT_TRADES_MAX_LINES_PER_FILE)
                     for line in fh:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except Exception:
-                            continue
-                        p = obj.get("payload") or obj
-                        if not isinstance(p, dict):
-                            continue
-                        if p.get("status") != "paper_fill":
-                            continue
-                        recs.append(p)
+                        _tail.append(line)
+                    lines_to_process = list(_tail)
+                for line in lines_to_process:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    p = obj.get("payload") or obj
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("status") != "paper_fill":
+                        continue
+                    recs.append(p)
             except Exception:
                 continue
         recs.sort(key=lambda r: r.get("fill_time_utc") or "", reverse=True)

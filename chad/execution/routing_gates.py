@@ -35,6 +35,7 @@ LOG = logging.getLogger(__name__)
 REASON_OK = "ok"
 REASON_BAR_STALE = "bar_stale"
 REASON_BAR_MISSING = "bar_timestamp_missing"
+REASON_BAR_MISSING_INTRADAY = "bar_timestamp_missing_intraday"
 REASON_INTENT_EXPIRED = "intent_expired"
 REASON_INTENT_CREATED_AT_MISSING = "created_at_missing"
 REASON_PRICE_MOVED = "price_moved_beyond_tolerance"
@@ -127,17 +128,36 @@ def data_freshness_gate(
 ) -> Tuple[bool, str]:
     """A4 — reject if bar feeding the signal is older than max_bar_age_seconds.
 
-    Graceful degradation: if no bar_timestamp is supplied, the gate passes
-    (older intent sources that do not emit bar_timestamp continue to work).
+    D6 split: intraday strategies (signal_family=='intraday', strategy
+    name contains 'intraday', or asset_class=='OPTIONS') require fresh
+    bars (<=900s); other strategies (daily/swing/futures/equity) tolerate
+    up to 172800s (48h). Caller-supplied max_bar_age_seconds is overridden
+    by this split so a single config value cannot accidentally let intraday
+    strategies trade on day-old bars.
+
+    Graceful degradation: missing bar_timestamp passes for non-intraday
+    intents (older sources that do not emit bar_timestamp continue to work)
+    but fails for intraday intents — stale bars are too dangerous there.
     """
+    _is_intraday = (
+        str(getattr(intent, "signal_family", "") or "").lower() == "intraday"
+        or "intraday" in str(getattr(intent, "strategy", "") or "").lower()
+        or str(getattr(intent, "asset_class", "") or "").lower() in ("options",)
+    )
+    _max_age = 900 if _is_intraday else 172800
+
     if bar_timestamp is None:
+        if _is_intraday:
+            return False, REASON_BAR_MISSING_INTRADAY
         return True, REASON_BAR_MISSING
     bar_dt = _parse_iso_utc(bar_timestamp)
     if bar_dt is None:
+        if _is_intraday:
+            return False, REASON_BAR_MISSING_INTRADAY
         return True, REASON_BAR_MISSING
     age = (_utcnow() - bar_dt).total_seconds()
-    if age > float(max_bar_age_seconds):
-        return False, f"{REASON_BAR_STALE}:age={age:.1f}s>max={max_bar_age_seconds}s"
+    if age > float(_max_age):
+        return False, f"{REASON_BAR_STALE}:age={age:.1f}s>max={_max_age}s"
     return True, REASON_OK
 
 
@@ -440,6 +460,7 @@ __all__ = [
     "REASON_OK",
     "REASON_BAR_STALE",
     "REASON_BAR_MISSING",
+    "REASON_BAR_MISSING_INTRADAY",
     "REASON_INTENT_EXPIRED",
     "REASON_INTENT_CREATED_AT_MISSING",
     "REASON_PRICE_MOVED",

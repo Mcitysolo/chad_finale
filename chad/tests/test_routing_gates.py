@@ -73,8 +73,11 @@ def test_fresh_bar_passes():
 
 
 def test_stale_bar_rejects():
+    # D6: A4 threshold is intent-driven (intraday=900s, otherwise=172800s)
+    # and overrides max_bar_age_seconds. Use a bar > 172800s (48h) old so
+    # the non-intraday default fires.
     intent = _intent()
-    stale_bar = datetime.now(timezone.utc) - timedelta(seconds=600)
+    stale_bar = datetime.now(timezone.utc) - timedelta(seconds=200000)
     passed, reason = data_freshness_gate(intent, stale_bar, max_bar_age_seconds=300)
     assert passed is False
     assert "bar_stale" in reason
@@ -195,7 +198,8 @@ def test_zero_edge_with_zero_min_passes():
 
 def test_first_failing_gate_stops_chain():
     """Order: data_freshness (A4) runs first. If it rejects, net_ev is never reached."""
-    stale_bar = datetime.now(timezone.utc) - timedelta(seconds=900)
+    # D6: bar must exceed the intent-driven threshold (172800s for non-intraday).
+    stale_bar = datetime.now(timezone.utc) - timedelta(seconds=200000)
     # Use an intent with a negative EV too — but A4 should short-circuit.
     intent = _intent(expected_pnl=-100.0)
     passed, reason = run_all_gates(
@@ -262,10 +266,13 @@ def test_e5_with_real_price_beyond_tolerance_rejects():
 
 
 def test_a4_with_real_bar_timestamp_stale_rejects():
-    """A4 rejects when the bar predates max_bar_age_seconds."""
-    intent = _intent()
-    # Bar 10 minutes old; tolerance 5 minutes → reject.
-    stale_bar_ts = datetime.now(timezone.utc) - timedelta(minutes=10)
+    """A4 rejects when the bar predates the intent-driven threshold.
+
+    D6: threshold split — intraday gets 900s, otherwise 172800s. Use an
+    intraday strategy with a 10-minute-old bar (> 900s) to force rejection.
+    """
+    intent = _intent(strategy="intraday_momo")
+    stale_bar_ts = datetime.now(timezone.utc) - timedelta(minutes=20)
     passed, reason = data_freshness_gate(
         intent, bar_timestamp=stale_bar_ts, max_bar_age_seconds=300
     )
