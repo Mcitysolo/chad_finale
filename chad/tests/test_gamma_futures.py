@@ -389,7 +389,7 @@ class TestConfigBuilder:
         cfg = config_build_gamma_futures_config()
         assert cfg.name == StrategyName.GAMMA_FUTURES
         assert cfg.enabled is True
-        assert cfg.target_universe == ["MES", "MNQ", "MCL", "MGC"]
+        assert cfg.target_universe == ["MCL", "MYM", "M2K", "ZN", "ZB"]
         assert cfg.max_gross_exposure == 0.20
         assert "reversion" in cfg.notes.lower()
 
@@ -399,9 +399,9 @@ class TestConfigBuilder:
         assert cfg.enabled is False
 
     def test_env_universe_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("CHAD_GAMMA_FUTURES_UNIVERSE", "MES,MNQ")
+        monkeypatch.setenv("CHAD_GAMMA_FUTURES_UNIVERSE", "MCL,MYM")
         cfg = config_build_gamma_futures_config()
-        assert cfg.target_universe == ["MES", "MNQ"]
+        assert cfg.target_universe == ["MCL", "MYM"]
 
     def test_env_exposure_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CHAD_GAMMA_FUTURES_MAX_GROSS_EXPOSURE", "0.15")
