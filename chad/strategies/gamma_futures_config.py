@@ -26,10 +26,11 @@ from chad.types import StrategyConfig, StrategyName
 # ---------------------------------------------------------------------------
 
 DEFAULT_GAMMA_FUTURES_UNIVERSE: Tuple[str, ...] = (
-    "MES",   # Micro E-mini S&P 500
-    "MNQ",   # Micro E-mini Nasdaq-100
     "MCL",   # Micro WTI Crude Oil
-    "MGC",   # Micro Gold
+    "MYM",   # Micro E-mini Dow
+    "M2K",   # Micro E-mini Russell 2000
+    "ZN",    # 10-Year T-Note
+    "ZB",    # 30-Year T-Bond
 )
 
 DEFAULT_ENABLED: bool = True

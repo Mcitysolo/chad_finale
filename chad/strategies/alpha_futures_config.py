@@ -55,7 +55,6 @@ from chad.types import StrategyConfig, StrategyName
 DEFAULT_ALPHA_FUTURES_UNIVERSE: Tuple[str, ...] = (
     "MES",  # Micro E-mini S&P 500
     "MNQ",  # Micro E-mini Nasdaq-100
-    "MCL",  # Micro WTI Crude Oil
     "MGC",  # Micro Gold
 )
 

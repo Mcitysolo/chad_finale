@@ -162,15 +162,24 @@ def _next_phase_requirement(
 
 
 def _days_in_phase(history: List[Dict[str, Any]], current_phase: str) -> int:
+    """Return actual calendar days since phase was entered.
+
+    Reads phase_entered_utc from withdrawal_authorization.json if present;
+    falls back to len(history) for compatibility.
     """
-    Approximate days-in-phase by counting how long the equity has been
-    in the band that defines the current phase. Without a phase-history
-    log we can only approximate. We use:
-      - BUILD: count of records (in chronological order) where equity
-        was below build threshold at the tail.
-      - GROW/PAY: count of records since equity first crossed seed*1.20.
-    Falls back to history length when input is too thin to reason about.
-    """
+    try:
+        if WITHDRAWAL_PATH.is_file():
+            wa = json.loads(WITHDRAWAL_PATH.read_text(encoding="utf-8"))
+            entered = wa.get("phase_entered_utc", "")
+            if entered:
+                dt = datetime.fromisoformat(
+                    str(entered).replace("Z", "+00:00")
+                )
+                delta = datetime.now(timezone.utc) - dt
+                return max(0, delta.days)
+    except Exception:
+        pass
+    # Fallback: row count (prior behavior)
     if not history:
         return 0
     return len(history)

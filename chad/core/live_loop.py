@@ -374,7 +374,7 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
     The IB Gateway is NOT queried in paper mode.
     """
     from datetime import datetime, timezone
-    from chad.core.position_guard import _load_state, _save_state
+    from chad.core.position_guard import _load_state, save_state
 
     queues_by_key: Dict[Tuple[str, str], list] = {}
     if _TRADE_CLOSER_STATE_PATH.is_file():
@@ -454,7 +454,7 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
             entry["closed_by"] = "paper_ledger_rebuild"
             closed_count += 1
 
-    _save_state(guard_state)
+    save_state(guard_state)
     logger.info(
         "PAPER_GUARD_RECONCILE: rebuilt from trade_closer_state, %d positions open, %d newly closed",
         open_count,
@@ -491,7 +491,7 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
        broken entry as "repaired" vs "newly corrected".
     """
     import json
-    from chad.core.position_guard import _load_state, _save_state
+    from chad.core.position_guard import _load_state, save_state
 
     broker_positions = position_sync.fetch_positions()
     guard_state = _load_state()
@@ -537,7 +537,7 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
             corrections_opened += 1
 
     if corrections_closed or corrections_opened:
-        _save_state(guard_state)
+        save_state(guard_state)
         logger.info(
             "BROKER_TRUTH_REBUILD",
             extra={

@@ -317,14 +317,14 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
                 )
             else:
                 try:
-                    from chad.core.position_guard import _load_state, _save_state  # type: ignore
+                    from chad.core.position_guard import _load_state, save_state  # type: ignore
                     state = _load_state()
                     if pk and pk in state:
                         state[pk]["open"] = False
                         state[pk]["last_state"] = "CLOSED"
                         state[pk]["closed_by"] = "position_reconciler"
                         state[pk]["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-                        _save_state(state)
+                        save_state(state)
                 except Exception as gs_err:  # noqa: BLE001
                     LOG.warning("reconciler guard update failed: %s", gs_err)
 

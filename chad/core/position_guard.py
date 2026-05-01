@@ -46,7 +46,12 @@ def _load_state() -> Dict[str, dict]:
         return {}
 
 
-def _save_state(state: Dict[str, dict]) -> None:
+def save_state(state: Dict[str, dict]) -> None:
+    """Public API: atomically persist position-guard state to STATE_PATH.
+
+    Promoted from `_save_state` per ISSUE-75 (encapsulation cleanup).
+    Atomicity is preserved via tmp-file + os.replace.
+    """
     import os as _os
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     _tmp = STATE_PATH.with_suffix('.json.tmp')
@@ -95,7 +100,7 @@ def is_same_side_open(intent) -> bool:
         key = _position_key(_intent_strategy(intent), _intent_symbol(intent))
         if key in state:
             state[key]["last_state"] = PositionState.MAINTAINED.value
-            _save_state(state)
+            save_state(state)
     return match
 
 
@@ -166,7 +171,7 @@ def mark_position_open(intent) -> None:
         "quantity": quantity,
         "last_state": PositionState.OPEN.value,
     }
-    _save_state(state)
+    save_state(state)
 
 
 def mark_position_closed(intent) -> None:
@@ -176,7 +181,7 @@ def mark_position_closed(intent) -> None:
         state[key]["open"] = False
         state[key]["updated_at_utc"] = _utc_now_iso()
         state[key]["last_state"] = PositionState.CLOSED.value
-        _save_state(state)
+        save_state(state)
 
 
 def replace_position(intent) -> None:
@@ -204,7 +209,7 @@ def replace_position(intent) -> None:
         "quantity": quantity,
         "last_state": PositionState.FLIPPED.value,
     }
-    _save_state(state)
+    save_state(state)
 
 
 def reset_from_broker(strategy: str, symbol: str) -> None:
@@ -225,8 +230,8 @@ def reset_from_broker(strategy: str, symbol: str) -> None:
             "quantity": 0.0,
             "last_state": PositionState.RESET_FROM_BROKER_TRUTH.value,
         }
-    _save_state(state)
+    save_state(state)
 
 
 def reset_all_positions() -> None:
-    _save_state({})
+    save_state({})
