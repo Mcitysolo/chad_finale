@@ -101,6 +101,9 @@ class AlphaOptionsTuning:
     # Universe
     options_universe: tuple = ("SPY",)
 
+    # Max hold — force exit after this many seconds (intraday options)
+    max_hold_seconds: int = 3600  # force exit after 1 hour
+
 
 DEFAULT_TUNING = AlphaOptionsTuning()
 
@@ -181,6 +184,18 @@ def _extract_price(ctx: Any, symbol: str) -> float:
 # ---------------------------------------------------------------------------
 # Chain loading from file cache
 # ---------------------------------------------------------------------------
+
+def _read_guard_positions() -> Dict[str, Any]:
+    """Read raw position-guard state. Returns {} on any failure."""
+    try:
+        path = RUNTIME_DIR / "position_guard.json"
+        if not path.is_file():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
 
 def _load_chain_from_cache(symbol: str) -> Optional[OptionsChain]:
     """
@@ -442,8 +457,63 @@ def build_alpha_options_signals(
 
     signals: List[TradeSignal] = []
 
+    # ---- Max-hold exit check ----
+    # Wrapped so a guard read failure never blocks normal signal generation.
+    forced_exit_symbols: set = set()
+    try:
+        _now_dt = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        _guard = _read_guard_positions()
+        for _key, _entry in _guard.items():
+            if not isinstance(_entry, dict):
+                continue
+            if not _entry.get("open"):
+                continue
+            if str(_entry.get("strategy", "")) != "alpha_options":
+                continue
+            _opened_raw = _entry.get("opened_at", "")
+            if not _opened_raw:
+                continue
+            try:
+                _opened_dt = datetime.fromisoformat(
+                    str(_opened_raw).replace("Z", "+00:00")
+                )
+                _age_s = (_now_dt - _opened_dt).total_seconds()
+            except Exception:
+                continue
+            if _age_s <= tuning.max_hold_seconds:
+                continue
+            _symbol = str(_entry.get("symbol", str(_key).split("|")[-1]))
+            _qty = _safe_float(_entry.get("quantity", 1.0), 1.0) or 1.0
+            LOG.warning(
+                "alpha_options_max_hold_exit symbol=%s age=%.0fs "
+                "limit=%ds — emitting SELL",
+                _symbol, _age_s, tuning.max_hold_seconds,
+            )
+            signals.append(TradeSignal(
+                strategy=StrategyName.ALPHA_OPTIONS,
+                symbol=_symbol,
+                side=SignalSide.SELL,
+                size=float(_qty),
+                confidence=1.0,
+                asset_class=AssetClass.OPTIONS,
+                created_at=now,
+                meta={
+                    "engine": "alpha_options.v1",
+                    "reason": "max_hold_exit",
+                    "age_seconds": int(_age_s),
+                    "max_hold_seconds": int(tuning.max_hold_seconds),
+                    "exit": True,
+                },
+            ))
+            forced_exit_symbols.add(_symbol)
+    except Exception as _exc:
+        LOG.debug("alpha_options: max_hold_check_failed exc=%s", _exc)
+
     for symbol in tuning.options_universe:
         sym = symbol.strip().upper()
+        if sym in forced_exit_symbols:
+            # Skip new BUY this cycle — exit signal already emitted.
+            continue
         price = _extract_price(ctx, sym)
         if price <= 0:
             continue
