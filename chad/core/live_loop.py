@@ -147,6 +147,28 @@ _redis_live_gate_ts: Optional[str] = None
 # leaves the halted set so re-halts after a clear can re-alert.
 _EDGE_DECAY_ALERTED: set = set()
 
+# SIGTERM-driven clean shutdown flag — set by _handle_sigterm so the
+# main run_loop() can break between cycles instead of being killed
+# mid-trade by systemd.
+_SHUTDOWN_REQUESTED: bool = False
+
+
+def _handle_sigterm(signum: int, frame) -> None:
+    """Handle SIGTERM from systemd gracefully."""
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    logger = logging.getLogger("chad.live_loop")
+    logger.warning("SIGTERM received — requesting clean shutdown")
+    try:
+        from chad.utils.telegram_notify import notify
+        notify(
+            "⚠️ CHAD LIVE LOOP — SIGTERM received. Clean shutdown requested.",
+            severity="warning",
+            dedupe_key="live_loop_sigterm",
+        )
+    except Exception:
+        pass
+
 
 from chad.core.kraken_execution import execute_kraken_intents as _execute_kraken_intents
 from chad.risk.symbol_performance_blocker import is_symbol_blocked
@@ -1389,6 +1411,10 @@ def run_loop() -> None:
     logger.setLevel(logging.INFO)
     logger.info("Starting CHAD live loop")
 
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, _handle_sigterm)
+    _signal.signal(_signal.SIGINT, _handle_sigterm)
+
     # Subscribe to Redis stop signal for <100ms propagation
     _init_redis_stop_subscriber(logger)
     # Subscribe to Redis dynamic_caps for real-time cap updates
@@ -1397,6 +1423,10 @@ def run_loop() -> None:
     _init_redis_live_gate_subscriber(logger)
 
     while True:
+        if _SHUTDOWN_REQUESTED:
+            logger.warning("live_loop_shutdown: clean exit on SIGTERM")
+            break
+
         # Check Redis stop flag before each cycle
         if _redis_stop_flag:
             logger.warning(
