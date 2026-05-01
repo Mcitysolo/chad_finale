@@ -353,7 +353,8 @@ def _resolve_execution_mode(live_gate: Optional[Dict[str, Any]]) -> str:
             cm = md.get("chad_mode")
             if isinstance(cm, str) and cm.strip():
                 return cm.strip()
-    env_m = os.environ.get("CHAD_EXECUTION_MODE")
+    from chad.execution.execution_config import get_execution_mode
+    env_m = get_execution_mode().value
     return env_m.strip() if env_m and env_m.strip() else "unknown"
 
 

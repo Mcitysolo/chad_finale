@@ -128,10 +128,13 @@ def _ensure_thread_event_loop() -> None:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 position_sync = BrokerPositionSync(ib)
+from chad.execution.execution_config import (
+    ExecutionMode as _ExecMode,
+    get_execution_mode as _get_exec_mode,
+)
 _paper_adapter = IbkrAdapter(
     config=IbkrConfig(
-        dry_run=(os.environ.get("CHAD_EXECUTION_MODE", "dry_run").strip().lower()
-                 not in ("paper",)),
+        dry_run=(_get_exec_mode() != _ExecMode.IBKR_PAPER),
     ),
     ib_factory=lambda: ib,
 )
@@ -343,14 +346,9 @@ def _attach_strategy_to_intent(intent: object, routed_signal_map: Dict[Tuple[str
 
 
 def _is_paper_mode() -> bool:
-    """Detect paper / dry_run posture from env (mirrors live_gate._load_execution_config)."""
-    raw = (
-        os.environ.get("CHAD_EXECUTION_MODE")
-        or os.environ.get("CHAD_EXEC_MODE")
-        or os.environ.get("CHAD_MODE")
-        or "dry_run"
-    ).strip().lower()
-    return raw in ("dry_run", "paper")
+    """Detect paper / dry_run posture via canonical execution_config reader."""
+    from chad.execution.execution_config import is_paper_mode
+    return is_paper_mode()
 
 
 _TRADE_CLOSER_STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/trade_closer_state.json")

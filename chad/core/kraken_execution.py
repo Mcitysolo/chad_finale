@@ -46,8 +46,8 @@ def resolve_kraken_mode() -> str:
     raw = (os.environ.get("CHAD_KRAKEN_MODE") or "").strip().lower()
     if raw in ("live", "paper_kraken"):
         return raw
-    fallback = (os.environ.get("CHAD_EXECUTION_MODE") or "").strip().lower()
-    if fallback == "live":
+    from chad.execution.execution_config import is_live_mode
+    if is_live_mode():
         return "live"
     return "off"
 

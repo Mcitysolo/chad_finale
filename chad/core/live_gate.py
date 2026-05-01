@@ -471,13 +471,16 @@ def _load_shadow_state() -> ShadowState:
 
 
 def _load_execution_config() -> ExecutionConfig:
-    raw_mode = (
-        os.environ.get("CHAD_EXECUTION_MODE")
-        or os.environ.get("CHAD_EXEC_MODE")
-        or os.environ.get("CHAD_MODE")
-        or "dry_run"
-    ).strip().lower()
-    if raw_mode not in ("dry_run", "paper", "live"):
+    from chad.execution.execution_config import (
+        get_execution_mode,
+        ExecutionMode as _ExecMode,
+    )
+    _m = get_execution_mode()
+    if _m == _ExecMode.IBKR_LIVE:
+        raw_mode = "live"
+    elif _m == _ExecMode.IBKR_PAPER:
+        raw_mode = "paper"
+    else:
         raw_mode = "dry_run"
 
     ibkr_enabled = _env_bool("IBKR_ENABLED", True)

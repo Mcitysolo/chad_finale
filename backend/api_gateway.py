@@ -119,10 +119,11 @@ class OperatorIntent:
 
 
 def _get_chad_mode() -> ChadMode:
-    raw = str(os.environ.get("CHAD_EXECUTION_MODE", "dry_run")).strip().lower()
-    if raw == "live":
+    from chad.execution.execution_config import get_execution_mode, ExecutionMode
+    _exec_mode = get_execution_mode()
+    if _exec_mode == ExecutionMode.IBKR_LIVE:
         return ChadMode.LIVE
-    if raw == "paper":
+    if _exec_mode == ExecutionMode.IBKR_PAPER:
         return ChadMode.PAPER
     return ChadMode.DRY_RUN
 

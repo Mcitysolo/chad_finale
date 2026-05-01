@@ -190,12 +190,13 @@ def normalize_exec_mode(raw: str) -> str:
 
 
 def detect_execution_mode() -> str:
-    return normalize_exec_mode(
-        os.environ.get("CHAD_EXECUTION_MODE")
-        or os.environ.get("CHAD_EXEC_MODE")
-        or os.environ.get("CHAD_MODE")
-        or "dry_run"
-    )
+    from chad.execution.execution_config import get_execution_mode, ExecutionMode
+    m = get_execution_mode()
+    if m == ExecutionMode.IBKR_LIVE:
+        return "live"
+    if m == ExecutionMode.IBKR_PAPER:
+        return "paper"
+    return "dry_run"
 
 
 def build_context() -> RuntimeContext:

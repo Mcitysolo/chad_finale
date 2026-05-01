@@ -223,6 +223,7 @@ def _run_single_cycle() -> FullCycleSummary:
 
     now_dt: datetime = ctx.now if isinstance(getattr(ctx, "now", None), datetime) else _utc_now()
 
+    from chad.execution.execution_config import get_execution_mode as _get_exec_mode
     summary = FullCycleSummary(
         now_iso=now_dt.isoformat(),
         tick_symbols=_safe_keys(getattr(ctx, "ticks", {})),
@@ -236,7 +237,7 @@ def _run_single_cycle() -> FullCycleSummary:
         repo_root=str(REPO_ROOT),
         runtime_dir=str(RUNTIME_DIR),
         plan_path=str(LAST_SUMMARY_PATH),
-        execution_mode=str(os.environ.get("CHAD_EXECUTION_MODE", "dry_run")),
+        execution_mode=_get_exec_mode().value,
     )
 
     _persist_plan_artifact(summary=summary, plan=plan, ibkr_intents=ibkr_intents)

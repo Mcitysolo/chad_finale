@@ -30,7 +30,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final
+from typing import Dict, Final
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +42,19 @@ class ExecutionMode(str, Enum):
     DRY_RUN = "dry_run"
     IBKR_PAPER = "ibkr_paper"
     IBKR_LIVE = "ibkr_live"
+
+
+# Vocabulary aliases — CHAD_EXECUTION_MODE env var has historically used the
+# short forms "paper" / "live"; the canonical enum uses "ibkr_paper" /
+# "ibkr_live". Map both forms to the enum so direct os.environ readers can be
+# migrated without changing operator-facing env values.
+_ALIASES: Final[Dict[str, str]] = {
+    "paper": "ibkr_paper",
+    "live": "ibkr_live",
+    "ibkr_paper": "ibkr_paper",
+    "ibkr_live": "ibkr_live",
+    "dry_run": "dry_run",
+}
 
 
 @dataclass(frozen=True)
@@ -56,7 +69,7 @@ def _parse_raw_mode(raw: str | None) -> ExecutionMode:
     if not raw:
         return ExecutionMode.DRY_RUN
 
-    raw_normalised = raw.strip().lower()
+    raw_normalised = _ALIASES.get(raw.strip().lower(), raw.strip().lower())
     try:
         return ExecutionMode(raw_normalised)
     except ValueError:
@@ -67,6 +80,27 @@ def _parse_raw_mode(raw: str | None) -> ExecutionMode:
             ExecutionMode.DRY_RUN.value,
         )
         return ExecutionMode.DRY_RUN
+
+
+def get_execution_mode() -> ExecutionMode:
+    """Single canonical reader for CHAD_EXECUTION_MODE.
+
+    Normalizes paper -> ibkr_paper, live -> ibkr_live. All production code
+    must call this instead of reading os.environ directly so that the
+    paper/live vs ibkr_paper/ibkr_live vocabulary mismatch is contained
+    in one place (ISSUE-78).
+    """
+    return _parse_raw_mode(os.getenv(_ENV_VAR_NAME))
+
+
+def is_paper_mode() -> bool:
+    """True when execution mode is paper or dry_run (i.e. NOT live)."""
+    return get_execution_mode() in (ExecutionMode.DRY_RUN, ExecutionMode.IBKR_PAPER)
+
+
+def is_live_mode() -> bool:
+    """True only when execution mode is ibkr_live."""
+    return get_execution_mode() == ExecutionMode.IBKR_LIVE
 
 
 def _truthy_env(name: str) -> bool:

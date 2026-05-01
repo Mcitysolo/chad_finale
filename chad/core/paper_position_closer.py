@@ -157,7 +157,8 @@ def assert_safe_to_run(cfg: CloserConfig) -> Tuple[bool, List[str]]:
         reasons.append(f"STOP_ENABLED reason={stop.get('reason', '')!r}")
         return False, reasons
 
-    exec_mode = _env_str("CHAD_EXECUTION_MODE", "").lower()
+    from chad.execution.execution_config import get_execution_mode
+    exec_mode = get_execution_mode().value
     if cfg.require_dry_run_mode and exec_mode != "dry_run":
         reasons.append(f"CHAD_EXECUTION_MODE={exec_mode!r} (must be 'dry_run')")
         return False, reasons

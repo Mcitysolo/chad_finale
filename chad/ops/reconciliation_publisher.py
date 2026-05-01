@@ -69,8 +69,8 @@ def _load_guard_positions() -> Dict[str, float]:
     against IBKR — strategy positions are never submitted to the broker
     in paper mode and will always appear as mismatches if included.
     """
-    import os
-    is_paper = os.environ.get("CHAD_EXECUTION_MODE", "dry_run").lower() != "live"
+    from chad.execution.execution_config import is_paper_mode
+    is_paper = is_paper_mode()
 
     if not GUARD_PATH.exists():
         return {}
@@ -109,8 +109,8 @@ def _load_guard_breakdown() -> Dict[str, Dict[str, float]]:
         raw = json.loads(GUARD_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
-    import os
-    is_paper = os.environ.get("CHAD_EXECUTION_MODE", "dry_run").lower() != "live"
+    from chad.execution.execution_config import is_paper_mode
+    is_paper = is_paper_mode()
 
     agg: Dict[str, Dict[str, float]] = {}
     for entry in raw.values():
