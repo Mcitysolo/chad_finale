@@ -1295,24 +1295,24 @@ def run_once(logger: logging.Logger) -> None:
                             paths.get("fills_path", ""),
                         )
 
-                        # Real-time Telegram trade alert — best effort only,
-                        # must never block execution or evidence persistence.
-                        try:
-                            from chad.utils.telegram_notify import send_trade_alert
-                            _alert_qty = float(order.quantity or 0.0)
-                            _alert_price = float(ev.fill_price or 0.0)
-                            _alert_notional = abs(_alert_qty) * _alert_price
-                            send_trade_alert(
-                                symbol=order.symbol,
-                                side=str(order.side or ""),
-                                quantity=_alert_qty,
-                                price=_alert_price,
-                                strategy=str(getattr(intent, "strategy", "") or ""),
-                                notional=_alert_notional,
-                                is_live=False,
-                            )
-                        except Exception:
-                            pass
+#                         # Real-time Telegram trade alert — best effort only,
+#                         # must never block execution or evidence persistence.
+#                         try:
+#                             from chad.utils.telegram_notify import send_trade_alert
+#                             _alert_qty = float(order.quantity or 0.0)
+#                             _alert_price = float(ev.fill_price or 0.0)
+#                             _alert_notional = abs(_alert_qty) * _alert_price
+#                             send_trade_alert(
+#                                 symbol=order.symbol,
+#                                 side=str(order.side or ""),
+#                                 quantity=_alert_qty,
+#                                 price=_alert_price,
+#                                 strategy=str(getattr(intent, "strategy", "") or ""),
+#                                 notional=_alert_notional,
+#                                 is_live=False,
+#                             )
+#                         except Exception:
+#                             pass
                     except StrategyAttributionError as attr_err:
                         logger.warning("Evidence attribution failed (non-fatal): %s", attr_err)
                     except Exception as ev_err:
