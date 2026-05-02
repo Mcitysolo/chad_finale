@@ -83,12 +83,20 @@ class ClosedTrade:
 
     def to_payload(self) -> Dict[str, Any]:
         notional = self.entry_price * self.quantity * self.contract_multiplier
+        gross = float(self.pnl)
+        commission = 0.0  # populated by fill enrichment in future
+        slippage = 0.0    # populated by fill enrichment in future
+        net = gross - commission - slippage
         return {
             "schema_version": self.schema,
             "strategy": self.strategy,
             "symbol": self.symbol,
             "side": self.side,
             "pnl": self.pnl,
+            "gross_pnl": round(gross, 4),
+            "commission": commission,
+            "slippage": slippage,
+            "net_pnl": round(net, 4),
             "entry_time_utc": self.entry_time_utc,
             "exit_time_utc": self.exit_time_utc,
             "fill_price": self.exit_price,

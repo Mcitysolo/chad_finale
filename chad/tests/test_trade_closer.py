@@ -294,6 +294,12 @@ def test_run_once_writes_trade_history(tmp_path):
     rec = json.loads(lines[0])
     assert rec["payload"]["schema_version"] == "closed_trade.v1"
     assert rec["payload"]["pnl"] == pytest.approx(50.0)
+    # Per-trade PnL breakdown — schema must expose the four explicit fields.
+    # Values for commission / slippage start at 0.0 (populated by future
+    # fill enrichment), so we only assert keys are present here.
+    payload = rec["payload"]
+    for k in ("gross_pnl", "commission", "slippage", "net_pnl"):
+        assert k in payload, f"missing payload key: {k}"
     assert "record_hash" in rec
     assert "sequence_id" in rec
 

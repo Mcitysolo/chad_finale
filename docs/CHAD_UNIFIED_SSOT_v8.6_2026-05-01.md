@@ -3488,6 +3488,106 @@ GO, and continued HWM discipline. Mechanical from here.
 If the code disagrees, either the code drifted or this revision
 needs another pass. Cut v8.7 before relying on the disagreement.
 
+---
+
+## v8.7 AMENDMENT — appended 2026-05-01
+
+> This amendment is appended to v8.6 to preserve forensic continuity.
+> The fully-integrated edition lives at
+> `docs/CHAD_UNIFIED_SSOT_v8.7_2026-05-01.md`. The single change since
+> v8.6 is commit `1207eeb` — the **CHAD AI Health Monitor**.
+
+### Commit added since v8.6
+
+**`1207eeb`** — *Build: CHAD AI Health Monitor — 3-tier autonomous
+bug detection, rule engine, Claude reasoning, auto-remediation*
+(2026-05-01).
+
+### Summary
+
+A new three-tier autonomous health surveillance system is layered on
+top of the v8.6 foundations. **All v8.6 invariants remain intact** —
+the audit-session deltas, SCR=CONFIDENT, the feed watchdog, the
+SIGTERM handler, the surgical phantom-fill guard, the drain-aware
+profit router, and the GREEN reconciliation with `chad_strategy_open`
+separated. The amendment is purely additive.
+
+### Three-tier architecture
+
+- **Tier 1 — Rule engine**
+  (`chad/ops/health_monitor_rules.py`). Runs every 5 minutes via
+  `chad-health-monitor.timer`. Evaluates **9 rules**:
+  - **R01 critical services** — hot-path systemd units active.
+  - **R02 feed freshness** — 7 v8.6 feeds inside their TTLs.
+  - **R03 SCR paused** — `runtime/scr_state.json:state=PAUSED`.
+  - **R04 stop bus** — `runtime/stop_bus.json:active=true`.
+  - **R05 reconciliation RED** —
+    `runtime/reconciliation_state.json:status=RED`.
+  - **R06 profit lock** — mode `LOCK2`/`LOCK3`/`HARD_STOP`.
+  - **R07 disk usage** — root partition at threshold.
+  - **R08 corrupt runtime files** — zero-byte / invalid-JSON
+    `runtime/*.json`.
+  - **R09 edge decay halts** — strategies halted by the v8.6 wiring.
+
+- **Tier 2 — Claude reasoning**
+  (`chad/ops/health_monitor.py`). On critical or unfamiliar Tier-1
+  output, the monitor packages a full system snapshot and dispatches
+  it to `claude-sonnet-4-6` for diagnostic narrative + recommended
+  actions; the response is forwarded to Telegram as
+  `AI HEALTH ANALYSIS`.
+
+- **Tier 3 — Auto-remediation**
+  (`chad/ops/health_monitor_remediation.py`). Vetted safe actions:
+  - **Restart dead services** — `sudo systemctl restart chad-*`
+    (passwordless pre-confirmed for that exact form; no broader sudo
+    privilege).
+  - **Restart stale feed publishers** — when R02 fires on a feed
+    whose owning unit is identifiable.
+  - **Restore corrupt runtime files from backup** — when R08 fires
+    and a recent valid snapshot exists.
+  - **Archive old fill files** — when R07 crosses threshold and
+    `data/fills/FILLS_*.ndjson` are eligible for rotation.
+
+  All other detected states are **notify-only** — SCR PAUSED (R03),
+  stop bus active (R04), reconciliation RED (R05), profit lock LOCK2+
+  (R06), edge decay halts (R09). The monitor never auto-resumes a
+  paused SCR, never clears the stop bus, never self-cancels a profit
+  lock.
+
+### Telegram surface
+
+Three new message types:
+- **`AUTO-FIXED`** — Tier 3 success.
+- **`HEALTH MONITOR CRITICAL`** — Tier 1 escalation that lacks a
+  Tier-3 fix path.
+- **`AI HEALTH ANALYSIS`** — Tier 2 Claude-authored narrative.
+
+### Files / units
+
+- `chad/ops/health_monitor.py` — orchestrator, Claude dispatch.
+- `chad/ops/health_monitor_rules.py` — R01..R09 deterministic
+  evaluators.
+- `chad/ops/health_monitor_remediation.py` — Tier-3 action set.
+- `/etc/systemd/system/chad-health-monitor.service`
+- `/etc/systemd/system/chad-health-monitor.timer`
+  - `OnBootSec=120`, `OnUnitActiveSec=300` (every 5 minutes).
+
+### v8.6 → v8.7 delta — at a glance
+
+| Metric | v8.6 | v8.7 |
+|---|---|---|
+| HEAD | `eafb8cc` | `1207eeb` |
+| Commits since predecessor | 17 | **1** |
+| Health Monitor | none | **ACTIVE — 9 rules, Claude reasoning, auto-fix** |
+| Auto-fix scope | n/a | **restart service, restart feed, restore runtime, archive fills** |
+| Notify-only scope | n/a | **SCR PAUSED, stop bus, recon RED, profit lock LOCK2+, edge decay halts** |
+| New Telegram types | n/a | **`AUTO-FIXED`, `HEALTH MONITOR CRITICAL`, `AI HEALTH ANALYSIS`** |
+| Sudo passwordless | not granted | **`systemctl restart chad-*`** |
+| Services loaded | 97 | **99** |
+
+**End of v8.7 amendment.** The integrated v8.7 SSOT is at
+`docs/CHAD_UNIFIED_SSOT_v8.7_2026-05-01.md`.
+
 
 
 
