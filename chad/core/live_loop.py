@@ -922,6 +922,60 @@ def run_once(logger: logging.Logger) -> None:
             pass
 
     # ------------------------------------------------------------------
+    # Net Exposure Conflict Gate — runs after throttle trim, before
+    # intent building. Prevents strategies from fighting each other
+    # while preserving hedges, reductions, and reversals. Failure-soft:
+    # any error allows all signals through.
+    # ------------------------------------------------------------------
+    try:
+        from chad.execution.net_exposure_gate import run_gate as _run_net_exposure_gate
+        _pre_gate_count = len(routed_signals or [])
+        routed_signals, _gate_decisions = _run_net_exposure_gate(list(routed_signals or []))
+        _blocked = sum(
+            1 for d in _gate_decisions
+            if d.action.value == "BLOCK"
+        )
+        if _blocked:
+            logger.warning(
+                "NET_EXPOSURE_GATE blocked=%d remaining=%d",
+                _blocked, len(routed_signals),
+            )
+    except Exception as _gate_err:
+        logger.debug(
+            "net_exposure_gate_failed err=%s — proceeding without gate",
+            _gate_err,
+        )
+
+    # ------------------------------------------------------------------
+    # Smart Strategy Throttle Gate — performance-aware time-window
+    # throttle. Sits between net exposure gate and intent building.
+    # Winning strategies pass unrestricted; losing strategies are
+    # progressively throttled. Exits/protectives never blocked.
+    # Failure-soft.
+    # ------------------------------------------------------------------
+    try:
+        from chad.execution.strategy_throttle_gate import (
+            run_throttle_gate as _run_throttle_gate,
+        )
+        routed_signals, _throttle_decisions = _run_throttle_gate(
+            list(routed_signals or [])
+        )
+        _throttled = sum(
+            1 for d in _throttle_decisions
+            if d.level.value not in ("ALLOW", "HALT_DEFER_TO_EDGE_DECAY")
+        )
+        if _throttled:
+            logger.warning(
+                "STRATEGY_THROTTLE_GATE throttled=%d remaining=%d",
+                _throttled, len(routed_signals),
+            )
+    except Exception as _throttle_err:
+        logger.debug(
+            "strategy_throttle_gate_failed err=%s — proceeding",
+            _throttle_err,
+        )
+
+    # ------------------------------------------------------------------
     # Position reconciler — close open positions when the net strategy
     # signal direction flips. Runs BEFORE intent planning so close
     # intents bypass the pipeline's netting step and cannot be
