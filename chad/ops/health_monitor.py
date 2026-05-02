@@ -169,6 +169,7 @@ Rules:
 4. If everything looks healthy, say "SYSTEM HEALTHY — no anomalies detected".
 5. For each issue: severity → exact fix (command or file change) → safe to auto-apply (yes/no).
 6. Max 8 lines total.
+7. Ignore strategies with fewer than 10 trades — their health scores are statistically meaningless.
 
 Focus on: strategy performance trends, regime stability, SCR trajectory,
 equity curve shape, fill rate patterns, anything that looks unusual."""

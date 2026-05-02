@@ -378,7 +378,11 @@ def rule_alpha_cluster_degradation(findings: List[Finding]) -> None:
         if "alpha" not in name.lower():
             continue
         score = info.get("health_score")
-        if score is None:
+        sample = int(
+            info.get("sample_count",
+            info.get("trade_count", 0)) or 0
+        )
+        if score is None or sample < 10:
             continue
         try:
             if float(score) < 0.5:
