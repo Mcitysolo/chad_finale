@@ -1060,6 +1060,71 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as _reg_err:  # noqa: BLE001
         logger.warning("regime classifier/reduction failed (non-fatal): %s", _reg_err)
 
+    # ------------------------------------------------------------------
+    # Choppy regime defensive gate. Reads the overlay state written by
+    # the choppy_regime systemd timer; falls back to inactive on any
+    # error. When active: low-confidence entries are blocked, exits and
+    # protectives always pass. Sizing reduction is recorded in the
+    # overlay for downstream sizing logic to consume.
+    # ------------------------------------------------------------------
+    _choppy_active = False
+    _choppy_sizing_mult = 1.0
+    _choppy_confidence_add = 0.0
+    try:
+        from chad.analytics.choppy_regime_detector import get_choppy_state
+        _choppy_state = get_choppy_state()
+        _choppy_active = bool(_choppy_state.get("choppy_active", False))
+        if _choppy_active:
+            _choppy_sizing_mult = 0.25
+            _choppy_confidence_add = 0.15
+            logger.warning(
+                "CHOPPY_REGIME_ACTIVE score=%.3f sizing_mult=%.2f confidence_add=%.2f",
+                float(_choppy_state.get("choppy_score", 0) or 0),
+                _choppy_sizing_mult,
+                _choppy_confidence_add,
+            )
+    except Exception:
+        pass
+
+    if _choppy_active and routed_signals:
+        try:
+            _pre_choppy = len(routed_signals)
+            _choppy_allowed = []
+            for _sig in routed_signals:
+                _sig_meta = getattr(_sig, "meta", {}) or {}
+                _is_exit = (
+                    isinstance(_sig_meta, dict)
+                    and (
+                        _sig_meta.get("exit")
+                        or _sig_meta.get("reason") == "max_hold_exit"
+                        or _sig_meta.get("intent") in ("exit", "close", "reduce", "hedge")
+                    )
+                )
+                if _is_exit:
+                    _choppy_allowed.append(_sig)
+                    continue
+                _sig_conf = float(getattr(_sig, "confidence", 0.5) or 0.5)
+                if _sig_conf < (0.5 + _choppy_confidence_add):
+                    logger.info(
+                        "CHOPPY_GATE_BLOCK symbol=%s strategy=%s conf=%.2f required=%.2f",
+                        getattr(_sig, "symbol", "?"),
+                        getattr(_sig, "primary_strategy", None)
+                        or getattr(_sig, "strategy", "?"),
+                        _sig_conf,
+                        0.5 + _choppy_confidence_add,
+                    )
+                    continue
+                _choppy_allowed.append(_sig)
+            routed_signals = _choppy_allowed
+            if len(routed_signals) < _pre_choppy:
+                logger.warning(
+                    "CHOPPY_GATE filtered=%d remaining=%d",
+                    _pre_choppy - len(routed_signals),
+                    len(routed_signals),
+                )
+        except Exception as _cg_err:  # noqa: BLE001
+            logger.debug("choppy_gate_failed err=%s — proceeding without gate", _cg_err)
+
     # Edge decay check moved before stage-4 signal building (FINDING-2 fix)
 
     # Phase-8 Session 6 (F2): compute retrospective signal decay for any

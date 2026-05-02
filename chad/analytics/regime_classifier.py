@@ -265,8 +265,51 @@ def write_regime_state(
         "previous_regime": previous_regime,
         "notes": "",
     }
+
+    # Choppy overlay — additive, never changes the base regime label.
+    # Failure-soft: a missing/broken choppy state must not block regime writes.
+    try:
+        overlay = get_choppy_overlay()
+        if isinstance(overlay, dict):
+            payload["choppy_overlay"] = {
+                "active": bool(overlay.get("active", False)),
+                "score": float(overlay.get("score", 0.0) or 0.0),
+                "sizing_multiplier": float(
+                    overlay.get("sizing_multiplier", 1.0) or 1.0
+                ),
+                "confidence_floor_add": float(
+                    overlay.get("confidence_floor_add", 0.0) or 0.0
+                ),
+                "block_trend_following": bool(
+                    overlay.get("block_trend_following", False)
+                ),
+            }
+    except Exception as _ov_err:  # noqa: BLE001
+        LOG.debug("choppy_overlay_attach_failed err=%s", _ov_err)
+
     _write_atomic(path, payload)
     return payload
+
+
+def get_choppy_overlay() -> Dict[str, Any]:
+    """
+    Thin re-export of the choppy detector's overlay so callers (live_loop,
+    regime_classifier) have a single entrypoint here. Fail-open: returns
+    an inactive overlay if the detector module is unavailable.
+    """
+    try:
+        from chad.analytics.choppy_regime_detector import (
+            get_choppy_overlay as _detector_overlay,
+        )
+        return _detector_overlay()
+    except Exception:
+        return {
+            "active": False,
+            "score": 0.0,
+            "sizing_multiplier": 1.0,
+            "confidence_floor_add": 0.0,
+            "block_trend_following": False,
+        }
 
 
 def classify_and_write(
@@ -296,6 +339,7 @@ __all__ = [
     "RegimeResult",
     "classify_regime",
     "classify_and_write",
+    "get_choppy_overlay",
     "read_regime_state",
     "write_regime_state",
 ]
