@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,6 +46,13 @@ RUNTIME = REPO_ROOT / "runtime"
 REVERSAL_CONFIDENCE_THRESHOLD = 0.70
 OVERRIDE_CONFIDENCE_DELTA = 0.15
 HEDGE_BUDGET_FRACTION = 0.05
+
+# Per-symbol daily loss limit — blocks new entries on a (strategy, symbol, side)
+# combination that has already lost more than this threshold today. Resets at
+# UTC midnight via the date filter in _compute_symbol_daily_pnl.
+MAX_SYMBOL_DAILY_LOSS_USD = float(
+    os.environ.get("CHAD_MAX_SYMBOL_DAILY_LOSS", "300")
+)
 
 STRATEGY_PRIORITY: Dict[str, int] = {
     "delta": 10,
@@ -206,6 +215,62 @@ def _strategy_priority(strategy: str) -> int:
     return STRATEGY_PRIORITY.get((strategy or "").lower(), 5)
 
 
+def _compute_symbol_daily_pnl() -> Dict[Tuple[str, str, str], float]:
+    """
+    Compute today's realized PnL per (strategy, symbol, side) combination.
+    Reads from data/trades/trade_history_*.ndjson for today only.
+    Returns dict: {(strategy, symbol, side): total_pnl}
+    """
+    today = datetime.now(timezone.utc).date()
+    pnl_map: Dict[Tuple[str, str, str], float] = {}
+
+    trade_dir = REPO_ROOT / "data" / "trades"
+    try:
+        for fname in sorted(trade_dir.glob("trade_history_*.ndjson"))[-2:]:
+            try:
+                with open(fname, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        payload = rec.get("payload", rec)
+                        if not isinstance(payload, dict):
+                            continue
+                        exit_time = payload.get("exit_time_utc", "")
+                        if not exit_time:
+                            continue
+                        try:
+                            exit_dt = datetime.fromisoformat(
+                                str(exit_time).replace("Z", "+00:00")
+                            )
+                            if exit_dt.date() != today:
+                                continue
+                        except Exception:
+                            continue
+                        strategy = str(
+                            payload.get("strategy", "")
+                        ).lower().strip()
+                        symbol = str(
+                            payload.get("symbol", "")
+                        ).upper().strip()
+                        side = str(
+                            payload.get("side", "")
+                        ).upper().strip()
+                        pnl = float(payload.get("pnl", 0.0) or 0.0)
+                        key = (strategy, symbol, side)
+                        pnl_map[key] = pnl_map.get(key, 0.0) + pnl
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("net_exposure_gate: symbol_pnl_load_failed err=%s", e)
+
+    return pnl_map
+
+
 def _find_conflicts(
     symbol: str,
     asset_class: str,
@@ -263,6 +328,34 @@ def evaluate_signal(
             signal_index=signal_index,
             symbol=symbol,
             strategy=strategy,
+        )
+
+    # Rule 0.5: per-symbol daily loss limit
+    # If this strategy+symbol+side has already lost more than the configured
+    # threshold today, block new entries in this direction. Exits and
+    # opposite-direction signals are unaffected (different key).
+    try:
+        _symbol_pnl = _compute_symbol_daily_pnl()
+        _key = (strategy, symbol, side)
+        _today_pnl = _symbol_pnl.get(_key, 0.0)
+        if _today_pnl < -MAX_SYMBOL_DAILY_LOSS_USD:
+            if not _is_exit_signal(signal):
+                return GateDecision(
+                    action=GateAction.BLOCK,
+                    reason=(
+                        f"symbol_daily_loss_limit_exceeded_"
+                        f"{strategy}_{symbol}_{side}_"
+                        f"loss=${abs(_today_pnl):.2f}_"
+                        f"limit=${MAX_SYMBOL_DAILY_LOSS_USD:.2f}"
+                    ),
+                    signal_index=signal_index,
+                    symbol=symbol,
+                    strategy=strategy,
+                )
+    except Exception as _loss_check_err:
+        logger.debug(
+            "net_exposure_gate: symbol_loss_check_failed err=%s",
+            _loss_check_err,
         )
 
     # Rule 1: reconciliation not GREEN → block opposite-direction exposure
@@ -456,6 +549,15 @@ def run_gate(
                     decision.reason,
                     decision.conflicting_strategy,
                 )
+                if decision.reason.startswith("symbol_daily_loss_limit_exceeded"):
+                    logger.warning(
+                        "NET_EXPOSURE_GATE SYMBOL_LOSS_LIMIT symbol=%s "
+                        "strategy=%s limit=$%.2f detail=%s",
+                        decision.symbol,
+                        decision.strategy,
+                        MAX_SYMBOL_DAILY_LOSS_USD,
+                        decision.reason,
+                    )
             else:
                 allowed.append(signal)
                 if decision.action != GateAction.ALLOW:

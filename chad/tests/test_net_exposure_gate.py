@@ -213,6 +213,81 @@ def test_gate_failure_allows_all():
     assert decisions == []
 
 
+def test_symbol_daily_loss_limit_blocks_when_exceeded():
+    """If alpha SELL LLY has lost more than the limit today, block new SELL entries."""
+    sig = MockSignal(strategy="alpha", symbol="LLY", side="SELL", confidence=0.85)
+    with patch(
+        "chad.execution.net_exposure_gate._compute_symbol_daily_pnl",
+        return_value={("alpha", "LLY", "SELL"): -500.0},
+    ):
+        decision = evaluate_signal(
+            signal=sig,
+            signal_index=0,
+            open_positions={},
+            reconciliation_status="GREEN",
+            portfolio_equity=200000.0,
+        )
+    assert decision.action == GateAction.BLOCK
+    assert "symbol_daily_loss_limit" in decision.reason
+
+
+def test_symbol_daily_loss_limit_allows_when_under_threshold():
+    """Loss under $300 limit should not block."""
+    sig = MockSignal(strategy="alpha", symbol="LLY", side="SELL", confidence=0.85)
+    with patch(
+        "chad.execution.net_exposure_gate._compute_symbol_daily_pnl",
+        return_value={("alpha", "LLY", "SELL"): -100.0},
+    ):
+        decision = evaluate_signal(
+            signal=sig,
+            signal_index=0,
+            open_positions={},
+            reconciliation_status="GREEN",
+            portfolio_equity=200000.0,
+        )
+    assert decision.action == GateAction.ALLOW
+
+
+def test_symbol_daily_loss_limit_never_blocks_exit():
+    """Even when daily loss exceeds limit, an exit-tagged signal must pass."""
+    sig = MockSignal(
+        strategy="alpha",
+        symbol="LLY",
+        side="SELL",
+        confidence=0.85,
+        meta={"exit": True, "reason": "max_hold_exit"},
+    )
+    with patch(
+        "chad.execution.net_exposure_gate._compute_symbol_daily_pnl",
+        return_value={("alpha", "LLY", "SELL"): -500.0},
+    ):
+        decision = evaluate_signal(
+            signal=sig,
+            signal_index=0,
+            open_positions={},
+            reconciliation_status="GREEN",
+            portfolio_equity=200000.0,
+        )
+    assert decision.action == GateAction.CLOSE_ONLY
+
+
+def test_symbol_daily_loss_limit_allows_opposite_direction():
+    """Loss key is (strategy, symbol, side) — opposite side is a different key."""
+    sig = MockSignal(strategy="alpha", symbol="LLY", side="BUY", confidence=0.85)
+    with patch(
+        "chad.execution.net_exposure_gate._compute_symbol_daily_pnl",
+        return_value={("alpha", "LLY", "SELL"): -500.0},
+    ):
+        decision = evaluate_signal(
+            signal=sig,
+            signal_index=0,
+            open_positions={},
+            reconciliation_status="GREEN",
+            portfolio_equity=200000.0,
+        )
+    assert decision.action == GateAction.ALLOW
+
+
 def test_run_gate_filters_blocked_returns_decisions():
     """End-to-end run_gate filters BLOCK and returns full decision log."""
     sigs = [
