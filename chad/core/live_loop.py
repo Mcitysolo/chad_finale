@@ -790,6 +790,45 @@ def run_once(logger: logging.Logger) -> None:
         v = getattr(v, "value", v)
         return str(v or "").strip().lower()
 
+    # Signal throttle — written by health_monitor when churn detected.
+    # Detected here so routing runs on the full signal set; trim happens
+    # AFTER stage-4 so only submission is capped.
+    _max_signals_this_cycle = None
+    try:
+        _throttle_path = Path("/home/ubuntu/chad_finale/runtime/signal_throttle.json")
+        if _throttle_path.exists():
+            _thr = json.loads(_throttle_path.read_text(encoding="utf-8"))
+            if _thr.get("active"):
+                _expires_raw = _thr.get("auto_expires_at_utc", "")
+                _expired = False
+                if _expires_raw:
+                    try:
+                        from datetime import datetime, timezone
+                        _exp_dt = datetime.fromisoformat(
+                            str(_expires_raw).replace("Z", "+00:00")
+                        )
+                        if datetime.now(timezone.utc) > _exp_dt:
+                            _expired = True
+                            _thr["active"] = False
+                            _throttle_path.write_text(
+                                json.dumps(_thr, indent=2),
+                                encoding="utf-8",
+                            )
+                            logger.info("signal_throttle_expired — removed")
+                    except Exception:
+                        pass
+                if not _expired:
+                    _max_signals_this_cycle = int(
+                        _thr.get("max_signals_per_cycle", 3)
+                    )
+                    logger.warning(
+                        "SIGNAL_THROTTLE_ACTIVE max=%d reason=%s",
+                        _max_signals_this_cycle,
+                        _thr.get("reason", "unknown"),
+                    )
+    except Exception:
+        pass
+
     try:
         if is_always_active_routing():
             all_result = build_all_live_signals(logger)
@@ -868,6 +907,19 @@ def run_once(logger: logging.Logger) -> None:
             _stage4_exc,
         )
         return []
+
+    # Signal throttle — apply trim AFTER routing decisions are made so
+    # only submission is capped. See detection block above stage-4.
+    if _max_signals_this_cycle is not None:
+        try:
+            if routed_signals and len(routed_signals) > _max_signals_this_cycle:
+                logger.warning(
+                    "SIGNAL_THROTTLE_TRIMMED from=%d to=%d",
+                    len(routed_signals), _max_signals_this_cycle,
+                )
+                routed_signals = list(routed_signals)[:_max_signals_this_cycle]
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Position reconciler — close open positions when the net strategy
