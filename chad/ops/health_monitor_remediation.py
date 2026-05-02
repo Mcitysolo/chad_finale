@@ -20,7 +20,7 @@ VENV_PYTHON = REPO_ROOT / "venv/bin/python3"
 # Feed → publisher service mapping
 FEED_PUBLISHER_MAP = {
     "price_cache.json": "chad-ibkr-price-refresh.timer",
-    "regime_state.json": "chad-orchestrator.service",
+    "regime_state.json": "chad-live-loop.service",
     "dynamic_caps.json": "chad-orchestrator.service",
     "regime_booster.json": "chad-regime-booster.timer",
     "kraken_prices.json": "chad-kraken-ws.service",
