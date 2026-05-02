@@ -72,8 +72,6 @@ DEFAULT_NEUTRAL_SCORE: float = 0.5
 # 'neutral' rows that pollute downstream filters. Filter them here so
 # every caller sees the same whitelist.
 EXCLUDED_FROM_HEALTH: frozenset = frozenset({
-    "RECONCILED_PHASE2_20260419",
-    "reconciled_phase2_20260419_carryover",
     "broker_sync",
 })
 

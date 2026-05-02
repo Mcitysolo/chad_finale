@@ -88,18 +88,23 @@ def _build_system_snapshot() -> str:
     recon = _read_json(RUNTIME / "reconciliation_state.json")
     lines.append(f"Reconciliation: status={recon.get('status')} worst_diff={recon.get('worst_diff')}")
 
-    # Strategy health — include all scores so Claude can see the full distribution
+    # Strategy health — only include strategies with sample_count >= 10 so
+    # Claude never sees statistically meaningless rows and can't flag them.
     health = _read_json(RUNTIME / "strategy_health.json")
     if health:
         strats = health.get("strategies", {}) or {}
+        strats_with_data = {
+            k: v for k, v in strats.items()
+            if isinstance(v, dict)
+            and int(v.get("sample_count", v.get("trade_count", 0)) or 0) >= 10
+        }
         scores = {k: round(float(v.get("health_score", 1.0)), 3)
-                  for k, v in strats.items() if isinstance(v, dict)}
+                  for k, v in strats_with_data.items()}
         if scores:
             lines.append(f"Strategy health scores: {scores}")
-        flagged = [(k, v.get("health_score", 1.0)) for k, v in strats.items()
-                   if isinstance(v, dict)
-                   and v.get("health_score", 1.0) < 0.5
-                   and v.get("sample_count", 0) >= 10]
+        flagged = [(k, v.get("health_score", 1.0))
+                   for k, v in strats_with_data.items()
+                   if v.get("health_score", 1.0) < 0.5]
         if flagged:
             lines.append(f"Low health strategies (sample>=10): {flagged}")
         # Alpha cluster correlated degradation
