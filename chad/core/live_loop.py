@@ -1039,7 +1039,7 @@ def run_once(logger: logging.Logger) -> None:
             trend_slope=_load_optional_metric("trend_slope"),
             market_breadth=_load_optional_metric("market_breadth"),
         )
-        new_state = write_regime_state(regime_result, source="live_loop.run_once", ttl_seconds=120)
+        new_state = write_regime_state(regime_result, source="live_loop.run_once", ttl_seconds=360)
         logger.info(
             "REGIME_CLASSIFIED regime=%s confidence=%.2f inputs=%s previous=%s",
             new_state.get("regime"),

@@ -242,7 +242,7 @@ def write_regime_state(
     result: RegimeResult,
     source: str = "regime_classifier",
     path: Path = REGIME_STATE_PATH,
-    ttl_seconds: int = 60,
+    ttl_seconds: int = 120,
 ) -> Dict[str, Any]:
     """Persist a regime classification result to runtime/regime_state.json.
 

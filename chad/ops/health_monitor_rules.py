@@ -20,7 +20,7 @@ DATA = REPO_ROOT / "data"
 # Feed → publisher service mapping (mirrors remediation.FEED_PUBLISHER_MAP)
 _FEED_PUBLISHER_MAP = {
     "price_cache.json": "chad-ibkr-price-refresh.timer",
-    "regime_state.json": "chad-orchestrator.service",
+    "regime_state.json": "chad-live-loop.service",
     "dynamic_caps.json": "chad-orchestrator.service",
     "regime_booster.json": "chad-regime-booster.timer",
     "kraken_prices.json": "chad-kraken-ws.service",
@@ -114,7 +114,7 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
     """R02 — Critical feeds must be within TTL."""
     feeds = [
         ("price_cache.json", 180),
-        ("regime_state.json", 180),
+        ("regime_state.json", 360),
         ("dynamic_caps.json", 180),
         ("regime_booster.json", 240),
         ("kraken_prices.json", 120),
