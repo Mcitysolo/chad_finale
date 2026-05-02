@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -91,6 +92,51 @@ def notify(**kwargs) -> str:
     return "📢 Alert sent — no auto-fix for this finding type"
 
 
+def write_signal_throttle(trade_count: int, pnl: float, **kwargs) -> str:
+    """Write a throttle flag to runtime/signal_throttle.json
+    that live_loop reads to reduce signal frequency."""
+    throttle = {
+        "active": True,
+        "reason": f"churn_detected_{trade_count}_trades",
+        "max_signals_per_cycle": 3,
+        "activated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "auto_expires_at_utc": (
+            datetime.now(timezone.utc) + timedelta(hours=4)
+        ).isoformat(),
+        "trade_count": trade_count,
+        "realized_pnl": pnl,
+    }
+    _path = RUNTIME / "signal_throttle.json"
+    _tmp = _path.with_suffix(".json.tmp")
+    _tmp.write_text(json.dumps(throttle, indent=2), encoding="utf-8")
+    os.replace(str(_tmp), str(_path))
+    return (
+        f"✅ Signal throttle activated: max 3 signals/cycle "
+        f"for 4 hours (churn: {trade_count} trades, "
+        f"PnL=${pnl:.2f})"
+    )
+
+
+def clear_reconciliation_artifact(strategy: str, **kwargs) -> str:
+    """Remove stale reconciliation strategy from winner_scaling."""
+    try:
+        ws_path = RUNTIME / "winner_scaling.json"
+        if not ws_path.exists():
+            return f"⚠️ winner_scaling.json not found"
+        data = json.loads(ws_path.read_text(encoding="utf-8"))
+        multipliers = data.get("multipliers", {})
+        if strategy in multipliers:
+            del multipliers[strategy]
+            data["multipliers"] = multipliers
+            _tmp = ws_path.with_suffix(".json.tmp")
+            _tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(str(_tmp), str(ws_path))
+            return f"✅ Cleared stale artifact: {strategy}"
+        return f"ℹ️ {strategy} not found in winner_scaling"
+    except Exception as e:
+        return f"❌ Failed to clear {strategy}: {e}"
+
+
 # Remediation dispatch
 REMEDY_DISPATCH = {
     "restart_service": restart_service,
@@ -98,6 +144,8 @@ REMEDY_DISPATCH = {
     "archive_old_fills": archive_old_fills,
     "restore_from_backup": restore_from_backup,
     "notify": notify,
+    "write_signal_throttle": write_signal_throttle,
+    "clear_reconciliation_artifact": clear_reconciliation_artifact,
 }
 
 

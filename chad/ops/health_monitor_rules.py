@@ -5,16 +5,27 @@ Fast mechanical checks. No API call. Runs every cycle.
 from __future__ import annotations
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 REPO_ROOT = Path("/home/ubuntu/chad_finale")
 RUNTIME = REPO_ROOT / "runtime"
 DATA = REPO_ROOT / "data"
+
+# Feed → publisher service mapping (mirrors remediation.FEED_PUBLISHER_MAP)
+_FEED_PUBLISHER_MAP = {
+    "price_cache.json": "chad-ibkr-price-refresh.timer",
+    "regime_state.json": "chad-orchestrator.service",
+    "dynamic_caps.json": "chad-orchestrator.service",
+    "regime_booster.json": "chad-regime-booster.timer",
+    "kraken_prices.json": "chad-kraken-ws.service",
+    "reconciliation_state.json": "chad-reconciliation-publisher.timer",
+}
 
 @dataclass
 class Finding:
@@ -122,6 +133,7 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
                 evidence=f"{fname} not found in {RUNTIME}",
             ))
         elif age > ttl * 2:
+            svc = _FEED_PUBLISHER_MAP.get(fname, "")
             findings.append(Finding(
                 rule_id="R02",
                 severity="CRITICAL",
@@ -129,8 +141,9 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
                 description=f"{fname} is {int(age)}s old — more than 2× TTL.",
                 remedy_type="SERVICE_RESTART",
                 remedy_action="restart_feed_publisher",
-                remedy_args={"feed": fname, "age": age, "ttl": ttl},
-                evidence=f"mtime age={int(age)}s TTL={ttl}s",
+                remedy_args={"feed": fname, "age": age, "ttl": ttl,
+                             "service": svc},
+                evidence=f"mtime age={int(age)}s TTL={ttl}s service={svc}",
             ))
 
 
@@ -287,6 +300,133 @@ def rule_edge_decay_halts(findings: List[Finding]) -> None:
             ))
 
 
+def rule_high_trade_churn(findings: List[Finding]) -> None:
+    """R10 — Detect high trade churn with negative PnL."""
+    d = _read_json(RUNTIME / "pnl_state.json")
+    if not d:
+        return
+    trade_count = int(d.get("trade_count", 0) or 0)
+    realized_pnl = float(d.get("realized_pnl", 0.0) or 0.0)
+    if trade_count > 300 and realized_pnl < -500:
+        findings.append(Finding(
+            rule_id="R10",
+            severity="CRITICAL",
+            title=f"High churn: {trade_count} trades, PnL=${realized_pnl:.2f}",
+            description=(
+                f"{trade_count} trades today with ${realized_pnl:.2f} realized. "
+                "Strategies are churning losses. Signal throttle recommended."
+            ),
+            remedy_type="SAFE_AUTO",
+            remedy_action="write_signal_throttle",
+            remedy_args={"trade_count": trade_count, "pnl": realized_pnl},
+            evidence="runtime/pnl_state.json",
+        ))
+
+
+def rule_stale_reconciliation_artifact(findings: List[Finding]) -> None:
+    """R11 — Detect stale reconciliation strategy entries with penalties."""
+    p = RUNTIME / "winner_scaling.json"
+    if not p.exists():
+        return
+    d = _read_json(p)
+    multipliers = d.get("multipliers", {})
+    now = datetime.now(timezone.utc)
+    for strategy, mult in multipliers.items():
+        try:
+            mult_f = float(mult)
+        except Exception:
+            continue
+        name_lower = strategy.lower()
+        if "reconciled" not in name_lower and "reconciled_phase" not in name_lower:
+            continue
+        if mult_f >= 1.0:
+            continue
+        # Parse YYYYMMDD date suffix from the name to estimate age
+        m = re.search(r"(\d{8})", strategy)
+        if not m:
+            continue
+        try:
+            dt = datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        age_days = (now - dt).total_seconds() / 86400.0
+        if age_days <= 7:
+            continue
+        findings.append(Finding(
+            rule_id="R11",
+            severity="WARNING",
+            title=f"Stale reconciliation artifact: {strategy}",
+            description=f"Strategy {strategy} has been penalized for {int(age_days)}+ days.",
+            remedy_type="SAFE_AUTO",
+            remedy_action="clear_reconciliation_artifact",
+            remedy_args={"strategy": strategy},
+            evidence="runtime/winner_scaling.json",
+        ))
+
+
+def rule_alpha_cluster_degradation(findings: List[Finding]) -> None:
+    """R12 — Detect correlated degradation across alpha-cluster strategies."""
+    p = RUNTIME / "strategy_health.json"
+    if not p.exists():
+        return
+    d = _read_json(p)
+    strats = d.get("strategies", {}) or {}
+    low_alphas = []
+    for name, info in strats.items():
+        if not isinstance(info, dict):
+            continue
+        if "alpha" not in name.lower():
+            continue
+        score = info.get("health_score")
+        if score is None:
+            continue
+        try:
+            if float(score) < 0.5:
+                low_alphas.append((name, float(score)))
+        except Exception:
+            continue
+    if len(low_alphas) >= 3:
+        details = ", ".join(f"{n}={s:.2f}" for n, s in sorted(low_alphas))
+        findings.append(Finding(
+            rule_id="R12",
+            severity="WARNING",
+            title="Alpha cluster correlated degradation",
+            description=(
+                "Multiple alpha strategies simultaneously below health "
+                "threshold — shared signal or data dependency issue. "
+                f"Affected: {details}"
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence="runtime/strategy_health.json",
+        ))
+
+
+def rule_scr_effective_trades_gap(findings: List[Finding]) -> None:
+    """R13 — Flag large gaps between raw trade count and SCR effective trades."""
+    pnl = _read_json(RUNTIME / "pnl_state.json")
+    scr = _read_json(RUNTIME / "scr_state.json")
+    if not pnl or not scr:
+        return
+    raw_trade_count = int(pnl.get("trade_count", 0) or 0)
+    effective = int((scr.get("stats", {}) or {}).get("effective_trades", 0) or 0)
+    if raw_trade_count <= 0 or effective <= 0:
+        return
+    if raw_trade_count > effective * 2:
+        findings.append(Finding(
+            rule_id="R13",
+            severity="INFO",
+            title=f"SCR gap: {raw_trade_count} raw vs {effective} effective",
+            description=(
+                f"{raw_trade_count - effective} trades excluded from SCR. "
+                "Check for rejected/partial/excluded fills."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence="runtime/scr_state.json + runtime/pnl_state.json",
+        ))
+
+
 def run_all_rules() -> List[Finding]:
     """Run all rules and return list of findings."""
     findings: List[Finding] = []
@@ -300,6 +440,10 @@ def run_all_rules() -> List[Finding]:
         rule_disk_usage,
         rule_corrupt_runtime_files,
         rule_edge_decay_halts,
+        rule_high_trade_churn,
+        rule_stale_reconciliation_artifact,
+        rule_alpha_cluster_degradation,
+        rule_scr_effective_trades_gap,
     ]:
         try:
             fn(findings)

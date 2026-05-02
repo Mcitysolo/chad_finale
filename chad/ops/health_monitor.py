@@ -49,16 +49,32 @@ def _build_system_snapshot() -> str:
 
     # SCR
     scr = _read_json(RUNTIME / "scr_state.json")
+    scr_effective = (scr.get("stats", {}) or {}).get("effective_trades")
     lines.append(f"SCR: state={scr.get('state')} sizing={scr.get('sizing_factor')} "
-                 f"effective_trades={scr.get('stats', {}).get('effective_trades')}")
+                 f"effective_trades={scr_effective}")
 
     # Regime
     regime = _read_json(RUNTIME / "regime_state.json")
     lines.append(f"Regime: {regime.get('regime')} confidence={regime.get('confidence')}")
 
-    # PnL
+    # PnL — include trade_count and realized_pnl explicitly,
+    # and flag the gap with SCR effective_trades
     pnl = _read_json(RUNTIME / "pnl_state.json")
-    lines.append(f"PnL today: realized={pnl.get('realized_pnl')} trades={pnl.get('trade_count')}")
+    raw_trades = pnl.get("trade_count")
+    realized = pnl.get("realized_pnl")
+    lines.append(f"PnL today: realized={realized} trades={raw_trades}")
+    try:
+        if raw_trades is not None and scr_effective is not None and \
+                int(raw_trades) > 0 and int(scr_effective) > 0 and \
+                int(raw_trades) > int(scr_effective) * 2:
+            gap = int(raw_trades) - int(scr_effective)
+            lines.append(
+                f"SCR/raw gap: {gap} trades excluded "
+                f"(raw={raw_trades} effective={scr_effective}) — "
+                "likely rejected/partial/excluded fills"
+            )
+    except Exception:
+        pass
 
     # Profit lock
     pl = _read_json(RUNTIME / "profit_lock_state.json")
@@ -72,24 +88,38 @@ def _build_system_snapshot() -> str:
     recon = _read_json(RUNTIME / "reconciliation_state.json")
     lines.append(f"Reconciliation: status={recon.get('status')} worst_diff={recon.get('worst_diff')}")
 
-    # Strategy health
+    # Strategy health — include all scores so Claude can see the full distribution
     health = _read_json(RUNTIME / "strategy_health.json")
     if health:
-        strats = health.get("strategies", {})
+        strats = health.get("strategies", {}) or {}
+        scores = {k: round(float(v.get("health_score", 1.0)), 3)
+                  for k, v in strats.items() if isinstance(v, dict)}
+        if scores:
+            lines.append(f"Strategy health scores: {scores}")
         flagged = [(k, v.get("health_score", 1.0)) for k, v in strats.items()
-                   if v.get("health_score", 1.0) < 0.5 and v.get("sample_count", 0) >= 10]
+                   if isinstance(v, dict)
+                   and v.get("health_score", 1.0) < 0.5
+                   and v.get("sample_count", 0) >= 10]
         if flagged:
-            lines.append(f"Low health strategies: {flagged}")
+            lines.append(f"Low health strategies (sample>=10): {flagged}")
+        # Alpha cluster correlated degradation
+        alphas_low = [k for k, s in scores.items()
+                      if "alpha" in k.lower() and s < 0.5]
+        if len(alphas_low) >= 3:
+            lines.append(
+                f"Alpha cluster degraded: {len(alphas_low)} strategies "
+                f"<0.5 health: {alphas_low}"
+            )
 
-    # Winner scaling
+    # Winner scaling — flag anything <0.7 or >1.3
     ws = _read_json(RUNTIME / "winner_scaling.json")
-    multipliers = ws.get("multipliers", {})
-    penalized = {k: v for k, v in multipliers.items() if v < 0.8}
-    boosted = {k: v for k, v in multipliers.items() if v > 1.2}
+    multipliers = ws.get("multipliers", {}) or {}
+    penalized = {k: v for k, v in multipliers.items() if v < 0.7}
+    boosted = {k: v for k, v in multipliers.items() if v > 1.3}
     if penalized:
-        lines.append(f"Penalized strategies: {penalized}")
+        lines.append(f"Penalized strategies (<0.7): {penalized}")
     if boosted:
-        lines.append(f"Boosted strategies: {boosted}")
+        lines.append(f"Boosted strategies (>1.3): {boosted}")
 
     # Business phase
     biz = _read_json(RUNTIME / "business_phase.json")
@@ -98,6 +128,15 @@ def _build_system_snapshot() -> str:
     # Stop bus
     sb = _read_json(RUNTIME / "stop_bus.json")
     lines.append(f"Stop bus: active={sb.get('active')}")
+
+    # Signal throttle — surface if active so Claude knows churn brake is engaged
+    throttle = _read_json(RUNTIME / "signal_throttle.json")
+    if throttle.get("active"):
+        lines.append(
+            f"Signal throttle ACTIVE: max={throttle.get('max_signals_per_cycle')} "
+            f"reason={throttle.get('reason')} "
+            f"expires={throttle.get('auto_expires_at_utc')}"
+        )
 
     return "\n".join(lines)
 
@@ -119,17 +158,17 @@ def _ask_claude(snapshot: str, rule_findings: List[Finding]) -> str:
                 f"- [{f.severity}] {f.title}" for f in rule_findings
             )
 
-        prompt = f"""You are CHAD's AI health monitor. Review this system snapshot and identify anything anomalous, degrading, or approaching a problem threshold.
+        prompt = f"""You are CHAD's AI health monitor. Review this system snapshot and identify issues AND for each issue state: (1) severity, (2) exact fix, (3) whether it is safe to auto-apply.
 
 {snapshot}{rule_summary}
 
 Rules:
-1. Be specific — name exact metrics, values, and thresholds
-2. Only flag real issues — not normal operating conditions
-3. Prioritize: CRITICAL (trading broken/halted) > WARNING (degrading) > INFO (watch)
-4. If everything looks healthy, say "SYSTEM HEALTHY — no anomalies detected"
-5. For each issue found, suggest the specific fix in one line
-6. Max 10 lines total
+1. Be specific. Name exact metrics, values, and thresholds.
+2. Only flag real issues — not normal operating conditions.
+3. Prioritize: CRITICAL (trading broken/halted) > WARNING (degrading) > INFO (watch).
+4. If everything looks healthy, say "SYSTEM HEALTHY — no anomalies detected".
+5. For each issue: severity → exact fix (command or file change) → safe to auto-apply (yes/no).
+6. Max 8 lines total.
 
 Focus on: strategy performance trends, regime stability, SCR trajectory,
 equity curve shape, fill rate patterns, anything that looks unusual."""
