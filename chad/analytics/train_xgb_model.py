@@ -41,8 +41,34 @@ DATA_DIR = ROOT / "data" / "trades"
 MODELS_DIR = ROOT / "shared" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_PATH = MODELS_DIR / "xgb_model.json"
+MODEL_PATH = MODELS_DIR / "xgb_veto_model.json"
 PERF_PATH = MODELS_DIR / "model_performance.json"
+
+# Feature encodings — must match chad/analytics/ml_veto_predictor.py
+_STRATEGY_MAP = {
+    "alpha": 0, "alpha_intraday": 1, "alpha_futures": 2,
+    "alpha_options": 3, "alpha_crypto": 4, "beta": 5,
+    "beta_trend": 6, "delta": 7, "delta_pairs": 8,
+    "gamma": 9, "gamma_futures": 10, "gamma_reversion": 11,
+    "omega_vol": 12, "omega_momentum_options": 13,
+    "omega_macro": 14, "omega": 15,
+}
+_REGIME_MAP = {
+    "trending_bull": 0, "ranging": 1, "trending_bear": 2,
+    "volatile": 3, "unknown": 4,
+}
+FEATURE_NAMES = [
+    "strategy_encoded",
+    "regime_encoded",
+    "vix_level",
+    "hour_of_day",
+    "day_of_week",
+    "scr_sizing_factor",
+    "is_buy",
+    "equity_normalized",
+    "recent_win_rate",
+    "regime_confidence",
+]
 
 LOG = logging.getLogger("chad.analytics.xgb_train")
 
@@ -65,7 +91,7 @@ def _setup_logging() -> None:
     )
 
 
-def _load_trade_rows(max_files: int = 30) -> List[Dict[str, Any]]:
+def _load_trade_rows(max_files: int = 120) -> List[Dict[str, Any]]:
     """
     Load recent trade history rows from NDJSON files.
 
@@ -108,49 +134,73 @@ def _load_trade_rows(max_files: int = 30) -> List[Dict[str, Any]]:
 
 def _build_dataset(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Build a simple feature matrix from raw trade rows.
+    Build the 10-feature matrix used by the ML veto predictor.
+    Label: 1 = loss (pnl <= 0), 0 = win (pnl > 0). We predict P(loss).
 
-    Expected keys (adjust to your schema as needed):
-    - 'pnl'                     : realized PnL for the trade (float)
-    - 'holding_period_minutes'  : optional, time in minutes
-    - 'side'                    : "BUY" or "SELL"
-    - 'volatility'              : optional float
-
-    Returns
-    -------
-    X : np.ndarray
-        Feature matrix of shape (n_samples, n_features).
-    y : np.ndarray
-        Target vector (PnL).
+    Trade history rows may be flat or wrapped in a {"payload": ...} envelope.
+    Most historical fields are absent; we substitute neutral defaults that
+    match the runtime predictor's defaults so train and inference align.
     """
-    X: List[List[float]] = []
-    y: List[float] = []
+    from datetime import datetime
 
-    for r in rows:
+    X: List[List[float]] = []
+    y: List[int] = []
+
+    for raw in rows:
+        r = raw.get("payload", raw) if isinstance(raw, dict) else raw
+        if not isinstance(r, dict):
+            continue
         pnl = r.get("pnl")
         if pnl is None:
             continue
-
         try:
-            hp = float(r.get("holding_period_minutes", 0.0) or 0.0)
+            pnl_f = float(pnl)
         except Exception:
-            hp = 0.0
+            continue
 
-        side_raw = str(r.get("side", "")).upper()
-        is_long = 1.0 if side_raw == "BUY" else 0.0
+        strategy = str(r.get("strategy", "") or "").lower()
+        side = str(r.get("side", "") or "").upper()
+        regime = str(r.get("regime", "") or "unknown").lower()
+        if regime not in _REGIME_MAP:
+            regime = "unknown"
 
-        try:
-            vol = float(r.get("volatility", 0.0) or 0.0)
-        except Exception:
-            vol = 0.0
+        # Time features from exit_time_utc when available
+        hour = 12.0
+        weekday = 2.0
+        ts = r.get("exit_time_utc") or r.get("entry_time_utc") or r.get("timestamp_utc")
+        if isinstance(ts, str) and ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                hour = float(dt.hour)
+                weekday = float(dt.weekday())
+            except Exception:
+                pass
 
-        X.append([hp, is_long, vol])
-        y.append(float(pnl))
+        # Defaults for fields not stored in trade history — match predictor
+        vix = 20.0
+        sizing = 0.25
+        equity_norm = 1.0
+        win_rate = 0.5
+        regime_conf = 0.5
+
+        X.append([
+            float(_STRATEGY_MAP.get(strategy, 15)),
+            float(_REGIME_MAP.get(regime, 4)),
+            vix,
+            hour,
+            weekday,
+            sizing,
+            1.0 if "BUY" in side else 0.0,
+            equity_norm,
+            win_rate,
+            regime_conf,
+        ])
+        y.append(0 if pnl_f > 0.0 else 1)
 
     if not X:
-        return np.empty((0, 0), dtype=float), np.empty((0,), dtype=float)
+        return np.empty((0, 0), dtype=float), np.empty((0,), dtype=int)
 
-    return np.asarray(X, dtype=float), np.asarray(y, dtype=float)
+    return np.asarray(X, dtype=float), np.asarray(y, dtype=int)
 
 
 def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
@@ -191,16 +241,16 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
     X_train, X_val = X[:idx_split], X[idx_split:]
     y_train, y_val = y[:idx_split], y[idx_split:]
 
-    dtrain = xgb.DMatrix(X_train, label=y_train)
-    dval = xgb.DMatrix(X_val, label=y_val)
+    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=FEATURE_NAMES)
+    dval = xgb.DMatrix(X_val, label=y_val, feature_names=FEATURE_NAMES)
 
     params: Dict[str, Any] = {
         "max_depth": 4,
         "eta": 0.05,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "objective": "reg:squarederror",
-        "eval_metric": "rmse",
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
         "seed": 42,
     }
 
@@ -215,20 +265,32 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
         verbose_eval=False,
     )
 
-    y_pred = bst.predict(dval)
+    y_pred_prob = bst.predict(dval)
     if len(y_val) == 0:
-        rmse = float("nan")
-        mae = float("nan")
+        accuracy = float("nan")
+        logloss = float("nan")
+        veto_rate_at_065 = 0.0
     else:
-        rmse = float(np.sqrt(np.mean((y_pred - y_val) ** 2)))
-        mae = float(np.mean(np.abs(y_pred - y_val)))
+        y_pred_label = (y_pred_prob > 0.5).astype(int)
+        accuracy = float(np.mean(y_pred_label == y_val))
+        eps = 1e-7
+        p = np.clip(y_pred_prob, eps, 1 - eps)
+        logloss = float(-np.mean(y_val * np.log(p) + (1 - y_val) * np.log(1 - p)))
+        veto_rate_at_065 = float(np.mean(y_pred_prob > 0.65))
 
+    base_loss_rate = float(np.mean(y)) if y.size else 0.0
     metrics = {
-        "rmse": float(rmse),
-        "mae": float(mae),
+        "accuracy": float(accuracy),
+        "logloss": float(logloss),
         "n_train": float(idx_split),
         "n_val": float(len(y_val)),
+        "base_loss_rate": float(base_loss_rate),
+        "val_veto_rate_at_0.65": float(veto_rate_at_065),
     }
+    print(f"[xgb_train] accuracy={accuracy:.4f} logloss={logloss:.4f} "
+          f"n_train={idx_split} n_val={len(y_val)} "
+          f"base_loss_rate={base_loss_rate:.3f} "
+          f"veto_rate@0.65={veto_rate_at_065:.3f}")
 
     LOG.info("Saving XGBoost model to %s", MODEL_PATH)
     try:

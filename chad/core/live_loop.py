@@ -1213,6 +1213,42 @@ def run_once(logger: logging.Logger) -> None:
                     )
                     continue
 
+            # --- ML veto loop (shadow always on; hard veto behind flag) ---
+            try:
+                from chad.analytics.ml_veto_predictor import should_veto as _ml_should_veto
+                _ml_ctx = {
+                    "regime": {"regime": locals().get("_regime_now", "unknown")},
+                    "prices": {},
+                    "scr": {"sizing_factor": locals().get("_scr_sizing", 0.25)},
+                    "strategy_health": {},
+                    "portfolio": {
+                        "total_equity": float(
+                            getattr(getattr(_ctx, "portfolio", None), "equity", 0.0) or 0.0
+                        ),
+                    },
+                }
+                _shadow_veto, _shadow_prob = _ml_should_veto(intent, _ml_ctx)
+                logger.debug(
+                    "ML_SHADOW symbol=%s strategy=%s loss_prob=%.3f would_veto=%s",
+                    getattr(intent, "symbol", "?"),
+                    getattr(intent, "strategy", "?"),
+                    _shadow_prob, _shadow_veto,
+                )
+                _ml_veto_enabled = os.environ.get(
+                    "CHAD_ML_VETO_ENABLED", ""
+                ).lower() in ("1", "true", "yes")
+                if _ml_veto_enabled and _shadow_veto:
+                    logger.warning(
+                        "ML_VETO symbol=%s strategy=%s loss_prob=%.3f",
+                        getattr(intent, "symbol", "?"),
+                        getattr(intent, "strategy", "?"),
+                        _shadow_prob,
+                    )
+                    continue
+            except Exception:
+                pass  # veto failure never blocks trade
+            # --- end ML veto loop ---
+
             emitted += 1
 
             if is_flip_signal(intent):

@@ -1,0 +1,15 @@
+{
+  "account_equity": 998109.89,
+  "equity_known": true,
+  "pnl_pct_of_equity": 0.0,
+  "pnl_sources": [
+    "/home/ubuntu/chad_finale/data/trades/trade_history_20260426.ndjson",
+    "/home/ubuntu/chad_finale/data/trades/trade_history_20260426.ndjson"
+  ],
+  "realized_pnl": 0.0,
+  "schema_version": "pnl_state.v1",
+  "source": "profit_lock_engine",
+  "trade_count": 2,
+  "ts_utc": "2026-04-26T11:21:35Z",
+  "ttl_seconds": 60
+}
