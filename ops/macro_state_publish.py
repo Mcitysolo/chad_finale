@@ -461,12 +461,17 @@ async def build_state(provider: MacroProvider) -> MacroState:
 
 
 def fail_closed_state(ts: str, *, reason: str) -> Dict[str, Any]:
+    # DS06: shape must mirror state_to_dict() exactly so consumers see one
+    # canonical schema regardless of whether the publisher succeeded.
     return {
         "ts_utc": ts,
         "ttl_seconds": int(TTL_SECONDS),
         "yields": {},
         "curve_slope_10y_2y": 0.0,
         "risk_label": "unknown",
+        "indicators": {},
+        "risk_flags": {},
+        "composite_risk_label": "unknown",
         "notes": reason,
         "source": {"provider": "error"},
         "schema_version": "macro_state.v1",

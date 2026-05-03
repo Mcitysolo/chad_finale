@@ -1183,16 +1183,28 @@ def run_once(logger: logging.Logger) -> None:
     try:
         from chad.analytics.choppy_regime_detector import get_choppy_state
         _choppy_state = get_choppy_state()
-        _choppy_active = bool(_choppy_state.get("choppy_active", False))
-        if _choppy_active:
-            _choppy_sizing_mult = 0.25
-            _choppy_confidence_add = 0.15
+        # CB05: when choppy state is stale, the detector returns
+        # choppy_active=False (fail-open). That hides regime risk. Apply
+        # a conservative-but-not-maximum default instead.
+        if _choppy_state.get("stale"):
+            _choppy_active = True
+            _choppy_sizing_mult = 0.50
+            _choppy_confidence_add = 0.10
             logger.warning(
-                "CHOPPY_REGIME_ACTIVE score=%.3f sizing_mult=%.2f confidence_add=%.2f",
-                float(_choppy_state.get("choppy_score", 0) or 0),
-                _choppy_sizing_mult,
-                _choppy_confidence_add,
+                "CHOPPY_STATE_STALE — applying conservative defaults "
+                "sizing=0.50 confidence_add=0.10"
             )
+        else:
+            _choppy_active = bool(_choppy_state.get("choppy_active", False))
+            if _choppy_active:
+                _choppy_sizing_mult = 0.25
+                _choppy_confidence_add = 0.15
+                logger.warning(
+                    "CHOPPY_REGIME_ACTIVE score=%.3f sizing_mult=%.2f confidence_add=%.2f",
+                    float(_choppy_state.get("choppy_score", 0) or 0),
+                    _choppy_sizing_mult,
+                    _choppy_confidence_add,
+                )
     except Exception:
         pass
 

@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +354,15 @@ class DynamicRiskAllocator:
 
         # --- BUSINESS OVERLAYS (tier / winner / regime) ---
         tier_set = load_tier_filter()
-        winner_mults = load_winner_multipliers()
+        winner_mults, winner_stale = load_winner_multipliers_or_stale()
+        # CB05: when winner scaling is stale, fall back to a conservative
+        # 0.5x multiplier per strategy rather than silently leaving sizing
+        # at 1.0x — stale-fail-open was the audit finding.
+        if winner_stale:
+            logger.warning(
+                "winner_scaling_stale — using conservative 0.5x multipliers"
+            )
+            winner_mults = {name.lower(): 0.5 for name in norm.keys()}
         regime_mult = load_regime_booster_multiplier()
         # Clamp regime multiplier to the documented 1.0..1.5 band.
         regime_mult = max(1.0, min(1.5, float(regime_mult)))
@@ -366,7 +374,9 @@ class DynamicRiskAllocator:
             tier_factor = 1.0
             if tier_set is not None and name.lower() not in tier_set:
                 tier_factor = 0.0
-            winner_factor = float(winner_mults.get(name.lower(), 1.0))
+            # CB05: when stale, every strategy gets 0.5x (default in lookup).
+            winner_default = 0.5 if winner_stale else 1.0
+            winner_factor = float(winner_mults.get(name.lower(), winner_default))
             cap = base_cap * tier_factor * winner_factor * regime_mult
             caps[name] = cap
             applied_overlays[name] = {
@@ -633,10 +643,38 @@ def load_winner_multipliers() -> Dict[str, float]:
     return out
 
 
+def load_winner_multipliers_or_stale() -> Tuple[Dict[str, float], bool]:
+    """
+    CB05: returns (multipliers, stale).
+
+    Differs from load_winner_multipliers() only by exposing whether the
+    underlying file was missing/stale, so callers can fall back to a
+    conservative default (e.g. 0.5x) instead of silently no-op'ing to 1.0.
+    """
+    doc = _read_business_runtime(_runtime_dir() / "winner_scaling.json", stale_seconds=1800)
+    if not doc:
+        return {}, True
+    raw = doc.get("multipliers")
+    if not isinstance(raw, dict):
+        return {}, True
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        try:
+            out[k.strip().lower()] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out, False
+
+
 def load_regime_booster_multiplier() -> float:
     """Global regime boost. Returns 1.0 when missing/stale."""
     doc = _read_business_runtime(_runtime_dir() / "regime_booster.json", stale_seconds=120)
     if not doc:
+        # CB05: stale booster already fails conservative (1.0x = no boost),
+        # but log so operators see the missing input.
+        logger.warning("regime_booster_stale — no boost applied (1.0x)")
         return 1.0
     try:
         return float(doc.get("multiplier", 1.0))

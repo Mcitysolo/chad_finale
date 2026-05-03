@@ -108,6 +108,7 @@ class SignalRouter:
                     "size_by_strategy": {},  # type: ignore[var-annotated]
                     "created_at": sig.created_at,
                     "meta_by_strategy": {},  # type: ignore[var-annotated]
+                    "contributors": [],  # type: ignore[var-annotated]
                 }
 
             bucket = buckets[key]
@@ -128,6 +129,23 @@ class SignalRouter:
             mbs = bucket["meta_by_strategy"]  # type: ignore[assignment]
             if sig.meta:
                 mbs[strat_key] = sig.meta  # type: ignore[union-attr]
+
+            # CF01: preserve every contributing signal so downstream consumers
+            # (audit, attribution, dashboard) can see all merged sources.
+            bucket["contributors"].append(  # type: ignore[union-attr]
+                {
+                    "strategy": str(
+                        sig.strategy.value
+                        if hasattr(sig.strategy, "value")
+                        else sig.strategy
+                    ),
+                    "side": str(
+                        sig.side.value if hasattr(sig.side, "value") else sig.side
+                    ),
+                    "size": float(getattr(sig, "size", 1.0) or 1.0),
+                    "confidence": float(getattr(sig, "confidence", 0.5) or 0.5),
+                }
+            )
 
             # Track the most recent timestamp for the bucket
             if sig.created_at > bucket["created_at"]:  # type: ignore[operator]
@@ -166,6 +184,14 @@ class SignalRouter:
 
             created_at = data["created_at"]  # type: ignore[assignment]
 
+            existing_meta = data.get("meta_by_strategy", {}).get(primary) or {}
+            # CF01: contributors live inside meta to remain backward compatible
+            # with consumers that don't know about the field.
+            merged_meta = {
+                **(existing_meta if isinstance(existing_meta, dict) else {}),
+                "contributors": list(data.get("contributors", []) or []),
+            }
+
             routed.append(
                 RoutedSignal(
                     symbol=symbol,
@@ -176,7 +202,7 @@ class SignalRouter:
                     confidence=confidence,
                     asset_class=asset_class,
                     created_at=created_at,
-                    meta=data.get("meta_by_strategy", {}).get(primary) or {},
+                    meta=merged_meta,
                 )
             )
 

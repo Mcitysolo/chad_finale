@@ -87,12 +87,13 @@ class ClosedTrade:
         commission = 0.0  # populated by fill enrichment in future
         slippage = 0.0    # populated by fill enrichment in future
         net = gross - commission - slippage
+        # DS07: pnl is deprecated alias for net_pnl; use net_pnl
         return {
             "schema_version": self.schema,
             "strategy": self.strategy,
             "symbol": self.symbol,
             "side": self.side,
-            "pnl": self.pnl,
+            "pnl": round(float(self.pnl), 4),
             "gross_pnl": round(gross, 4),
             "commission": commission,
             "slippage": slippage,

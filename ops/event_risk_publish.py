@@ -443,13 +443,16 @@ class EconomicCalendarRiskProvider:
                 )
             )
 
-            # Track next future event (first by sorted order)
+            # Track next future event (first by sorted order).
+            # DS05: emit a structured object with severity so downstream
+            # consumers don't have to re-derive it from the name.
             if next_event is None and ev_ts >= now_utc:
                 next_event = {
                     "name": ev["name"],
                     "ts_utc": ev["ts_utc"],
-                    "source": ev.get("source"),
                     "hours_until": round((ev_ts - now_utc).total_seconds() / 3600.0, 2),
+                    "severity": sev,
+                    "source": ev.get("source"),
                 }
 
             # Elevated risk if this event lies inside lookahead window

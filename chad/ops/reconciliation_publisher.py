@@ -49,6 +49,33 @@ except Exception:  # noqa: BLE001
 _BROKER_PREEXISTING = frozenset({"NVDA"})
 KNOWN_NON_CHAD_SYMBOLS = _RECONCILER_NON_CHAD | _BROKER_PREEXISTING
 
+# DS08: bounded exclusion policy. Every symbol skipped from reconciliation
+# carries reason/owner/added/expires/reviewed metadata so excluded items
+# stay auditable instead of becoming permanent blind spots.
+EXCLUSION_POLICY: Dict[str, Dict[str, Any]] = {
+    "AAPL": {
+        "reason": "pre-existing broker position",
+        "owner": "operator",
+        "added_utc": "2026-04-01",
+        "expires_utc": None,
+        "reviewed_utc": "2026-05-03",
+    },
+    "MSFT": {
+        "reason": "pre-existing broker position",
+        "owner": "operator",
+        "added_utc": "2026-04-01",
+        "expires_utc": None,
+        "reviewed_utc": "2026-05-03",
+    },
+    "NVDA": {
+        "reason": "pre-existing broker position",
+        "owner": "operator",
+        "added_utc": "2026-04-01",
+        "expires_utc": None,
+        "reviewed_utc": "2026-05-03",
+    },
+}
+
 # Futures symbols whose IBKR positions cannot be reliably reconciled
 # without explicit contract_month resolution (ISSUE-29 companion). Any
 # diff on these is skipped rather than flagged as a mismatch until the
@@ -201,6 +228,7 @@ def main() -> int:
                 "broker_positions": 0,
             },
             "mismatches": [],
+            "exclusion_policy": EXCLUSION_POLICY,
             "notes": ["ibkr_unavailable"],
         })
         try:
@@ -284,6 +312,7 @@ def main() -> int:
         "drifts": drifts,
         "excluded_symbols": excluded,
         "futures_excluded_symbols": futures_excluded,
+        "exclusion_policy": EXCLUSION_POLICY,
         "notes": [],
     })
     LOG.info(
