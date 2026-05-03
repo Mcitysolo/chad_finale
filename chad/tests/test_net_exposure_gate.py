@@ -265,7 +265,7 @@ def test_symbol_daily_loss_limit_blocks_when_exceeded():
             portfolio_equity=200000.0,
         )
     assert decision.action == GateAction.BLOCK
-    assert "symbol_daily_loss_limit" in decision.reason
+    assert "symbol_loss_limit" in decision.reason
 
 
 def test_symbol_daily_loss_limit_allows_when_under_threshold():

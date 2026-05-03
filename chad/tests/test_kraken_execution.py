@@ -172,12 +172,22 @@ def test_build_kraken_intents_skips_non_crypto_and_missing_prices() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_executor_validate_only_does_not_call_live_router() -> None:
+def test_executor_validate_only_does_not_call_live_router(tmp_path) -> None:
     """
     KrakenExecutor.execute_with_risk(intent, live=False) must route through
     the router with validate_only=True and never invoke a live submission.
+
+    Uses an isolated dynamic_caps.json fixture so the assertion does not
+    depend on runtime/dynamic_caps.json (which the orchestrator rewrites
+    each cycle and may zero alpha_crypto when no weight is allocated).
     """
+    import json as _json
     from chad.execution.kraken_executor import KrakenExecutor, StrategyTradeIntent
+
+    caps_path = tmp_path / "dynamic_caps.json"
+    caps_path.write_text(
+        _json.dumps({"strategy_caps": {"alpha_crypto": 1000.0}})
+    )
 
     fake_router = MagicMock()
     # router.execute returns a TradeResponse-like object
@@ -186,7 +196,7 @@ def test_executor_validate_only_does_not_call_live_router() -> None:
     fake_resp.raw = {"validate": True}
     fake_router.execute.return_value = fake_resp
 
-    executor = KrakenExecutor(router=fake_router)
+    executor = KrakenExecutor(router=fake_router, caps_path=caps_path)
 
     intent = StrategyTradeIntent(
         strategy="alpha_crypto",

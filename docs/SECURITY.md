@@ -18,29 +18,73 @@ All operator secrets live under `/etc/chad/` as `EnvironmentFile=`
 inputs to systemd units. The runtime never reads secrets from the
 repository, runtime/, or any user shell history.
 
-| File                       | Contains                                    |
-| -------------------------- | ------------------------------------------- |
-| `/etc/chad/telegram.env`   | Telegram bot token + admin chat IDs         |
-| `/etc/chad/claude.env`     | Anthropic API key (Claude advisor)          |
-| `/etc/chad/chad.env`       | Execution mode flags + non-credential env   |
-| `/etc/chad/ibkr.env`       | IBKR account credentials / clientId base    |
+| File                        | Contains                                    |
+| --------------------------- | ------------------------------------------- |
+| `/etc/chad/telegram.env`    | Telegram bot token + admin chat IDs         |
+| `/etc/chad/claude.env`      | Anthropic API key (Claude advisor)          |
+| `/etc/chad/openai.env`      | OpenAI API key (legacy advisor path)        |
+| `/etc/chad/dashboard.env`   | Dashboard auth credential                   |
+| `/etc/chad/ibkr.env`        | IBKR account credentials / clientId base    |
+| `/etc/chad/kraken.env`      | Kraken API key/secret                       |
+| `/etc/chad/polygon.env`     | Polygon market-data key                     |
 
 ### 1.2 Permissions
 
-All `/etc/chad/*.env` files MUST be:
+All CHAD systemd units (chad-live-loop, chad-orchestrator, chad-backend,
+chad-dashboard, …) run as `User=ubuntu`. Secrets must be readable by
+that account but no broader. Two ownership shapes are permitted:
 
-- Owner: `ubuntu:ubuntu`
-- Mode: `600` (owner read/write only)
-- Never world-readable, never group-readable
+- **Service-shared secrets** — `root:chad`, mode `640`. Read access is
+  granted to the runtime via the `chad` POSIX group (`getent group chad`
+  contains `ubuntu`). Root retains write so an operator action is
+  required to mutate the file. This is the canonical shape for files
+  consumed by one or more systemd units.
+- **Operator-only secrets** — `ubuntu:ubuntu`, mode `600` (or `640`
+  when `chad` is the only other group consumer). Use this shape when
+  the secret is rotated by the `ubuntu` operator from the shell rather
+  than by `sudo $EDITOR`.
 
-Verification one-liner:
+Files MUST never be:
+
+- World-readable (`o+r`).
+- Group-writable (`g+w`).
+- Owned by a group other than `chad` or `ubuntu`.
+
+Verification one-liners:
 
 ```bash
-ls -l /etc/chad/*.env
+ls -la /etc/chad/*.env
+getent group chad
 ```
 
-If any file shows other than `-rw-------` for `ubuntu:ubuntu`, fix
-immediately with `chmod 600` and `chown ubuntu:ubuntu`.
+Expected output shape (mode `640`, owner `root:chad` or `ubuntu:ubuntu`,
+`chad` group must contain `ubuntu`):
+
+```text
+-rw-r----- 1 root   chad  ... /etc/chad/ibkr.env
+-rw-r----- 1 root   chad  ... /etc/chad/telegram.env
+-rw-r----- 1 ubuntu ubuntu... /etc/chad/claude.env
+chad:x:1001:ubuntu
+```
+
+If a file shows `-rw-rw-r--`, world-readable bits, or owner outside
+`{root, ubuntu}` × `{chad, ubuntu}`, fix immediately:
+
+```bash
+sudo chown root:chad /etc/chad/<file>.env  # for service-shared
+sudo chmod 640 /etc/chad/<file>.env
+```
+
+Service read-access can be confirmed without printing secrets via:
+
+```bash
+sudo -u ubuntu test -r /etc/chad/<file>.env && echo READABLE_BY_RUNTIME
+systemctl show chad-live-loop.service -p EnvironmentFiles
+```
+
+The first line returns `READABLE_BY_RUNTIME` if the runtime account can
+open the file. The second confirms which `EnvironmentFile=` directives
+the unit will load at start.
 
 ### 1.3 Source control
 

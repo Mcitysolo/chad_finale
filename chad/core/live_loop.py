@@ -1055,6 +1055,45 @@ def run_once(logger: logging.Logger) -> None:
             "net_exposure_gate_failed err=%s — proceeding without gate",
             _gate_err,
         )
+        _gate_decisions = []
+
+    # ------------------------------------------------------------------
+    # BG11 — FLIP_ALLOWED close-first / open-second enforcement.
+    # For every FLIP_ALLOWED gate decision, submit the close intent for
+    # the conflicting position FIRST. The new flipped entry is only
+    # permitted if the close is broker-confirmed; otherwise it is
+    # dropped and position_guard is left untouched (no false-flat).
+    # ------------------------------------------------------------------
+    try:
+        from chad.core.flip_executor import enforce_flip_close_first
+        _flip_pre_count = len(routed_signals or [])
+        routed_signals, _flip_audit = enforce_flip_close_first(
+            list(routed_signals or []),
+            _gate_decisions or [],
+            _paper_adapter,
+        )
+        _flip_dropped = _flip_pre_count - len(routed_signals)
+        if _flip_dropped:
+            logger.warning(
+                "BG11_FLIP_EXECUTOR dropped=%d remaining=%d",
+                _flip_dropped, len(routed_signals),
+            )
+        if _flip_audit:
+            try:
+                _audit_path = Path(
+                    "/home/ubuntu/chad_finale/runtime/flip_executor_audit.json"
+                )
+                with open(_audit_path, "a", encoding="utf-8") as _fh:
+                    for _row in _flip_audit:
+                        _fh.write(json.dumps(_row, default=str) + "\n")
+            except Exception:
+                pass
+    except Exception as _flip_err:
+        logger.debug(
+            "flip_executor_failed err=%s — flipped entries kept; gate "
+            "still enforces priority. Manual review required.",
+            _flip_err,
+        )
 
     # ------------------------------------------------------------------
     # Smart Strategy Throttle Gate — performance-aware time-window
