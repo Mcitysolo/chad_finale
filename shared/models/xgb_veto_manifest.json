@@ -1,0 +1,21 @@
+{
+  "model_path": "/home/ubuntu/chad_finale/shared/models/xgb_veto_model.json",
+  "trained_at_utc": "2026-05-03T11:51:06.519205+00:00",
+  "training_samples": 7672,
+  "validation_accuracy": 0.5498371335504886,
+  "validation_logloss": 0.6935948332086059,
+  "feature_names": [
+    "strategy_encoded",
+    "regime_encoded",
+    "vix_level",
+    "hour_of_day",
+    "day_of_week",
+    "scr_sizing_factor",
+    "is_buy",
+    "equity_normalized",
+    "recent_win_rate",
+    "regime_confidence"
+  ],
+  "prior_model_backup": "/home/ubuntu/chad_finale/shared/models/xgb_veto_model_20260503_115106.json",
+  "schema_version": "xgb_manifest.v1"
+}
