@@ -21,3 +21,6 @@ status_server.log
 runtime/*.bak.*
 untracked_quarantine_*/
 wip_quarantine_*/
+runtime/pnl_state.json
+*.bak
+*.pre_*
