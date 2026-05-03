@@ -67,9 +67,87 @@ LOSS_STREAK_FOR_PAUSE = 4
 # Level 4 — defer to edge decay (5 consecutive losses)
 EDGE_DECAY_LOSS_STREAK = 5
 
-# In-memory tracking (process lifetime — resets on restart by design)
+# In-memory tracking, persisted to runtime/strategy_throttle_state.json
+# so pause windows and entry-rate state survive process restart.
 _ENTRY_TIMESTAMPS: Dict[str, List[float]] = {}
 _PAUSED_UNTIL: Dict[str, float] = {}
+
+_THROTTLE_STATE_PATH = (
+    Path(__file__).parent.parent.parent
+    / "runtime" / "strategy_throttle_state.json"
+)
+
+
+def _save_throttle_state() -> None:
+    """Persist throttle state atomically.
+
+    Only active pauses (until > now) and recent entry timestamps
+    (within the last 2 hours) are written.
+    """
+    try:
+        import os as _os
+        now = time.time()
+        state = {
+            "schema_version": "strategy_throttle_state.v1",
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "paused_until": {
+                k: datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+                for k, v in _PAUSED_UNTIL.items()
+                if v > now
+            },
+            "entry_timestamps": {
+                k: [t for t in v if t > now - 7200]
+                for k, v in _ENTRY_TIMESTAMPS.items()
+                if any(t > now - 7200 for t in v)
+            },
+        }
+        _THROTTLE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _tmp = _THROTTLE_STATE_PATH.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        _os.replace(str(_tmp), str(_THROTTLE_STATE_PATH))
+    except Exception as e:
+        logger.debug("strategy_throttle: state_save_failed err=%s", e)
+
+
+def _load_throttle_state() -> None:
+    """Load persisted throttle state on module import.
+
+    Restores pause windows still in the future and entry timestamps
+    from the last 2 hours. Silently ignores missing/corrupt state.
+    """
+    try:
+        if not _THROTTLE_STATE_PATH.exists():
+            return
+        data = json.loads(
+            _THROTTLE_STATE_PATH.read_text(encoding="utf-8")
+        )
+        now = time.time()
+        for strategy, until_iso in (data.get("paused_until") or {}).items():
+            try:
+                until_ts = datetime.fromisoformat(
+                    str(until_iso).replace("Z", "+00:00")
+                ).timestamp()
+                if until_ts > now:
+                    _PAUSED_UNTIL[strategy] = until_ts
+                    logger.info(
+                        "strategy_throttle: restored pause "
+                        "strategy=%s until=%s",
+                        strategy, until_iso,
+                    )
+            except Exception:
+                pass
+        for strategy, timestamps in (data.get("entry_timestamps") or {}).items():
+            try:
+                valid = [float(t) for t in timestamps if float(t) > now - 7200]
+                if valid:
+                    _ENTRY_TIMESTAMPS[strategy] = valid
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("strategy_throttle: state_load_failed err=%s", e)
+
+
+_load_throttle_state()
 
 
 class ThrottleLevel(str, Enum):
@@ -279,6 +357,10 @@ def _record_entry(strategy: str) -> None:
         t for t in _ENTRY_TIMESTAMPS[strategy] if t > cutoff
     ]
     _ENTRY_TIMESTAMPS[strategy].append(now)
+    try:
+        _save_throttle_state()
+    except Exception:
+        pass
 
 
 def _entries_in_window(strategy: str, window_seconds: int) -> int:
@@ -300,6 +382,10 @@ def _set_pause(strategy: str, duration_minutes: int) -> str:
     until = time.time() + (duration_minutes * 60)
     _PAUSED_UNTIL[strategy] = until
     dt = datetime.fromtimestamp(until, tz=timezone.utc)
+    try:
+        _save_throttle_state()
+    except Exception:
+        pass
     return dt.isoformat()
 
 
@@ -527,7 +613,28 @@ def run_throttle_gate(
                     "strategy_throttle DEFER_EDGE_DECAY strategy=%s streak=%d",
                     decision.strategy, decision.loss_streak,
                 )
-                # Edge decay is the actual enforcement layer — let signal pass
+                # Actually write the halt to strategy_allocations.json so
+                # edge-decay enforcement picks it up immediately rather
+                # than waiting for the next edge_decay_monitor pass.
+                try:
+                    from chad.risk.edge_decay_monitor import (
+                        set_strategy_halted as _set_strategy_halted,
+                    )
+                    _set_strategy_halted(
+                        decision.strategy,
+                        int(decision.loss_streak or 0),
+                    )
+                    logger.warning(
+                        "strategy_throttle HALT_WRITTEN strategy=%s "
+                        "streak=%d — written to strategy_allocations.json",
+                        decision.strategy, decision.loss_streak,
+                    )
+                except Exception as _halt_err:
+                    logger.warning(
+                        "strategy_throttle: halt_write_failed err=%s",
+                        _halt_err,
+                    )
+                # Still allow the signal — edge decay gate will enforce
                 allowed.append(signal)
 
         except Exception as e:

@@ -829,6 +829,15 @@ def run_once(logger: logging.Logger) -> None:
     except Exception:
         pass
 
+    # Weekend market hours gate — equity strategies do not trade on
+    # Saturday/Sunday (UTC). Crypto strategies (alpha_crypto, omega_vol,
+    # kraken) trade 24/7. Setup is here; filter applied after stage-4.
+    from datetime import datetime, timezone
+    _now_utc = datetime.now(timezone.utc)
+    _is_weekend = _now_utc.weekday() >= 5  # 5=Saturday, 6=Sunday
+    CRYPTO_STRATEGIES = {"alpha_crypto", "omega_vol", "kraken", "crypto"}
+    EQUITY_BLOCKED_ON_WEEKEND = True
+
     try:
         if is_always_active_routing():
             all_result = build_all_live_signals(logger)
@@ -908,16 +917,76 @@ def run_once(logger: logging.Logger) -> None:
         )
         return []
 
+    # Weekend gate — drop equity signals on Saturday/Sunday UTC; crypto
+    # strategies pass through unchanged.
+    if _is_weekend and routed_signals:
+        _pre_weekend_count = len(routed_signals)
+        routed_signals = [
+            s for s in routed_signals
+            if _signal_strategy_name(s) in CRYPTO_STRATEGIES
+            or not EQUITY_BLOCKED_ON_WEEKEND
+        ]
+        _filtered_count = _pre_weekend_count - len(routed_signals)
+        if _filtered_count > 0:
+            logger.info(
+                "WEEKEND_GATE blocked=%d equity signals (market closed)",
+                _filtered_count,
+            )
+
     # Signal throttle — apply trim AFTER routing decisions are made so
-    # only submission is capped. See detection block above stage-4.
+    # only submission is capped. Exits/risk-reducing signals are NEVER
+    # trimmed; only fresh entries are capped at _max_signals_this_cycle.
     if _max_signals_this_cycle is not None:
         try:
-            if routed_signals and len(routed_signals) > _max_signals_this_cycle:
-                logger.warning(
-                    "SIGNAL_THROTTLE_TRIMMED from=%d to=%d",
-                    len(routed_signals), _max_signals_this_cycle,
+            if routed_signals:
+                _EXIT_INTENT_TYPES = {
+                    "exit", "stop_loss", "reduce", "liquidation",
+                    "hedge", "close", "risk_reduction",
+                }
+                _protected = []
+                _fresh_entries = []
+                for _sig in routed_signals:
+                    _sig_meta = getattr(_sig, "meta", {}) or {}
+                    _sig_tags = getattr(_sig, "tags", None) or ()
+                    _meta_tags = (
+                        _sig_meta.get("tags", _sig_meta.get("signal_tags", []))
+                        if isinstance(_sig_meta, dict) else []
+                    )
+                    if not isinstance(_meta_tags, list):
+                        _meta_tags = []
+                    _all_tags = list(_sig_tags) + list(_meta_tags)
+                    _is_exit = (
+                        (isinstance(_sig_meta, dict) and (
+                            _sig_meta.get("exit")
+                            or _sig_meta.get("reason") == "max_hold_exit"
+                            or _sig_meta.get("intent") in (
+                                "exit", "close", "reduce", "hedge"
+                            )
+                        ))
+                        or any(
+                            str(t).lower() in _EXIT_INTENT_TYPES
+                            for t in _all_tags
+                        )
+                    )
+                    if _is_exit:
+                        _protected.append(_sig)
+                    else:
+                        _fresh_entries.append(_sig)
+                # Sort fresh entries deterministically:
+                # confidence DESC, created_at ASC
+                _fresh_entries.sort(
+                    key=lambda s: (
+                        -float(getattr(s, "confidence", 0.5) or 0.5),
+                        str(getattr(s, "created_at", "") or ""),
+                    )
                 )
-                routed_signals = list(routed_signals)[:_max_signals_this_cycle]
+                _trimmed = _fresh_entries[:_max_signals_this_cycle]
+                if len(_fresh_entries) > _max_signals_this_cycle:
+                    logger.warning(
+                        "SIGNAL_THROTTLE_TRIMMED entries=%d→%d protected=%d",
+                        len(_fresh_entries), len(_trimmed), len(_protected),
+                    )
+                routed_signals = _protected + _trimmed
         except Exception:
             pass
 

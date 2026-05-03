@@ -17,6 +17,11 @@ REPO_ROOT = Path("/home/ubuntu/chad_finale")
 RUNTIME = REPO_ROOT / "runtime"
 DATA = REPO_ROOT / "data"
 
+
+def is_weekday() -> bool:
+    """True Mon–Fri (UTC); False Sat/Sun. Used to gate equity-only rules."""
+    return datetime.now(timezone.utc).weekday() < 5
+
 # Feed → publisher service mapping (mirrors remediation.FEED_PUBLISHER_MAP)
 _FEED_PUBLISHER_MAP = {
     "price_cache.json": "chad-ibkr-price-refresh.timer",
@@ -25,6 +30,8 @@ _FEED_PUBLISHER_MAP = {
     "regime_booster.json": "chad-regime-booster.timer",
     "kraken_prices.json": "chad-kraken-ws.service",
     "reconciliation_state.json": "chad-reconciliation-publisher.timer",
+    "choppy_regime_state.json": "chad-choppy-regime.timer",
+    "macro_state.json": "chad-macro-state.timer",
 }
 
 @dataclass
@@ -119,6 +126,8 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
         ("regime_booster.json", 240),
         ("kraken_prices.json", 120),
         ("reconciliation_state.json", 480),
+        ("choppy_regime_state.json", 900),
+        ("macro_state.json", 7200),
     ]
     for fname, ttl in feeds:
         age = _age(RUNTIME / fname)
@@ -301,7 +310,10 @@ def rule_edge_decay_halts(findings: List[Finding]) -> None:
 
 
 def rule_high_trade_churn(findings: List[Finding]) -> None:
-    """R10 — Detect high trade churn with negative PnL."""
+    """R10 — Detect high trade churn with negative PnL. Weekday-only:
+    weekend churn signal is meaningless when equity markets are closed."""
+    if not is_weekday():
+        return
     d = _read_json(RUNTIME / "pnl_state.json")
     if not d:
         return
@@ -365,7 +377,11 @@ def rule_stale_reconciliation_artifact(findings: List[Finding]) -> None:
 
 
 def rule_alpha_cluster_degradation(findings: List[Finding]) -> None:
-    """R12 — Detect correlated degradation across alpha-cluster strategies."""
+    """R12 — Detect correlated degradation across alpha-cluster strategies.
+    Weekday-only: equity alpha strategies do not trade on weekends, so
+    health scores are stale by construction."""
+    if not is_weekday():
+        return
     p = RUNTIME / "strategy_health.json"
     if not p.exists():
         return

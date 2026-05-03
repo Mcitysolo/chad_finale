@@ -147,7 +147,9 @@ def test_hedge_signal_always_allowed():
     assert decision.reason == "hedge_tagged_within_budget"
 
 
-def test_reconciliation_red_blocks_opposite():
+def test_reconciliation_red_blocks_all_fresh_entries():
+    # CB06: when reconciliation is not GREEN, ALL fresh entries are blocked
+    # regardless of direction. Only protective signals (exits/hedges) pass.
     sig = MockSignal(strategy="alpha", symbol="SPY", side="SELL", confidence=0.85)
     open_positions = {
         "gamma|SPY": _open_pos("gamma", "SPY", "BUY"),
@@ -160,7 +162,42 @@ def test_reconciliation_red_blocks_opposite():
         portfolio_equity=200000.0,
     )
     assert decision.action == GateAction.BLOCK
-    assert "reconciliation_RED_blocks_opposite_exposure" in decision.reason
+    assert "reconciliation_RED_blocks_all_fresh_entries" in decision.reason
+
+
+def test_reconciliation_red_blocks_same_direction_fresh_entry():
+    # CB06: even with no opposite-direction conflict, a fresh entry under
+    # non-GREEN reconciliation must be blocked.
+    sig = MockSignal(strategy="alpha", symbol="SPY", side="BUY", confidence=0.85)
+    decision = evaluate_signal(
+        signal=sig,
+        signal_index=0,
+        open_positions={},
+        reconciliation_status="RED",
+        portfolio_equity=200000.0,
+    )
+    assert decision.action == GateAction.BLOCK
+    assert "reconciliation_RED_blocks_all_fresh_entries" in decision.reason
+
+
+def test_reconciliation_red_allows_hedge_signal():
+    # CB06 protective-signal carve-out: hedges still pass when recon is RED.
+    sig = MockSignal(
+        strategy="omega_vol",
+        symbol="VIX",
+        side="BUY",
+        confidence=0.5,
+        tags=["hedge"],
+    )
+    decision = evaluate_signal(
+        signal=sig,
+        signal_index=0,
+        open_positions={},
+        reconciliation_status="RED",
+        portfolio_equity=200000.0,
+    )
+    assert decision.action == GateAction.ALLOW
+    assert decision.reason == "hedge_tagged_within_budget"
 
 
 def test_lower_priority_strategy_blocked():

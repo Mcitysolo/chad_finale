@@ -358,24 +358,23 @@ def evaluate_signal(
             _loss_check_err,
         )
 
-    # Rule 1: reconciliation not GREEN → block opposite-direction exposure
+    # Rule 1: reconciliation not GREEN → block ALL fresh entries.
+    # When CHAD's view of broker positions is uncertain, opening new
+    # exposure in any direction risks doubling up. Only protective
+    # signals (exits/reductions/hedges) are allowed through; the exit
+    # tag was already handled in Rule 0 above, so here we only need to
+    # admit hedges.
     if reconciliation_status != "GREEN":
-        conflicts = _find_conflicts(
-            symbol, asset_class, side, strategy, open_positions
-        )
-        opposite_conflicts = [
-            c for c in conflicts
-            if c["side"] and c["side"] != side
-        ]
-        if opposite_conflicts:
+        if not _is_hedge_signal(signal):
             return GateDecision(
                 action=GateAction.BLOCK,
-                reason=f"reconciliation_{reconciliation_status}_blocks_opposite_exposure",
+                reason=(
+                    f"reconciliation_{reconciliation_status}_"
+                    f"blocks_all_fresh_entries"
+                ),
                 signal_index=signal_index,
                 symbol=symbol,
                 strategy=strategy,
-                conflicting_strategy=opposite_conflicts[0]["strategy"],
-                conflicting_side=opposite_conflicts[0]["side"],
             )
 
     # Rule 2: hedge signals → ALLOW within budget

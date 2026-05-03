@@ -185,7 +185,7 @@ def read_regime_state(path: Path = REGIME_STATE_PATH) -> Dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
             "ts_utc": "",
-            "ttl_seconds": 60,
+            "ttl_seconds": 360,
             "ok": False,
             "regime": "unknown",
             "confidence": 0.0,
@@ -200,7 +200,7 @@ def read_regime_state(path: Path = REGIME_STATE_PATH) -> Dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
             "ts_utc": "",
-            "ttl_seconds": 60,
+            "ttl_seconds": 360,
             "ok": False,
             "regime": "unknown",
             "confidence": 0.0,
@@ -210,7 +210,7 @@ def read_regime_state(path: Path = REGIME_STATE_PATH) -> Dict[str, Any]:
             "notes": "",
         }
     if isinstance(data, dict):
-        _ttl = int(data.get("ttl_seconds", 120) or 120)
+        _ttl = int(data.get("ttl_seconds", 360) or 360)
         _ts = data.get("ts_utc", "") or ""
         if _ts:
             try:
@@ -242,7 +242,7 @@ def write_regime_state(
     result: RegimeResult,
     source: str = "regime_classifier",
     path: Path = REGIME_STATE_PATH,
-    ttl_seconds: int = 120,
+    ttl_seconds: int = 360,
 ) -> Dict[str, Any]:
     """Persist a regime classification result to runtime/regime_state.json.
 

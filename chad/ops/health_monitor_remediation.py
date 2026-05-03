@@ -26,6 +26,8 @@ FEED_PUBLISHER_MAP = {
     "kraken_prices.json": "chad-kraken-ws.service",
     "reconciliation_state.json": "chad-reconciliation-publisher.timer",
     "event_risk.json": "chad-event-risk.timer",
+    "choppy_regime_state.json": "chad-choppy-regime.timer",
+    "macro_state.json": "chad-macro-state.timer",
 }
 
 

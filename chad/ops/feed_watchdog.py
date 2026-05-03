@@ -16,12 +16,14 @@ if str(ROOT) not in sys.path:
 
 WATCHED_FEEDS = [
     {"name": "price_cache",    "file": "price_cache.json",          "ttl": 180},
-    {"name": "regime_state",   "file": "regime_state.json",         "ttl": 180},
+    {"name": "regime_state",   "file": "regime_state.json",         "ttl": 360},
     {"name": "dynamic_caps",   "file": "dynamic_caps.json",         "ttl": 180},
     {"name": "regime_booster", "file": "regime_booster.json",       "ttl": 180},
     {"name": "kraken_prices",  "file": "kraken_prices.json",        "ttl": 120},
     {"name": "reconciliation", "file": "reconciliation_state.json", "ttl": 480},
     {"name": "event_risk",     "file": "event_risk.json",           "ttl": 2400},
+    {"name": "choppy_regime",  "file": "choppy_regime_state.json",  "ttl": 900},
+    {"name": "macro_state",    "file": "macro_state.json",          "ttl": 7200},
 ]
 
 
