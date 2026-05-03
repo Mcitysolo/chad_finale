@@ -275,8 +275,40 @@ def _compute_followthrough(bars: List[dict], threshold: float = 0.01) -> float:
         return 0.5
 
 
-def compute_choppy_score(proxy_symbol: str = "SPY") -> Dict:
-    """Compute choppy score and indicator breakdown."""
+_PROXY_BY_ASSET_CLASS = {
+    "equity": "SPY",
+    "futures": "MES",   # Micro E-mini S&P as equity-futures proxy
+    "crypto": None,     # Crypto is 24/7; choppy concept does not apply
+    "options": "SPY",
+    "forex": None,      # Not applicable
+}
+
+
+def compute_choppy_score(
+    proxy_symbol: str = "SPY",
+    asset_class: str = "equity",
+) -> Dict:
+    """Compute choppy score and indicator breakdown.
+
+    BG13: choppy proxy is now scoped by asset class. Crypto and forex are
+    exempt (24/7 / non-applicable); equities and equity-futures map to SPY/MES.
+    """
+    _proxy = _PROXY_BY_ASSET_CLASS.get(
+        str(asset_class or "").lower(), proxy_symbol
+    )
+    if _proxy is None:
+        return {
+            "choppy_score": 0.0,
+            "is_choppy_raw": False,
+            "choppy_exempt": True,
+            "asset_class": asset_class,
+            "reason": f"{asset_class}_exempt_from_choppy",
+            "indicators": {},
+            "proxy_symbol": None,
+            "computed_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    proxy_symbol = _proxy
+
     bars = _load_daily_bars(proxy_symbol, n_days=35)
     if not bars:
         bars = _load_daily_bars("MES", n_days=35)
@@ -425,11 +457,26 @@ def evaluate_and_persist(state_path: Optional[Path] = None) -> Dict:
     return state
 
 
-def get_choppy_state(state_path: Optional[Path] = None) -> Dict:
+def get_choppy_state(
+    state_path: Optional[Path] = None,
+    asset_class: str = "equity",
+) -> Dict:
     """
     Read current choppy regime state without recomputing.
     Fail-open: returns choppy_active=False on any error or staleness.
+
+    BG13: when asset_class is exempt (crypto/forex), short-circuit with an
+    inactive overlay so callers can pass the signal's asset_class without
+    further branching.
     """
+    _ac = str(asset_class or "").lower()
+    if _ac in ("crypto", "forex"):
+        return {
+            "choppy_active": False,
+            "choppy_score": 0.0,
+            "choppy_exempt": True,
+            "asset_class": asset_class,
+        }
     if state_path is None:
         state_path = STATE_PATH
     try:

@@ -233,6 +233,31 @@ def _write_route_decision(detail: Dict[str, Any]) -> None:
         pass
 
 
+def _log_throttle_audit(event: str, reason: str, thr_data: dict) -> None:
+    """SS05: append-only audit log for signal throttle state transitions.
+
+    Each event (activate / expire / manual_clear) is written as a single
+    NDJSON line so a tail can recover the throttle's full lifecycle without
+    parsing the live runtime file. Failures are intentionally silent —
+    audit logging must never break the trading loop.
+    """
+    try:
+        from datetime import datetime, timezone
+        audit_path = Path(
+            "/home/ubuntu/chad_finale/runtime/signal_throttle_audit.json"
+        )
+        entry = {
+            "event": event,
+            "reason": reason,
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+            "throttle_data": thr_data,
+        }
+        with open(audit_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def _load_optional_metric(name: str) -> Optional[float]:
     """Best-effort lookup of a regime classifier input.
 
@@ -814,7 +839,23 @@ def run_once(logger: logging.Logger) -> None:
                                 json.dumps(_thr, indent=2),
                                 encoding="utf-8",
                             )
-                            logger.info("signal_throttle_expired — removed")
+                            # SS05: emit audit-grade warning + append-only log
+                            # so post-mortems can reconstruct exactly when the
+                            # throttle deactivated and why.
+                            logger.warning(
+                                "SIGNAL_THROTTLE_DEACTIVATED "
+                                "reason=expired "
+                                "activated_at=%s "
+                                "deactivated_at=%s "
+                                "trades_during_throttle=UNKNOWN",
+                                _thr.get("activated_at_utc", "?"),
+                                datetime.now(timezone.utc).isoformat(),
+                            )
+                            _log_throttle_audit(
+                                event="deactivated",
+                                reason="expired",
+                                thr_data=_thr,
+                            )
                     except Exception:
                         pass
                 if not _expired:
@@ -1170,6 +1211,16 @@ def run_once(logger: logging.Logger) -> None:
                     )
                 )
                 if _is_exit:
+                    _choppy_allowed.append(_sig)
+                    continue
+                # BG13: scope choppy filter by asset class. Crypto/forex are
+                # exempt because the SPY choppy proxy is not meaningful for
+                # 24/7 or non-equity markets.
+                _sig_ac = getattr(_sig, "asset_class", None)
+                if _sig_ac is not None and hasattr(_sig_ac, "value"):
+                    _sig_ac = _sig_ac.value
+                _sig_ac_str = str(_sig_ac or "").lower()
+                if _sig_ac_str in ("crypto", "forex"):
                     _choppy_allowed.append(_sig)
                     continue
                 _sig_conf = float(getattr(_sig, "confidence", 0.5) or 0.5)

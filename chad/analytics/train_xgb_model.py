@@ -23,10 +23,12 @@ You MUST:
 
 import json
 import logging
+import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -292,6 +294,21 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
           f"base_loss_rate={base_loss_rate:.3f} "
           f"veto_rate@0.65={veto_rate_at_065:.3f}")
 
+    # SS08: snapshot the prior model with a UTC timestamp before overwriting
+    # so each retrain is recoverable. Filename collisions are avoided because
+    # the timestamp resolves to the second.
+    backup_path: Optional[Path] = None
+    if MODEL_PATH.exists():
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_path = MODEL_PATH.with_name(f"xgb_veto_model_{ts}.json")
+        try:
+            shutil.copy2(MODEL_PATH, backup_path)
+            LOG.info("Backed up prior model to %s", backup_path)
+            print(f"Backed up prior model to {backup_path}")
+        except Exception:  # noqa: BLE001
+            LOG.exception("Failed to back up prior model — continuing")
+            backup_path = None
+
     LOG.info("Saving XGBoost model to %s", MODEL_PATH)
     try:
         bst.save_model(str(MODEL_PATH))
@@ -304,6 +321,30 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
             n_features=int(n_features),
             metrics=metrics,
         )
+
+    # SS08: write a manifest beside the model recording training metadata,
+    # the backup path of the prior model (rollback target), and the feature
+    # set the model was trained on. Operators can restore by copying the
+    # backup over MODEL_PATH.
+    try:
+        manifest = {
+            "model_path": str(MODEL_PATH),
+            "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+            "training_samples": int(n_samples),
+            "validation_accuracy": float(metrics.get("accuracy", 0.0)),
+            "validation_logloss": float(metrics.get("logloss", 0.0)),
+            "feature_names": list(FEATURE_NAMES),
+            "prior_model_backup": str(backup_path) if backup_path else None,
+            "schema_version": "xgb_manifest.v1",
+        }
+        manifest_path = MODEL_PATH.parent / "xgb_veto_manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        LOG.info("Manifest written to %s", manifest_path)
+        print(f"Manifest written to {manifest_path}")
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to write XGBoost manifest — continuing")
 
     LOG.info("Writing performance metrics to %s", PERF_PATH)
     try:

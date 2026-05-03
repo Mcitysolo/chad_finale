@@ -17,10 +17,14 @@ REPO_ROOT = Path("/home/ubuntu/chad_finale")
 RUNTIME = REPO_ROOT / "runtime"
 VENV_PYTHON = REPO_ROOT / "venv/bin/python3"
 
-# Feed → publisher service mapping
+# Feed → publisher service mapping.
+# SS01: regime_state.json was previously mapped to chad-live-loop.service,
+# but auto-restarting the trading engine on regime staleness is unsafe.
+# regime_state staleness now degrades gracefully (NOTIFY_ONLY in R02);
+# this map only routes to non-trading publishers.
 FEED_PUBLISHER_MAP = {
     "price_cache.json": "chad-ibkr-price-refresh.timer",
-    "regime_state.json": "chad-live-loop.service",
+    "regime_state.json": "chad-regime-classifier-refresh.timer",
     "dynamic_caps.json": "chad-orchestrator.service",
     "regime_booster.json": "chad-regime-booster.timer",
     "kraken_prices.json": "chad-kraken-ws.service",
@@ -28,6 +32,15 @@ FEED_PUBLISHER_MAP = {
     "event_risk.json": "chad-event-risk.timer",
     "choppy_regime_state.json": "chad-choppy-regime.timer",
     "macro_state.json": "chad-macro-state.timer",
+}
+
+# SS01: services that must NEVER be auto-restarted by the health monitor.
+# These are trading engines — restarting them mid-cycle can drop in-flight
+# orders, lose position state, or cause double-fills. Operators must restart
+# them manually after explicit investigation.
+NEVER_AUTO_RESTART = {
+    "chad-live-loop.service",
+    "chad-orchestrator.service",
 }
 
 
@@ -43,7 +56,15 @@ def _run(cmd: list, timeout: int = 30) -> tuple[int, str, str]:
 
 
 def restart_service(service: str, **kwargs) -> str:
-    """Restart a systemd service."""
+    """Restart a systemd service.
+
+    SS01: refuses to touch any service in NEVER_AUTO_RESTART (trading engines).
+    """
+    if service in NEVER_AUTO_RESTART:
+        return (
+            f"⚠️ REFUSED: {service} is a trading engine — "
+            f"auto-restart not allowed. Manual restart required."
+        )
     rc, out, err = _run(["sudo", "-n", "systemctl", "restart", service])
     if rc == 0:
         return f"✅ Restarted {service}"
@@ -55,6 +76,12 @@ def restart_feed_publisher(feed: str, age: float, ttl: int, **kwargs) -> str:
     svc = FEED_PUBLISHER_MAP.get(feed)
     if not svc:
         return f"⚠️ No publisher mapped for {feed} — manual investigation needed"
+    # SS01: defence-in-depth — never restart trading engines through any path.
+    if svc in NEVER_AUTO_RESTART:
+        return (
+            f"⚠️ REFUSED: feed {feed} mapped to {svc} which is a trading "
+            f"engine — auto-restart not allowed. Manual investigation required."
+        )
     rc, out, err = _run(["sudo", "-n", "systemctl", "restart", svc])
     if rc == 0:
         return f"✅ Restarted {svc} (feed {feed} was {int(age)}s old, TTL={ttl}s)"

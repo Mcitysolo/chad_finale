@@ -93,6 +93,12 @@ class GateDecision:
     strategy: str
     conflicting_strategy: Optional[str] = None
     conflicting_side: Optional[str] = None
+    # BG11: FLIP_ALLOWED partial-failure handling. When action == FLIP_ALLOWED
+    # the executor MUST first close the conflicting position described by these
+    # fields and only proceed with the new entry if the close succeeds.
+    flip_close_strategy: Optional[str] = None
+    flip_close_symbol: Optional[str] = None
+    flip_close_side: Optional[str] = None
 
 
 def _read_json(path: Path) -> dict:
@@ -271,6 +277,69 @@ def _compute_symbol_daily_pnl() -> Dict[Tuple[str, str, str], float]:
     return pnl_map
 
 
+def _compute_symbol_unrealized_pnl() -> Dict[Tuple[str, str, str], float]:
+    """
+    Compute unrealized PnL per (strategy, symbol, side) from open positions
+    in position_guard.json, marked against runtime/price_cache.json.
+    Returns {} on any failure — loss limit degrades gracefully (CB07).
+    """
+    result: Dict[Tuple[str, str, str], float] = {}
+    try:
+        guard = _read_json(RUNTIME / "position_guard.json")
+        prices = _read_json(RUNTIME / "price_cache.json")
+        price_map: Dict[str, float] = {}
+        if isinstance(prices, dict):
+            for sym, data in prices.items():
+                try:
+                    if isinstance(data, dict):
+                        price_map[str(sym).upper()] = float(
+                            data.get("last", data.get("price", 0)) or 0
+                        )
+                    elif isinstance(data, (int, float)):
+                        price_map[str(sym).upper()] = float(data)
+                except Exception:
+                    continue
+
+        if not isinstance(guard, dict):
+            return result
+
+        for _key, pos in guard.items():
+            if not isinstance(pos, dict) or not pos.get("open"):
+                continue
+            strategy = str(pos.get("strategy", "")).lower()
+            symbol = str(pos.get("symbol", "")).upper()
+            side = str(pos.get("side", "")).upper()
+            try:
+                size = float(
+                    pos.get("size", pos.get("quantity", 0)) or 0
+                )
+                entry_price = float(
+                    pos.get("fill_price",
+                    pos.get("entry_price", 0)) or 0
+                )
+            except Exception:
+                continue
+            current_price = price_map.get(symbol, 0.0)
+
+            if entry_price <= 0 or current_price <= 0 or size <= 0:
+                continue
+
+            if side == "BUY":
+                unrealized = (current_price - entry_price) * size
+            elif side == "SELL":
+                unrealized = (entry_price - current_price) * size
+            else:
+                continue
+
+            k = (strategy, symbol, side)
+            result[k] = result.get(k, 0.0) + unrealized
+    except Exception as e:
+        logger.debug(
+            "net_exposure_gate: unrealized_pnl_failed err=%s", e
+        )
+    return result
+
+
 def _find_conflicts(
     symbol: str,
     asset_class: str,
@@ -312,6 +381,8 @@ def evaluate_signal(
     open_positions: Dict[str, dict],
     reconciliation_status: str,
     portfolio_equity: float,
+    symbol_realized_pnl: Optional[Dict[Tuple[str, str, str], float]] = None,
+    symbol_unrealized_pnl: Optional[Dict[Tuple[str, str, str], float]] = None,
 ) -> GateDecision:
     """Evaluate a single signal against the net exposure conflict rules."""
     symbol = _signal_symbol(signal)
@@ -330,23 +401,37 @@ def evaluate_signal(
             strategy=strategy,
         )
 
-    # Rule 0.5: per-symbol daily loss limit
+    # Rule 0.5: per-symbol daily loss limit (CB07 — realized + unrealized)
     # If this strategy+symbol+side has already lost more than the configured
-    # threshold today, block new entries in this direction. Exits and
-    # opposite-direction signals are unaffected (different key).
+    # threshold today (closed PnL plus open-position drawdown vs current
+    # price), block new entries in this direction. Exits and opposite-side
+    # signals are unaffected (different key).
     try:
-        _symbol_pnl = _compute_symbol_daily_pnl()
+        _symbol_pnl = (
+            symbol_realized_pnl
+            if symbol_realized_pnl is not None
+            else _compute_symbol_daily_pnl()
+        )
+        _unrealized_pnl = (
+            symbol_unrealized_pnl
+            if symbol_unrealized_pnl is not None
+            else _compute_symbol_unrealized_pnl()
+        )
         _key = (strategy, symbol, side)
-        _today_pnl = _symbol_pnl.get(_key, 0.0)
-        if _today_pnl < -MAX_SYMBOL_DAILY_LOSS_USD:
+        _realized = _symbol_pnl.get(_key, 0.0)
+        _unrealized = _unrealized_pnl.get(_key, 0.0)
+        _total_exposure = _realized + _unrealized
+        if _total_exposure < -MAX_SYMBOL_DAILY_LOSS_USD:
             if not _is_exit_signal(signal):
                 return GateDecision(
                     action=GateAction.BLOCK,
                     reason=(
-                        f"symbol_daily_loss_limit_exceeded_"
+                        f"symbol_loss_limit_"
                         f"{strategy}_{symbol}_{side}_"
-                        f"loss=${abs(_today_pnl):.2f}_"
-                        f"limit=${MAX_SYMBOL_DAILY_LOSS_USD:.2f}"
+                        f"realized={_realized:.2f}_"
+                        f"unrealized={_unrealized:.2f}_"
+                        f"total={_total_exposure:.2f}_"
+                        f"limit={MAX_SYMBOL_DAILY_LOSS_USD:.2f}"
                     ),
                     signal_index=signal_index,
                     symbol=symbol,
@@ -487,6 +572,12 @@ def evaluate_signal(
                 strategy=strategy,
                 conflicting_strategy=highest_priority_conflict["strategy"],
                 conflicting_side=highest_priority_conflict["side"],
+                # BG11: executor MUST close this position first; only proceed
+                # with the flip entry if the close succeeds. Atomicity is
+                # enforced by position_guard.replace_position().
+                flip_close_strategy=highest_priority_conflict["strategy"],
+                flip_close_symbol=symbol,
+                flip_close_side=highest_priority_conflict["side"],
             )
 
     return GateDecision(
@@ -519,9 +610,18 @@ def run_gate(
         open_positions = _get_open_positions()
         reconciliation_status = _get_reconciliation_status()
         portfolio_equity = _get_portfolio_equity()
+        # CB07: compute realized + unrealized symbol PnL once per gate run
+        # and pass into every evaluate_signal call. Both fail-open to {}.
+        symbol_realized_pnl = _compute_symbol_daily_pnl()
+        symbol_unrealized_pnl = _compute_symbol_unrealized_pnl()
     except Exception as e:
         logger.warning("net_exposure_gate: context_load_failed err=%s — ALLOW all", e)
         return signals, []
+
+    # FLIP_ALLOWED: executor must close flip_close_* first.
+    # If close fails, the new entry must NOT proceed.
+    # This is enforced by the position guard's replace_position()
+    # which atomically replaces the existing entry.
 
     allowed: List[Any] = []
     decisions: List[GateDecision] = []
@@ -535,6 +635,8 @@ def run_gate(
                 open_positions=open_positions,
                 reconciliation_status=reconciliation_status,
                 portfolio_equity=portfolio_equity,
+                symbol_realized_pnl=symbol_realized_pnl,
+                symbol_unrealized_pnl=symbol_unrealized_pnl,
             )
             decisions.append(decision)
 
@@ -548,7 +650,7 @@ def run_gate(
                     decision.reason,
                     decision.conflicting_strategy,
                 )
-                if decision.reason.startswith("symbol_daily_loss_limit_exceeded"):
+                if decision.reason.startswith("symbol_loss_limit"):
                     logger.warning(
                         "NET_EXPOSURE_GATE SYMBOL_LOSS_LIMIT symbol=%s "
                         "strategy=%s limit=$%.2f detail=%s",

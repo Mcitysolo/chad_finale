@@ -19,6 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
 import json
+import time as _time
 
 STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/position_guard.json")
 
@@ -51,8 +52,14 @@ def save_state(state: Dict[str, dict]) -> None:
 
     Promoted from `_save_state` per ISSUE-75 (encapsulation cleanup).
     Atomicity is preserved via tmp-file + os.replace.
+
+    CB08/DS03: stamps a monotonic millisecond `_version` and `_written_by`
+    on the top-level state dict before write so consumers can detect
+    concurrent modification (CAS basis).
     """
     import os as _os
+    state["_version"] = int(_time.time() * 1000)
+    state["_written_by"] = "position_guard"
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     _tmp = STATE_PATH.with_suffix('.json.tmp')
     _tmp.write_text(json.dumps(state, indent=2, default=str),
@@ -170,6 +177,7 @@ def mark_position_open(intent) -> None:
         "side": side,
         "quantity": quantity,
         "last_state": PositionState.OPEN.value,
+        "_entry_version": int(_time.time() * 1000),
     }
     save_state(state)
 
@@ -181,6 +189,7 @@ def mark_position_closed(intent) -> None:
         state[key]["open"] = False
         state[key]["updated_at_utc"] = _utc_now_iso()
         state[key]["last_state"] = PositionState.CLOSED.value
+        state[key]["_entry_version"] = int(_time.time() * 1000)
         save_state(state)
 
 
@@ -208,6 +217,7 @@ def replace_position(intent) -> None:
         "side": side,
         "quantity": quantity,
         "last_state": PositionState.FLIPPED.value,
+        "_entry_version": int(_time.time() * 1000),
     }
     save_state(state)
 

@@ -22,16 +22,26 @@ def is_weekday() -> bool:
     """True Mon–Fri (UTC); False Sat/Sun. Used to gate equity-only rules."""
     return datetime.now(timezone.utc).weekday() < 5
 
-# Feed → publisher service mapping (mirrors remediation.FEED_PUBLISHER_MAP)
+# Feed → publisher service mapping (mirrors remediation.FEED_PUBLISHER_MAP).
+# SS01: regime_state and the orchestrator-published feed (dynamic_caps) are
+# served by trading engines; their staleness must NEVER trigger an
+# auto-restart of the trading engine itself. The remediation map below is
+# only consulted for feeds whose publisher is a side-car timer/service.
 _FEED_PUBLISHER_MAP = {
     "price_cache.json": "chad-ibkr-price-refresh.timer",
-    "regime_state.json": "chad-live-loop.service",
+    "regime_state.json": "chad-regime-classifier-refresh.timer",
     "dynamic_caps.json": "chad-orchestrator.service",
     "regime_booster.json": "chad-regime-booster.timer",
     "kraken_prices.json": "chad-kraken-ws.service",
     "reconciliation_state.json": "chad-reconciliation-publisher.timer",
     "choppy_regime_state.json": "chad-choppy-regime.timer",
     "macro_state.json": "chad-macro-state.timer",
+}
+
+# SS01: feeds whose staleness must degrade to NOTIFY_ONLY rather than a
+# service restart, because the only available publisher is a trading engine.
+_FEED_NOTIFY_ONLY = {
+    "regime_state.json",
 }
 
 @dataclass
@@ -143,17 +153,34 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
             ))
         elif age > ttl * 2:
             svc = _FEED_PUBLISHER_MAP.get(fname, "")
-            findings.append(Finding(
-                rule_id="R02",
-                severity="CRITICAL",
-                title=f"Feed STALE: {fname} ({int(age)}s old, TTL={ttl}s)",
-                description=f"{fname} is {int(age)}s old — more than 2× TTL.",
-                remedy_type="SERVICE_RESTART",
-                remedy_action="restart_feed_publisher",
-                remedy_args={"feed": fname, "age": age, "ttl": ttl,
-                             "service": svc},
-                evidence=f"mtime age={int(age)}s TTL={ttl}s service={svc}",
-            ))
+            # SS01: regime_state staleness alerts but never triggers a
+            # trading-engine restart. Operator must investigate manually.
+            if fname in _FEED_NOTIFY_ONLY:
+                findings.append(Finding(
+                    rule_id="R02",
+                    severity="WARNING",
+                    title=f"Feed STALE (notify): {fname} ({int(age)}s old, TTL={ttl}s)",
+                    description=(
+                        f"{fname} is {int(age)}s old — more than 2× TTL. "
+                        "Auto-restart suppressed: publisher is a trading "
+                        "engine. Operator investigation required."
+                    ),
+                    remedy_type="NOTIFY_ONLY",
+                    remedy_action="notify",
+                    evidence=f"mtime age={int(age)}s TTL={ttl}s feed={fname}",
+                ))
+            else:
+                findings.append(Finding(
+                    rule_id="R02",
+                    severity="CRITICAL",
+                    title=f"Feed STALE: {fname} ({int(age)}s old, TTL={ttl}s)",
+                    description=f"{fname} is {int(age)}s old — more than 2× TTL.",
+                    remedy_type="SERVICE_RESTART",
+                    remedy_action="restart_feed_publisher",
+                    remedy_args={"feed": fname, "age": age, "ttl": ttl,
+                                 "service": svc},
+                    evidence=f"mtime age={int(age)}s TTL={ttl}s service={svc}",
+                ))
 
 
 def rule_scr_state(findings: List[Finding]) -> None:
