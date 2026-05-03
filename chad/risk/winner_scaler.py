@@ -89,6 +89,22 @@ def _load_policy() -> Dict[str, Any]:
     return merged
 
 
+def _is_reconciliation_artifact(name: str) -> bool:
+    """True for reconciliation/closeout-strategy labels that must never
+    appear in winner_scaling.json (they are bookkeeping rows, not real
+    trading strategies). Keeps the writer side authoritative so the
+    health monitor doesn't have to keep clearing them downstream.
+    """
+    nlow = str(name or "").strip().lower()
+    if not nlow:
+        return False
+    if nlow.startswith("reconciled_phase"):
+        return True
+    if nlow.startswith("reconciled_"):
+        return True
+    return False
+
+
 def compute_multipliers(
     expectancy_doc: Dict[str, Any],
     policy: Dict[str, Any],
@@ -109,6 +125,11 @@ def compute_multipliers(
         nlow = name.lower()
         if nlow in excluded:
             continue
+        if _is_reconciliation_artifact(name):
+            # Reconciliation artifacts (RECONCILED_PHASE2_* etc.) are
+            # closeout bookkeeping, not strategies — they must not
+            # influence the median-expectancy denominator.
+            continue
         try:
             trades = int(info.get("total_trades", 0))
             exp = float(info.get("expectancy", 0.0))
@@ -128,6 +149,10 @@ def compute_multipliers(
     n_scaled = 0
     n_neutral = 0
     for name, info in strategies.items():
+        # Drop reconciliation artifacts from the published map entirely so
+        # downstream consumers (allocator, health monitor) never see them.
+        if _is_reconciliation_artifact(name):
+            continue
         nlow = name.lower()
         if nlow in excluded:
             multipliers[name] = 1.0

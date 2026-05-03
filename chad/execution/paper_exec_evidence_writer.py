@@ -937,6 +937,13 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
          after normalization in paper mode — the writer caller is missing
          data we cannot synthesize and the record must not be persisted
          as untrusted.
+      5. Sanity-check the proposed fill_price against runtime/price_cache.json.
+         If the cache has a positive price for the symbol AND the proposed
+         fill_price deviates by >50%, the fill is flagged untrusted via
+         extra.pnl_untrusted (so trade_closer / SCR / profit_lock skip it)
+         rather than being silently used as a real fill. The cache-lookup
+         step also overwrites placeholder fill_price values (<=0) with the
+         cached price when available.
 
     Live-mode records (is_live=True) are returned unchanged: the broker is
     the source of truth and we must not rewrite its statuses or prices.
@@ -953,14 +960,43 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
         return ev
 
     # 2) fill_price — resolve from price cache with futures normalization.
-    if _safe_float(ev.fill_price, 0.0) <= 0.0:
-        cached = _lookup_paper_fill_price(ev.symbol)
+    cached = _lookup_paper_fill_price(ev.symbol)
+    proposed = _safe_float(ev.fill_price, 0.0)
+    if proposed <= 0.0:
         if cached > 0.0:
             ev.fill_price = cached
         else:
             expected = _safe_float(ev.expected_price, 0.0)
             if expected > 0.0:
                 ev.fill_price = expected
+
+    # 5) Price-sanity guard: when both proposed fill_price and a cached
+    # reference price are available and they diverge by >50%, the proposed
+    # fill is almost certainly a placeholder (e.g. fill_price=100.0 for
+    # SPY when SPY is actually 720). Flag untrusted instead of silently
+    # accepting the bogus price as realized PnL feedstock.
+    final_fill = _safe_float(ev.fill_price, 0.0)
+    if cached > 0.0 and final_fill > 0.0:
+        try:
+            deviation = abs(final_fill - cached) / cached
+        except ZeroDivisionError:
+            deviation = 0.0
+        if deviation > 0.50:
+            try:
+                if not isinstance(ev.extra, dict):
+                    ev.extra = dict(ev.extra) if ev.extra else {}
+                ev.extra["pnl_untrusted"] = True
+                ev.extra["pnl_untrusted_reason"] = (
+                    f"fill_price={final_fill} deviates "
+                    f"{deviation*100:.0f}% from price_cache={cached}"
+                )
+                # Also tag for tag-based untrusted detectors.
+                tags_list = list(ev.tags) if ev.tags else []
+                if "pnl_untrusted" not in tags_list:
+                    tags_list.append("pnl_untrusted")
+                ev.tags = tuple(tags_list)
+            except Exception:
+                pass
 
     # 3) status — translate pending/error → paper_fill if we have a price.
     status_norm = _safe_str(ev.status, "").strip().lower()

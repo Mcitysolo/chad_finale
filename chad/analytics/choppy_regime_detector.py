@@ -467,7 +467,9 @@ def get_choppy_state(
 
     BG13: when asset_class is exempt (crypto/forex), short-circuit with an
     inactive overlay so callers can pass the signal's asset_class without
-    further branching.
+    further branching. For futures, the persisted state file always carries
+    the equity-publisher proxy_symbol (typically SPY) — override the proxy
+    based on _PROXY_BY_ASSET_CLASS so callers see the right reference symbol.
     """
     _ac = str(asset_class or "").lower()
     if _ac in ("crypto", "forex"):
@@ -476,13 +478,17 @@ def get_choppy_state(
             "choppy_score": 0.0,
             "choppy_exempt": True,
             "asset_class": asset_class,
+            "proxy_symbol": None,
         }
     if state_path is None:
         state_path = STATE_PATH
     try:
         state = _read_json(state_path)
         if not state:
-            return {"choppy_active": False, "choppy_score": 0.0}
+            base = {"choppy_active": False, "choppy_score": 0.0}
+            base["proxy_symbol"] = _PROXY_BY_ASSET_CLASS.get(_ac, "SPY")
+            base["asset_class"] = asset_class
+            return base
 
         ts = state.get("ts_utc", "")
         if ts:
@@ -496,13 +502,27 @@ def get_choppy_state(
                         "choppy_active": False,
                         "choppy_score": 0.0,
                         "stale": True,
+                        "asset_class": asset_class,
+                        "proxy_symbol": _PROXY_BY_ASSET_CLASS.get(_ac, "SPY"),
                     }
             except Exception:
                 pass
 
-        return state
+        # Override the persisted proxy_symbol with the per-asset-class
+        # reference so futures callers see "MES" rather than the publisher's
+        # equity proxy ("SPY"). The persisted state was computed against
+        # equity bars; this is metadata for the caller, not a recomputation.
+        out = dict(state)
+        out["asset_class"] = asset_class
+        out["proxy_symbol"] = _PROXY_BY_ASSET_CLASS.get(_ac, state.get("proxy_symbol", "SPY"))
+        return out
     except Exception:
-        return {"choppy_active": False, "choppy_score": 0.0}
+        return {
+            "choppy_active": False,
+            "choppy_score": 0.0,
+            "asset_class": asset_class,
+            "proxy_symbol": _PROXY_BY_ASSET_CLASS.get(_ac, "SPY"),
+        }
 
 
 def get_choppy_overlay(state_path: Optional[Path] = None) -> Dict:

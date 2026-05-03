@@ -265,3 +265,63 @@ def test_clean_market_zero_score(monkeypatch):
     assert out["choppy_score"] < crd.CLEAN_THRESHOLD
     assert out["is_choppy_raw"] is False
     assert out["indicators"]["direction_flip_high"] is False
+
+
+# ---------------------------------------------------------------------------
+# BG13 — per-asset-class scoping
+# ---------------------------------------------------------------------------
+
+
+def test_crypto_choppy_exempt_in_live_loop_path(_isolated_state):
+    """get_choppy_state(asset_class='crypto') must short-circuit to exempt."""
+    out = crd.get_choppy_state(asset_class="crypto")
+    assert out.get("choppy_exempt") is True
+    assert out.get("choppy_active") is False
+    assert out.get("proxy_symbol") is None
+
+
+def test_forex_choppy_exempt(_isolated_state):
+    """Forex never has a meaningful choppy proxy — must report exempt."""
+    out = crd.get_choppy_state(asset_class="forex")
+    assert out.get("choppy_exempt") is True
+    assert out.get("choppy_active") is False
+    assert out.get("proxy_symbol") is None
+
+
+def test_futures_choppy_uses_mes_proxy(_isolated_state):
+    """get_choppy_state(asset_class='futures') must report proxy_symbol=MES
+    even though the persisted state file was written by the equity publisher
+    (which writes proxy_symbol=SPY)."""
+    just_now = datetime.now(timezone.utc) - timedelta(minutes=1)
+    _isolated_state.write_text(
+        json.dumps({
+            "choppy_active": True,
+            "choppy_score": 0.7,
+            "ts_utc": just_now.isoformat(),
+            "ttl_seconds": 300,
+            "proxy_symbol": "SPY",
+        }),
+        encoding="utf-8",
+    )
+    out = crd.get_choppy_state(asset_class="futures")
+    assert out.get("proxy_symbol") == "MES"
+    assert out.get("choppy_exempt") is not True
+
+
+def test_equity_choppy_still_applies(_isolated_state):
+    """Equity asset_class must still surface the persisted choppy_active flag."""
+    just_now = datetime.now(timezone.utc) - timedelta(minutes=1)
+    _isolated_state.write_text(
+        json.dumps({
+            "choppy_active": True,
+            "choppy_score": 0.8,
+            "ts_utc": just_now.isoformat(),
+            "ttl_seconds": 300,
+            "proxy_symbol": "SPY",
+        }),
+        encoding="utf-8",
+    )
+    out = crd.get_choppy_state(asset_class="equity")
+    assert out.get("choppy_active") is True
+    assert out.get("choppy_exempt") is not True
+    assert out.get("proxy_symbol") == "SPY"

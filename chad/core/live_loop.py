@@ -1210,45 +1210,15 @@ def run_once(logger: logging.Logger) -> None:
         logger.warning("regime classifier/reduction failed (non-fatal): %s", _reg_err)
 
     # ------------------------------------------------------------------
-    # Choppy regime defensive gate. Reads the overlay state written by
-    # the choppy_regime systemd timer; falls back to inactive on any
-    # error. When active: low-confidence entries are blocked, exits and
-    # protectives always pass. Sizing reduction is recorded in the
-    # overlay for downstream sizing logic to consume.
+    # Choppy regime defensive gate. Per-signal asset-class scoping (BG13):
+    # crypto/forex are always exempt; equity/options/futures evaluate the
+    # choppy overlay against their own asset_class. Stale state applies a
+    # conservative confidence floor (only to non-exempt asset classes).
+    # Exits and protectives always pass.
     # ------------------------------------------------------------------
-    _choppy_active = False
-    _choppy_sizing_mult = 1.0
-    _choppy_confidence_add = 0.0
-    try:
-        from chad.analytics.choppy_regime_detector import get_choppy_state
-        _choppy_state = get_choppy_state()
-        # CB05: when choppy state is stale, the detector returns
-        # choppy_active=False (fail-open). That hides regime risk. Apply
-        # a conservative-but-not-maximum default instead.
-        if _choppy_state.get("stale"):
-            _choppy_active = True
-            _choppy_sizing_mult = 0.50
-            _choppy_confidence_add = 0.10
-            logger.warning(
-                "CHOPPY_STATE_STALE — applying conservative defaults "
-                "sizing=0.50 confidence_add=0.10"
-            )
-        else:
-            _choppy_active = bool(_choppy_state.get("choppy_active", False))
-            if _choppy_active:
-                _choppy_sizing_mult = 0.25
-                _choppy_confidence_add = 0.15
-                logger.warning(
-                    "CHOPPY_REGIME_ACTIVE score=%.3f sizing_mult=%.2f confidence_add=%.2f",
-                    float(_choppy_state.get("choppy_score", 0) or 0),
-                    _choppy_sizing_mult,
-                    _choppy_confidence_add,
-                )
-    except Exception:
-        pass
-
-    if _choppy_active and routed_signals:
+    if routed_signals:
         try:
+            from chad.analytics.choppy_regime_detector import get_choppy_state
             _pre_choppy = len(routed_signals)
             _choppy_allowed = []
             for _sig in routed_signals:
@@ -1264,25 +1234,50 @@ def run_once(logger: logging.Logger) -> None:
                 if _is_exit:
                     _choppy_allowed.append(_sig)
                     continue
-                # BG13: scope choppy filter by asset class. Crypto/forex are
-                # exempt because the SPY choppy proxy is not meaningful for
-                # 24/7 or non-equity markets.
+
+                # BG13: derive asset class per-signal with safe fallbacks.
                 _sig_ac = getattr(_sig, "asset_class", None)
                 if _sig_ac is not None and hasattr(_sig_ac, "value"):
                     _sig_ac = _sig_ac.value
-                _sig_ac_str = str(_sig_ac or "").lower()
-                if _sig_ac_str in ("crypto", "forex"):
+                if not _sig_ac and isinstance(_sig_meta, dict):
+                    _sig_ac = (
+                        _sig_meta.get("asset_class")
+                        or _sig_meta.get("required_asset_class")
+                    )
+                _sig_ac_str = str(_sig_ac or "equity").lower()
+
+                # Per-signal choppy state — crypto/forex short-circuit to
+                # choppy_exempt=True inside get_choppy_state.
+                try:
+                    _sig_choppy = get_choppy_state(asset_class=_sig_ac_str)
+                except Exception:
+                    _sig_choppy = {"choppy_active": False, "choppy_score": 0.0}
+
+                if _sig_choppy.get("choppy_exempt"):
                     _choppy_allowed.append(_sig)
                     continue
+
+                # Stale → conservative floor; active → normal floor; else
+                # the gate is a no-op for this signal.
+                if _sig_choppy.get("stale"):
+                    _conf_add = 0.10
+                elif _sig_choppy.get("choppy_active"):
+                    _conf_add = 0.15
+                else:
+                    _choppy_allowed.append(_sig)
+                    continue
+
                 _sig_conf = float(getattr(_sig, "confidence", 0.5) or 0.5)
-                if _sig_conf < (0.5 + _choppy_confidence_add):
+                _required = 0.5 + _conf_add
+                if _sig_conf < _required:
                     logger.info(
-                        "CHOPPY_GATE_BLOCK symbol=%s strategy=%s conf=%.2f required=%.2f",
+                        "CHOPPY_GATE_BLOCK symbol=%s strategy=%s asset=%s conf=%.2f required=%.2f",
                         getattr(_sig, "symbol", "?"),
                         getattr(_sig, "primary_strategy", None)
                         or getattr(_sig, "strategy", "?"),
+                        _sig_ac_str,
                         _sig_conf,
-                        0.5 + _choppy_confidence_add,
+                        _required,
                     )
                     continue
                 _choppy_allowed.append(_sig)

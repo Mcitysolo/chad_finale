@@ -175,3 +175,108 @@ def test_expected_price_fallback_when_cache_miss(fake_price_cache):
     # No cache match; falls back to expected_price.
     assert ev2.fill_price == pytest.approx(42.0)
     assert ev2.status == "paper_fill"
+
+
+# ---------------------------------------------------------------------------
+# Pre-Epoch-2 blocker fix tests — price-sanity guard / placeholder rejection
+# ---------------------------------------------------------------------------
+
+
+def test_paper_executor_uses_price_cache_for_spy(fake_price_cache):
+    """When fill_price is missing, SPY fill resolves to the cached price."""
+    ev = PaperExecEvidence(
+        symbol="SPY",
+        side="SELL",
+        quantity=10.0,
+        fill_price=0.0,
+        status="filled",
+        is_live=False,
+        asset_class="equity",
+        expected_price=0.0,
+    )
+    normalize_paper_fill_evidence(ev)
+    assert ev.fill_price == pytest.approx(700.0)
+
+
+def test_paper_executor_rejects_placeholder_100_when_cache_real(fake_price_cache):
+    """A proposed fill_price=100.0 for SPY (cache=700.0) is flagged untrusted.
+    The 50% deviation guard catches placeholder prices that would otherwise
+    silently feed bogus realized PnL into the trade closer."""
+    ev = PaperExecEvidence(
+        symbol="SPY",
+        side="SELL",
+        quantity=10.0,
+        fill_price=100.0,
+        expected_price=100.0,
+        status="filled",
+        is_live=False,
+        asset_class="equity",
+    )
+    normalize_paper_fill_evidence(ev)
+    assert isinstance(ev.extra, dict)
+    assert ev.extra.get("pnl_untrusted") is True
+    reason = ev.extra.get("pnl_untrusted_reason", "")
+    assert "100" in reason and "700" in reason
+    assert any(
+        str(t).strip().lower() == "pnl_untrusted" for t in (ev.tags or ())
+    )
+
+
+def test_invalid_fill_not_trusted_closed_trade(tmp_path, monkeypatch):
+    """trade_closer._extract_fill must skip records flagged pnl_untrusted —
+    they are not allowed to feed FIFO matching."""
+    from chad.execution.trade_closer import _extract_fill
+
+    bad = {
+        "payload": {
+            "fill_id": "abc123",
+            "strategy": "delta",
+            "symbol": "SPY",
+            "side": "SELL",
+            "quantity": 10.0,
+            "fill_price": 100.0,
+            "fill_time_utc": "2026-05-03T11:48:55.976Z",
+            "extra": {"pnl_untrusted": True, "pnl_untrusted_reason": "placeholder"},
+            "tags": ["paper", "filled", "delta", "pnl_untrusted"],
+            "status": "filled",
+            "reject": False,
+        }
+    }
+    assert _extract_fill(bad) is None
+
+    good = {
+        "payload": {
+            "fill_id": "def456",
+            "strategy": "delta",
+            "symbol": "SPY",
+            "side": "SELL",
+            "quantity": 10.0,
+            "fill_price": 700.0,
+            "fill_time_utc": "2026-05-03T11:48:55.976Z",
+            "extra": {},
+            "tags": ["paper", "filled", "delta"],
+            "status": "filled",
+            "reject": False,
+        }
+    }
+    fill = _extract_fill(good)
+    assert fill is not None
+    assert fill["fill_price"] == pytest.approx(700.0)
+
+
+def test_in_range_fill_price_is_trusted(fake_price_cache):
+    """Fill within 50% of cache passes through clean — no untrusted flag."""
+    ev = PaperExecEvidence(
+        symbol="SPY",
+        side="SELL",
+        quantity=10.0,
+        fill_price=720.0,  # cache is 700.0; ~3% deviation
+        expected_price=720.0,
+        status="filled",
+        is_live=False,
+        asset_class="equity",
+    )
+    normalize_paper_fill_evidence(ev)
+    extra = ev.extra if isinstance(ev.extra, dict) else {}
+    assert not extra.get("pnl_untrusted")
+    assert ev.fill_price == pytest.approx(720.0)

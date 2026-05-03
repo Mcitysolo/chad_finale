@@ -144,6 +144,20 @@ def _extract_fill(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if status in ("rejected", "cancelled", "canceled"):
         return None
 
+    # Skip untrusted fills (e.g. placeholder fill_price flagged by the
+    # paper executor's price-sanity guard). Untrusted fills must not feed
+    # into FIFO matching — they would produce phantom realized PnL.
+    extra = payload.get("extra") if isinstance(payload, dict) else None
+    if isinstance(extra, dict) and bool(extra.get("pnl_untrusted")):
+        return None
+    if payload.get("pnl_untrusted") is True:
+        return None
+    tags_list = payload.get("tags") if isinstance(payload, dict) else None
+    if isinstance(tags_list, (list, tuple)) and any(
+        str(t).strip().lower() == "pnl_untrusted" for t in tags_list
+    ):
+        return None
+
     fill_id = payload.get("fill_id")
     if not fill_id:
         # Synthesize a deterministic id so we can de-dup
