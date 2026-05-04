@@ -805,8 +805,12 @@ def run_once(logger: logging.Logger) -> None:
         # Clear alert-tracking entries for strategies that are no longer
         # halted (operator cleared via scripts/clear_edge_decay.py),
         # so subsequent re-halts can re-alert.
+        # Use intersection_update (in-place mutation) rather than `-=`:
+        # augmented assignment would mark the module-global as a function
+        # local for the entire run_once frame, raising UnboundLocalError
+        # on the earlier reads at lines 800/802 above.
         _currently_halted = set(halted)
-        _EDGE_DECAY_ALERTED -= (set(_EDGE_DECAY_ALERTED) - _currently_halted)
+        _EDGE_DECAY_ALERTED.intersection_update(_currently_halted)
     except Exception as _decay_err:  # noqa: BLE001
         logger.warning("edge_decay_monitor failed (non-fatal): %s", _decay_err)
 
