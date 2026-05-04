@@ -108,6 +108,18 @@ _PAPER_PENDING_STATUSES = frozenset({
     "inactive", "unknown", "", "error",
 })
 
+# Strategies that exclusively trade options instruments. A fill attributed to
+# any of these MUST carry asset_class="options"; if the writer would otherwise
+# persist the fill with asset_class="etf"/"equity" (e.g. because the BAG combo
+# silently downgraded to a plain SPY/STK shape upstream), the normalizer
+# rejects the record instead of letting the misclassified ETF fill enter
+# trade_closer / SCR / profit_lock as an options trade.
+_OPTIONS_ONLY_STRATEGIES = frozenset({
+    "alpha_options",
+    "omega_momentum_options",
+})
+_OPTIONS_ASSET_CLASSES = frozenset({"options"})
+
 # Known futures contract roots — used both for asset_class resolution and for
 # stripping contract-month suffixes (e.g. "MGCK6" → "MGC", "MES2606" → "MES")
 # when looking up the symbol in runtime/price_cache.json. Longest first so
@@ -959,6 +971,37 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
     current_ac = _safe_str(ev.asset_class, "").strip()
     if not current_ac or current_ac.lower() == "unknown":
         ev.asset_class = _resolve_asset_class_safe(ev.symbol, "")
+
+    # 1b) Strategy↔asset_class consistency for options-only strategies. If an
+    # alpha_options / omega_momentum_options fill is about to be written with
+    # asset_class != "options" (e.g. the BAG combo was silently downgraded to
+    # an SPY/STK shape upstream), demote to rejected with a clear reason
+    # rather than persist a misclassified ETF fill that downstream consumers
+    # would treat as a trusted equity round trip. Applies in both paper and
+    # live mode — the invariant is structural, not paper-specific.
+    strategy_norm = _safe_str(ev.strategy, "").strip().lower()
+    asset_class_norm = _safe_str(ev.asset_class, "").strip().lower()
+    if strategy_norm in _OPTIONS_ONLY_STRATEGIES and asset_class_norm not in _OPTIONS_ASSET_CLASSES:
+        if not isinstance(ev.extra, dict):
+            ev.extra = dict(ev.extra) if ev.extra else {}
+        ev.extra["pnl_untrusted"] = True
+        ev.extra["pnl_untrusted_reason"] = (
+            f"options_strategy_asset_class_mismatch: strategy={strategy_norm} "
+            f"asset_class={asset_class_norm or '<empty>'} (expected options) — "
+            f"BAG/options combo downgrade prevented"
+        )
+        ev.extra["rejected_reason"] = "unsupported_options_combo"
+        tags_list = list(ev.tags) if ev.tags else []
+        for t in ("pnl_untrusted", "unsupported_options_combo"):
+            if t not in tags_list:
+                tags_list.append(t)
+        ev.tags = tuple(tags_list)
+        ev.reject = True
+        ev.status = "rejected"
+        # Stop further normalization. The fill is rejected; do not run
+        # price-cache resolution / pending-status translation that would
+        # otherwise promote this record to "paper_fill".
+        return ev
 
     if _safe_bool(ev.is_live, False):
         return ev

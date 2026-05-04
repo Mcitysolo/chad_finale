@@ -19,6 +19,12 @@ LEDGER_PATH = ROOT / "runtime" / "ibkr_paper_ledger_state.json"
 
 PRICE_CACHE_TTL_SECONDS = 300
 
+# Strategies that exclusively trade options. A plan order tagged with one of
+# these but carrying a non-options asset_class (e.g. asset_class="" or "etf")
+# is a silent BAG-combo downgrade and must be skipped — not paper-filled as
+# a SPY equity buy. Mirrors paper_exec_evidence_writer._OPTIONS_ONLY_STRATEGIES.
+OPTIONS_ONLY_STRATEGIES = frozenset({"alpha_options", "omega_momentum_options"})
+
 logger = logging.getLogger("chad_paper_trade_executor")
 logging.basicConfig(
     level=logging.INFO,
@@ -217,6 +223,22 @@ def main():
 
         contributors = o.get("contributors") or []
         strategy = normalize_strategy(o.get("strategy"), contributors)
+
+        # --- OPTIONS STRATEGY ASSET-CLASS GUARD ---
+        # alpha_options / omega_momentum_options can only legitimately produce
+        # asset_class="options" fills. If the planner artifact has the strategy
+        # tagged but the asset_class is missing or non-options, the BAG combo
+        # was silently downgraded upstream (no real options-execution path
+        # exists yet). Skip rather than pretend a SPY ETF buy is the spread.
+        plan_asset_class = str(o.get("asset_class") or "").strip().lower()
+        if strategy in OPTIONS_ONLY_STRATEGIES and plan_asset_class != "options":
+            logger.warning(
+                "Order %d %s: strategy=%s asset_class=%r — options strategy "
+                "must carry asset_class=options; refusing to paper-fill as "
+                "non-options (unsupported_options_combo)",
+                idx, symbol, strategy, plan_asset_class or "<empty>",
+            )
+            continue
 
         # --- PNL COMPUTATION ---
         pnl_untrusted = False

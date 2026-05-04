@@ -446,6 +446,12 @@ def resolve_asset_class(symbol: Any, sec_type: Any = "") -> str:
         return "forex"
     if stype == "OPT":
         return "options"
+    # BAG is IBKR's combo container — used exclusively for multi-leg
+    # options orders in CHAD (vertical spreads from alpha_options). Without
+    # this branch, SPY/BAG would fall through to the ETF lookup below and
+    # silently downgrade options combo fills to "etf".
+    if stype in ("BAG", "COMBO"):
+        return "options"
     if stype == "CRYPTO":
         return "crypto"
     # STK is ambiguous between equity and ETF — fall through to symbol lookup.
