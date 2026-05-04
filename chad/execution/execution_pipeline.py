@@ -272,14 +272,26 @@ def _load_latest_bar_for_symbol(symbol: str) -> Optional[Dict[str, object]]:
     return None — callers treat this as "no bar data" and fall back to
     the default spread estimate. No I/O is performed for empty symbols.
     """
-    if not symbol:
+    return _load_latest_bar_for_symbol_with_timeframe(symbol, "1d")
+
+
+def _load_latest_bar_for_symbol_with_timeframe(
+    symbol: str, timeframe: str
+) -> Optional[Dict[str, object]]:
+    """Best-effort load of the most recent bar at the given timeframe.
+
+    Reads data/bars/{timeframe}/{SYMBOL}.json. Missing files or parse
+    errors return None — callers treat this as "no bar data". No I/O is
+    performed for empty symbols or empty timeframes.
+    """
+    if not symbol or not timeframe:
         return None
     try:
         import json as _json
         from pathlib import Path as _Path
 
         root = _Path(__file__).resolve().parents[2]
-        path = root / "data" / "bars" / "1d" / f"{str(symbol).upper()}.json"
+        path = root / "data" / "bars" / str(timeframe) / f"{str(symbol).upper()}.json"
         if not path.is_file():
             return None
         data = _json.loads(path.read_text(encoding="utf-8"))
@@ -294,6 +306,38 @@ def _load_latest_bar_for_symbol(symbol: str) -> Optional[Dict[str, object]]:
     if not isinstance(last, dict):
         return None
     return last
+
+
+def _load_latest_bar_ts_for_symbol(symbol: str) -> str:
+    """Return the most recent bar timestamp string, preferring 1m over 1d.
+
+    Used for ``intent.bar_timestamp`` so the A4 data_freshness_gate
+    compares against intraday-fresh bars when they exist. Falls back to
+    the 1d bar's ts_utc only when 1m is missing, empty, or carries no
+    parseable timestamp. Returns "" when neither source yields one — the
+    gate then degrades to its None-passthrough behavior for non-intraday
+    intents.
+
+    Spread / limit-price modeling continues to use
+    ``_load_latest_bar_for_symbol`` (1d only) so existing pricing
+    behavior is unchanged by this helper.
+    """
+    if not symbol:
+        return ""
+    for tf in ("1m", "1d"):
+        bar = _load_latest_bar_for_symbol_with_timeframe(symbol, tf)
+        if bar is None:
+            continue
+        ts_raw = bar.get("ts_utc") or bar.get("timestamp") or bar.get("date")
+        if ts_raw is None:
+            continue
+        ts_str = str(ts_raw).strip()
+        if not ts_str:
+            continue
+        if _parse_bar_timestamp(ts_str) is None:
+            continue
+        return ts_str
+    return ""
 
 
 _STALE_BAR_WARN_DAYS: int = 5
@@ -1048,14 +1092,17 @@ def build_ibkr_intents_from_plan(
         # A high-urgency intent or a wide estimated spread forces a marketable
         # limit priced through the market; otherwise we submit a passive LMT
         # at the strategy's reference price.
-        # Phase-8 Session 8 (A4/E5 full threading): the same bar feeds
-        # bar_timestamp (A4) and current_price (E5) so the routing gates
-        # compare against real data rather than degrading to time-based mode.
+        # Phase-8 Session 8 (A4/E5 full threading): bar_timestamp (A4) and
+        # current_price (E5) feed the routing gates with real data rather
+        # than degrading to time-based / None-passthrough mode.
+        # 2026-05-04 freshness fix: bar_timestamp now prefers the 1m bar so
+        # intraday/futures/equity signals are not penalised by the daily
+        # bar's date-only ts_utc on Mondays. Spread/limit-price modeling
+        # still uses the 1d bar via _load_latest_bar_for_symbol below.
         latest_bar = _load_latest_bar_for_symbol(order.symbol)
-        bar_ts_raw = ""
+        bar_ts_raw = _load_latest_bar_ts_for_symbol(order.symbol)
         bar_close: Optional[float] = None
         if latest_bar is not None:
-            bar_ts_raw = str(latest_bar.get("ts_utc") or "")
             try:
                 bc = float(latest_bar.get("close") or 0.0)
                 if bc > 0.0:
@@ -1340,10 +1387,11 @@ def _build_kraken_intent_from_routed_signal(
     # the market; passive: limit at the bar's close. Missing bar data keeps
     # the legacy "market" routing so the change cannot break existing callers
     # that don't emit signals with enough metadata.
+    # 2026-05-04 freshness fix: bar_timestamp prefers 1m bar over 1d so
+    # the A4 gate sees fresh intraday timestamps when available. The 1d
+    # bar continues to drive spread / limit-price modeling below.
     kraken_latest_bar = _load_latest_bar_for_symbol(symbol)
-    kraken_bar_ts = ""
-    if kraken_latest_bar is not None:
-        kraken_bar_ts = str(kraken_latest_bar.get("ts_utc") or "")
+    kraken_bar_ts = _load_latest_bar_ts_for_symbol(symbol)
     kraken_spread_pct = estimate_spread_pct(symbol, kraken_latest_bar)
     kraken_order_params = select_order_type(
         urgency=signal_urgency,
