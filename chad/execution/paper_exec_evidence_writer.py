@@ -995,6 +995,13 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
                 if "pnl_untrusted" not in tags_list:
                     tags_list.append("pnl_untrusted")
                 ev.tags = tuple(tags_list)
+                # Demote the record from "filled" to "rejected" so the
+                # placeholder cannot enter trade_closer FIFO matching even
+                # if a downstream consumer ignores the pnl_untrusted flag.
+                # Audit trail is preserved (record is still persisted) but
+                # status/reject make it ineligible for realized PnL.
+                ev.reject = True
+                ev.status = "rejected"
             except Exception:
                 pass
 

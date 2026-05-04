@@ -372,6 +372,83 @@ def test_synthesize_fill_id_for_broker_sync_lot(tmp_path):
     assert closer2.queues[key][0]["fill_id"] == lot["fill_id"]
 
 
+def test_trade_closer_skips_pnl_untrusted_fill_ids(tmp_path):
+    """Fills tagged pnl_untrusted (via extra, payload, or tags) must never
+    enter FIFO matching — even when a counter-side trusted fill is present.
+    Trade closer must not produce a closed_trade record from them."""
+    closer = _make_closer(tmp_path)
+
+    untrusted_via_extra = _fill("u_extra", "SELL", 10, 100.0, symbol="SPY", seq=1)
+    untrusted_via_extra["payload"]["extra"] = {
+        "pnl_untrusted": True,
+        "pnl_untrusted_reason": "fill_price=100.0 deviates from price_cache",
+    }
+
+    untrusted_via_tags = _fill("u_tags", "SELL", 10, 100.0, symbol="SPY", seq=2)
+    untrusted_via_tags["payload"]["tags"] = [
+        "paper", "filled", "delta", "pnl_untrusted",
+    ]
+
+    untrusted_via_payload = _fill("u_payload", "SELL", 10, 100.0, symbol="SPY", seq=3)
+    untrusted_via_payload["payload"]["pnl_untrusted"] = True
+
+    # A real trusted closing fill on the other side — must not match anything
+    # because the queues are still empty (untrusted fills were skipped).
+    trusted_close = _fill("t_close", "BUY", 10, 720.0, symbol="SPY", seq=4)
+
+    _write_fills(
+        tmp_path / "fills" / "FILLS_20260408.ndjson",
+        [untrusted_via_extra, untrusted_via_tags, untrusted_via_payload, trusted_close],
+    )
+    closer.load_state()
+    closed = closer.process_fills("20260408")
+
+    # No FIFO match should be produced. The trusted_close becomes a fresh
+    # opening lot (no opposite-side trusted lot to match against).
+    assert closed == [], (
+        "untrusted fills must be skipped before FIFO matching; "
+        f"unexpectedly produced: {closed}"
+    )
+    # None of the untrusted fill_ids should be tracked as processed.
+    assert "u_extra" not in closer.processed_fill_ids
+    assert "u_tags" not in closer.processed_fill_ids
+    assert "u_payload" not in closer.processed_fill_ids
+    # The trusted close is processed (opens a SELL-side lot from BUY 720,
+    # held until a counter-side trusted fill arrives).
+    assert "t_close" in closer.processed_fill_ids
+
+
+def test_trade_closer_dedupes_duplicate_fill_ids(tmp_path):
+    """The same fill_id appearing multiple times in a FILLS_*.ndjson must
+    produce only ONE FIFO event. The IBKR harvester occasionally emits
+    duplicate records for the same execID; trade_closer must dedup via
+    its processed_fill_ids set."""
+    closer = _make_closer(tmp_path)
+
+    # Opening BUY at $100, then 3 identical SELL records all sharing the
+    # same fill_id. Only the first SELL should match against the BUY; the
+    # other two duplicates must be dropped.
+    fills = [
+        _fill("open", "BUY", 1, 5000.0, symbol="MES", seq=1),
+        _fill("dup", "SELL", 1, 5010.0, symbol="MES", seq=2),
+        _fill("dup", "SELL", 1, 5010.0, symbol="MES", seq=3),
+        _fill("dup", "SELL", 1, 5010.0, symbol="MES", seq=4),
+    ]
+    _write_fills(tmp_path / "fills" / "FILLS_20260408.ndjson", fills)
+    closer.load_state()
+    closed = closer.process_fills("20260408")
+
+    assert len(closed) == 1, (
+        f"expected exactly one closed trade after dedup, got {len(closed)}"
+    )
+    ct = closed[0]
+    assert ct.fill_ids == ["open", "dup"]
+    # Run again — duplicates should still produce nothing because both
+    # fill_ids are in processed_fill_ids.
+    closed_again = closer.process_fills("20260408")
+    assert closed_again == []
+
+
 def test_preserve_existing_fill_id_when_present(tmp_path):
     """
     When a lot already has a fill_id, load_state() must not overwrite it.

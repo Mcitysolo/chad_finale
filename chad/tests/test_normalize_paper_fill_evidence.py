@@ -280,3 +280,90 @@ def test_in_range_fill_price_is_trusted(fake_price_cache):
     extra = ev.extra if isinstance(ev.extra, dict) else {}
     assert not extra.get("pnl_untrusted")
     assert ev.fill_price == pytest.approx(720.0)
+
+
+def test_paper_executor_never_writes_placeholder_100_as_filled_when_cache_valid(
+    fake_price_cache,
+):
+    """Placeholder fill_price=100 for SPY (cache=700) must never be persisted
+    as a trusted ``filled`` record. The normalizer demotes it to ``rejected``
+    + reject=True so trade_closer cannot consume it via FIFO matching."""
+    ev = PaperExecEvidence(
+        symbol="SPY",
+        side="SELL",
+        quantity=10.0,
+        fill_price=100.0,
+        expected_price=100.0,
+        status="filled",
+        is_live=False,
+        asset_class="equity",
+    )
+    normalize_paper_fill_evidence(ev)
+    # Status must NOT remain "filled" — it has been demoted.
+    assert str(ev.status).lower() != "filled"
+    assert str(ev.status).lower() == "rejected"
+    assert ev.reject is True
+    # Untrusted flag must still be set so multiple guards catch it.
+    assert isinstance(ev.extra, dict)
+    assert ev.extra.get("pnl_untrusted") is True
+
+
+def test_untrusted_placeholder_fill_is_not_fifo_matched(
+    fake_price_cache, tmp_path, monkeypatch
+):
+    """End-to-end: a placeholder $100 SPY fill written through the normalizer
+    must be filtered by trade_closer._extract_fill before FIFO matching can
+    produce a phantom closed trade."""
+    import datetime as _dt
+    from chad.execution import paper_exec_evidence_writer as pew
+    from chad.execution.trade_closer import TradeCloser, _extract_fill
+
+    fills_dir = tmp_path / "fills"
+    fees_dir = tmp_path / "fees"
+    metrics_dir = tmp_path / "execution_metrics"
+    fills_dir.mkdir(parents=True, exist_ok=True)
+    fees_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pew, "FILLS_DIR", fills_dir)
+    monkeypatch.setattr(pew, "FEES_DIR", fees_dir)
+    monkeypatch.setattr(pew, "EXEC_METRICS_DIR", metrics_dir)
+
+    # 1) Build placeholder fill, normalize, write through the real writer.
+    bad = PaperExecEvidence(
+        symbol="SPY",
+        strategy="delta",
+        source_strategies=["delta"],
+        side="SELL",
+        quantity=10.0,
+        fill_price=100.0,
+        expected_price=100.0,
+        status="filled",
+        is_live=False,
+        asset_class="equity",
+        fill_time_utc="2026-05-04T14:00:00+00:00",
+        entry_time_utc="2026-05-04T14:00:00+00:00",
+        exit_time_utc="2026-05-04T14:00:00+00:00",
+    )
+    pew.write_paper_exec_evidence(bad)
+
+    # 2) Run trade_closer over the persisted record on whichever YYYYMMDD
+    # the writer used (today's UTC date).
+    day = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
+    fills_path = fills_dir / f"FILLS_{day}.ndjson"
+    assert fills_path.exists(), f"writer did not produce {fills_path}"
+
+    closer = TradeCloser(
+        fills_dir=fills_dir,
+        trades_dir=tmp_path / "trades",
+        state_path=tmp_path / "state.json",
+    )
+    closer.load_state()
+    closed = closer.process_fills(day)
+    assert closed == [], (
+        "trade_closer must not produce a closed trade from an untrusted "
+        "placeholder fill"
+    )
+
+    # 3) Direct _extract_fill check: the on-disk record reads as None.
+    raw = json.loads(fills_path.read_text(encoding="utf-8").splitlines()[0])
+    assert _extract_fill(raw) is None
