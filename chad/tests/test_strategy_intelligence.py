@@ -302,3 +302,151 @@ class TestNeutralDefaults:
         uf = _neutral_universe_filter()
         assert uf.avoid_symbols == []
         assert uf.prefer_symbols == []
+
+
+# ---------------------------------------------------------------------------
+# Macro / event placeholder containment (Batch 7)
+# ---------------------------------------------------------------------------
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _stamp(payload, age_seconds=0, ttl=1800):
+    payload = dict(payload)
+    ts = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    payload["ts_utc"] = ts
+    payload["ttl_seconds"] = ttl
+    return payload
+
+
+def test_strategy_intelligence_uses_runtime_vix_when_available(tmp_path):
+    """Real VIX from price_cache.json should be the source — never 'unknown'."""
+    rd = tmp_path / "runtime"
+    rd.mkdir()
+    (rd / "macro_state.json").write_text(json.dumps(_stamp({
+        "risk_label": "risk_on",
+        "schema_version": "macro_state.v1",
+        "source": {"provider": "FredYieldProvider"},
+    })))
+    (rd / "price_cache.json").write_text(json.dumps(_stamp({
+        "prices": {"VIX": 16.99, "SPY": 717.58},
+    }, ttl=300)))
+    (rd / "event_risk.json").write_text(json.dumps(_stamp({
+        "severity": "low",
+        "elevated_risk": False,
+        "next_event": {
+            "name": "FOMC Rate Decision",
+            "ts_utc": _now_iso(),
+            "hours_until": 69.0,
+            "severity": "high",
+            "source": "operator_calendar",
+        },
+        "source": {"provider": "EconomicCalendarRiskProvider"},
+    })))
+
+    si = StrategyIntelligence(MagicMock(), rd)
+    ctx = si._load_market_context()
+
+    assert ctx["vix"]["vix"] == 16.99
+    assert ctx["vix"]["vix_source"] == "VIX"
+    assert ctx["vix"]["provider_status"] == "real"
+    # Sanity: nowhere in context is the placeholder string 'unknown' substituted in.
+    assert ctx["vix"]["vix"] != "unknown"
+
+
+def test_strategy_intelligence_marks_macro_unavailable_when_stale(tmp_path):
+    """Macro/VIX past ts_utc+ttl must be marked stale — not silently passed as fresh."""
+    rd = tmp_path / "runtime"
+    rd.mkdir()
+    # Stale: age 7200s with ttl 1800s
+    (rd / "macro_state.json").write_text(json.dumps(_stamp({
+        "risk_label": "risk_on",
+    }, age_seconds=7200, ttl=1800)))
+    (rd / "price_cache.json").write_text(json.dumps(_stamp({
+        "prices": {"VIX": 18.0},
+    }, age_seconds=600, ttl=300)))
+    # No event_risk file at all
+    si = StrategyIntelligence(MagicMock(), rd)
+    ctx = si._load_market_context()
+
+    assert ctx["macro_meta"]["provider_status"] == "stale"
+    assert ctx["vix"]["provider_status"] == "stale"
+    assert ctx["event_risk"]["provider_status"] == "unavailable"
+
+
+def test_event_context_uses_structured_event_risk_next_event(tmp_path):
+    """Structured next_event from EconomicCalendarRiskProvider must surface intact."""
+    rd = tmp_path / "runtime"
+    rd.mkdir()
+    (rd / "event_risk.json").write_text(json.dumps(_stamp({
+        "severity": "low",
+        "elevated_risk": False,
+        "next_event": {
+            "name": "FOMC Rate Decision",
+            "ts_utc": "2026-05-07T18:00:00Z",
+            "hours_until": 69.48,
+            "severity": "high",
+            "source": "operator_calendar",
+        },
+        "source": {"provider": "EconomicCalendarRiskProvider"},
+    })))
+    si = StrategyIntelligence(MagicMock(), rd)
+    ev = si._load_event_context()
+    assert ev["provider_status"] == "real"
+    assert ev["next_event"]["name"] == "FOMC Rate Decision"
+    assert ev["next_event"]["severity"] == "high"
+    assert ev["source_provider"] == "EconomicCalendarRiskProvider"
+
+
+def test_event_context_does_not_treat_time_of_day_placeholder_as_real(tmp_path):
+    """MarketHoursRiskProvider time-of-day stub must NOT pass as real event data."""
+    rd = tmp_path / "runtime"
+    rd.mkdir()
+    (rd / "event_risk.json").write_text(json.dumps(_stamp({
+        "severity": "medium",
+        "elevated_risk": False,
+        "next_event": None,
+        "windows": [
+            {"label": "US_MARKET_OPEN", "severity": "medium", "start_utc": "x", "end_utc": "y"},
+        ],
+        "source": {
+            "provider": "MarketHoursRiskProvider",
+            "provider_status": "placeholder_or_unavailable",
+            "kind": "time_of_day_placeholder",
+        },
+    })))
+    si = StrategyIntelligence(MagicMock(), rd)
+    ev = si._load_event_context()
+    assert ev["provider_status"] == "placeholder_or_unavailable"
+    assert ev["next_event"] is None
+
+
+def test_macro_event_context_degrades_conservatively_when_missing(tmp_path):
+    """No runtime files at all → all sections marked unavailable, prompt steers to conservative."""
+    rd = tmp_path / "runtime"
+    rd.mkdir()
+    si = StrategyIntelligence(MagicMock(), rd)
+    ctx = si._load_market_context()
+    assert ctx["macro_meta"]["provider_status"] == "unavailable"
+    assert ctx["vix"]["provider_status"] in ("unavailable", "unavailable_no_symbol")
+    assert ctx["event_risk"]["provider_status"] == "unavailable"
+
+    # Verify the regime prompt path declares unavailable rather than treating
+    # missing data as neutral. We exercise it by having Claude return 'normal'
+    # and confirming the prompt itself flagged unavailability — the regime
+    # rule says "default to conservative if any input is missing".
+    client = MagicMock()
+    captured = {}
+    def _capture(prompt, system=None, task_type=None):
+        captured["prompt"] = prompt
+        return {"profile": "conservative", "reasoning": "All inputs unavailable — degrade conservatively"}
+    client.chat_json.side_effect = _capture
+    si2 = StrategyIntelligence(client, rd)
+    profile = si2.get_regime_profile("alpha")
+    assert profile == "conservative"
+    assert "unavailable" in captured["prompt"]
+    assert "degrade conservatively" in captured["prompt"].lower()

@@ -197,12 +197,140 @@ class StrategyIntelligence:
     # Context builders
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _freshness_status(payload: Dict[str, Any]) -> str:
+        """
+        Classify a published runtime payload as 'real', 'stale', or 'unavailable'.
+
+        Treats missing/empty payloads as unavailable, payloads older than
+        ts_utc + ttl_seconds as stale, otherwise real. ts_utc and ttl_seconds
+        are SSOT v5 contract fields written by every runtime publisher.
+        """
+        if not payload:
+            return "unavailable"
+        ts_str = str(payload.get("ts_utc") or "")
+        ttl = payload.get("ttl_seconds")
+        if not ts_str or ttl is None:
+            return "unavailable"
+        try:
+            ttl_sec = float(ttl)
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age <= ttl_sec:
+                return "real"
+            return "stale"
+        except Exception:
+            return "unavailable"
+
+    def _load_vix_context(self) -> Dict[str, Any]:
+        """
+        Load VIX (and equity-vol cousins) from runtime/price_cache.json with
+        explicit freshness metadata. Never invents a number — if the cache is
+        missing/stale or the symbol is absent, returns provider_status that
+        downstream prompts and consumers can read.
+        """
+        price_cache = _read_json(self._runtime_dir / "price_cache.json")
+        status = self._freshness_status(price_cache)
+        prices = price_cache.get("prices", {}) if isinstance(price_cache, dict) else {}
+
+        vix_val: Optional[float] = None
+        vix_source: Optional[str] = None
+        for key in ("VIX", "VIXY", "VXX", "UVXY"):
+            raw = prices.get(key)
+            if raw is None:
+                continue
+            try:
+                vix_val = float(raw)
+                vix_source = key
+                break
+            except (TypeError, ValueError):
+                continue
+
+        if vix_val is None:
+            return {
+                "vix": None,
+                "vix_source": None,
+                "provider_status": "unavailable" if status != "real" else "unavailable_no_symbol",
+                "ts_utc": price_cache.get("ts_utc") if isinstance(price_cache, dict) else None,
+                "ttl_seconds": price_cache.get("ttl_seconds") if isinstance(price_cache, dict) else None,
+            }
+        return {
+            "vix": vix_val,
+            "vix_source": vix_source,
+            "provider_status": status,  # real | stale | unavailable
+            "ts_utc": price_cache.get("ts_utc"),
+            "ttl_seconds": price_cache.get("ttl_seconds"),
+        }
+
+    def _load_event_context(self) -> Dict[str, Any]:
+        """
+        Load runtime/event_risk.json with freshness + provider status.
+
+        Prefers structured next_event (real economic-calendar provider).
+        Marks provider_status='placeholder_or_unavailable' if the publisher
+        emitted a time-of-day MarketHoursRiskProvider stub or no real event.
+        """
+        event_risk = _read_json(self._runtime_dir / "event_risk.json")
+        status = self._freshness_status(event_risk)
+
+        if not event_risk:
+            return {
+                "provider_status": "unavailable",
+                "severity": None,
+                "next_event": None,
+                "elevated_risk": False,
+                "source_provider": None,
+            }
+
+        provider = ""
+        source = event_risk.get("source")
+        if isinstance(source, dict):
+            provider = str(source.get("provider") or "")
+
+        next_event = event_risk.get("next_event")
+        is_real_provider = provider == "EconomicCalendarRiskProvider" and isinstance(next_event, dict)
+        is_placeholder = provider in ("MarketHoursRiskProvider", "MarketHoursRiskProvider(fallback)", "error")
+
+        if is_placeholder or not is_real_provider:
+            ps = "placeholder_or_unavailable"
+        elif status == "stale":
+            ps = "stale"
+        else:
+            ps = status  # real | unavailable
+
+        return {
+            "provider_status": ps,
+            "severity": event_risk.get("severity"),
+            "next_event": next_event if isinstance(next_event, dict) else None,
+            "elevated_risk": bool(event_risk.get("elevated_risk", False)),
+            "source_provider": provider or None,
+            "ts_utc": event_risk.get("ts_utc"),
+            "ttl_seconds": event_risk.get("ttl_seconds"),
+        }
+
     def _load_market_context(self) -> Dict[str, Any]:
-        """Load macro_state.json and execution_quality.json."""
+        """
+        Load macro / VIX / event-risk runtime state with freshness+source metadata.
+
+        Each subsection carries provider_status so prompts and audit consumers
+        can distinguish real, stale, unavailable, and placeholder data — no
+        section is silently passed through as 'unknown'.
+        """
         macro = _read_json(self._runtime_dir / "macro_state.json")
         exec_quality = _read_json(self._runtime_dir / "execution_quality.json")
+        macro_status = self._freshness_status(macro)
+        macro_meta = {
+            "provider_status": macro_status,
+            "ts_utc": macro.get("ts_utc") if isinstance(macro, dict) else None,
+            "ttl_seconds": macro.get("ttl_seconds") if isinstance(macro, dict) else None,
+            "provider": (macro.get("source") or {}).get("provider") if isinstance(macro.get("source"), dict) else None,
+        } if isinstance(macro, dict) else {"provider_status": "unavailable"}
+
         return {
             "macro_state": macro,
+            "macro_meta": macro_meta,
+            "vix": self._load_vix_context(),
+            "event_risk": self._load_event_context(),
             "execution_quality": exec_quality,
         }
 
@@ -572,19 +700,52 @@ Rules:
         """Fetch regime profile from Claude."""
         market_ctx = self._load_market_context()
 
-        # Extract key metrics
-        macro = market_ctx.get("macro_state", {})
-        vix_val = macro.get("vix", macro.get("vix_close", "unknown"))
-        risk_label = macro.get("risk_label", "unknown")
+        macro = market_ctx.get("macro_state", {}) or {}
+        macro_meta = market_ctx.get("macro_meta", {}) or {}
+        vix_ctx = market_ctx.get("vix", {}) or {}
+        event_ctx = market_ctx.get("event_risk", {}) or {}
+
+        macro_status = macro_meta.get("provider_status", "unavailable")
+        risk_label = (
+            str(macro.get("risk_label") or macro.get("macro_label") or "unavailable")
+            if macro_status == "real" else "unavailable"
+        )
+
+        vix_status = vix_ctx.get("provider_status", "unavailable")
+        if vix_status == "real" and vix_ctx.get("vix") is not None:
+            vix_line = (
+                f"VIX: {vix_ctx['vix']} (source={vix_ctx.get('vix_source')}, status=real)"
+            )
+        elif vix_status == "stale" and vix_ctx.get("vix") is not None:
+            vix_line = (
+                f"VIX: {vix_ctx['vix']} (source={vix_ctx.get('vix_source')}, status=stale — DEGRADE CONSERVATIVELY)"
+            )
+        else:
+            vix_line = f"VIX: unavailable (status={vix_status} — do not infer; degrade conservatively)"
+
+        event_status = event_ctx.get("provider_status", "unavailable")
+        next_event = event_ctx.get("next_event") or {}
+        if event_status == "real" and next_event:
+            event_line = (
+                f"Event risk: severity={event_ctx.get('severity')}; "
+                f"next_event={next_event.get('name')} in {next_event.get('hours_until')}h "
+                f"(severity={next_event.get('severity')}, source={next_event.get('source')}, status=real)"
+            )
+        else:
+            event_line = (
+                f"Event risk: status={event_status} — no real structured next_event; "
+                f"do not treat as neutral; degrade conservatively"
+            )
 
         prompt = f"""Classify current market regime for strategy parameter selection.
 
 Strategy: {strategy_name}
-VIX: {vix_val}
-Macro risk label: {risk_label}
+{vix_line}
+Macro risk label: {risk_label} (status={macro_status})
+{event_line}
 
 Full macro context:
-{json.dumps(macro, indent=2, default=str)[:3000]}
+{json.dumps(macro, indent=2, default=str)[:2500]}
 
 Respond with JSON:
 {{
@@ -593,9 +754,10 @@ Respond with JSON:
 }}
 
 Rules:
-- "conservative" if: VIX > 25, or drawdown > 5%, or macro risk is high/extreme, or crisis regime
+- "conservative" if: VIX > 25, or drawdown > 5%, or macro risk is high/extreme, or crisis regime,
+  or any of (VIX status, macro status, event_risk status) is stale/unavailable/placeholder_or_unavailable
 - "normal" otherwise
-- Default to "normal" if data is insufficient"""
+- Default to "conservative" if any input is missing or marked unavailable — never treat 'unavailable' as neutral"""
 
         t0 = time.monotonic()
         result = self._client.chat_json(

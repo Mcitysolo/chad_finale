@@ -185,7 +185,11 @@ class MarketHoursRiskProvider:
             severity="medium",
             windows=windows,
             notes="bootstrap_provider=market_hours; replace with CPI/FOMC/NFP calendar",
-            source={"provider": "MarketHoursRiskProvider"},
+            source={
+                "provider": "MarketHoursRiskProvider",
+                "provider_status": "placeholder_or_unavailable",
+                "kind": "time_of_day_placeholder",
+            },
         )
 
 
@@ -481,6 +485,7 @@ class EconomicCalendarRiskProvider:
             ),
             source={
                 "provider": "EconomicCalendarRiskProvider",
+                "provider_status": "real",
                 "operator_calendar_path": str(self.operator_calendar_path),
                 "operator_calendar_present": self.operator_calendar_path.is_file(),
                 "lookahead_hours": self.lookahead_hours,
@@ -516,7 +521,7 @@ def fail_closed_state(ts: str, reason: str) -> Dict[str, Any]:
         "severity": "unknown",
         "windows": [],
         "notes": reason,
-        "source": {"provider": "error"},
+        "source": {"provider": "error", "provider_status": "unavailable"},
         "schema_version": "event_risk.v1",
     }
 

@@ -52,11 +52,24 @@ def run_regime_classifier(symbol: str) -> Dict[str, Any]:
         client, si = _get_client_and_si()
         profile = si.get_regime_profile("advisory")
         market_ctx = si._load_market_context()
-        macro = market_ctx.get("macro_state", {})
+        macro = market_ctx.get("macro_state", {}) or {}
+        macro_meta = market_ctx.get("macro_meta", {}) or {}
+        vix_ctx = market_ctx.get("vix", {}) or {}
+        event_ctx = market_ctx.get("event_risk", {}) or {}
+        macro_status = macro_meta.get("provider_status", "unavailable")
+        risk_label = (
+            str(macro.get("risk_label") or macro.get("macro_label"))
+            if macro_status == "real" and (macro.get("risk_label") or macro.get("macro_label")) else None
+        )
         return {
             "profile": profile,
-            "vix": macro.get("vix", macro.get("vix_close", "unknown")),
-            "risk_label": macro.get("risk_label", "unknown"),
+            "vix": vix_ctx.get("vix"),
+            "vix_source": vix_ctx.get("vix_source"),
+            "vix_status": vix_ctx.get("provider_status", "unavailable"),
+            "risk_label": risk_label,
+            "macro_status": macro_status,
+            "event_status": event_ctx.get("provider_status", "unavailable"),
+            "next_event": event_ctx.get("next_event"),
             "regime_source": "claude_intelligence",
         }
     except Exception as exc:
