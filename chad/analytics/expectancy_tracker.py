@@ -31,6 +31,17 @@ def _status(total: int, win_rate: float, expectancy: float) -> str:
 
 
 def _iter_trades():
+    # Quarantine awareness: skip records explicitly listed in
+    # runtime/quarantine_manifest_*.json so polluted trades cannot
+    # re-enter expectancy_state -> winner_scaling/strategy_health.
+    try:
+        from chad.utils.quarantine import get_quarantine_sets
+        invalid_fill_ids, invalid_trade_hashes = get_quarantine_sets(
+            runtime_dir=os.path.join(REPO_ROOT, "runtime"),
+        )
+    except Exception:
+        invalid_fill_ids, invalid_trade_hashes = set(), set()
+
     for path in sorted(glob.glob(TRADES_GLOB)):
         if ".scr_reset_bak" in path or path.endswith(".bak"):
             continue
@@ -44,8 +55,14 @@ def _iter_trades():
                         rec = json.loads(line)
                     except Exception:
                         continue
+                    rh = rec.get("record_hash") if isinstance(rec, dict) else None
+                    if isinstance(rh, str) and rh in invalid_trade_hashes:
+                        continue
                     payload = rec.get("payload", rec)
                     if not isinstance(payload, dict):
+                        continue
+                    fid = payload.get("fill_id")
+                    if isinstance(fid, str) and fid in invalid_fill_ids:
                         continue
                     if payload.get("pnl_untrusted") is True:
                         continue

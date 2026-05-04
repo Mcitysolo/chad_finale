@@ -328,21 +328,43 @@ def _parse_ledger(
     include_live: bool,
     max_trades: int,
     counters: Dict[str, int],
+    invalid_fill_ids: Optional[set] = None,
+    invalid_trade_hashes: Optional[set] = None,
 ) -> List[ParsedTrade]:
     """
     Parse a ledger file into ParsedTrade rows with strict numeric hygiene.
 
     counters mutated:
       - excluded_nonfinite increments for skipped records
+      - excluded_quarantined increments for records in runtime/
+        quarantine_manifest_*.json (matched by record_hash or fill_id).
     """
     out: List[ParsedTrade] = []
     if max_trades <= 0:
         return out
 
+    bad_fills = invalid_fill_ids or set()
+    bad_hashes = invalid_trade_hashes or set()
+
     for ln in _iter_ndjson_lines(path):
         rec = _parse_record(ln)
         if rec is None:
             continue
+
+        # Quarantine awareness: skip records explicitly flagged in
+        # runtime/quarantine_manifest_*.json. Matched on top-level
+        # record_hash (trades) or payload.fill_id (fills).
+        rh = rec.get("record_hash")
+        if isinstance(rh, str) and rh in bad_hashes:
+            counters["excluded_quarantined"] = counters.get("excluded_quarantined", 0) + 1
+            continue
+        _payload_for_fill = rec.get("payload")
+        if isinstance(_payload_for_fill, dict):
+            fid = _payload_for_fill.get("fill_id")
+            if isinstance(fid, str) and fid in bad_fills:
+                counters["excluded_quarantined"] = counters.get("excluded_quarantined", 0) + 1
+                continue
+
         payload = rec.get("payload") or {}
         if not isinstance(payload, dict):
             continue
@@ -407,14 +429,25 @@ def _load_all_trades(
 ) -> Tuple[List[ParsedTrade], Dict[str, int]]:
     """
     Load raw + optional enriched trades, bounded by max_trades overall.
-    Returns (trades, counters) where counters includes excluded_nonfinite.
+    Returns (trades, counters) where counters includes excluded_nonfinite
+    and excluded_quarantined.
     """
-    counters: Dict[str, int] = {"excluded_nonfinite": 0}
+    counters: Dict[str, int] = {"excluded_nonfinite": 0, "excluded_quarantined": 0}
 
     trades: List[ParsedTrade] = []
     remaining = max(0, int(max_trades))
     if remaining <= 0:
         return trades, counters
+
+    # Quarantine awareness: load IDs once per call so the same exclusion
+    # set applies across the raw daily ledgers and the enrichment ledger.
+    try:
+        from chad.utils.quarantine import get_quarantine_sets
+        invalid_fill_ids, invalid_trade_hashes = get_quarantine_sets(
+            runtime_dir=_resolve_repo_root() / "runtime",
+        )
+    except Exception:
+        invalid_fill_ids, invalid_trade_hashes = set(), set()
 
     # Raw daily ledgers (newest-first)
     for f in _iter_day_trade_files(days_back):
@@ -427,6 +460,8 @@ def _load_all_trades(
             include_live=include_live,
             max_trades=remaining,
             counters=counters,
+            invalid_fill_ids=invalid_fill_ids,
+            invalid_trade_hashes=invalid_trade_hashes,
         )
         trades.extend(rows)
         remaining -= len(rows)
@@ -441,6 +476,8 @@ def _load_all_trades(
             include_live=include_live,
             max_trades=remaining,
             counters=counters,
+            invalid_fill_ids=invalid_fill_ids,
+            invalid_trade_hashes=invalid_trade_hashes,
         )
         trades.extend(rows)
 
@@ -518,6 +555,7 @@ def load_and_compute(
     # Aggregate counters (finite-only trades are "total_trades")
     total_trades = len(trades)
     excluded_nonfinite = int(counters.get("excluded_nonfinite") or 0)
+    excluded_quarantined = int(counters.get("excluded_quarantined") or 0)
 
     # Lane counts (finite-only)
     live_trades = sum(1 for t in trades if bool(t.is_live))
@@ -577,7 +615,13 @@ def load_and_compute(
         "total_trades": int(total_trades),
         "effective_trades": int(effective_trades),
         "excluded_manual": int(excluded_manual),
-        "excluded_untrusted": int(excluded_untrusted),
+        # Quarantined records are excluded BEFORE the parse step so they
+        # never appear in trades/effective; surface the count via the
+        # existing untrusted bucket so dashboards/SCR see the full
+        # exclusion picture, and also expose the discrete counter for
+        # operator forensics.
+        "excluded_untrusted": int(excluded_untrusted + excluded_quarantined),
+        "excluded_quarantined": int(excluded_quarantined),
         "excluded_nonfinite": int(excluded_nonfinite),
         "excluded_pnl_zero": int(excluded_pnl_zero),
         "live_trades": int(live_trades),

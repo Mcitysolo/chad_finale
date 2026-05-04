@@ -353,6 +353,16 @@ class NdjsonPnlProvider(PnlProvider):
     async def get_realized_pnl(self, repo_root: Path, days: int = 0) -> Tuple[float, int, List[str]]:
         trades_dir = repo_root / "data" / "trades"
         fills_dir = repo_root / "data" / "fills"
+        # Quarantine awareness: load invalid IDs once per call from
+        # runtime/quarantine_manifest_*.json so polluted fills/trades
+        # don't re-enter pnl_state via this provider.
+        try:
+            from chad.utils.quarantine import get_quarantine_sets
+            invalid_fill_ids, invalid_trade_hashes = get_quarantine_sets(
+                runtime_dir=repo_root / "runtime",
+            )
+        except Exception:
+            invalid_fill_ids, invalid_trade_hashes = set(), set()
         # compute date strings to search
         day_strings = []
         today = _utc_now().date()
@@ -370,7 +380,12 @@ class NdjsonPnlProvider(PnlProvider):
         if not files:
             return 0.0, 0, []
         # process files concurrently
-        tasks = [asyncio.create_task(self._process_file(fp)) for fp in files]
+        tasks = [
+            asyncio.create_task(
+                self._process_file(fp, invalid_fill_ids, invalid_trade_hashes)
+            )
+            for fp in files
+        ]
         totals: List[Tuple[float, int, bool]] = await asyncio.gather(*tasks)
         total_pnl = 0.0
         total_count = 0
@@ -382,17 +397,26 @@ class NdjsonPnlProvider(PnlProvider):
                 used_sources.append(str(files[totals.index((pnl, count, used))]))
         return round(total_pnl, 8), total_count, used_sources
 
-    async def _process_file(self, path: Path) -> Tuple[float, int, bool]:
+    async def _process_file(
+        self,
+        path: Path,
+        invalid_fill_ids: Optional[set] = None,
+        invalid_trade_hashes: Optional[set] = None,
+    ) -> Tuple[float, int, bool]:
         """Return (pnl, trade_count, file_used)."""
         pnl_sum = 0.0
         trade_count = 0
         file_used = False
+        bad_fills = invalid_fill_ids or set()
+        bad_hashes = invalid_trade_hashes or set()
         try:
             if aiofiles:
                 async with aiofiles.open(path, mode="r", encoding="utf-8") as handle:  # type: ignore[attr-defined]
                     async for raw in handle:
                         rec = self._parse_line(raw)
                         if rec is None:
+                            continue
+                        if self._is_quarantined(rec, bad_fills, bad_hashes):
                             continue
                         if not self._is_effective_trade(rec):
                             continue
@@ -409,6 +433,8 @@ class NdjsonPnlProvider(PnlProvider):
                         rec = self._parse_line(raw)
                         if rec is None:
                             continue
+                        if self._is_quarantined(rec, bad_fills, bad_hashes):
+                            continue
                         if not self._is_effective_trade(rec):
                             continue
                         pnl_value = self._extract_pnl(rec)
@@ -420,6 +446,23 @@ class NdjsonPnlProvider(PnlProvider):
         except Exception as exc:
             logger.warning("NdjsonPnlProvider: failed to read %s: %s", path, exc)
         return pnl_sum, trade_count, file_used
+
+    @staticmethod
+    def _is_quarantined(
+        record: Mapping[str, Any],
+        invalid_fill_ids: set,
+        invalid_trade_hashes: set,
+    ) -> bool:
+        """Skip records listed in runtime/quarantine_manifest_*.json."""
+        rh = record.get("record_hash")
+        if isinstance(rh, str) and rh in invalid_trade_hashes:
+            return True
+        payload = record.get("payload")
+        if isinstance(payload, Mapping):
+            fid = payload.get("fill_id")
+            if isinstance(fid, str) and fid in invalid_fill_ids:
+                return True
+        return False
 
     def _parse_line(self, raw: str) -> Optional[Mapping[str, Any]]:
         """Parse a JSON line, ignoring invalid entries."""
