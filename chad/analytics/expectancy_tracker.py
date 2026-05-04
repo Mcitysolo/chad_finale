@@ -32,12 +32,15 @@ def _status(total: int, win_rate: float, expectancy: float) -> str:
 
 def _iter_trades():
     # Quarantine awareness: skip records explicitly listed in
-    # runtime/quarantine_manifest_*.json so polluted trades cannot
-    # re-enter expectancy_state -> winner_scaling/strategy_health.
+    # runtime/quarantine_manifest_*.json plus any fill_id flagged
+    # pnl_untrusted in data/fills/FILLS_*.ndjson, so polluted trades
+    # — including derived closed trades referencing untrusted fills —
+    # cannot re-enter expectancy_state -> winner_scaling/strategy_health.
     try:
-        from chad.utils.quarantine import get_quarantine_sets
-        invalid_fill_ids, invalid_trade_hashes = get_quarantine_sets(
+        from chad.utils.quarantine import get_exclusion_sets
+        invalid_fill_ids, invalid_trade_hashes = get_exclusion_sets(
             runtime_dir=os.path.join(REPO_ROOT, "runtime"),
+            fills_dir=os.path.join(REPO_ROOT, "data", "fills"),
         )
     except Exception:
         invalid_fill_ids, invalid_trade_hashes = set(), set()
@@ -63,6 +66,11 @@ def _iter_trades():
                         continue
                     fid = payload.get("fill_id")
                     if isinstance(fid, str) and fid in invalid_fill_ids:
+                        continue
+                    fids = payload.get("fill_ids")
+                    if isinstance(fids, list) and any(
+                        isinstance(f, str) and f in invalid_fill_ids for f in fids
+                    ):
                         continue
                     if payload.get("pnl_untrusted") is True:
                         continue

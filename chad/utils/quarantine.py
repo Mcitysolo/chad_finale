@@ -41,6 +41,9 @@ LOG = logging.getLogger("chad.utils.quarantine")
 # runtime/ and the union expands automatically.
 _MANIFEST_GLOB = "quarantine_manifest_*.json"
 
+# Default fills glob — used by the untrusted-fill scan helper.
+_FILLS_GLOB = "FILLS_*.ndjson"
+
 
 def _runtime_dir(runtime_dir: Optional[Path] = None) -> Path:
     if runtime_dir is not None:
@@ -49,6 +52,15 @@ def _runtime_dir(runtime_dir: Optional[Path] = None) -> Path:
     if env:
         return Path(env)
     return Path(__file__).resolve().parents[2] / "runtime"
+
+
+def _fills_dir(fills_dir: Optional[Path] = None) -> Path:
+    if fills_dir is not None:
+        return Path(fills_dir)
+    env = os.environ.get("CHAD_FILLS_DIR", "").strip()
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parents[2] / "data" / "fills"
 
 
 def _iter_manifest_paths(runtime_dir: Path) -> Iterable[Path]:
@@ -108,6 +120,104 @@ def get_quarantine_sets(
     return fill_ids, trade_hashes
 
 
+def _payload_is_untrusted(payload: Mapping[str, object]) -> bool:
+    """Return True if *payload* carries any pnl_untrusted marker.
+
+    Markers checked (any one suffices):
+      * ``payload.pnl_untrusted == True``
+      * ``payload.extra.pnl_untrusted == True``
+      * any tag in ``payload.tags`` equals ``"pnl_untrusted"`` (case-insensitive)
+    """
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("pnl_untrusted") is True:
+        return True
+    extra = payload.get("extra")
+    if isinstance(extra, Mapping) and extra.get("pnl_untrusted") is True:
+        return True
+    tags = payload.get("tags")
+    if isinstance(tags, list) and any(
+        str(t).strip().lower() == "pnl_untrusted" for t in tags
+    ):
+        return True
+    return False
+
+
+def get_untrusted_fill_ids_from_fills(
+    fills_dir: Optional[Path] = None,
+) -> Set[str]:
+    """Scan ``data/fills/FILLS_*.ndjson`` and return the set of
+    ``fill_id`` values whose record carries any ``pnl_untrusted`` marker.
+
+    A fill counts as untrusted when the payload (or top-level record)
+    has ``pnl_untrusted=True``, has a ``"pnl_untrusted"`` tag, or has
+    ``extra.pnl_untrusted=True``. Original ledgers are not mutated.
+
+    Fail-safe: missing directory or unreadable files yield an empty
+    set; corrupt JSON lines are skipped silently. The publisher must
+    keep running rather than crash.
+    """
+    out: Set[str] = set()
+    fdir = _fills_dir(fills_dir)
+    if not fdir.is_dir():
+        return out
+    for path in sorted(fdir.glob(_FILLS_GLOB)):
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for raw in handle:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, Mapping):
+                        continue
+                    payload = rec.get("payload")
+                    if not isinstance(payload, Mapping):
+                        payload = rec
+                    untrusted = _payload_is_untrusted(payload) or (
+                        rec.get("pnl_untrusted") is True
+                    )
+                    if not untrusted:
+                        continue
+                    fid = payload.get("fill_id")
+                    if isinstance(fid, str) and fid:
+                        out.add(fid)
+        except OSError as exc:
+            LOG.warning(
+                "untrusted_fills_scan_unreadable path=%s err=%s — skipping",
+                path,
+                exc,
+            )
+            continue
+    return out
+
+
+def get_exclusion_sets(
+    runtime_dir: Optional[Path] = None,
+    fills_dir: Optional[Path] = None,
+) -> Tuple[Set[str], Set[str]]:
+    """Return ``(invalid_fill_ids, invalid_trade_hashes)`` as the union
+    of:
+      * ``runtime/quarantine_manifest_*.json`` (operator-managed)
+      * ``data/fills/FILLS_*.ndjson`` rows flagged ``pnl_untrusted``
+        (live source-of-truth — Epoch 2 untrusted fills may not yet
+        be in any manifest, so the fills scan is required to keep
+        derived closed trades from re-entering SCR/pnl_state).
+
+    Fail-safe: each loader is independent — a failure in one branch
+    does not prevent the other from contributing.
+    """
+    fill_ids, trade_hashes = get_quarantine_sets(runtime_dir=runtime_dir)
+    try:
+        fill_ids = fill_ids | get_untrusted_fill_ids_from_fills(fills_dir=fills_dir)
+    except Exception as exc:  # noqa: BLE001 — must never break publishers
+        LOG.warning("untrusted_fills_scan_failed err=%s — using manifest only", exc)
+    return fill_ids, trade_hashes
+
+
 def is_record_quarantined(
     record: Mapping[str, object],
     invalid_fill_ids: Set[str],
@@ -118,6 +228,11 @@ def is_record_quarantined(
     A record is quarantined if any of:
       * top-level ``record_hash`` is in *invalid_trade_hashes*
       * ``payload.fill_id`` is in *invalid_fill_ids*
+      * any element of ``payload.fill_ids`` (closed-trade derived
+        records) is in *invalid_fill_ids* — this catches derived
+        closed trades that reference untrusted opening or closing
+        fills, even when the closed-trade row itself carries no
+        ``pnl_untrusted`` marker
       * payload (or top-level) carries ``pnl_untrusted=True`` or a
         ``"pnl_untrusted"`` tag
     """
@@ -133,15 +248,12 @@ def is_record_quarantined(
         fid = payload.get("fill_id")
         if isinstance(fid, str) and fid in invalid_fill_ids:
             return True
-        if payload.get("pnl_untrusted") is True:
-            return True
-        tags = payload.get("tags")
-        if isinstance(tags, list) and any(
-            str(t).strip().lower() == "pnl_untrusted" for t in tags
-        ):
-            return True
-        extra = payload.get("extra")
-        if isinstance(extra, Mapping) and extra.get("pnl_untrusted") is True:
+        fids = payload.get("fill_ids")
+        if isinstance(fids, list):
+            for f in fids:
+                if isinstance(f, str) and f in invalid_fill_ids:
+                    return True
+        if _payload_is_untrusted(payload):
             return True
 
     if record.get("pnl_untrusted") is True:
@@ -152,5 +264,7 @@ def is_record_quarantined(
 
 __all__ = [
     "get_quarantine_sets",
+    "get_untrusted_fill_ids_from_fills",
+    "get_exclusion_sets",
     "is_record_quarantined",
 ]

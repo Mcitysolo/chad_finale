@@ -355,8 +355,13 @@ def _parse_ledger(
             continue
 
         # Quarantine awareness: skip records explicitly flagged in
-        # runtime/quarantine_manifest_*.json. Matched on top-level
-        # record_hash (trades) or payload.fill_id (fills).
+        # runtime/quarantine_manifest_*.json or referenced via the
+        # untrusted-fill set built from data/fills/FILLS_*.ndjson.
+        # Matched on top-level record_hash (trades), payload.fill_id
+        # (fills), or any element of payload.fill_ids (derived closed
+        # trades). The fill_ids check is what blocks contaminated
+        # derived closed trades from re-entering SCR even when the
+        # closed-trade row itself carries no pnl_untrusted marker.
         rh = rec.get("record_hash")
         if isinstance(rh, str) and rh in bad_hashes:
             counters["excluded_quarantined"] = counters.get("excluded_quarantined", 0) + 1
@@ -365,6 +370,12 @@ def _parse_ledger(
         if isinstance(_payload_for_fill, dict):
             fid = _payload_for_fill.get("fill_id")
             if isinstance(fid, str) and fid in bad_fills:
+                counters["excluded_quarantined"] = counters.get("excluded_quarantined", 0) + 1
+                continue
+            fids = _payload_for_fill.get("fill_ids")
+            if isinstance(fids, list) and any(
+                isinstance(f, str) and f in bad_fills for f in fids
+            ):
                 counters["excluded_quarantined"] = counters.get("excluded_quarantined", 0) + 1
                 continue
 
@@ -463,10 +474,18 @@ def _load_all_trades(
 
     # Quarantine awareness: load IDs once per call so the same exclusion
     # set applies across the raw daily ledgers and the enrichment ledger.
+    # Use get_exclusion_sets so the fill-id set is the union of the
+    # operator manifest and a live scan of FILLS_*.ndjson rows tagged
+    # pnl_untrusted — required because derived closed trades may
+    # reference untrusted fills that have not yet been pinned in any
+    # quarantine_manifest_*.json (Epoch 2 source guard catches new
+    # placeholders inline rather than via manifest).
     try:
-        from chad.utils.quarantine import get_quarantine_sets
-        invalid_fill_ids, invalid_trade_hashes = get_quarantine_sets(
-            runtime_dir=_resolve_repo_root() / "runtime",
+        from chad.utils.quarantine import get_exclusion_sets
+        repo_root = _resolve_repo_root()
+        invalid_fill_ids, invalid_trade_hashes = get_exclusion_sets(
+            runtime_dir=repo_root / "runtime",
+            fills_dir=repo_root / "data" / "fills",
         )
     except Exception:
         invalid_fill_ids, invalid_trade_hashes = set(), set()

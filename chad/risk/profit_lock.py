@@ -353,13 +353,17 @@ class NdjsonPnlProvider(PnlProvider):
     async def get_realized_pnl(self, repo_root: Path, days: int = 0) -> Tuple[float, int, List[str]]:
         trades_dir = repo_root / "data" / "trades"
         fills_dir = repo_root / "data" / "fills"
-        # Quarantine awareness: load invalid IDs once per call from
-        # runtime/quarantine_manifest_*.json so polluted fills/trades
-        # don't re-enter pnl_state via this provider.
+        # Quarantine awareness: load invalid IDs once per call as the
+        # union of runtime/quarantine_manifest_*.json and a live scan
+        # of data/fills/FILLS_*.ndjson rows tagged pnl_untrusted, so
+        # derived closed trades that reference an untrusted opening
+        # or closing fill (even when the closed-trade row itself
+        # carries no marker) do not re-enter pnl_state.
         try:
-            from chad.utils.quarantine import get_quarantine_sets
-            invalid_fill_ids, invalid_trade_hashes = get_quarantine_sets(
+            from chad.utils.quarantine import get_exclusion_sets
+            invalid_fill_ids, invalid_trade_hashes = get_exclusion_sets(
                 runtime_dir=repo_root / "runtime",
+                fills_dir=fills_dir,
             )
         except Exception:
             invalid_fill_ids, invalid_trade_hashes = set(), set()
@@ -453,7 +457,12 @@ class NdjsonPnlProvider(PnlProvider):
         invalid_fill_ids: set,
         invalid_trade_hashes: set,
     ) -> bool:
-        """Skip records listed in runtime/quarantine_manifest_*.json."""
+        """Skip records listed in runtime/quarantine_manifest_*.json
+        or referenced via the untrusted-fill set built from
+        data/fills/FILLS_*.ndjson. Closed-trade records expose their
+        opening + closing fill IDs in ``payload.fill_ids``; any
+        intersection with *invalid_fill_ids* drops the trade so the
+        derived realized PnL never reaches pnl_state."""
         rh = record.get("record_hash")
         if isinstance(rh, str) and rh in invalid_trade_hashes:
             return True
@@ -461,6 +470,11 @@ class NdjsonPnlProvider(PnlProvider):
         if isinstance(payload, Mapping):
             fid = payload.get("fill_id")
             if isinstance(fid, str) and fid in invalid_fill_ids:
+                return True
+            fids = payload.get("fill_ids")
+            if isinstance(fids, list) and any(
+                isinstance(f, str) and f in invalid_fill_ids for f in fids
+            ):
                 return True
         return False
 

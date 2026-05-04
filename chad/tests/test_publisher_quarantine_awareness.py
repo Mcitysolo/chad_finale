@@ -341,3 +341,295 @@ def test_strategy_health_excludes_quarantined_records(
     assert delta.get("total_trades") == 1, state
     assert delta.get("total_pnl") == 25.0, state
     assert state["total_clean_trades"] == 1, state
+
+
+# ---------------------------------------------------------------------------
+# Derived closed-trade contamination — exclusion via untrusted fill IDs
+# ---------------------------------------------------------------------------
+
+
+def _untrusted_fill_record(*, fill_id: str, marker: str = "extra") -> dict:
+    """Construct a FILLS_*.ndjson record carrying a pnl_untrusted marker.
+
+    ``marker`` selects which form of the marker to apply:
+      * ``"extra"``    -> payload.extra.pnl_untrusted = True
+      * ``"payload"``  -> payload.pnl_untrusted = True
+      * ``"tag"``      -> "pnl_untrusted" in payload.tags
+    """
+    payload = {
+        "broker": "ibkr_paper",
+        "is_live": False,
+        "strategy": "delta",
+        "symbol": "SPY",
+        "side": "SELL",
+        "quantity": 10.0,
+        "fill_price": 100.0,
+        "notional": 1000.0,
+        "fill_id": fill_id,
+        "status": "rejected",
+        "tags": ["paper", "filled", "delta"],
+        "extra": {},
+    }
+    if marker == "extra":
+        payload["extra"]["pnl_untrusted"] = True
+    elif marker == "payload":
+        payload["pnl_untrusted"] = True
+    elif marker == "tag":
+        payload["tags"] = list(payload["tags"]) + ["pnl_untrusted"]
+    else:
+        raise ValueError(f"unknown marker: {marker}")
+    return {
+        "timestamp_utc": "2099-01-01T00:00:00+00:00",
+        "sequence_id": 1,
+        "payload": payload,
+        "prev_hash": "GENESIS",
+        "record_hash": f"FILL_REC_{fill_id}",
+    }
+
+
+def _derived_closed_trade_record(
+    *,
+    record_hash: str,
+    fill_ids: list[str],
+    pnl: float,
+    entry_price: float = 100.0,
+    exit_price: float = 720.04,
+) -> dict:
+    """Closed-trade record matching trade_closer.ClosedTrade.to_payload().
+
+    The row itself has *no* pnl_untrusted marker — the only signal of
+    contamination is that its fill_ids reference untrusted fills.
+    """
+    payload = {
+        "schema_version": "closed_trade.v1",
+        "strategy": "delta",
+        "symbol": "SPY",
+        "side": "SELL",
+        "broker": "paper_exec",
+        "is_live": False,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "fill_price": exit_price,
+        "quantity": 10.0,
+        "contract_multiplier": 1.0,
+        "notional": entry_price * 10.0,
+        "pnl": pnl,
+        "net_pnl": pnl,
+        "fill_ids": list(fill_ids),
+        "tags": ["paper", "closed", "delta"],
+    }
+    return {
+        "timestamp_utc": "2099-01-01T00:00:00+00:00",
+        "sequence_id": 1,
+        "payload": payload,
+        "prev_hash": "GENESIS",
+        "record_hash": record_hash,
+    }
+
+
+def test_untrusted_fill_id_set_built_from_fills(tmp_path: Path) -> None:
+    """get_untrusted_fill_ids_from_fills must collect fill_ids carrying
+    any of the three pnl_untrusted markers (payload, payload.extra,
+    payload.tags) and ignore trusted fills."""
+    from chad.utils.quarantine import get_untrusted_fill_ids_from_fills
+
+    fills_dir = tmp_path / "data" / "fills"
+    fills_dir.mkdir(parents=True)
+
+    today = _today_ymd()
+    fills = [
+        _untrusted_fill_record(fill_id="UNT_EXTRA", marker="extra"),
+        _untrusted_fill_record(fill_id="UNT_PAYLOAD", marker="payload"),
+        _untrusted_fill_record(fill_id="UNT_TAG", marker="tag"),
+        _fill_record(record_hash="FILL_OK", fill_id="GOOD_FILL"),
+    ]
+    (fills_dir / f"FILLS_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in fills) + "\n", encoding="utf-8"
+    )
+
+    out = get_untrusted_fill_ids_from_fills(fills_dir=fills_dir)
+    assert "UNT_EXTRA" in out
+    assert "UNT_PAYLOAD" in out
+    assert "UNT_TAG" in out
+    assert "GOOD_FILL" not in out
+
+
+def test_trade_stats_excludes_trade_referencing_untrusted_fill_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A derived closed trade with no pnl_untrusted marker must still
+    be excluded from SCR/trade_stats when any of its fill_ids points
+    at an untrusted FILLS_*.ndjson row."""
+    from chad.analytics import trade_stats_engine
+
+    trades_dir = tmp_path / "data" / "trades"
+    fills_dir = tmp_path / "data" / "fills"
+    runtime_dir = tmp_path / "runtime"
+    trades_dir.mkdir(parents=True)
+    fills_dir.mkdir(parents=True)
+    runtime_dir.mkdir(parents=True)
+
+    today = _today_ymd()
+    # Untrusted opening fill — placeholder $100 SPY.
+    fills = [_untrusted_fill_record(fill_id="UNT_ENTRY", marker="extra")]
+    (fills_dir / f"FILLS_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in fills) + "\n", encoding="utf-8"
+    )
+
+    trades = [
+        _derived_closed_trade_record(
+            record_hash="DERIVED_CONTAMINATED",
+            fill_ids=["UNT_ENTRY", "TRUSTED_EXIT"],
+            pnl=-3720.24,
+        ),
+        _trade_record(
+            record_hash="GOOD_TRADE_X",
+            payload={
+                "broker": "ibkr",
+                "is_live": False,
+                "strategy": "delta",
+                "symbol": "MES",
+                "side": "BUY",
+                "quantity": 1.0,
+                "fill_price": 5500.0,
+                "notional": 5500.0,
+                "pnl": 25.0,
+                "tags": ["paper", "filled"],
+            },
+        ),
+    ]
+    (trades_dir / f"trade_history_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in trades) + "\n", encoding="utf-8"
+    )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CHAD_REPO_ROOT", str(tmp_path))
+
+    stats = trade_stats_engine.load_and_compute(
+        max_trades=100, days_back=2, include_paper=True, include_live=True
+    )
+
+    # Contaminated derived trade dropped; only the +25 trusted row remains.
+    assert stats["total_trades"] == 1, stats
+    assert stats["total_pnl"] == 25.0, stats
+    assert stats["excluded_quarantined"] >= 1, stats
+    assert stats["excluded_untrusted"] >= 1, stats
+
+
+def test_profit_lock_excludes_trade_referencing_untrusted_fill_id(
+    tmp_path: Path,
+) -> None:
+    """NdjsonPnlProvider must skip a derived closed trade whose
+    fill_ids reference an untrusted FILLS_*.ndjson row, even when
+    the closed-trade record itself carries no pnl_untrusted marker."""
+    from chad.risk.profit_lock import NdjsonPnlProvider
+
+    repo_root = tmp_path
+    trades_dir = repo_root / "data" / "trades"
+    fills_dir = repo_root / "data" / "fills"
+    trades_dir.mkdir(parents=True)
+    fills_dir.mkdir(parents=True)
+
+    today = _today_ymd()
+
+    fills = [_untrusted_fill_record(fill_id="UNT_ENTRY", marker="extra")]
+    (fills_dir / f"FILLS_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in fills) + "\n", encoding="utf-8"
+    )
+
+    trades = [
+        _derived_closed_trade_record(
+            record_hash="DERIVED_CONTAMINATED",
+            fill_ids=["UNT_ENTRY", "TRUSTED_EXIT"],
+            pnl=-3720.24,
+        ),
+        _trade_record(
+            record_hash="GOOD_TRADE_1",
+            payload={
+                "broker": "ibkr",
+                "is_live": False,
+                "strategy": "delta",
+                "symbol": "MES",
+                "side": "BUY",
+                "quantity": 1.0,
+                "fill_price": 5500.0,
+                "notional": 5500.0,
+                "pnl": 25.0,
+            },
+        ),
+    ]
+    (trades_dir / f"trade_history_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in trades) + "\n", encoding="utf-8"
+    )
+
+    provider = NdjsonPnlProvider()
+    pnl, _count, _sources = asyncio.run(
+        provider.get_realized_pnl(repo_root, days=0)
+    )
+
+    # The -3720.24 derived contaminated trade must NOT enter pnl_state.
+    # Untrusted fill rows are also dropped. Only the +25 trusted trade
+    # contributes; remaining files (e.g. the FILLS file's untrusted row)
+    # are excluded entirely.
+    assert pnl == 25.0, f"expected 25.0 (contaminated trade dropped), got {pnl}"
+
+
+def test_expectancy_excludes_trade_referencing_untrusted_fill_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """expectancy_tracker must skip a derived closed trade whose
+    fill_ids reference an untrusted FILLS_*.ndjson row."""
+    from chad.analytics import expectancy_tracker
+
+    trades_dir = tmp_path / "data" / "trades"
+    fills_dir = tmp_path / "data" / "fills"
+    runtime_dir = tmp_path / "runtime"
+    trades_dir.mkdir(parents=True)
+    fills_dir.mkdir(parents=True)
+    runtime_dir.mkdir(parents=True)
+    today = _today_ymd()
+
+    fills = [_untrusted_fill_record(fill_id="UNT_ENTRY", marker="tag")]
+    (fills_dir / f"FILLS_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in fills) + "\n", encoding="utf-8"
+    )
+
+    trades = [
+        _derived_closed_trade_record(
+            record_hash="DERIVED_CONTAMINATED",
+            fill_ids=["UNT_ENTRY", "TRUSTED_EXIT"],
+            pnl=-3720.24,
+        ),
+        _trade_record(
+            record_hash="GOOD_DELTA_1",
+            payload={
+                "strategy": "delta",
+                "symbol": "MES",
+                "pnl": 25.0,
+            },
+        ),
+    ]
+    (trades_dir / f"trade_history_{today}.ndjson").write_text(
+        "\n".join(json.dumps(r) for r in trades) + "\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(expectancy_tracker, "REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        expectancy_tracker,
+        "TRADES_GLOB",
+        str(trades_dir / "trade_history_*.ndjson"),
+    )
+    monkeypatch.setattr(
+        expectancy_tracker, "PNL_STATE", str(runtime_dir / "pnl_state.json")
+    )
+    monkeypatch.setattr(
+        expectancy_tracker, "DYNAMIC_CAPS", str(runtime_dir / "dynamic_caps.json")
+    )
+
+    state = expectancy_tracker.compute()
+    delta = state["strategies"].get("delta") or {}
+
+    # Derived contaminated trade dropped; only +25 remains.
+    assert delta.get("total_trades") == 1, state
+    assert delta.get("total_pnl") == 25.0, state
+    assert state["total_clean_trades"] == 1, state
