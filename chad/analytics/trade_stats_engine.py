@@ -330,6 +330,7 @@ def _parse_ledger(
     counters: Dict[str, int],
     invalid_fill_ids: Optional[set] = None,
     invalid_trade_hashes: Optional[set] = None,
+    epoch_cutoff_utc: Optional[datetime] = None,
 ) -> List[ParsedTrade]:
     """
     Parse a ledger file into ParsedTrade rows with strict numeric hygiene.
@@ -338,6 +339,8 @@ def _parse_ledger(
       - excluded_nonfinite increments for skipped records
       - excluded_quarantined increments for records in runtime/
         quarantine_manifest_*.json (matched by record_hash or fill_id).
+      - excluded_pre_epoch increments for records whose realised time is
+        strictly before runtime/epoch_state.json::epoch_started_at_utc.
     """
     out: List[ParsedTrade] = []
     if max_trades <= 0:
@@ -363,6 +366,16 @@ def _parse_ledger(
             fid = _payload_for_fill.get("fill_id")
             if isinstance(fid, str) and fid in bad_fills:
                 counters["excluded_quarantined"] = counters.get("excluded_quarantined", 0) + 1
+                continue
+
+        # Epoch boundary filter (opt-in via runtime/epoch_state.json):
+        # records realised strictly before the active epoch are skipped
+        # so SCR/strategy_health/winner_scaler can compute from a clean
+        # post-epoch window after a controlled paper reset.
+        if epoch_cutoff_utc is not None:
+            from chad.utils.epoch import is_pre_epoch  # local import: keep helper optional
+            if is_pre_epoch(rec, epoch_cutoff_utc):
+                counters["excluded_pre_epoch"] = counters.get("excluded_pre_epoch", 0) + 1
                 continue
 
         payload = rec.get("payload") or {}
@@ -426,13 +439,22 @@ def _load_all_trades(
     include_paper: bool,
     include_live: bool,
     max_trades: int,
+    epoch_cutoff_utc: Optional[datetime] = None,
 ) -> Tuple[List[ParsedTrade], Dict[str, int]]:
     """
     Load raw + optional enriched trades, bounded by max_trades overall.
-    Returns (trades, counters) where counters includes excluded_nonfinite
-    and excluded_quarantined.
+    Returns (trades, counters) where counters includes excluded_nonfinite,
+    excluded_quarantined, and excluded_pre_epoch.
+
+    ``epoch_cutoff_utc`` (when not None) drops records realised strictly
+    before the cutoff. The helper is opt-in via runtime/epoch_state.json
+    and is loaded once per ``load_and_compute`` call upstream.
     """
-    counters: Dict[str, int] = {"excluded_nonfinite": 0, "excluded_quarantined": 0}
+    counters: Dict[str, int] = {
+        "excluded_nonfinite": 0,
+        "excluded_quarantined": 0,
+        "excluded_pre_epoch": 0,
+    }
 
     trades: List[ParsedTrade] = []
     remaining = max(0, int(max_trades))
@@ -462,6 +484,7 @@ def _load_all_trades(
             counters=counters,
             invalid_fill_ids=invalid_fill_ids,
             invalid_trade_hashes=invalid_trade_hashes,
+            epoch_cutoff_utc=epoch_cutoff_utc,
         )
         trades.extend(rows)
         remaining -= len(rows)
@@ -478,6 +501,7 @@ def _load_all_trades(
             counters=counters,
             invalid_fill_ids=invalid_fill_ids,
             invalid_trade_hashes=invalid_trade_hashes,
+            epoch_cutoff_utc=epoch_cutoff_utc,
         )
         trades.extend(rows)
 
@@ -526,6 +550,7 @@ def load_and_compute(
     days_back: int = 60,
     include_paper: bool = True,
     include_live: bool = True,
+    epoch_filter: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Compute performance stats from ledgers with deterministic hygiene.
@@ -539,9 +564,33 @@ def load_and_compute(
 
     include_paper/include_live:
       Lane filters.
+
+    epoch_filter:
+      Tri-state flag controlling the epoch-boundary filter
+      (runtime/epoch_state.json::epoch_started_at_utc):
+        * None  (default) -> apply the boundary if a valid epoch_state
+                             file is present; otherwise legacy behavior.
+        * True            -> require the boundary (still legacy if absent).
+        * False           -> disable the filter (used by audit/replay
+                             tooling that needs full history).
     """
     max_trades_i = max(0, int(max_trades))
     days_back_i = max(0, int(days_back))
+
+    # Resolve epoch boundary (opt-in via runtime/epoch_state.json).
+    epoch_cutoff: Optional[datetime] = None
+    epoch_active_label: str = ""
+    epoch_started_raw: str = ""
+    if epoch_filter is not False:
+        try:
+            from chad.utils.epoch import load_epoch_state
+            es = load_epoch_state(runtime_dir=_resolve_repo_root() / "runtime")
+        except Exception:
+            es = None
+        if es is not None:
+            epoch_cutoff = es.epoch_started_at
+            epoch_active_label = es.active_epoch
+            epoch_started_raw = es.epoch_started_at_raw
 
     # Load + dedupe
     trades, counters = _load_all_trades(
@@ -549,6 +598,7 @@ def load_and_compute(
         include_paper=bool(include_paper),
         include_live=bool(include_live),
         max_trades=max_trades_i if max_trades_i > 0 else 0,
+        epoch_cutoff_utc=epoch_cutoff,
     )
     trades = _dedupe_kraken(trades)
 
@@ -556,6 +606,7 @@ def load_and_compute(
     total_trades = len(trades)
     excluded_nonfinite = int(counters.get("excluded_nonfinite") or 0)
     excluded_quarantined = int(counters.get("excluded_quarantined") or 0)
+    excluded_pre_epoch = int(counters.get("excluded_pre_epoch") or 0)
 
     # Lane counts (finite-only)
     live_trades = sum(1 for t in trades if bool(t.is_live))
@@ -622,6 +673,7 @@ def load_and_compute(
         # operator forensics.
         "excluded_untrusted": int(excluded_untrusted + excluded_quarantined),
         "excluded_quarantined": int(excluded_quarantined),
+        "excluded_pre_epoch": int(excluded_pre_epoch),
         "excluded_nonfinite": int(excluded_nonfinite),
         "excluded_pnl_zero": int(excluded_pnl_zero),
         "live_trades": int(live_trades),
@@ -630,7 +682,44 @@ def load_and_compute(
         "total_pnl": float(total_pnl),
         "max_drawdown": float(max_drawdown),
         "sharpe_like": float(sharpe_like),
+        "epoch": {
+            "active_epoch": epoch_active_label,
+            "epoch_started_at_utc": epoch_started_raw,
+            "filter_applied": epoch_cutoff is not None,
+        },
     }
+
+
+def preview_epoch_filtered(
+    *,
+    max_trades: int = 5000,
+    days_back: int = 60,
+    include_paper: bool = True,
+    include_live: bool = True,
+) -> Dict[str, Any]:
+    """Read-only preview comparing legacy vs. epoch-filtered SCR stats.
+
+    Returns a dict with two ``load_and_compute`` results — ``legacy``
+    (pre-epoch behavior, full history) and ``with_epoch`` (current
+    behavior with runtime/epoch_state.json applied if present). Useful
+    for operators sanity-checking the epoch boundary before relying on
+    it. No files are written and no SCR state is mutated.
+    """
+    legacy = load_and_compute(
+        max_trades=max_trades,
+        days_back=days_back,
+        include_paper=include_paper,
+        include_live=include_live,
+        epoch_filter=False,
+    )
+    with_epoch = load_and_compute(
+        max_trades=max_trades,
+        days_back=days_back,
+        include_paper=include_paper,
+        include_live=include_live,
+        epoch_filter=None,
+    )
+    return {"legacy": legacy, "with_epoch": with_epoch}
 
 
 if __name__ == "__main__":
