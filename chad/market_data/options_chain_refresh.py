@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -37,7 +38,8 @@ IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4002
 IBKR_CLIENT_ID = 88
 CONNECT_TIMEOUT_SEC = 20
-CONTRACT_DETAILS_TIMEOUT_SEC = 30
+DEFAULT_CONTRACT_DETAILS_TIMEOUT_SEC = 30
+OPTIONS_CHAIN_TIMEOUT_ENV = "CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS"
 PRICE_PCT_WINDOW = 0.10
 # alpha_options.AlphaOptionsTuning targets DTE 21-45. With MAX_EXPIRIES=2 the
 # refresher only ever kept the two nearest (weekly/daily) expirations, which
@@ -48,6 +50,18 @@ MAX_EXPIRIES = 20
 # excludes LEAPs that alpha_options will never select.
 MAX_EXPIRY_DTE = 90
 CACHE_TTL_SECONDS = 3600
+
+
+class OptionsChainTimeoutError(TimeoutError):
+    """Raised when an IBKR options-chain metadata fetch exceeds its bound."""
+
+    def __init__(self, *, symbol: str, timeout_seconds: float) -> None:
+        super().__init__(
+            f"options chain refresh timed out for {symbol} "
+            f"after {timeout_seconds}s"
+        )
+        self.symbol = symbol
+        self.timeout_seconds = float(timeout_seconds)
 
 
 def _ts() -> str:
@@ -64,6 +78,35 @@ def _utc_now_iso() -> str:
 
 def _log(msg: str) -> None:
     print(f"{_ts()} {msg}", flush=True)
+
+
+def _resolve_contract_details_timeout() -> float:
+    """
+    Resolve the per-call timeout (seconds) for the IBKR options-chain
+    metadata fetch. Honors ``CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS`` and
+    falls back safely to ``DEFAULT_CONTRACT_DETAILS_TIMEOUT_SEC`` when
+    the env var is unset, empty, non-numeric, non-finite, or non-positive.
+    """
+    default = float(DEFAULT_CONTRACT_DETAILS_TIMEOUT_SEC)
+    raw = os.environ.get(OPTIONS_CHAIN_TIMEOUT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _log(
+            f"WARNING options_chain_timeout_invalid env={OPTIONS_CHAIN_TIMEOUT_ENV} "
+            f"value={raw!r} reason=non_numeric — falling back to default {default}s"
+        )
+        return default
+    if not math.isfinite(v) or v <= 0:
+        _log(
+            f"WARNING options_chain_timeout_invalid env={OPTIONS_CHAIN_TIMEOUT_ENV} "
+            f"value={raw!r} reason=non_positive_or_non_finite — "
+            f"falling back to default {default}s"
+        )
+        return default
+    return v
 
 
 def _spot_price_from_bars(symbol: str) -> float | None:
@@ -176,23 +219,29 @@ def _fetch_chain_via_contract_details(
         currency="USD",
     )
 
-    # ISSUE-50 fix: bound reqContractDetails with the
-    # CONTRACT_DETAILS_TIMEOUT_SEC declared above. The synchronous
-    # ib.reqContractDetails call has no internal timeout and was
-    # hanging the whole refresh service when IBKR Gateway stalled.
+    # ISSUE-50 fix: bound the IBKR options-chain metadata fetch with a
+    # configurable timeout (CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS, default
+    # 30s). The synchronous ib.reqContractDetails call has no internal
+    # timeout and was hanging the whole refresh service when IBKR
+    # Gateway / data servers stalled. On timeout we raise a typed error
+    # so the caller can log a WARNING and write a valid empty/error
+    # cache artifact instead of leaving the service hung.
+    timeout_sec = _resolve_contract_details_timeout()
     try:
         details = ib.run(
             asyncio.wait_for(
                 ib.reqContractDetailsAsync(template),
-                timeout=CONTRACT_DETAILS_TIMEOUT_SEC,
+                timeout=timeout_sec,
             )
         )
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         _log(
-            f"options_chain_reqcontractdetails_timeout symbol={symbol} "
-            f"timeout={CONTRACT_DETAILS_TIMEOUT_SEC}s — skipping"
+            f"WARNING options_chain_reqcontractdetails_timeout symbol={symbol} "
+            f"timeout={timeout_sec}s — IBKR data servers unresponsive, aborting symbol"
         )
-        return [], [], "SMART"
+        raise OptionsChainTimeoutError(
+            symbol=symbol, timeout_seconds=timeout_sec
+        ) from exc
     if not details:
         raise RuntimeError(f"reqContractDetails returned empty for {symbol}")
 
@@ -333,6 +382,7 @@ def run(symbols: Sequence[str]) -> int:
             pass
 
         chains: Dict[str, Any] = {}
+        symbol_errors: Dict[str, str] = {}
         success = 0
         failure = 0
 
@@ -348,18 +398,54 @@ def run(symbols: Sequence[str]) -> int:
                     f"{len(chain['expirations'])} expiries written"
                 )
                 success += 1
+            except OptionsChainTimeoutError as exc:
+                symbol_errors[sym] = (
+                    f"timeout_after_{exc.timeout_seconds}s"
+                )
+                _log(f"{sym}: FAILED err=timeout ({exc})")
+                failure += 1
             except Exception as exc:
+                symbol_errors[sym] = f"{type(exc).__name__}: {exc}"
                 _log(f"{sym}: FAILED err={exc}")
                 failure += 1
 
         if not chains:
-            _log(f"SUMMARY success={success} failure={failure} (no chains written)")
+            error_msg = (
+                "all_symbols_failed: "
+                + (
+                    "; ".join(
+                        f"{s}={r}" for s, r in symbol_errors.items()
+                    )
+                    or "no_symbols_processed"
+                )
+            )
+            cache_doc = {
+                "ts_utc": _utc_now_iso(),
+                "chains": {},
+                "error": error_msg,
+            }
+            try:
+                _atomic_write(CACHE_PATH, cache_doc)
+                _log(
+                    f"WARNING wrote empty options_chains_cache with error field: "
+                    f"{error_msg}"
+                )
+            except Exception as exc:
+                _log(
+                    f"ERROR atomic write of empty cache failed path={CACHE_PATH} "
+                    f"err={exc}"
+                )
+            _log(f"SUMMARY success={success} failure={failure} (empty cache written)")
             return 1
 
         cache_doc = {
             "ts_utc": _utc_now_iso(),
             "chains": chains,
         }
+        if symbol_errors:
+            cache_doc["error"] = "partial: " + "; ".join(
+                f"{s}={r}" for s, r in symbol_errors.items()
+            )
 
         try:
             _atomic_write(CACHE_PATH, cache_doc)
