@@ -323,7 +323,10 @@ def rule_edge_decay_halts(findings: List[Finding]) -> None:
     if not p.exists():
         return
     d = _read_json(p)
-    for strategy, info in d.items():
+    allocations = d.get("allocations", {}) if isinstance(d, dict) else {}
+    if not isinstance(allocations, dict):
+        return
+    for strategy, info in allocations.items():
         if isinstance(info, dict) and info.get("halted"):
             findings.append(Finding(
                 rule_id="R09",
@@ -332,7 +335,7 @@ def rule_edge_decay_halts(findings: List[Finding]) -> None:
                 description=f"Strategy {strategy} is halted by edge decay monitor.",
                 remedy_type="NOTIFY_ONLY",
                 remedy_action="notify",
-                evidence=f"strategy_allocations.json {strategy}.halted=true",
+                evidence=f"strategy_allocations.json allocations.{strategy}.halted=true",
             ))
 
 
