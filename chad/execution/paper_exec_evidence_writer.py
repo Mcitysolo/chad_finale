@@ -830,6 +830,10 @@ class PaperExecutionEvidenceWriter:
             "fills_path": fill_meta["path"],
             "fees_path": fee_meta["path"],
             "execution_metrics_path": metric_meta["path"],
+            # ISSUE-29: surface the deterministic fill_id so callers
+            # (position_reconciler.apply_close_intents) can verify a
+            # confirmed fill before mutating position_guard.json.
+            "fill_id": _safe_str(fill_payload.get("fill_id"), ""),
         }
 
 

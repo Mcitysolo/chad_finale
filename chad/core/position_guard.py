@@ -14,14 +14,35 @@ Track currently open strategy/symbol positions and allow:
 
 from __future__ import annotations
 
+import logging
+import os as _os
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 import json
 import time as _time
 
 STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/position_guard.json")
+
+_LOG = logging.getLogger("chad.core.position_guard")
+
+# Status values that indicate a confirmed fill (broker-accepted close).
+# Anything else — PendingSubmit, error, rejected, unknown — must NOT be
+# treated as a close confirmation per ISSUE-29.
+_CONFIRMED_FILL_STATUSES: frozenset = frozenset({"filled", "paper_fill"})
+
+# Status values that explicitly indicate a non-confirmed (still pending)
+# state. Listed for symmetry with paper_exec_evidence_writer's pending set.
+_PENDING_FILL_STATUSES: frozenset = frozenset({
+    "pendingsubmit", "presubmitted", "submitted", "apipending",
+    "inactive", "unknown", "",
+})
+
+# Status values that indicate an outright rejection.
+_REJECTED_FILL_STATUSES: frozenset = frozenset({
+    "error", "rejected", "reject", "cancelled", "canceled",
+})
 
 
 class PositionState(str, Enum):
@@ -47,24 +68,95 @@ def _load_state() -> Dict[str, dict]:
         return {}
 
 
-def save_state(state: Dict[str, dict]) -> None:
-    """Public API: atomically persist position-guard state to STATE_PATH.
+def _validate_position_guard_schema(state: Mapping[str, Any]) -> None:
+    """Validate the top-level shape of a position_guard state dict.
 
-    Promoted from `_save_state` per ISSUE-75 (encapsulation cleanup).
-    Atomicity is preserved via tmp-file + os.replace.
-
-    CB08/DS03: stamps a monotonic millisecond `_version` and `_written_by`
-    on the top-level state dict before write so consumers can detect
-    concurrent modification (CAS basis).
+    The on-disk schema is a flat mapping of "<strategy>|<symbol>" → entry-dict
+    (plus reserved meta keys `_version` / `_written_by`). Each entry must be
+    a dict; entries with `open` set must carry strategy and symbol fields
+    so downstream readers (reconciliation_publisher, net_exposure_gate)
+    do not crash on a partial record. Raises ValueError on validation
+    failure so callers — and the atomic writer — can refuse the write.
     """
-    import os as _os
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"position_guard state must be a dict, got {type(state).__name__}"
+        )
+    for key, entry in state.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"position_guard key must be str, got {type(key).__name__}"
+            )
+        if key.startswith("_"):
+            # Reserved meta keys (_version / _written_by) — allowed scalars.
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"position_guard entry {key!r} must be a dict, "
+                f"got {type(entry).__name__}"
+            )
+        # Entries that claim to be open must carry the minimum identification
+        # the rest of CHAD relies on. Closed entries can be sparse.
+        if entry.get("open") is True:
+            for required in ("strategy", "symbol", "side"):
+                if required not in entry:
+                    raise ValueError(
+                        f"position_guard entry {key!r} is open but missing "
+                        f"required field {required!r}"
+                    )
+
+
+def write_position_guard(
+    state: Dict[str, Any],
+    path: Optional[Path] = None,
+) -> None:
+    """Single atomic writer for position_guard.json (ISSUE-75).
+
+    Validates schema, writes atomically via temp file + fsync + os.replace,
+    raises on validation failure, and never partially writes corrupted state.
+
+    Stamps `_version` (monotonic ms) and `_written_by` so consumers can
+    detect concurrent modification (CAS basis — CB08/DS03).
+
+    All callers — internal position_guard mutators, live_loop reconcilers,
+    position_reconciler.apply_close_intents — must route writes through
+    this function. Direct json.dump or write_text against position_guard.json
+    is forbidden and asserted in chad/tests/test_position_guard_atomic_writer.py.
+    """
+    target = Path(path) if path is not None else STATE_PATH
+    _validate_position_guard_schema(state)
     state["_version"] = int(_time.time() * 1000)
     state["_written_by"] = "position_guard"
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _tmp = STATE_PATH.with_suffix('.json.tmp')
-    _tmp.write_text(json.dumps(state, indent=2, default=str),
-                    encoding='utf-8')
-    _os.replace(str(_tmp), str(STATE_PATH))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    payload = json.dumps(state, indent=2, default=str)
+    # Open with write+fsync to harden against truncation on crash.
+    fd = _os.open(
+        str(tmp),
+        _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC,
+        0o644,
+    )
+    try:
+        _os.write(fd, payload.encode("utf-8"))
+        try:
+            _os.fsync(fd)
+        except OSError:
+            # fsync may fail on some filesystems (tmpfs); the atomic
+            # rename below still guarantees no partial write is observed.
+            pass
+    finally:
+        _os.close(fd)
+    _os.replace(str(tmp), str(target))
+
+
+def save_state(state: Dict[str, dict]) -> None:
+    """Backward-compatible alias for write_position_guard (ISSUE-75).
+
+    Existing callers (live_loop, position_reconciler) import save_state.
+    Keeping the alias avoids a churn-PR while routing all writes through
+    the single atomic writer.
+    """
+    write_position_guard(state)
 
 
 def _intent_strategy(intent) -> str:
@@ -182,15 +274,87 @@ def mark_position_open(intent) -> None:
     save_state(state)
 
 
-def mark_position_closed(intent) -> None:
+def is_fill_confirmed(fill_evidence: Optional[Mapping[str, Any]]) -> bool:
+    """Return True iff `fill_evidence` represents a confirmed broker/paper fill.
+
+    Per ISSUE-29 a position_guard.json entry may only be marked closed
+    when ALL of the following hold:
+      - `fill_id` exists (non-empty),
+      - status is `filled` or `paper_fill`,
+      - status is NOT `PendingSubmit` (or any other pending value),
+      - the fill is NOT flagged `pnl_untrusted`, rejected, or otherwise
+        untrusted (via `pnl_untrusted` bool or `tags` containing the marker).
+
+    Any other shape — missing dict, missing fill_id, pending status,
+    untrusted flag — must return False so callers leave guard state
+    unchanged and log a warning instead of mutating to a phantom close.
+    """
+    if not isinstance(fill_evidence, Mapping):
+        return False
+    fill_id = fill_evidence.get("fill_id")
+    if not fill_id or not str(fill_id).strip():
+        return False
+    status = str(fill_evidence.get("status", "") or "").strip().lower()
+    if status in _PENDING_FILL_STATUSES:
+        return False
+    if status in _REJECTED_FILL_STATUSES:
+        return False
+    if status not in _CONFIRMED_FILL_STATUSES:
+        return False
+    if bool(fill_evidence.get("pnl_untrusted")):
+        return False
+    if bool(fill_evidence.get("reject")):
+        return False
+    tags = fill_evidence.get("tags")
+    if isinstance(tags, (list, tuple)) and any(
+        str(t).strip().lower() == "pnl_untrusted" for t in tags
+    ):
+        return False
+    extra = fill_evidence.get("extra")
+    if isinstance(extra, Mapping) and bool(extra.get("pnl_untrusted")):
+        return False
+    return True
+
+
+def mark_position_closed(
+    intent,
+    fill_evidence: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Close the guard entry for `intent` only when fill is confirmed.
+
+    ISSUE-29: previously this function unconditionally flipped the entry
+    to `open=False`, which produced phantom-closed positions when called
+    before the broker (or paper executor) actually confirmed the fill.
+
+    Now requires `fill_evidence` to satisfy `is_fill_confirmed`. When
+    confirmation is absent the function logs a warning and returns False
+    without mutating state; the caller is expected to retry on the next
+    cycle once a confirmed fill exists.
+
+    Returns True iff the guard entry was mutated and persisted.
+    """
+    if not is_fill_confirmed(fill_evidence):
+        _LOG.warning(
+            "ISSUE29_GUARD_SKIP mark_position_closed: fill not confirmed for "
+            "strategy=%s symbol=%s — guard left unchanged (evidence=%s)",
+            _intent_strategy(intent),
+            _intent_symbol(intent),
+            (fill_evidence or {}).get("status") if isinstance(fill_evidence, Mapping)
+            else None,
+        )
+        return False
     state = _load_state()
     key = _position_key(_intent_strategy(intent), _intent_symbol(intent))
     if key in state:
         state[key]["open"] = False
         state[key]["updated_at_utc"] = _utc_now_iso()
         state[key]["last_state"] = PositionState.CLOSED.value
+        state[key]["closed_by"] = "fill_confirmed"
+        state[key]["closed_fill_id"] = str(fill_evidence.get("fill_id"))
         state[key]["_entry_version"] = int(_time.time() * 1000)
-        save_state(state)
+        write_position_guard(state)
+        return True
+    return False
 
 
 def replace_position(intent) -> None:

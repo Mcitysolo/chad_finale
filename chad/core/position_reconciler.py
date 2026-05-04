@@ -240,6 +240,11 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
         try:
             intent_obj = _close_intent_to_ibkr(close)
             submitted = paper_adapter.submit_strategy_trade_intents([intent_obj])
+            # ISSUE-29 (extended): collect post-normalize fill evidence so
+            # the guard mutation below requires POSITIVE confirmation
+            # (status=filled/paper_fill, fill_id present, not pending,
+            # not pnl_untrusted) — not just absence-of-rejection.
+            confirmed_fills: List[dict] = []
             for order in submitted:
                 fill_price = _load_price(order.symbol)
                 try:
@@ -280,7 +285,17 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
                     # safety net; calling it here lets us catch and skip a
                     # ValueError before the hash-chained write happens.
                     normalize_paper_fill_evidence(ev)
-                    write_paper_exec_evidence(ev)
+                    paths = write_paper_exec_evidence(ev)
+                    # Capture post-normalize, post-write evidence so the
+                    # guard mutation can verify positive confirmation.
+                    _post_status = str(getattr(ev, "status", "") or "").strip().lower()
+                    confirmed_fills.append({
+                        "fill_id": str(paths.get("fill_id", "")) if isinstance(paths, dict) else "",
+                        "status": _post_status,
+                        "pnl_untrusted": bool(getattr(ev, "pnl_untrusted", False)),
+                        "reject": bool(getattr(ev, "reject", False)),
+                        "fills_path": (paths.get("fills_path", "") if isinstance(paths, dict) else ""),
+                    })
                 except StrategyAttributionError as attr_err:
                     LOG.warning("reconciler evidence attribution failed: %s", attr_err)
                 except ValueError as norm_err:
@@ -307,6 +322,16 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
                     _reject_status = _status
                     break
 
+            # ISSUE-29 (extended): positive fill confirmation required.
+            # Even when the broker did not return an explicit reject
+            # (e.g. PendingSubmit / unknown / no fills written), the
+            # guard MUST stay open until at least one confirmed fill
+            # evidence record exists for this close intent.
+            from chad.core.position_guard import is_fill_confirmed  # type: ignore
+            _fill_confirmed = bool(confirmed_fills) and all(
+                is_fill_confirmed(f) for f in confirmed_fills
+            )
+
             pk = close.get("position_key")
             if _broker_rejected:
                 LOG.warning(
@@ -315,16 +340,35 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
                     "avoid phantom close",
                     pk, _reject_status,
                 )
+            elif not _fill_confirmed:
+                LOG.warning(
+                    "ISSUE29_GUARD_SKIP: close intent for position_key=%s "
+                    "lacks confirmed fill evidence (fills=%s) — guard NOT "
+                    "mutated; will retry on next cycle",
+                    pk, confirmed_fills,
+                )
             else:
                 try:
-                    from chad.core.position_guard import _load_state, save_state  # type: ignore
+                    from chad.core.position_guard import (  # type: ignore
+                        _load_state,
+                        write_position_guard,
+                    )
                     state = _load_state()
                     if pk and pk in state:
                         state[pk]["open"] = False
                         state[pk]["last_state"] = "CLOSED"
                         state[pk]["closed_by"] = "position_reconciler"
                         state[pk]["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-                        save_state(state)
+                        # Stamp the fill_id of the confirming evidence so
+                        # downstream auditors (reconciliation_publisher)
+                        # can trace which fill closed which guard entry.
+                        _first_fill_id = (
+                            confirmed_fills[0].get("fill_id", "")
+                            if confirmed_fills else ""
+                        )
+                        if _first_fill_id:
+                            state[pk]["closed_fill_id"] = _first_fill_id
+                        write_position_guard(state)
                 except Exception as gs_err:  # noqa: BLE001
                     LOG.warning("reconciler guard update failed: %s", gs_err)
 
