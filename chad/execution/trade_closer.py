@@ -82,12 +82,38 @@ class ClosedTrade:
     schema: str = "closed_trade.v1"
 
     def to_payload(self) -> Dict[str, Any]:
+        # Local import: keeps trade_closer's import surface narrow and avoids
+        # any analytics→execution import cycle if it ever surfaces.
+        from chad.analytics.pnl_breakdown import build_pnl_breakdown
+
         notional = self.entry_price * self.quantity * self.contract_multiplier
         gross = float(self.pnl)
-        commission = 0.0  # populated by fill enrichment in future
-        slippage = 0.0    # populated by fill enrichment in future
-        net = gross - commission - slippage
-        # DS07: pnl is deprecated alias for net_pnl; use net_pnl
+        # Per-fill cost enrichment is not yet wired into FIFO matching, so
+        # commission/slippage/fees are *unknown* — not zero. The breakdown
+        # carries cost_basis_status="unavailable" so downstream readers see
+        # the uncertainty explicitly instead of inheriting a silent default.
+        breakdown = build_pnl_breakdown(
+            gross_price_pnl=gross,
+            entry_price=self.entry_price,
+            exit_price=self.exit_price,
+            quantity=self.quantity,
+            contract_multiplier=self.contract_multiplier,
+            commission=None,
+            fees=None,
+            slippage=None,
+            source="paper_exec",
+            cost_basis_status="unavailable",
+        )
+        net = float(breakdown["net_pnl"])
+        # DS07: pnl is deprecated alias for net_pnl; use net_pnl.
+        # Top-level commission/slippage are kept as numeric for backwards
+        # compatibility with old report tooling that pre-dates pnl_breakdown.
+        # When costs are unknown we keep them at 0.0 here ONLY to preserve
+        # the existing top-level shape — the canonical truth lives in
+        # pnl_breakdown.cost_basis_status / pnl_breakdown.commission etc.
+        commission_top = breakdown["commission"] if breakdown["commission"] is not None else 0.0
+        slippage_top = breakdown["slippage"] if breakdown["slippage"] is not None else 0.0
+        fees_top = breakdown["fees"]  # None preserved; legacy field already nullable
         return {
             "schema_version": self.schema,
             "strategy": self.strategy,
@@ -95,8 +121,9 @@ class ClosedTrade:
             "side": self.side,
             "pnl": round(float(self.pnl), 4),
             "gross_pnl": round(gross, 4),
-            "commission": commission,
-            "slippage": slippage,
+            "commission": commission_top,
+            "slippage": slippage_top,
+            "fees": fees_top,
             "net_pnl": round(net, 4),
             "entry_time_utc": self.entry_time_utc,
             "exit_time_utc": self.exit_time_utc,
@@ -111,6 +138,7 @@ class ClosedTrade:
             "account_id": "PAPER_EXEC",
             "is_live": False,
             "tags": ["paper", "closed", self.strategy],
+            "pnl_breakdown": breakdown,
         }
 
 
