@@ -19,16 +19,14 @@ This is a *read-only* diagnostic. It never touches any broker.
 from __future__ import annotations
 
 import os
-from typing import Final
 
 from chad.core.mode import get_chad_mode, is_live_mode_enabled
 from chad.execution.execution_config import (
     ExecutionConfig,
     ExecutionMode,
+    _ENV_VAR_NAME,
     get_execution_config,
 )
-
-_ENV_VAR_NAME: Final[str] = "CHAD_EXECUTION_MODE"
 
 
 def _format_bool(value: bool) -> str:
