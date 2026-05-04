@@ -1556,7 +1556,11 @@ def run_once(logger: logging.Logger) -> None:
 
             # --- ML veto loop (shadow always on; hard veto behind flag) ---
             try:
-                from chad.analytics.ml_veto_predictor import should_veto as _ml_should_veto
+                from chad.analytics.ml_veto_predictor import (
+                    score_intent as _ml_score_intent,
+                    ACTION_VETO as _ML_ACTION_VETO,
+                    INTENT_ENTRY as _ML_INTENT_ENTRY,
+                )
                 _ml_ctx = {
                     "regime": {"regime": locals().get("_regime_now", "unknown")},
                     "prices": {},
@@ -1567,25 +1571,38 @@ def run_once(logger: logging.Logger) -> None:
                             getattr(getattr(_ctx, "portfolio", None), "equity", 0.0) or 0.0
                         ),
                     },
+                    # Pre-computed flip flag — predictor uses this to
+                    # classify the intent as protective so enforcement
+                    # never blocks an exit, even if tags are missing.
+                    "is_flip": bool(is_flip_signal(intent)),
                 }
-                _shadow_veto, _shadow_prob = _ml_should_veto(intent, _ml_ctx)
-                logger.debug(
-                    "ML_SHADOW symbol=%s strategy=%s loss_prob=%.3f would_veto=%s",
+                _shadow = _ml_score_intent(intent, _ml_ctx)
+                # Always log at INFO so the shadow soak is captured by
+                # default journald collection (DEBUG was previously
+                # filtered out in production).
+                logger.info(
+                    "ML_SHADOW symbol=%s strategy=%s intent_class=%s "
+                    "model_version=%s manifest_hash=%s loss_prob=%.3f "
+                    "threshold=%.2f would_veto=%s final_action=%s reason=%s",
                     getattr(intent, "symbol", "?"),
                     getattr(intent, "strategy", "?"),
-                    _shadow_prob, _shadow_veto,
+                    _shadow.intent_class,
+                    _shadow.model_version,
+                    _shadow.manifest_hash,
+                    _shadow.prediction,
+                    _shadow.threshold,
+                    _shadow.would_veto,
+                    _shadow.final_action,
+                    _shadow.reason,
                 )
-                _ml_veto_enabled = os.environ.get(
-                    "CHAD_ML_VETO_ENABLED", ""
-                ).lower() in ("1", "true", "yes")
-                if _ml_veto_enabled and _shadow_veto:
-                    logger.warning(
-                        "ML_VETO symbol=%s strategy=%s loss_prob=%.3f",
-                        getattr(intent, "symbol", "?"),
-                        getattr(intent, "strategy", "?"),
-                        _shadow_prob,
-                    )
-                    continue
+                if _shadow.final_action == _ML_ACTION_VETO:
+                    # Defense in depth: predictor already enforces the
+                    # protective-intent + canary + manifest gates, but
+                    # we still re-check intent_class here so a future
+                    # predictor regression cannot accidentally block
+                    # an exit.
+                    if _shadow.intent_class == _ML_INTENT_ENTRY:
+                        continue
             except Exception:
                 pass  # veto failure never blocks trade
             # --- end ML veto loop ---

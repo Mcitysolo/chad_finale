@@ -21,14 +21,16 @@ You MUST:
 - Adjust feature engineering if your trade_history schema differs.
 """
 
+import hashlib
 import json
 import logging
+import math
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
@@ -44,7 +46,26 @@ MODELS_DIR = ROOT / "shared" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_PATH = MODELS_DIR / "xgb_veto_model.json"
+MANIFEST_PATH = MODELS_DIR / "xgb_veto_manifest.json"
 PERF_PATH = MODELS_DIR / "model_performance.json"
+
+# Manifest schema bumped when trainer started excluding quarantined,
+# pnl_untrusted, untrusted-fill_id, nonfinite, and unusable-legacy
+# rows from training labels (Batch 9).
+MANIFEST_SCHEMA_VERSION = "xgb_manifest.v2"
+
+# Minimum sample count for a training run to be considered "promotable".
+# Training never overwrites the model below this floor; the prior model
+# stays in place. Configurable via env so canary/local runs can lower it.
+MIN_TRAINING_SAMPLES = 100
+
+# Schema versions whose label is considered usable. Older schemas with
+# unusable PnL semantics are excluded by default; an operator can opt
+# them in by listing them in CHAD_ML_TRAIN_LEGACY_SCHEMAS.
+USABLE_TRADE_SCHEMAS: Tuple[str, ...] = (
+    "closed_trade.v1",
+    "closed_trade.v2",
+)
 
 # Feature encodings — must match chad/analytics/ml_veto_predictor.py
 _STRATEGY_MAP = {
@@ -82,6 +103,11 @@ class TrainingResult:
     n_samples: int
     n_features: int
     metrics: Dict[str, float]
+    excluded: Dict[str, int] = field(default_factory=dict)
+    dataset_hash: str = ""
+    model_version: str = ""
+    manifest_path: Optional[Path] = None
+    backup_path: Optional[Path] = None
 
 
 def _setup_logging() -> None:
@@ -134,42 +160,153 @@ def _load_trade_rows(max_files: int = 120) -> List[Dict[str, Any]]:
     return rows
 
 
-def _build_dataset(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+def _legacy_schemas_allowed() -> Set[str]:
+    """Optional opt-in legacy schemas via CHAD_ML_TRAIN_LEGACY_SCHEMAS.
+
+    Operators can list schema_version values (comma-separated) that
+    should be re-admitted into training labels even though they are
+    older than the current usable schema set. Empty by default.
     """
-    Build the 10-feature matrix used by the ML veto predictor.
+    import os
+    raw = os.environ.get("CHAD_ML_TRAIN_LEGACY_SCHEMAS", "")
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _resolve_pnl(payload: Mapping[str, Any]) -> Optional[float]:
+    """Prefer the canonical per-trade pnl_breakdown.net_pnl when the
+    breakdown is present and well-formed; otherwise fall back to
+    payload.net_pnl, then payload.pnl. Returns None when no usable
+    PnL is available, when the value is non-numeric, or when the
+    value is non-finite (NaN/Inf).
+    """
+    breakdown = payload.get("pnl_breakdown")
+    if isinstance(breakdown, Mapping):
+        net = breakdown.get("net_pnl")
+        if net is not None:
+            try:
+                v = float(net)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(v):
+                return None
+            return v
+
+    for key in ("net_pnl", "pnl"):
+        v_raw = payload.get(key)
+        if v_raw is None:
+            continue
+        try:
+            v = float(v_raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(v):
+            return None
+        return v
+    return None
+
+
+def _build_dataset(
+    rows: List[Dict[str, Any]],
+    invalid_fill_ids: Optional[Set[str]] = None,
+    invalid_trade_hashes: Optional[Set[str]] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Build the 10-feature matrix used by the ML veto predictor.
+
     Label: 1 = loss (pnl <= 0), 0 = win (pnl > 0). We predict P(loss).
 
-    Trade history rows may be flat or wrapped in a {"payload": ...} envelope.
-    Most historical fields are absent; we substitute neutral defaults that
-    match the runtime predictor's defaults so train and inference align.
+    Trade rows are filtered to exclude:
+      * quarantined records (by record_hash)
+      * untrusted records (pnl_untrusted flag, tag, or extra)
+      * derived closed trades whose fill_ids intersect the untrusted
+        fill set (so a quarantined opening or closing fill can never
+        seed a trusted training label)
+      * non-finite PnL (NaN/Inf) and unparseable PnL
+      * legacy schema_version rows whose label semantics are not
+        currently considered usable (override via
+        CHAD_ML_TRAIN_LEGACY_SCHEMAS)
+
+    Returns ``(X, y, excluded)`` so callers can record the exclusion
+    counts alongside the model manifest.
     """
     from datetime import datetime
 
+    bad_fills = invalid_fill_ids or set()
+    bad_hashes = invalid_trade_hashes or set()
+    legacy_allow = _legacy_schemas_allowed()
+    usable_schemas = set(USABLE_TRADE_SCHEMAS) | legacy_allow
+
     X: List[List[float]] = []
     y: List[int] = []
+    excluded: Dict[str, int] = {
+        "quarantined": 0,
+        "untrusted": 0,
+        "untrusted_fill_id": 0,
+        "nonfinite_pnl": 0,
+        "missing_pnl": 0,
+        "legacy_schema": 0,
+        "malformed": 0,
+    }
 
     for raw in rows:
-        r = raw.get("payload", raw) if isinstance(raw, dict) else raw
-        if not isinstance(r, dict):
+        if not isinstance(raw, dict):
+            excluded["malformed"] += 1
             continue
-        pnl = r.get("pnl")
-        if pnl is None:
-            continue
-        try:
-            pnl_f = float(pnl)
-        except Exception:
+        record_hash = raw.get("record_hash")
+        payload = raw.get("payload")
+        if not isinstance(payload, Mapping):
+            payload = raw
+
+        # Quarantined record_hash → drop.
+        if isinstance(record_hash, str) and record_hash in bad_hashes:
+            excluded["quarantined"] += 1
             continue
 
-        strategy = str(r.get("strategy", "") or "").lower()
-        side = str(r.get("side", "") or "").upper()
-        regime = str(r.get("regime", "") or "unknown").lower()
+        # pnl_untrusted on payload, top-level, tags, or extra → drop.
+        if _is_untrusted_payload(payload) or raw.get("pnl_untrusted") is True:
+            excluded["untrusted"] += 1
+            continue
+
+        # Any fill_id intersection with the untrusted fill set → drop.
+        fid = payload.get("fill_id")
+        fids = payload.get("fill_ids")
+        if isinstance(fid, str) and fid in bad_fills:
+            excluded["untrusted_fill_id"] += 1
+            continue
+        if isinstance(fids, list) and any(
+            isinstance(f, str) and f in bad_fills for f in fids
+        ):
+            excluded["untrusted_fill_id"] += 1
+            continue
+
+        # Schema gate — closed_trade.v1+ only unless explicitly opted in.
+        schema_version = str(payload.get("schema_version") or "").strip()
+        if schema_version and schema_version not in usable_schemas:
+            excluded["legacy_schema"] += 1
+            continue
+
+        # Resolve PnL, preferring pnl_breakdown.net_pnl when present.
+        pnl_f = _resolve_pnl(payload)
+        if pnl_f is None:
+            # Distinguish "missing entirely" from "present but unparseable/nonfinite":
+            if (payload.get("pnl_breakdown") is None
+                    and payload.get("net_pnl") is None
+                    and payload.get("pnl") is None):
+                excluded["missing_pnl"] += 1
+            else:
+                excluded["nonfinite_pnl"] += 1
+            continue
+
+        strategy = str(payload.get("strategy", "") or "").lower()
+        side = str(payload.get("side", "") or "").upper()
+        regime = str(payload.get("regime", "") or "unknown").lower()
         if regime not in _REGIME_MAP:
             regime = "unknown"
 
-        # Time features from exit_time_utc when available
         hour = 12.0
         weekday = 2.0
-        ts = r.get("exit_time_utc") or r.get("entry_time_utc") or r.get("timestamp_utc")
+        ts = (payload.get("exit_time_utc")
+              or payload.get("entry_time_utc")
+              or payload.get("timestamp_utc"))
         if isinstance(ts, str) and ts:
             try:
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -178,7 +315,7 @@ def _build_dataset(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
             except Exception:
                 pass
 
-        # Defaults for fields not stored in trade history — match predictor
+        # Defaults for fields not stored in trade history — match predictor.
         vix = 20.0
         sizing = 0.25
         equity_norm = 1.0
@@ -200,17 +337,70 @@ def _build_dataset(rows: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
         y.append(0 if pnl_f > 0.0 else 1)
 
     if not X:
-        return np.empty((0, 0), dtype=float), np.empty((0,), dtype=int)
+        return (
+            np.empty((0, 0), dtype=float),
+            np.empty((0,), dtype=int),
+            excluded,
+        )
 
-    return np.asarray(X, dtype=float), np.asarray(y, dtype=int)
+    return np.asarray(X, dtype=float), np.asarray(y, dtype=int), excluded
 
 
-def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
+def _is_untrusted_payload(payload: Mapping[str, Any]) -> bool:
+    """Mirror chad/utils/quarantine._payload_is_untrusted without
+    importing it (so this trainer keeps a tight dependency surface
+    when invoked under restricted environments)."""
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("pnl_untrusted") is True:
+        return True
+    extra = payload.get("extra")
+    if isinstance(extra, Mapping) and extra.get("pnl_untrusted") is True:
+        return True
+    tags = payload.get("tags")
+    if isinstance(tags, list) and any(
+        str(t).strip().lower() == "pnl_untrusted" for t in tags
+    ):
+        return True
+    return False
+
+
+def _hash_dataset(X: np.ndarray, y: np.ndarray) -> str:
+    """SHA256 over the row-major bytes of (X, y). Empty datasets hash
+    to a stable sentinel so callers can detect "nothing to train"
+    without parsing manifest fields."""
+    if X.size == 0 or y.size == 0:
+        return "sha256:empty"
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(X, dtype=np.float64).tobytes())
+    h.update(np.ascontiguousarray(y, dtype=np.int32).tobytes())
+    return f"sha256:{h.hexdigest()}"
+
+
+def _hash_file(path: Path) -> Optional[str]:
+    try:
+        with path.open("rb") as f:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        return f"sha256:{h.hexdigest()}"
+    except OSError:
+        return None
+
+
+def _train_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    excluded: Optional[Dict[str, int]] = None,
+) -> TrainingResult:
     """
     Train an XGBoost regressor on the given dataset.
 
     Returns a TrainingResult describing success/failure and metrics.
     """
+    excluded = dict(excluded or {})
+    dataset_hash = _hash_dataset(X, y)
+
     if xgb is None:
         return TrainingResult(
             ok=False,
@@ -218,16 +408,23 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
             n_samples=0,
             n_features=0,
             metrics={},
+            excluded=excluded,
+            dataset_hash=dataset_hash,
         )
 
     n_samples, n_features = X.shape
-    if n_samples < 100:
+    if n_samples < MIN_TRAINING_SAMPLES:
         return TrainingResult(
             ok=False,
-            reason=f"Not enough samples for training ({n_samples} < 100)",
+            reason=(
+                f"Not enough samples for training "
+                f"({n_samples} < {MIN_TRAINING_SAMPLES})"
+            ),
             n_samples=int(n_samples),
             n_features=int(n_features),
             metrics={},
+            excluded=excluded,
+            dataset_hash=dataset_hash,
         )
 
     idx_split = int(0.8 * n_samples)
@@ -238,6 +435,8 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
             n_samples=int(n_samples),
             n_features=int(n_features),
             metrics={},
+            excluded=excluded,
+            dataset_hash=dataset_hash,
         )
 
     X_train, X_val = X[:idx_split], X[idx_split:]
@@ -320,29 +519,60 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
             n_samples=int(n_samples),
             n_features=int(n_features),
             metrics=metrics,
+            excluded=excluded,
+            dataset_hash=dataset_hash,
+            backup_path=backup_path,
         )
 
-    # SS08: write a manifest beside the model recording training metadata,
-    # the backup path of the prior model (rollback target), and the feature
-    # set the model was trained on. Operators can restore by copying the
-    # backup over MODEL_PATH.
+    model_hash = _hash_file(MODEL_PATH) or ""
+    trained_at = datetime.now(timezone.utc).isoformat()
+    # Stable model_version — uses the timestamped backup name for the
+    # *new* model. This makes "which model was scoring on day X" easy
+    # to answer even after subsequent retrains.
+    model_version = f"xgb_veto_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    # SS08 + Batch 9: manifest is the source-of-truth for the predictor's
+    # safety gates. It records the dataset fingerprint, the per-reason
+    # exclusion counts, validation metrics, and the rollback target so
+    # operators can restore by copying the backup over MODEL_PATH.
+    manifest_written = False
     try:
         manifest = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
             "model_path": str(MODEL_PATH),
-            "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+            "model_sha256": model_hash,
+            "model_version": model_version,
+            "trained_at_utc": trained_at,
             "training_samples": int(n_samples),
+            "feature_names": list(FEATURE_NAMES),
+            "metrics": {k: float(v) for k, v in metrics.items()},
             "validation_accuracy": float(metrics.get("accuracy", 0.0)),
             "validation_logloss": float(metrics.get("logloss", 0.0)),
-            "feature_names": list(FEATURE_NAMES),
+            "dataset_hash": dataset_hash,
+            "excluded": {k: int(v) for k, v in excluded.items()},
+            "min_training_samples": int(MIN_TRAINING_SAMPLES),
             "prior_model_backup": str(backup_path) if backup_path else None,
-            "schema_version": "xgb_manifest.v1",
+            "label_definition": "1=loss(net_pnl<=0), 0=win(net_pnl>0)",
+            "pnl_source_priority": [
+                "payload.pnl_breakdown.net_pnl",
+                "payload.net_pnl",
+                "payload.pnl",
+            ],
+            "training_filters": {
+                "exclude_quarantined": True,
+                "exclude_pnl_untrusted": True,
+                "exclude_untrusted_fill_ids": True,
+                "exclude_nonfinite_pnl": True,
+                "usable_schemas": list(USABLE_TRADE_SCHEMAS)
+                + sorted(_legacy_schemas_allowed()),
+            },
         }
-        manifest_path = MODEL_PATH.parent / "xgb_veto_manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
+        MANIFEST_PATH.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )
-        LOG.info("Manifest written to %s", manifest_path)
-        print(f"Manifest written to {manifest_path}")
+        manifest_written = True
+        LOG.info("Manifest written to %s", MANIFEST_PATH)
+        print(f"Manifest written to {MANIFEST_PATH}")
     except Exception:  # noqa: BLE001
         LOG.exception("Failed to write XGBoost manifest — continuing")
 
@@ -351,13 +581,17 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
         PERF_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     except Exception:  # noqa: BLE001
         LOG.exception("Failed to write performance metrics to %s", PERF_PATH)
-        # Model is still usable; treat as soft failure
         return TrainingResult(
             ok=True,
             reason="metrics_write_failed",
             n_samples=int(n_samples),
             n_features=int(n_features),
             metrics=metrics,
+            excluded=excluded,
+            dataset_hash=dataset_hash,
+            model_version=model_version,
+            manifest_path=MANIFEST_PATH if manifest_written else None,
+            backup_path=backup_path,
         )
 
     return TrainingResult(
@@ -366,7 +600,35 @@ def _train_model(X: np.ndarray, y: np.ndarray) -> TrainingResult:
         n_samples=int(n_samples),
         n_features=int(n_features),
         metrics=metrics,
+        excluded=excluded,
+        dataset_hash=dataset_hash,
+        model_version=model_version,
+        manifest_path=MANIFEST_PATH if manifest_written else None,
+        backup_path=backup_path,
     )
+
+
+def _load_exclusion_sets() -> Tuple[Set[str], Set[str]]:
+    """Load the canonical (invalid_fill_ids, invalid_trade_hashes) sets
+    used by every CHAD publisher. Failures are logged and degrade to
+    empty sets — training must keep running rather than crash, but
+    the manifest will then record zero exclusions for all reasons.
+    """
+    try:
+        from chad.utils.quarantine import get_exclusion_sets
+    except Exception:  # noqa: BLE001
+        LOG.warning(
+            "quarantine helper unavailable — training without exclusion sets"
+        )
+        return set(), set()
+    try:
+        return get_exclusion_sets(
+            runtime_dir=ROOT / "runtime",
+            fills_dir=ROOT / "data" / "fills",
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("get_exclusion_sets failed err=%s — using empty sets", exc)
+        return set(), set()
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -388,17 +650,30 @@ def main(argv: List[str] | None = None) -> int:
         LOG.warning("No trade rows loaded; aborting XGB training")
         return 0
 
-    X, y = _build_dataset(rows)
+    invalid_fill_ids, invalid_trade_hashes = _load_exclusion_sets()
+    if invalid_fill_ids or invalid_trade_hashes:
+        LOG.info(
+            "Training will exclude %d untrusted fill_ids and %d quarantined trade hashes",
+            len(invalid_fill_ids),
+            len(invalid_trade_hashes),
+        )
+
+    X, y, excluded = _build_dataset(rows, invalid_fill_ids, invalid_trade_hashes)
+    LOG.info("Training set: %d usable rows, exclusions=%s", len(y), excluded)
     if X.size == 0 or y.size == 0:
         LOG.warning("No usable samples after feature building; aborting")
         return 0
 
-    result = _train_model(X, y)
+    result = _train_model(X, y, excluded)
     LOG.info(
-        "Training result: ok=%s reason=%s metrics=%s",
+        "Training result: ok=%s reason=%s metrics=%s excluded=%s "
+        "dataset_hash=%s model_version=%s",
         result.ok,
         result.reason,
         result.metrics,
+        result.excluded,
+        result.dataset_hash,
+        result.model_version,
     )
 
     return 0 if result.ok else 1
