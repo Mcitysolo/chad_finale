@@ -453,28 +453,150 @@ def rule_alpha_cluster_degradation(findings: List[Finding]) -> None:
 
 
 def rule_scr_effective_trades_gap(findings: List[Finding]) -> None:
-    """R13 — Flag large gaps between raw trade count and SCR effective trades."""
+    """R13 — Flag large gaps between raw trade count and SCR effective trades.
+
+    Surfaces the SCR exclusion classification (excluded_untrusted,
+    excluded_manual, excluded_nonfinite) when present so the operator can
+    confirm the gap is composed of legitimate exclusions (pnl_untrusted,
+    rejected/partial fills, manual exclusions) rather than a counting bug.
+    """
     pnl = _read_json(RUNTIME / "pnl_state.json")
     scr = _read_json(RUNTIME / "scr_state.json")
     if not pnl or not scr:
         return
     raw_trade_count = int(pnl.get("trade_count", 0) or 0)
-    effective = int((scr.get("stats", {}) or {}).get("effective_trades", 0) or 0)
+    stats = scr.get("stats", {}) or {}
+    effective = int(stats.get("effective_trades", 0) or 0)
     if raw_trade_count <= 0 or effective <= 0:
         return
     if raw_trade_count > effective * 2:
+        gap = raw_trade_count - effective
+        # Surface classification breakdown so the gap can be triaged
+        # without manual log inspection.
+        cls_keys = (
+            "excluded_untrusted",
+            "excluded_manual",
+            "excluded_nonfinite",
+            "excluded_partial",
+            "excluded_pnl_zero",
+        )
+        cls_parts = []
+        accounted = 0
+        for k in cls_keys:
+            try:
+                v = int(stats.get(k, 0) or 0)
+            except Exception:
+                continue
+            if v > 0:
+                cls_parts.append(f"{k}={v}")
+                accounted += v
+        unaccounted = max(gap - accounted, 0)
+        if unaccounted > 0:
+            cls_parts.append(f"unclassified={unaccounted}")
+        cls_summary = ", ".join(cls_parts) if cls_parts else "no breakdown"
         findings.append(Finding(
             rule_id="R13",
             severity="INFO",
             title=f"SCR gap: {raw_trade_count} raw vs {effective} effective",
             description=(
-                f"{raw_trade_count - effective} trades excluded from SCR. "
+                f"{gap} trades excluded from SCR. "
+                f"Classification: {cls_summary}. "
                 "Check for rejected/partial/excluded fills."
             ),
             remedy_type="NOTIFY_ONLY",
             remedy_action="notify",
             evidence="runtime/scr_state.json + runtime/pnl_state.json",
         ))
+
+
+def rule_halted_with_unclamped_boost(findings: List[Finding]) -> None:
+    """R14 — Halted strategy must have its winner boost clamped.
+
+    Reads the *effective* per-strategy ``winner_factor`` from
+    ``dynamic_caps.json`` (the live, clamped value the allocator uses)
+    rather than the raw multiplier from ``winner_scaling.json``. The
+    orchestrator's halt clamp publishes ``winner_factor<=1.0`` with
+    ``halt_clamp_applied=true`` for any halted strategy, so a raw boost
+    of 1.5x in winner_scaling.json is *not* a contradiction once the
+    effective value is neutral.
+
+    Warns only when:
+      - ``dynamic_caps.json`` is missing/empty (cannot verify clamp), OR
+      - effective ``winner_factor`` for a halted strategy is > 1.0.
+    Stays silent when the clamp is correctly applied.
+    """
+    alloc = _read_json(RUNTIME / "strategy_allocations.json")
+    allocations = alloc.get("allocations", {}) if isinstance(alloc, dict) else {}
+    if not isinstance(allocations, dict):
+        return
+    halted = [
+        name for name, info in allocations.items()
+        if isinstance(info, dict) and info.get("halted")
+    ]
+    if not halted:
+        return
+
+    caps = _read_json(RUNTIME / "dynamic_caps.json")
+    caps_strats = (caps.get("strategies") if isinstance(caps, dict) else None) or {}
+    raw_ws = _read_json(RUNTIME / "winner_scaling.json")
+    raw_mults = (raw_ws.get("multipliers") if isinstance(raw_ws, dict) else None) or {}
+
+    for strategy in halted:
+        try:
+            raw_mult = float(raw_mults.get(strategy, 1.0))
+        except Exception:
+            raw_mult = 1.0
+        # Only audit halted strategies that actually carry a raw boost.
+        if raw_mult <= 1.0:
+            continue
+
+        cap_entry = caps_strats.get(strategy) if isinstance(caps_strats, dict) else None
+        if not isinstance(cap_entry, dict) or not caps_strats:
+            findings.append(Finding(
+                rule_id="R14",
+                severity="WARNING",
+                title=f"Halt+boost unverified: {strategy}",
+                description=(
+                    f"Strategy {strategy} is halted with raw winner boost "
+                    f"{raw_mult:.2f}x but dynamic_caps.json is missing or "
+                    "has no per-strategy entry — cannot verify the halt "
+                    "clamp suppressed the boost."
+                ),
+                remedy_type="NOTIFY_ONLY",
+                remedy_action="notify",
+                evidence=(
+                    f"strategy_allocations.{strategy}.halted=true; "
+                    f"winner_scaling.multipliers.{strategy}={raw_mult}; "
+                    "dynamic_caps.json missing per-strategy data"
+                ),
+            ))
+            continue
+
+        try:
+            eff = float(cap_entry.get("winner_factor", 1.0))
+        except Exception:
+            eff = 1.0
+        clamp_applied = bool(cap_entry.get("halt_clamp_applied", False))
+        if eff > 1.0:
+            findings.append(Finding(
+                rule_id="R14",
+                severity="WARNING",
+                title=f"Halt+boost contradiction: {strategy}",
+                description=(
+                    f"Strategy {strategy} is halted but effective "
+                    f"winner_factor={eff:.2f}x in dynamic_caps "
+                    f"(halt_clamp_applied={clamp_applied}). The boost "
+                    "should be clamped to <=1.0 while halted."
+                ),
+                remedy_type="NOTIFY_ONLY",
+                remedy_action="notify",
+                evidence=(
+                    f"strategy_allocations.{strategy}.halted=true; "
+                    f"dynamic_caps.strategies.{strategy}.winner_factor={eff}; "
+                    f"halt_clamp_applied={clamp_applied}"
+                ),
+            ))
+        # eff <= 1.0 → halt clamp working as designed; no finding emitted.
 
 
 def run_all_rules() -> List[Finding]:
@@ -494,6 +616,7 @@ def run_all_rules() -> List[Finding]:
         rule_stale_reconciliation_artifact,
         rule_alpha_cluster_degradation,
         rule_scr_effective_trades_gap,
+        rule_halted_with_unclamped_boost,
     ]:
         try:
             fn(findings)

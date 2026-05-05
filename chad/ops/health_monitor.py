@@ -116,15 +116,58 @@ def _build_system_snapshot() -> str:
                 f"<0.5 health: {alphas_low}"
             )
 
-    # Winner scaling — flag anything <0.7 or >1.3
+    # Winner scaling — report the *effective* multiplier the allocator
+    # actually applies (dynamic_caps.strategies.{name}.winner_factor),
+    # not the raw winner_scaling.json multiplier. The orchestrator's halt
+    # clamp publishes winner_factor<=1.0 with halt_clamp_applied=true for
+    # any halted strategy, so a raw 1.5x in winner_scaling that has been
+    # clamped to 1.0 must NOT be reported as a "boost" — otherwise Claude
+    # combines it with the R09 halt finding and emits a stale halt+boost
+    # contradiction warning.
     ws = _read_json(RUNTIME / "winner_scaling.json")
-    multipliers = ws.get("multipliers", {}) or {}
-    penalized = {k: v for k, v in multipliers.items() if v < 0.7}
-    boosted = {k: v for k, v in multipliers.items() if v > 1.3}
+    raw_multipliers = ws.get("multipliers", {}) or {}
+    caps = _read_json(RUNTIME / "dynamic_caps.json")
+    caps_strats = (caps.get("strategies") if isinstance(caps, dict) else None) or {}
+    effective_mults: dict = {}
+    if caps_strats:
+        for name, entry in caps_strats.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                effective_mults[name] = float(entry.get("winner_factor", 1.0))
+            except Exception:
+                continue
+    # Fall back to raw multipliers when dynamic_caps is unavailable.
+    src = effective_mults or raw_multipliers
+    penalized = {k: round(float(v), 3) for k, v in src.items()
+                 if float(v) < 0.7}
+    boosted = {k: round(float(v), 3) for k, v in src.items()
+               if float(v) > 1.3}
     if penalized:
-        lines.append(f"Penalized strategies (<0.7): {penalized}")
+        lines.append(f"Penalized strategies (<0.7, effective): {penalized}")
     if boosted:
-        lines.append(f"Boosted strategies (>1.3): {boosted}")
+        lines.append(f"Boosted strategies (>1.3, effective): {boosted}")
+    # Halt-clamp transparency: if any strategy has a raw boost that was
+    # suppressed by the halt clamp, surface that as INFO so Claude does
+    # not flag a contradiction that has already been resolved.
+    if caps_strats:
+        suppressed = []
+        for name, entry in caps_strats.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                raw_v = float(raw_multipliers.get(name, 1.0))
+                eff_v = float(entry.get("winner_factor", 1.0))
+            except Exception:
+                continue
+            if (entry.get("halt_clamp_applied") and raw_v > 1.0
+                    and eff_v <= 1.0):
+                suppressed.append(f"{name}(raw={raw_v}->eff={eff_v})")
+        if suppressed:
+            lines.append(
+                "Halt clamp suppressed boosts (no contradiction): "
+                + ", ".join(suppressed)
+            )
 
     # Business phase
     biz = _read_json(RUNTIME / "business_phase.json")
