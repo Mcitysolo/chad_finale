@@ -4,17 +4,35 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = "/home/ubuntu/chad_finale/ops/rebalance_auto_executor_paper.py"
 PYTHON = "/home/ubuntu/chad_finale/venv/bin/python3"
 
 
-def test_execute_blocks_when_disabled() -> None:
+def _neutral_event_risk_path(tmp_path: Path) -> str:
+    p = tmp_path / "event_risk.json"
+    p.write_text(json.dumps({
+        "schema_version": "event_risk.v1",
+        "severity": "low",
+        "elevated_risk": False,
+        "risk_score": 0.0,
+        "ts_utc": "2026-01-01T00:00:00Z",
+        "ttl_seconds": 1800,
+        "windows": [],
+    }))
+    return str(p)
+
+
+def test_execute_blocks_when_disabled(tmp_path: Path) -> None:
     env = {
         "PYTHONPATH": "/home/ubuntu/chad_finale",
         "CHAD_RUNTIME_DIR": "/home/ubuntu/chad_finale/runtime",
         # critical: AUTO_EXECUTE disabled
         "CHAD_AUTO_EXECUTE_REBALANCE": "0",
+        # isolate from live runtime event_risk.json
+        "CHAD_EVENT_RISK_PATH": _neutral_event_risk_path(tmp_path),
     }
     p = subprocess.run(
         [PYTHON, SCRIPT, "--execute"],
@@ -29,11 +47,13 @@ def test_execute_blocks_when_disabled() -> None:
     assert obj.get("reason") == "AUTO_EXECUTE_DISABLED"
 
 
-def test_preview_smoke() -> None:
+def test_preview_smoke(tmp_path: Path) -> None:
     env = {
         "PYTHONPATH": "/home/ubuntu/chad_finale",
         "CHAD_RUNTIME_DIR": "/home/ubuntu/chad_finale/runtime",
         "CHAD_PORTFOLIO_PROFILE": "BALANCED",
+        # isolate from live runtime event_risk.json
+        "CHAD_EVENT_RISK_PATH": _neutral_event_risk_path(tmp_path),
     }
     p = subprocess.run(
         [PYTHON, SCRIPT],
