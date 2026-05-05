@@ -367,6 +367,14 @@ class DynamicRiskAllocator:
         # Clamp regime multiplier to the documented 1.0..1.5 band.
         regime_mult = max(1.0, min(1.5, float(regime_mult)))
 
+        # Halt-aware boost suppression: a strategy halted by edge decay
+        # monitor must never receive an aggressive winner_factor > 1.0,
+        # even if winner_scaling.json still publishes a stale boost. The
+        # halt itself is preserved (suppression happens here on the read
+        # path only — winner_scaling.json and strategy_allocations.json
+        # are not mutated).
+        halted_lookup = _load_halted_strategy_set()
+
         caps: Dict[str, float] = {}
         applied_overlays: Dict[str, Dict[str, float]] = {}
         for name, frac in norm.items():
@@ -377,6 +385,10 @@ class DynamicRiskAllocator:
             # CB05: when stale, every strategy gets 0.5x (default in lookup).
             winner_default = 0.5 if winner_stale else 1.0
             winner_factor = float(winner_mults.get(name.lower(), winner_default))
+            halt_clamp_applied = False
+            if name.lower() in halted_lookup and winner_factor > 1.0:
+                winner_factor = 1.0
+                halt_clamp_applied = True
             cap = base_cap * tier_factor * winner_factor * regime_mult
             caps[name] = cap
             applied_overlays[name] = {
@@ -385,7 +397,13 @@ class DynamicRiskAllocator:
                 "winner_factor": winner_factor,
                 "regime_factor": regime_mult,
                 "final_cap": cap,
+                "halt_clamp_applied": halt_clamp_applied,
             }
+            if halt_clamp_applied:
+                logger.warning(
+                    "HALT_BOOST_SUPPRESSED strategy=%s winner_factor_clamped_to=1.0",
+                    name,
+                )
 
         logger.info(
             "DynamicRiskAllocator: total_equity=%.2f daily_risk_fraction=%.3f "
@@ -434,6 +452,7 @@ class DynamicRiskAllocator:
                 "winner_factor": float(ov.get("winner_factor", 1.0)),
                 "regime_factor": float(ov.get("regime_factor", 1.0)),
                 "base_cap_pre_overlay": float(ov.get("base_cap", 0.0)),
+                "halt_clamp_applied": bool(ov.get("halt_clamp_applied", False)),
             }
 
         return {
@@ -680,6 +699,35 @@ def load_regime_booster_multiplier() -> float:
         return float(doc.get("multiplier", 1.0))
     except (TypeError, ValueError):
         return 1.0
+
+
+def _load_halted_strategy_set() -> set[str]:
+    """Read runtime/strategy_allocations.json and return the lower-case
+    set of strategies currently flagged halted. Fail-safe: any error
+    returns an empty set so the allocator continues to compute caps —
+    halt enforcement is layered (live_loop also drops signals from
+    halted strategies), so a transient read failure must not break
+    risk allocation.
+    """
+    halted: set[str] = set()
+    try:
+        path = _runtime_dir() / "strategy_allocations.json"
+        if not path.is_file():
+            return halted
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return halted
+        allocations = doc.get("allocations", {})
+        if not isinstance(allocations, dict):
+            return halted
+        for name, entry in allocations.items():
+            if isinstance(entry, dict) and entry.get("halted") is True:
+                key = str(name).strip().lower()
+                if key:
+                    halted.add(key)
+    except Exception as exc:  # noqa: BLE001 — fail-safe by design
+        logger.warning("halted_strategy_set_unreadable err=%s", exc)
+    return halted
 
 
 
