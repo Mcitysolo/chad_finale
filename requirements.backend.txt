@@ -1,3 +1,4 @@
+# DEPRECATED — superseded for full environment reproducibility by requirements.txt (2026-05-06)
 fastapi==0.116.1
 httpx==0.28.1
 ib-insync==0.9.86
