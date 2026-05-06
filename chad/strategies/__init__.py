@@ -21,7 +21,7 @@ Strategies Covered
 - OMEGA         – Hedge / macro
 - DELTA         – Execution intelligence / meta-signals
 - ALPHA_CRYPTO  – Intraday crypto
-- ALPHA_FOREX   – Intraday FX
+- ALPHA_FOREX   – Intraday FX (DEFERRED — see DEFERRED_STRATEGIES below)
 - ALPHA_FUTURES – Futures momentum
 - GAMMA_FUTURES – Futures mean-reversion
 - OMEGA_MACRO      – Macro regime futures
@@ -35,10 +35,34 @@ Strategies Covered
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Protocol
+from typing import Callable, Dict, FrozenSet, Iterable, List, Protocol
 
 from chad.engine import StrategyEngine
 from chad.types import StrategyConfig, StrategyName
+
+# ---------------------------------------------------------------------------
+# Deferred-strategies policy (GAP-014 formal close)
+# ---------------------------------------------------------------------------
+#
+# StrategyName enum members listed here are intentionally NOT registered in
+# the active runtime registry. They remain in the enum because historical
+# runtime/data artifacts, allocator overlays, paper-trade ledgers, and
+# analytics already reference them by string value, and removing the enum
+# member would invalidate those records and break parity readers.
+#
+# Inclusion in DEFERRED_STRATEGIES is the single authoritative signal that a
+# strategy is "known but inactive by design", as opposed to "missing from
+# the registry by accident". Parity checks (registry vs enum, dynamic caps
+# vs active set) must consult this set.
+#
+# ALPHA_FOREX: FX universe (EUR-USD, GBP-USD, USD-CAD, USD-JPY) is not yet
+# mapped to active bar/price context. M6E (Micro EUR/FX future) is in the
+# universe, but the symbol-translation layer is not implemented. The
+# strategy module produces 0 signals every cycle, polluting audit output.
+# Re-enable when the FX universe is formally defined.
+DEFERRED_STRATEGIES: FrozenSet[StrategyName] = frozenset({
+    StrategyName.ALPHA_FOREX,
+})
 
 from .alpha import build_alpha_config, alpha_handler
 from .beta import build_beta_config, beta_handler
@@ -231,6 +255,29 @@ def iter_strategy_registrations() -> Iterable[StrategyRegistration]:
         reg = _REGISTRY.get(name)
         if reg is not None:
             yield reg
+
+
+def active_strategy_names() -> FrozenSet[StrategyName]:
+    """
+    Return the set of StrategyName values that are actively registered.
+
+    Equivalent to ``set(StrategyName) - DEFERRED_STRATEGIES`` and equal to
+    the keys of the registry. Used by parity checks that need to
+    distinguish "active registered" strategies from "historical/deferred
+    enum members" (see GAP-014 closure).
+    """
+    return frozenset(_REGISTRY.keys())
+
+
+def deferred_strategy_names() -> FrozenSet[StrategyName]:
+    """
+    Return the set of StrategyName values that are intentionally deferred.
+
+    Returns the canonical DEFERRED_STRATEGIES set. Callers should treat
+    membership here as authoritative — a deferred strategy is *known* to
+    be missing from the active registry by design, not by accident.
+    """
+    return DEFERRED_STRATEGIES
 
 
 # ---------------------------------------------------------------------------
