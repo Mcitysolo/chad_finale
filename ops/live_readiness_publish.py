@@ -43,6 +43,10 @@ OUT_DIR = REPORTS_DIR / "live_readiness"
 
 POINTER_PATH = RUNTIME_DIR / "live_readiness.json"
 
+# Pointer cadence is weekly (next_evaluation_cadence="weekly"); declare TTL
+# to match so freshness consumers (e.g. LiveGate) don't classify it as stale.
+POINTER_TTL_SECONDS = 7 * 24 * 60 * 60
+
 STATUS_URL = os.environ.get("CHAD_STATUS_URL", "http://127.0.0.1:9618/status")
 
 HTTP_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_TIMEOUT_S", "4.0"))
@@ -300,6 +304,7 @@ def main() -> int:
 
     pointer = {
         "ts_utc": ts,
+        "ttl_seconds": int(POINTER_TTL_SECONDS),
         "schema_version": "live_readiness_state.v1",
         "latest_report_path": str(report_path),
         "latest_report_sha256": f"sha256:{digest}",

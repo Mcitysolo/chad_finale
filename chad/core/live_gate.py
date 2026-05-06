@@ -245,6 +245,17 @@ def _runtime_dir() -> Path:
 
 
 # ----------------------------
+# Per-Source TTL Defaults
+# ----------------------------
+
+# live_readiness.json declares next_evaluation_cadence=weekly. Default TTL must
+# match that cadence so the gate does not classify the readiness pointer as
+# stale within the same week the publisher last ran. Per-file ttl_seconds in
+# the JSON still wins when present.
+LIVE_READINESS_DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+# ----------------------------
 # Runtime JSON Reader (Fail-Closed)
 # ----------------------------
 
@@ -510,7 +521,7 @@ def _load_mode_state(exec_cfg: ExecutionConfig) -> ModeState:
 
 def _load_live_readiness_state() -> LiveReadinessState:
     p = _runtime_dir() / "live_readiness.json"
-    obj, fr = read_runtime_state_json(p, default_ttl_s=600)
+    obj, fr = read_runtime_state_json(p, default_ttl_s=LIVE_READINESS_DEFAULT_TTL_SECONDS)
     if obj is None:
         return LiveReadinessState(
             ok=False,
