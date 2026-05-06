@@ -1,0 +1,84 @@
+{
+  "schema_version": "reconciliation_exclusions.v1",
+  "notes": "DS08 bounded exclusion policy. Symbols listed here are pre-existing broker positions or operator-owned holdings that CHAD did not open. They are skipped from the reconciliation mismatch check so they never flip status RED. Every entry must carry reason/owner/added_utc/expires_utc/reviewed_utc so excluded items stay auditable instead of becoming permanent blind spots.",
+  "reconciler_non_chad_symbols": [
+    "AAPL",
+    "MSFT"
+  ],
+  "broker_preexisting_symbols": [
+    "AAPL",
+    "BAC",
+    "CVX",
+    "LLY",
+    "MSFT",
+    "NVDA",
+    "PEP",
+    "QQQ",
+    "SPY"
+  ],
+  "exclusion_policy": {
+    "AAPL": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-04-01",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-03"
+    },
+    "MSFT": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-04-01",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-03"
+    },
+    "NVDA": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-04-01",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-03"
+    },
+    "BAC": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-05-06",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-06"
+    },
+    "CVX": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-05-06",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-06"
+    },
+    "LLY": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-05-06",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-06"
+    },
+    "PEP": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-05-06",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-06"
+    },
+    "QQQ": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-05-06",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-06"
+    },
+    "SPY": {
+      "reason": "pre-existing broker position",
+      "owner": "operator",
+      "added_utc": "2026-05-06",
+      "expires_utc": null,
+      "reviewed_utc": "2026-05-06"
+    }
+  }
+}

@@ -42,17 +42,12 @@ try:
 except Exception:  # noqa: BLE001
     _RECONCILER_NON_CHAD = frozenset({"AAPL", "MSFT"})
 
-# Publisher-only augmentation: symbols present at broker as pre-existing
-# paper positions that CHAD never opened. Kept separate from the
-# position_reconciler set so CHAD can still auto-close its own future
-# positions on these symbols via thesis-flip reconciliation.
-_BROKER_PREEXISTING = frozenset({"NVDA"})
-KNOWN_NON_CHAD_SYMBOLS = _RECONCILER_NON_CHAD | _BROKER_PREEXISTING
+_EXCLUSIONS_CONFIG_PATH = Path("/home/ubuntu/chad_finale/config/reconciliation_exclusions.json")
 
-# DS08: bounded exclusion policy. Every symbol skipped from reconciliation
-# carries reason/owner/added/expires/reviewed metadata so excluded items
-# stay auditable instead of becoming permanent blind spots.
-EXCLUSION_POLICY: Dict[str, Dict[str, Any]] = {
+# Hardcoded fallback used only when the JSON config is missing or unreadable.
+# Source of truth is config/reconciliation_exclusions.json.
+_FALLBACK_BROKER_PREEXISTING = frozenset({"NVDA"})
+_FALLBACK_EXCLUSION_POLICY: Dict[str, Dict[str, Any]] = {
     "AAPL": {
         "reason": "pre-existing broker position",
         "owner": "operator",
@@ -75,6 +70,57 @@ EXCLUSION_POLICY: Dict[str, Dict[str, Any]] = {
         "reviewed_utc": "2026-05-03",
     },
 }
+
+
+def _load_exclusion_config() -> Dict[str, Any]:
+    """Load reconciliation exclusion policy from config JSON.
+
+    Returns dict with broker_preexisting (frozenset) and exclusion_policy
+    (dict). Falls back to hardcoded values if the file is missing or
+    malformed so reconciliation never crashes on a config error.
+    """
+    try:
+        raw = json.loads(_EXCLUSIONS_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "broker_preexisting": _FALLBACK_BROKER_PREEXISTING,
+            "exclusion_policy": dict(_FALLBACK_EXCLUSION_POLICY),
+        }
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(
+            "reconciliation_exclusions.json unreadable (%s) — falling back to hardcoded policy",
+            exc,
+        )
+        return {
+            "broker_preexisting": _FALLBACK_BROKER_PREEXISTING,
+            "exclusion_policy": dict(_FALLBACK_EXCLUSION_POLICY),
+        }
+    bp = raw.get("broker_preexisting_symbols") or []
+    pol = raw.get("exclusion_policy") or {}
+    if not isinstance(bp, list) or not isinstance(pol, dict):
+        return {
+            "broker_preexisting": _FALLBACK_BROKER_PREEXISTING,
+            "exclusion_policy": dict(_FALLBACK_EXCLUSION_POLICY),
+        }
+    return {
+        "broker_preexisting": frozenset(str(s) for s in bp),
+        "exclusion_policy": pol,
+    }
+
+
+_EXCLUSION_CFG = _load_exclusion_config()
+
+# Publisher-only augmentation: symbols present at broker as pre-existing
+# paper positions that CHAD never opened. Kept separate from the
+# position_reconciler set so CHAD can still auto-close its own future
+# positions on these symbols via thesis-flip reconciliation.
+_BROKER_PREEXISTING: frozenset = _EXCLUSION_CFG["broker_preexisting"]
+KNOWN_NON_CHAD_SYMBOLS = _RECONCILER_NON_CHAD | _BROKER_PREEXISTING
+
+# DS08: bounded exclusion policy. Every symbol skipped from reconciliation
+# carries reason/owner/added/expires/reviewed metadata so excluded items
+# stay auditable instead of becoming permanent blind spots.
+EXCLUSION_POLICY: Dict[str, Dict[str, Any]] = _EXCLUSION_CFG["exclusion_policy"]
 
 # Futures symbols whose IBKR positions cannot be reliably reconciled
 # without explicit contract_month resolution (ISSUE-29 companion). Any
