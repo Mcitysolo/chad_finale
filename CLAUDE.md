@@ -5,8 +5,8 @@
 - Canonical root: /home/ubuntu/chad_finale
 - Python binary: python3 (never python)
 - Virtual environment: /home/ubuntu/chad_finale/venv
-- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper; SCR=WARMUP, sizing_factor=0.1, sharpe_like=+0.806, effective_trades=37 (as of 2026-04-21)
-- Account equity: ~$994k paper
+- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper; SCR=WARMUP, sizing_factor=0.1, sharpe_like=+1.057, effective_trades=9, win_rate=0.778, total_pnl=+$129.86 (as of 2026-05-06; SCR values are Paper Epoch 2 in-progress — will grow as trades accumulate)
+- Account equity: ~$183,264 USD paper
 - Hardening status: P0-P2 complete, GAP-1 through GAP-25 complete; 2026-04-19/21 Overhaul complete
 
 ## Governance Rules — Non-Negotiable
