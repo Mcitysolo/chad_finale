@@ -893,6 +893,28 @@ def build_execution_plan(
             "strategy_count": len(strategies),
         }
 
+        # Preserve the survivor signal's strategy meta so downstream
+        # paper-fill simulators (alpha_options BAG → vertical-spread debit)
+        # can reconstruct leg structure and net_debit_estimate from the
+        # plan artifact alone, without re-importing the strategy module.
+        # Only the well-known options-spread fields are copied — opaque or
+        # large meta payloads are not propagated, keeping the plan small.
+        survivor_meta = getattr(survivor, "meta", None) or {}
+        if isinstance(survivor_meta, dict) and survivor_meta:
+            BAG_META_KEYS = (
+                "sec_type", "spread_id", "spread_type", "expiry",
+                "long_strike", "short_strike", "long_right", "short_right",
+                "dte", "max_loss_per_contract", "net_debit_estimate",
+                "contracts", "required_asset_class", "engine",
+            )
+            signal_meta = {
+                k: survivor_meta[k]
+                for k in BAG_META_KEYS
+                if k in survivor_meta and survivor_meta[k] is not None
+            }
+            if signal_meta:
+                metadata["signal_meta"] = signal_meta
+
         # Preserve signal-quality inputs from the survivor signal so the
         # intent builder can compute confidence and apply S3 sizing.
         survivor_confidence = _safe_float_attr(survivor, "confidence", 0.5)

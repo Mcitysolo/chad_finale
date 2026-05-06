@@ -938,6 +938,141 @@ def _resolve_asset_class_safe(symbol: str, sec_type: str = "") -> str:
         return "equity"
 
 
+_BAG_REQUIRED_META_FIELDS = (
+    "long_strike",
+    "short_strike",
+    "long_right",
+    "short_right",
+    "expiry",
+    "net_debit_estimate",
+)
+_OPTIONS_MULTIPLIER = 100  # standard equity-option contract multiplier
+
+
+def simulate_bag_paper_fill(ev: "PaperExecEvidence") -> bool:
+    """Realistic paper fill for vertical-spread BAG/COMBO orders.
+
+    Activates when ``ev.extra`` carries ``sec_type == "BAG"`` (or
+    ``required_asset_class == "options"`` plus the leg-meta fields). The
+    simulator:
+
+      * Forces ``asset_class = "options"`` so the record cannot be misread
+        as an ETF round-trip.
+      * Sets ``fill_price`` to the strategy's ``net_debit_estimate`` —
+        the per-contract debit paid for one spread, *not* the underlying
+        price. Without this override the writer's price-cache lookup would
+        otherwise stamp a SPY-underlying price (~$720) onto the fill.
+      * Recomputes ``notional`` as
+        ``quantity * net_debit_estimate * 100`` (the equity-option
+        multiplier). One spread debit, multiplied by the contract count
+        and per-contract size.
+      * Records both leg details under ``ev.extra["bag_legs"]`` so
+        downstream consumers (trade_closer FIFO, SCR attribution,
+        portfolio engine) can match round-trips on close. Each leg
+        carries strike, right, action, and ratio.
+      * Marks the record as a trustworthy ``paper_fill`` (no
+        ``pnl_untrusted`` flag) — the strategy's own ``net_debit_estimate``
+        is the trusted reference price for paper-mode spread P&L.
+
+    Returns True when BAG simulation fired, False when ``ev`` did not
+    carry the required BAG metadata.
+    """
+    if not isinstance(ev, PaperExecEvidence):
+        return False
+
+    extra = ev.extra if isinstance(ev.extra, dict) else {}
+    sec_type = _safe_str(extra.get("sec_type"), "").strip().upper()
+    required_ac = _safe_str(extra.get("required_asset_class"), "").strip().lower()
+    is_bag = sec_type in ("BAG", "COMBO") or (
+        required_ac == "options" and any(k in extra for k in ("long_strike", "short_strike"))
+    )
+    if not is_bag:
+        return False
+
+    missing = [k for k in _BAG_REQUIRED_META_FIELDS if extra.get(k) in (None, "")]
+    if missing:
+        # Cannot simulate without leg / debit info — leave the record alone
+        # so the rest of the normalizer (or its rejection branch) can run.
+        extra["bag_simulator_skipped_reason"] = f"missing_meta:{','.join(missing)}"
+        ev.extra = extra
+        return False
+
+    try:
+        net_debit = float(extra.get("net_debit_estimate") or 0.0)
+        long_strike = float(extra.get("long_strike") or 0.0)
+        short_strike = float(extra.get("short_strike") or 0.0)
+    except (TypeError, ValueError):
+        extra["bag_simulator_skipped_reason"] = "non_numeric_meta"
+        ev.extra = extra
+        return False
+
+    if net_debit <= 0.0 or long_strike <= 0.0 or short_strike <= 0.0:
+        extra["bag_simulator_skipped_reason"] = "non_positive_meta"
+        ev.extra = extra
+        return False
+
+    long_right = _safe_str(extra.get("long_right"), "").strip().upper()
+    short_right = _safe_str(extra.get("short_right"), "").strip().upper()
+    expiry = _safe_str(extra.get("expiry"), "").strip()
+    contracts = _safe_float(ev.quantity, 0.0) or _safe_float(extra.get("contracts"), 0.0)
+    if contracts <= 0.0:
+        extra["bag_simulator_skipped_reason"] = "non_positive_quantity"
+        ev.extra = extra
+        return False
+
+    # Override the writer-level fields. The price-cache lookup that runs
+    # later in normalize_paper_fill_evidence keys off ev.symbol (the
+    # underlying), so we set fill_price directly here AND mark the record
+    # so the cache step short-circuits.
+    ev.asset_class = "options"
+    ev.fill_price = net_debit
+    ev.notional = contracts * net_debit * _OPTIONS_MULTIPLIER
+    # Paper-simulated fill: force the canonical paper_fill status so SCR /
+    # trade_closer / profit_lock include this record alongside other
+    # trusted paper fills (raw "FILLED" is treated as a live status by
+    # some downstream consumers).
+    ev.status = "paper_fill"
+
+    # Record both legs in a structured form. The "BUY THE SPREAD" semantics
+    # for a debit vertical: BUY the long leg, SELL the short leg, ratio 1:1.
+    bag_legs = [
+        {
+            "action": "BUY",
+            "strike": long_strike,
+            "right": long_right,
+            "ratio": 1,
+            "expiry": expiry,
+        },
+        {
+            "action": "SELL",
+            "strike": short_strike,
+            "right": short_right,
+            "ratio": 1,
+            "expiry": expiry,
+        },
+    ]
+    extra["bag_legs"] = bag_legs
+    extra["sec_type"] = "BAG"
+    extra["net_debit"] = net_debit
+    extra["expiry"] = expiry
+    extra["contracts"] = contracts
+    extra["options_multiplier"] = _OPTIONS_MULTIPLIER
+    extra.setdefault("simulator", "alpha_options.bag_paper_fill.v1")
+    # Mark trustworthy explicitly — strategy-supplied net_debit_estimate is
+    # the reference price, so downstream consumers should treat the fill as
+    # real for paper-mode P&L attribution.
+    extra["pnl_untrusted"] = False
+    ev.extra = extra
+
+    # Tag the record so trade_closer / SCR can short-circuit BAG fills.
+    tags_list = list(ev.tags) if ev.tags else []
+    for t in ("bag", "spread", "paper_fill"):
+        if t not in tags_list:
+            tags_list.append(t)
+    ev.tags = tuple(tags_list)
+    return True
+
+
 def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence":
     """Enforce paper-mode evidence invariants in place. Returns the same object.
 
@@ -961,11 +1096,23 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
          step also overwrites placeholder fill_price values (<=0) with the
          cached price when available.
 
+    BAG/COMBO short-circuit: when ``ev.extra`` carries spread metadata
+    (sec_type="BAG" + leg fields), simulate_bag_paper_fill runs first,
+    rewriting fill_price/asset_class/notional from the strategy-supplied
+    net_debit_estimate so the underlying-price cache lookup cannot stamp
+    a SPY-underlying price onto an options-spread fill.
+
     Live-mode records (is_live=True) are returned unchanged: the broker is
     the source of truth and we must not rewrite its statuses or prices.
     """
     if not isinstance(ev, PaperExecEvidence):
         return ev
+
+    # 0) BAG/COMBO simulator runs FIRST. When active, it sets asset_class
+    # to "options" and writes the trustworthy net-debit fill_price, so the
+    # subsequent strategy↔asset_class consistency check passes and the
+    # underlying-price cache lookup is bypassed.
+    bag_active = simulate_bag_paper_fill(ev)
 
     # 1) asset_class — fix unknown/blank using symbol pattern matching.
     current_ac = _safe_str(ev.asset_class, "").strip()
@@ -1004,6 +1151,14 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
         return ev
 
     if _safe_bool(ev.is_live, False):
+        return ev
+
+    # BAG fills have already had fill_price set from net_debit_estimate by
+    # simulate_bag_paper_fill. The cache-lookup branch below keys off the
+    # underlying symbol (e.g. SPY) and would overwrite the spread debit
+    # with the SPY price (~$720) — and the deviation guard would then flag
+    # the legitimate $1.50 debit as a "placeholder fill". Skip both for BAG.
+    if bag_active:
         return ev
 
     # 2) fill_price — resolve from price cache with futures normalization.

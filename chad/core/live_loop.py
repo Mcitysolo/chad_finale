@@ -1662,6 +1662,42 @@ def run_once(logger: logging.Logger) -> None:
                             except (TypeError, ValueError):
                                 _expected_px = 0.0
 
+                        # Look up the original routed signal so its meta —
+                        # including BAG/COMBO leg structure for alpha_options
+                        # vertical spreads — can be threaded into ev.extra.
+                        # The paper-fill simulator in paper_exec_evidence_writer
+                        # uses these fields to rewrite fill_price as the
+                        # net_debit_estimate (per-contract debit) instead of
+                        # the underlying ETF price.
+                        _bag_extra: dict = {}
+                        try:
+                            _intent_strategy = str(getattr(intent, "strategy", "") or "")
+                            _intent_symbol = str(getattr(intent, "symbol", "") or "")
+                            _intent_side = str(getattr(intent, "side", "") or "")
+                            _intent_qty = float(getattr(intent, "quantity", 0.0) or 0.0)
+                            _orig_sig = None
+                            for _key, _sig in (routed_signal_map or {}).items():
+                                _ks, _ksy, _ksi, _ = _key
+                                if (
+                                    _ks == _intent_strategy
+                                    and _ksy == _intent_symbol
+                                    and _ksi == _intent_side
+                                ):
+                                    _orig_sig = _sig
+                                    break
+                            _sm = getattr(_orig_sig, "meta", None) if _orig_sig else None
+                            if isinstance(_sm, dict):
+                                for _k in (
+                                    "sec_type", "spread_id", "spread_type", "expiry",
+                                    "long_strike", "short_strike", "long_right", "short_right",
+                                    "dte", "max_loss_per_contract", "net_debit_estimate",
+                                    "contracts", "required_asset_class", "engine",
+                                ):
+                                    if _k in _sm and _sm[_k] is not None:
+                                        _bag_extra[_k] = _sm[_k]
+                        except Exception:
+                            _bag_extra = {}
+
                         ev = PaperExecEvidence(
                             symbol=order.symbol,
                             side=order.side,
@@ -1675,6 +1711,7 @@ def run_once(logger: logging.Logger) -> None:
                             asset_class=getattr(order, "asset_class", "") or "",
                             is_live=False,
                             fill_time_utc=order.submitted_at.isoformat() if order.submitted_at else "",
+                            extra=_bag_extra,
                         )
                         normalize_paper_fill_evidence(ev)
                         if str(getattr(order, 'status', '') or '').strip().lower() == 'error':

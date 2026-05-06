@@ -19,11 +19,24 @@ LEDGER_PATH = ROOT / "runtime" / "ibkr_paper_ledger_state.json"
 
 PRICE_CACHE_TTL_SECONDS = 300
 
-# Strategies that exclusively trade options. A plan order tagged with one of
-# these but carrying a non-options asset_class (e.g. asset_class="" or "etf")
-# is a silent BAG-combo downgrade and must be skipped — not paper-filled as
-# a SPY equity buy. Mirrors paper_exec_evidence_writer._OPTIONS_ONLY_STRATEGIES.
-OPTIONS_ONLY_STRATEGIES = frozenset({"alpha_options", "omega_momentum_options"})
+# Strategies whose every fill must trade options (BAG / vertical spread). If
+# the plan-stage shape is missing the spread-leg metadata required to safely
+# simulate an options fill, the order is refused at this layer — no
+# log_trade_result, no write_paper_exec_evidence — so the misclassified
+# round-trip cannot enter trade_closer FIFO matching, SCR effective trades,
+# or profit_lock as a phantom equity fill. Mirrors the writer-level guard
+# in chad/execution/paper_exec_evidence_writer.py (_OPTIONS_ONLY_STRATEGIES)
+# so the invariant holds even when downstream normalization is bypassed.
+_OPTIONS_ONLY_STRATEGIES = frozenset({"alpha_options", "omega_momentum_options"})
+_OPTIONS_ASSET_CLASSES = frozenset({"options"})
+_BAG_REQUIRED_META_FIELDS = (
+    "long_strike",
+    "short_strike",
+    "long_right",
+    "short_right",
+    "expiry",
+    "net_debit_estimate",
+)
 
 logger = logging.getLogger("chad_paper_trade_executor")
 logging.basicConfig(
@@ -224,21 +237,49 @@ def main():
         contributors = o.get("contributors") or []
         strategy = normalize_strategy(o.get("strategy"), contributors)
 
-        # --- OPTIONS STRATEGY ASSET-CLASS GUARD ---
-        # alpha_options / omega_momentum_options can only legitimately produce
-        # asset_class="options" fills. If the planner artifact has the strategy
-        # tagged but the asset_class is missing or non-options, the BAG combo
-        # was silently downgraded upstream (no real options-execution path
-        # exists yet). Skip rather than pretend a SPY ETF buy is the spread.
-        plan_asset_class = str(o.get("asset_class") or "").strip().lower()
-        if strategy in OPTIONS_ONLY_STRATEGIES and plan_asset_class != "options":
-            logger.warning(
-                "Order %d %s: strategy=%s asset_class=%r — options strategy "
-                "must carry asset_class=options; refusing to paper-fill as "
-                "non-options (unsupported_options_combo)",
-                idx, symbol, strategy, plan_asset_class or "<empty>",
+        # Resolve plan-supplied signal_meta once: used both for the
+        # options-only guard below AND forwarded into ev.extra later so
+        # the writer's BAG paper-fill simulator can rebuild leg / debit
+        # information for valid alpha_options vertical spreads.
+        order_metadata = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+        signal_meta_raw = order_metadata.get("signal_meta") if isinstance(order_metadata, dict) else None
+        signal_meta = signal_meta_raw if isinstance(signal_meta_raw, dict) else {}
+
+        # --- OPTIONS-ONLY STRATEGY GUARD ---
+        # alpha_options / omega_momentum_options orders may only proceed
+        # when the plan order carries a complete BAG/COMBO signal_meta:
+        # sec_type=BAG|COMBO, all leg fields, net_debit_estimate, expiry,
+        # AND an options-class intent. If any piece is missing the order
+        # has been silently downgraded upstream (typically to a SPY/STK
+        # /etf shape) and writing it would produce a misclassified
+        # equity round-trip. We refuse the order here — before
+        # log_trade_result and before write_paper_exec_evidence — and
+        # log "unsupported_options_combo" with the strategy name so an
+        # operator can grep the diagnostic in the executor logs.
+        strategy_norm = (strategy or "").strip().lower()
+        order_asset_class = (o.get("asset_class") or "").strip().lower()
+        if strategy_norm in _OPTIONS_ONLY_STRATEGIES:
+            sec_type_meta = str(signal_meta.get("sec_type") or "").strip().upper()
+            required_ac_meta = str(signal_meta.get("required_asset_class") or "").strip().lower()
+            has_bag_marker = sec_type_meta in ("BAG", "COMBO")
+            leg_meta_complete = all(
+                signal_meta.get(k) not in (None, "")
+                for k in _BAG_REQUIRED_META_FIELDS
             )
-            continue
+            options_intent = (
+                required_ac_meta in _OPTIONS_ASSET_CLASSES
+                or order_asset_class in _OPTIONS_ASSET_CLASSES
+            )
+            if not (has_bag_marker and leg_meta_complete and options_intent):
+                logger.warning(
+                    "Order %d %s: unsupported_options_combo strategy=%s "
+                    "asset_class=%s sec_type=%s — skipping (no complete "
+                    "BAG metadata to safely simulate options fill)",
+                    idx, symbol, strategy_norm,
+                    order_asset_class or "<empty>",
+                    sec_type_meta or "<empty>",
+                )
+                continue
 
         # --- PNL COMPUTATION ---
         pnl_untrusted = False
@@ -286,6 +327,16 @@ def main():
             path = log_trade_result(tr)
 
             # --- EVIDENCE ---
+            # Forward signal_meta from the plan into ev.extra so the BAG
+            # paper-fill simulator (in paper_exec_evidence_writer) can
+            # rebuild the spread debit / leg structure for alpha_options
+            # vertical spreads. Without this, the writer's underlying-price
+            # cache lookup stamps a SPY-underlying fill_price (~$720) onto
+            # a record whose true cost basis is the per-contract net debit.
+            extra: dict = {"plan_path": str(PLAN_PATH)}
+            if signal_meta:
+                extra.update(signal_meta)
+
             ev = PaperExecEvidence(
                 strategy=strategy,
                 source_strategies=contributors,
@@ -302,7 +353,7 @@ def main():
                 entry_time_utc=now,
                 exit_time_utc=now,
                 tags=["paper", "filled", strategy],
-                extra={"plan_path": str(PLAN_PATH)},
+                extra=extra,
             )
             try:
                 normalize_paper_fill_evidence(ev)

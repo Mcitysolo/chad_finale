@@ -257,18 +257,23 @@ def _persist_plan_artifact(*, summary: FullCycleSummary, plan: ExecutionPlan, ib
         asset_class = getattr(o, "asset_class", None)
         contrib = getattr(o, "contributing_strategies", None)
 
-        orders_out.append(
-            {
-                "primary_strategy": getattr(primary, "name", str(primary)),
-                "symbol": str(getattr(o, "symbol", "")),
-                "side": getattr(side, "name", str(side)),
-                "size": _safe_float(getattr(o, "size", 0.0)),
-                "price": _safe_float(getattr(o, "price", 0.0)),
-                "notional": _safe_float(getattr(o, "notional", 0.0)),
-                "asset_class": getattr(asset_class, "value", str(asset_class)),
-                "contributors": [getattr(s, "name", str(s)) for s in (contrib or [])],
-            }
-        )
+        order_metadata = getattr(o, "metadata", None) or {}
+        # Pass through PlannedOrder.metadata so downstream consumers
+        # (paper_trade_executor, dashboards) see signal_meta — the BAG/
+        # combo leg structure preserved from the survivor TradeSignal.
+        order_dict = {
+            "primary_strategy": getattr(primary, "name", str(primary)),
+            "symbol": str(getattr(o, "symbol", "")),
+            "side": getattr(side, "name", str(side)),
+            "size": _safe_float(getattr(o, "size", 0.0)),
+            "price": _safe_float(getattr(o, "price", 0.0)),
+            "notional": _safe_float(getattr(o, "notional", 0.0)),
+            "asset_class": getattr(asset_class, "value", str(asset_class)),
+            "contributors": [getattr(s, "name", str(s)) for s in (contrib or [])],
+        }
+        if isinstance(order_metadata, dict) and order_metadata:
+            order_dict["metadata"] = dict(order_metadata)
+        orders_out.append(order_dict)
 
     intents_out: List[Dict[str, Any]] = []
     for i in ibkr_intents:
