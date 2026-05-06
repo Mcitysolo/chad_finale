@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-CHAD — Polygon Stocks Streamer (Production-Grade)
+CHAD — Polygon Stocks Streamer (LEGACY / OPT-IN)
+
+CHAD's authoritative price/bar source is IBKR. The associated systemd unit
+chad-polygon-stocks.service is masked. This streamer is retained as a
+legacy/optional tool and will not run unless CHAD_BAR_PROVIDER=polygon is
+explicitly set in the environment. Importing the module remains safe
+(no network or websocket connection at import time).
 
 Primary responsibilities:
 1) Connect to Polygon (WebSocket) with robust reconnect + backoff.
@@ -66,6 +72,22 @@ LOG = logging.getLogger("chad.polygon_stream")
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _require_polygon_provider() -> None:
+    """
+    Execution-time guard: refuse to run unless CHAD_BAR_PROVIDER=polygon.
+
+    Importing this module must remain safe. This function is intentionally
+    NOT called at import time — it is invoked only from main()/_amain so
+    that test harnesses, IDE tools, and unrelated imports never accidentally
+    open a Polygon WebSocket connection.
+    """
+    mode = os.environ.get("CHAD_BAR_PROVIDER", "").strip().lower()
+    if mode != "polygon":
+        raise SystemExit(
+            "This legacy Polygon path requires CHAD_BAR_PROVIDER=polygon"
+        )
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -477,6 +499,7 @@ async def _amain() -> int:
 
 
 def main() -> int:
+    _require_polygon_provider()
     try:
         return asyncio.run(_amain())
     except KeyboardInterrupt:

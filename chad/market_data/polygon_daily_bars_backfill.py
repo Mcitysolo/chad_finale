@@ -2,7 +2,13 @@
 """
 chad/market_data/polygon_daily_bars_backfill.py
 
-Polygon Daily OHLCV backfill + refresh for CHAD.
+LEGACY / OPT-IN: Polygon Daily OHLCV backfill + refresh for CHAD.
+
+CHAD's authoritative daily-bar source is IBKR
+(chad/market_data/ibkr_historical_provider.py). This script is retained
+as a legacy path and will not run unless CHAD_BAR_PROVIDER=polygon is
+explicitly set in the environment. Importing the module remains safe
+(no network calls and no polygon-api-client import at import time).
 
 This script writes daily bars to:
   data/bars/1d/<SYMBOL>.json
@@ -28,7 +34,21 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from polygon import RESTClient  # polygon-api-client
+
+def _require_polygon_provider() -> None:
+    """
+    Execution-time guard: refuse to run unless CHAD_BAR_PROVIDER=polygon.
+
+    Importing this module must remain safe. This function is intentionally
+    NOT called at import time — it is invoked only from main()/CLI so that
+    test harnesses, IDE tools, and unrelated imports never accidentally
+    trigger Polygon network access.
+    """
+    mode = os.environ.get("CHAD_BAR_PROVIDER", "").strip().lower()
+    if mode != "polygon":
+        raise SystemExit(
+            "This legacy Polygon path requires CHAD_BAR_PROVIDER=polygon"
+        )
 
 DEFAULT_DAYS_BACK = 400
 DEFAULT_TTL_SECONDS = 86400
@@ -92,6 +112,9 @@ class PolygonDailyBarsBackfill:
     def __init__(self, cfg: BackfillConfig) -> None:
         self._cfg = cfg
         api_key = _require_env("POLYGON_API_KEY")
+        # Lazy import: keep module-level import safe even if the
+        # polygon-api-client package is missing in the environment.
+        from polygon import RESTClient  # polygon-api-client
         self._client = RESTClient(api_key)
 
     def _coerce_results_list(self, aggs: Any) -> List[Any]:
@@ -223,6 +246,7 @@ class PolygonDailyBarsBackfill:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _require_polygon_provider()
     parser = argparse.ArgumentParser(description="Polygon Daily Bars Backfill (1d OHLCV).")
     parser.add_argument("--repo-root", default="", help="Repo root (default auto).")
     parser.add_argument("--days-back", type=int, default=DEFAULT_DAYS_BACK, help="Days of history to fetch.")

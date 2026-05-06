@@ -20,10 +20,18 @@ reqHistoricalData works without subscriptions.
 - Auto-reconnect on IBKR disconnect
 - Thread-safe cache writes
 
+Operational behavior (current):
+- IBKR historical bars are AUTHORITATIVE for ALL active symbols
+  (equities, ETFs, and futures). The daemon writes IBKR bars for the
+  full universe; Polygon is NOT in the active code path.
+
 Bar Provider Modes (CHAD_BAR_PROVIDER env var):
-- "ibkr":   IBKR for all instruments
-- "polygon": Polygon for all (legacy)
-- "hybrid":  IBKR for futures, Polygon for equities (default)
+- "ibkr":    IBKR for all instruments (current operational mode)
+- "hybrid":  IBKR for futures; equities path delegates to IBKR in this
+             build (legacy "Polygon for equities" wiring is retired)
+- "polygon": legacy/opt-in only — requires explicit operator action.
+             Not used in production. Will not run unless
+             CHAD_BAR_PROVIDER=polygon is set deliberately.
 
 Daemon mode:
     python3 -m chad.market_data.ibkr_bar_provider
@@ -581,9 +589,13 @@ def get_bar_provider_mode() -> str:
     Get the configured bar provider mode.
 
     CHAD_BAR_PROVIDER env var:
-    - "ibkr":   IBKR for all instruments
-    - "polygon": Polygon for all (legacy)
-    - "hybrid":  IBKR for futures, Polygon for equities (default)
+    - "ibkr":    IBKR for all instruments (current operational mode)
+    - "hybrid":  IBKR for futures; the equities branch returns through
+                 should_use_ibkr() — in this build IBKR is authoritative
+                 for the full universe and the legacy Polygon-for-equities
+                 wiring has been retired.
+    - "polygon": legacy/opt-in only. Not used in production. Will not run
+                 unless CHAD_BAR_PROVIDER=polygon is set deliberately.
     """
     mode = os.environ.get("CHAD_BAR_PROVIDER", "hybrid").strip().lower()
     if mode in ("ibkr", "polygon", "hybrid"):
@@ -598,7 +610,9 @@ def should_use_ibkr(symbol: str) -> bool:
         return True
     if mode == "polygon":
         return False
-    # hybrid: IBKR for futures, Polygon for equities
+    # hybrid: IBKR for futures; equities also routed through IBKR in current
+    # operational state (legacy "Polygon for equities" path is retired and
+    # only reachable via explicit CHAD_BAR_PROVIDER=polygon override).
     return _is_futures_symbol(symbol)
 
 
