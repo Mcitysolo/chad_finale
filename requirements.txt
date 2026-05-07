@@ -1,7 +1,8 @@
 # Authoritative full environment freeze generated from pip freeze on 2026-05-06
 # Python 3.12.3 / venv at /home/ubuntu/chad_finale/venv
 # GAP-008 remediation: full installed dependency inventory
-# Package count: 84
+# GAP-007 Phase 0 (2026-05-07): added ib_async==2.1.0 (and its dep aeventkit==2.1.0) for ib_insync->ib_async migration validation. Source imports unchanged in Phase 0.
+# Package count: 86
 # Note: requirements.backend.txt is retained as a legacy partial backend manifest.
 APScheduler==3.6.3
 Flask==2.3.3
@@ -9,6 +10,7 @@ Jinja2==3.1.6
 MarkupSafe==3.0.3
 Pygments==2.19.2
 Werkzeug==3.1.4
+aeventkit==2.1.0
 annotated-types==0.7.0
 anthropic==0.89.0
 anyio==4.11.0
@@ -30,6 +32,7 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 ib-insync==0.9.86
+ib_async==2.1.0
 ibapi==9.81.1.post1
 idna==3.11
 iniconfig==2.3.0
