@@ -947,6 +947,294 @@ _BAG_REQUIRED_META_FIELDS = (
     "net_debit_estimate",
 )
 _OPTIONS_MULTIPLIER = 100  # standard equity-option contract multiplier
+# Conservative paper-mode close credit: 30% of opening debit. Keeps trade_closer
+# from booking optimistic round-trip PnL when no live mid is available.
+_BAG_CLOSE_CREDIT_RATIO = 0.30
+
+
+def _find_opening_bag_fill(strategy: str, symbol: str) -> Optional[Dict[str, Any]]:
+    """Locate the most recent opening BAG paper fill for strategy+symbol.
+
+    Scans the last 7 daily ``data/fills/FILLS_*.ndjson`` files in reverse order
+    and returns the newest payload dict whose:
+
+      * ``strategy`` matches (case-insensitive),
+      * ``symbol`` matches (case-insensitive),
+      * ``side`` is ``BUY``,
+      * ``status`` is ``paper_fill``,
+      * ``extra.sec_type == "BAG"`` AND ``extra.bag_legs`` is a 2-leg list,
+      * ``reject`` is False and the record is not flagged ``pnl_untrusted``.
+
+    Returns None when no such fill exists. Failure-soft: any I/O or JSON
+    error returns None so a missing/corrupt fill log can never prevent a
+    SELL close path from running with empty opening context.
+    """
+    try:
+        if not FILLS_DIR.exists():
+            return None
+        files = sorted(FILLS_DIR.glob("FILLS_*.ndjson"), reverse=True)[:7]
+    except Exception:
+        return None
+    s_norm = (strategy or "").strip().lower()
+    sym_norm = (symbol or "").strip().upper()
+    if not s_norm or not sym_norm:
+        return None
+    for fpath in files:
+        try:
+            with fpath.open("r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh.readlines()
+        except Exception:
+            continue
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            payload = rec.get("payload") if isinstance(rec, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("strategy", "")).strip().lower() != s_norm:
+                continue
+            if str(payload.get("symbol", "")).strip().upper() != sym_norm:
+                continue
+            if str(payload.get("side", "")).strip().upper() != "BUY":
+                continue
+            if str(payload.get("status", "")).strip().lower() != "paper_fill":
+                continue
+            if bool(payload.get("reject")):
+                continue
+            extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+            if bool(extra.get("pnl_untrusted")):
+                continue
+            if str(extra.get("sec_type", "")).strip().upper() != "BAG":
+                continue
+            legs = extra.get("bag_legs")
+            if not isinstance(legs, list) or len(legs) != 2:
+                continue
+            return payload
+    return None
+
+
+def _simulate_bag_sell_close(ev: "PaperExecEvidence") -> bool:
+    """Realistic paper close fill for an alpha_options vertical-spread BAG.
+
+    Activates when ``ev.side == "SELL"`` and either ``ev.extra`` carries
+    ``sec_type == "BAG"`` / leg meta, OR the strategy is options-only
+    (``alpha_options`` / ``omega_momentum_options``) so we know this is a
+    spread close even when the upstream exit signal omitted leg meta.
+
+    Behaviour:
+
+      * Recovers ``original_debit`` and the original two legs from
+        ``ev.extra`` if provided; otherwise looks up the most recent
+        opening BAG paper fill for this strategy+symbol via
+        ``_find_opening_bag_fill``.
+      * ``close_credit = original_debit * _BAG_CLOSE_CREDIT_RATIO`` when
+        ``original_debit > 0`` is available; ``0.0`` otherwise.
+      * Reverses leg actions: original BUY long becomes SELL, original
+        SELL short becomes BUY (1:1 ratio preserved).
+      * Forces ``asset_class = "options"``, ``status = "paper_fill"``,
+        ``sec_type = "BAG"``, ``fill_price = close_credit``,
+        ``notional = quantity * close_credit * _OPTIONS_MULTIPLIER``.
+      * Records a structured ``extra.pnl_breakdown`` so trade_closer / SCR
+        can reconcile realized PnL: ``original_debit``, ``close_credit``,
+        ``quantity``, ``multiplier``, ``gross_pnl =
+        (close_credit - original_debit) * quantity * multiplier``.
+      * ``extra.pnl_untrusted = False`` when an opening debit was
+        recovered; ``True`` otherwise (no debit context — the close is
+        recorded for guard mutation but realized PnL is unknown).
+
+    Returns True when the SELL-close branch fired, False otherwise.
+    """
+    if not isinstance(ev, PaperExecEvidence):
+        return False
+    if str(ev.side or "").strip().upper() != "SELL":
+        return False
+
+    extra = ev.extra if isinstance(ev.extra, dict) else {}
+    sec_type = _safe_str(extra.get("sec_type"), "").strip().upper()
+    required_ac = _safe_str(extra.get("required_asset_class"), "").strip().lower()
+    strategy_norm = _safe_str(ev.strategy, "").strip().lower()
+
+    has_bag_meta = sec_type in ("BAG", "COMBO") or any(
+        k in extra for k in ("long_strike", "short_strike", "bag_legs", "net_debit_estimate")
+    )
+    is_options_strategy = strategy_norm in _OPTIONS_ONLY_STRATEGIES
+    is_options_required = required_ac == "options"
+
+    if not (has_bag_meta or is_options_strategy or is_options_required):
+        return False
+
+    # ---- Recover opening context ----
+    original_debit = _safe_float(
+        extra.get("net_debit_estimate") or extra.get("net_debit") or 0.0,
+        0.0,
+    )
+    long_strike = _safe_float(extra.get("long_strike") or 0.0, 0.0)
+    short_strike = _safe_float(extra.get("short_strike") or 0.0, 0.0)
+    long_right = _safe_str(extra.get("long_right"), "").strip().upper()
+    short_right = _safe_str(extra.get("short_right"), "").strip().upper()
+    expiry = _safe_str(extra.get("expiry"), "").strip()
+
+    legs_from_extra = extra.get("bag_legs")
+    have_full_legs = (
+        isinstance(legs_from_extra, list)
+        and len(legs_from_extra) == 2
+        and all(isinstance(_l, dict) for _l in legs_from_extra)
+    )
+
+    # Fall back to disk lookup if any of the leg fields or debit is missing.
+    needs_lookup = (
+        original_debit <= 0.0
+        or not have_full_legs
+        and (long_strike <= 0.0 or short_strike <= 0.0 or not long_right or not short_right)
+    )
+    if needs_lookup:
+        opener = _find_opening_bag_fill(ev.strategy, ev.symbol)
+        if opener is not None:
+            opener_extra = opener.get("extra") if isinstance(opener.get("extra"), dict) else {}
+            if original_debit <= 0.0:
+                original_debit = _safe_float(
+                    opener_extra.get("net_debit") or opener_extra.get("net_debit_estimate") or 0.0,
+                    0.0,
+                )
+            opener_legs = opener_extra.get("bag_legs")
+            if (
+                not have_full_legs
+                and isinstance(opener_legs, list)
+                and len(opener_legs) == 2
+            ):
+                legs_from_extra = opener_legs
+                have_full_legs = True
+            if not expiry:
+                expiry = _safe_str(opener_extra.get("expiry"), "").strip()
+            if long_strike <= 0.0 or short_strike <= 0.0:
+                if isinstance(opener_legs, list) and len(opener_legs) == 2:
+                    try:
+                        long_leg_o = next(
+                            (_l for _l in opener_legs if str(_l.get("action", "")).upper() == "BUY"),
+                            opener_legs[0],
+                        )
+                        short_leg_o = next(
+                            (_l for _l in opener_legs if str(_l.get("action", "")).upper() == "SELL"),
+                            opener_legs[1],
+                        )
+                        if long_strike <= 0.0:
+                            long_strike = _safe_float(long_leg_o.get("strike"), 0.0)
+                        if short_strike <= 0.0:
+                            short_strike = _safe_float(short_leg_o.get("strike"), 0.0)
+                        if not long_right:
+                            long_right = _safe_str(long_leg_o.get("right"), "").strip().upper()
+                        if not short_right:
+                            short_right = _safe_str(short_leg_o.get("right"), "").strip().upper()
+                    except Exception:
+                        pass
+
+    quantity = _safe_float(ev.quantity, 0.0) or _safe_float(extra.get("contracts"), 0.0)
+    if quantity <= 0.0:
+        # Cannot fabricate a close fill for non-positive size. Leave the
+        # record alone so the rest of normalization handles it.
+        extra["bag_simulator_skipped_reason"] = "non_positive_quantity_sell_close"
+        ev.extra = extra
+        return False
+
+    has_debit_context = original_debit > 0.0
+    close_credit = original_debit * _BAG_CLOSE_CREDIT_RATIO if has_debit_context else 0.0
+
+    # ---- Build reversed legs ----
+    if have_full_legs and isinstance(legs_from_extra, list):
+        try:
+            long_leg_src = next(
+                (_l for _l in legs_from_extra if str(_l.get("action", "")).upper() == "BUY"),
+                legs_from_extra[0],
+            )
+            short_leg_src = next(
+                (_l for _l in legs_from_extra if str(_l.get("action", "")).upper() == "SELL"),
+                legs_from_extra[1],
+            )
+        except Exception:
+            long_leg_src, short_leg_src = legs_from_extra[0], legs_from_extra[1]
+        reversed_long = {
+            "action": "SELL",
+            "strike": _safe_float(long_leg_src.get("strike"), long_strike),
+            "right": _safe_str(long_leg_src.get("right"), long_right).upper(),
+            "ratio": int(long_leg_src.get("ratio", 1) or 1),
+            "expiry": _safe_str(long_leg_src.get("expiry"), expiry),
+        }
+        reversed_short = {
+            "action": "BUY",
+            "strike": _safe_float(short_leg_src.get("strike"), short_strike),
+            "right": _safe_str(short_leg_src.get("right"), short_right).upper(),
+            "ratio": int(short_leg_src.get("ratio", 1) or 1),
+            "expiry": _safe_str(short_leg_src.get("expiry"), expiry),
+        }
+        bag_legs = [reversed_long, reversed_short]
+    elif long_strike > 0.0 and short_strike > 0.0 and long_right and short_right:
+        bag_legs = [
+            {
+                "action": "SELL",
+                "strike": long_strike,
+                "right": long_right,
+                "ratio": 1,
+                "expiry": expiry,
+            },
+            {
+                "action": "BUY",
+                "strike": short_strike,
+                "right": short_right,
+                "ratio": 1,
+                "expiry": expiry,
+            },
+        ]
+    else:
+        # No leg context recoverable. Record an empty legs list so downstream
+        # consumers can detect the limited-context close.
+        bag_legs = []
+
+    gross_pnl = (close_credit - original_debit) * quantity * _OPTIONS_MULTIPLIER
+
+    # ---- Apply close-fill fields ----
+    ev.asset_class = "options"
+    ev.fill_price = close_credit
+    ev.notional = quantity * close_credit * _OPTIONS_MULTIPLIER
+    ev.status = "paper_fill"
+
+    extra["sec_type"] = "BAG"
+    extra["bag_legs"] = bag_legs
+    extra["expiry"] = expiry
+    extra["contracts"] = quantity
+    extra["options_multiplier"] = _OPTIONS_MULTIPLIER
+    extra["net_debit"] = original_debit
+    extra["close_credit"] = close_credit
+    extra["pnl_breakdown"] = {
+        "original_debit": original_debit,
+        "close_credit": close_credit,
+        "quantity": quantity,
+        "multiplier": _OPTIONS_MULTIPLIER,
+        "gross_pnl": gross_pnl,
+    }
+    extra["pnl_untrusted"] = not has_debit_context
+    if not has_debit_context:
+        extra["pnl_untrusted_reason"] = (
+            "bag_sell_close_no_opening_debit_context: original_debit=0.0 — "
+            "opening fill not recoverable from extra meta or fills log"
+        )
+    extra.setdefault("simulator", "alpha_options.bag_paper_fill.v1")
+    extra["bag_close_path"] = True
+    ev.extra = extra
+
+    # Tag the record so trade_closer / SCR can short-circuit the close.
+    tags_list = list(ev.tags) if ev.tags else []
+    for t in ("bag", "spread", "paper_fill", "bag_close"):
+        if t not in tags_list:
+            tags_list.append(t)
+    if not has_debit_context and "pnl_untrusted" not in tags_list:
+        tags_list.append("pnl_untrusted")
+    ev.tags = tuple(tags_list)
+    return True
 
 
 def simulate_bag_paper_fill(ev: "PaperExecEvidence") -> bool:
@@ -979,6 +1267,12 @@ def simulate_bag_paper_fill(ev: "PaperExecEvidence") -> bool:
     """
     if not isinstance(ev, PaperExecEvidence):
         return False
+
+    # Close-side dispatch: SELL on an options-only strategy is treated as a
+    # BAG close. Handled in a dedicated helper so the open-side branch below
+    # can keep its strict required-meta contract.
+    if str(ev.side or "").strip().upper() == "SELL":
+        return _simulate_bag_sell_close(ev)
 
     extra = ev.extra if isinstance(ev.extra, dict) else {}
     sec_type = _safe_str(extra.get("sec_type"), "").strip().upper()

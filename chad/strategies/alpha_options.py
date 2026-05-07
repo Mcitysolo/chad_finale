@@ -197,6 +197,28 @@ def _read_guard_positions() -> Dict[str, Any]:
         return {}
 
 
+def _find_opening_bag_fill_for_strategy(
+    strategy: str, symbol: str
+) -> Optional[Dict[str, Any]]:
+    """Return the most recent opening BAG paper fill for strategy+symbol.
+
+    Thin wrapper around the writer-side helper so alpha_options can populate
+    its max_hold_exit SELL signal with leg / debit context recovered from
+    the daily fills log. Failure-soft — returns None on any I/O or import
+    error so the writer's own fallback lookup still runs.
+    """
+    try:
+        from chad.execution.paper_exec_evidence_writer import (
+            _find_opening_bag_fill,
+        )
+    except Exception:
+        return None
+    try:
+        return _find_opening_bag_fill(strategy, symbol)
+    except Exception:
+        return None
+
+
 def _load_chain_from_cache(symbol: str) -> Optional[OptionsChain]:
     """
     Load an options chain from the file-based cache.
@@ -484,10 +506,68 @@ def build_alpha_options_signals(
                 continue
             _symbol = str(_entry.get("symbol", str(_key).split("|")[-1]))
             _qty = _safe_float(_entry.get("quantity", 1.0), 1.0) or 1.0
+
+            # GAP-A001: include opening BAG context so the writer's
+            # simulate_bag_paper_fill SELL-close branch can produce a
+            # trusted close fill (with original_debit / reversed legs /
+            # pnl_breakdown). Lookup is failure-soft — meta absent simply
+            # means the writer will fall back to its own disk lookup or
+            # mark the close pnl_untrusted.
+            _exit_meta: Dict[str, Any] = {
+                "engine": "alpha_options.v1",
+                "reason": "max_hold_exit",
+                "age_seconds": int(_age_s),
+                "max_hold_seconds": int(tuning.max_hold_seconds),
+                "exit": True,
+                "sec_type": "BAG",
+                "required_asset_class": "options",
+            }
+            try:
+                _opener = _find_opening_bag_fill_for_strategy(
+                    "alpha_options", _symbol
+                )
+                if isinstance(_opener, dict):
+                    _opener_extra = _opener.get("extra") or {}
+                    if isinstance(_opener_extra, dict):
+                        _legs = _opener_extra.get("bag_legs")
+                        if isinstance(_legs, list) and len(_legs) == 2:
+                            _exit_meta["bag_legs"] = _legs
+                            try:
+                                _long_leg = next(
+                                    (_l for _l in _legs
+                                     if str(_l.get("action", "")).upper() == "BUY"),
+                                    _legs[0],
+                                )
+                                _short_leg = next(
+                                    (_l for _l in _legs
+                                     if str(_l.get("action", "")).upper() == "SELL"),
+                                    _legs[1],
+                                )
+                                _exit_meta["long_strike"] = _long_leg.get("strike")
+                                _exit_meta["short_strike"] = _short_leg.get("strike")
+                                _exit_meta["long_right"] = _long_leg.get("right")
+                                _exit_meta["short_right"] = _short_leg.get("right")
+                                _exit_meta["expiry"] = _long_leg.get("expiry")
+                            except Exception:
+                                pass
+                        _net_debit = _opener_extra.get("net_debit") or _opener_extra.get(
+                            "net_debit_estimate"
+                        )
+                        if _net_debit is not None:
+                            _exit_meta["net_debit_estimate"] = _net_debit
+                            _exit_meta["net_debit"] = _net_debit
+            except Exception as _opener_err:
+                LOG.debug(
+                    "alpha_options: opener_lookup_failed symbol=%s exc=%s",
+                    _symbol, _opener_err,
+                )
+
             LOG.warning(
                 "alpha_options_max_hold_exit symbol=%s age=%.0fs "
-                "limit=%ds — emitting SELL",
+                "limit=%ds — emitting SELL (opening_debit=%s legs=%s)",
                 _symbol, _age_s, tuning.max_hold_seconds,
+                _exit_meta.get("net_debit_estimate"),
+                "yes" if "bag_legs" in _exit_meta else "no",
             )
             signals.append(TradeSignal(
                 strategy=StrategyName.ALPHA_OPTIONS,
@@ -497,13 +577,7 @@ def build_alpha_options_signals(
                 confidence=1.0,
                 asset_class=AssetClass.OPTIONS,
                 created_at=now,
-                meta={
-                    "engine": "alpha_options.v1",
-                    "reason": "max_hold_exit",
-                    "age_seconds": int(_age_s),
-                    "max_hold_seconds": int(tuning.max_hold_seconds),
-                    "exit": True,
-                },
+                meta=_exit_meta,
             ))
             forced_exit_symbols.add(_symbol)
     except Exception as _exc:

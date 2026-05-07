@@ -1585,6 +1585,7 @@ def run_once(logger: logging.Logger) -> None:
     from chad.core.position_guard import (
         is_same_side_open,
         is_flip_signal,
+        mark_position_closed,
         mark_position_open,
         replace_position,
     )
@@ -1763,7 +1764,47 @@ def run_once(logger: logging.Logger) -> None:
 
             emitted += 1
 
-            if is_flip_signal(intent):
+            # GAP-A001: detect exit-intent (max_hold_exit / explicit close)
+            # by inspecting the originating signal's meta. Exit-intents must
+            # NOT mark the guard open or flip it — they will mark_position_closed
+            # AFTER a trusted fill evidence record is written below. This
+            # prevents a max_hold SELL from being treated as a flip (which
+            # would leave the guard open with the reversed side) and is the
+            # close-side counterpart to mark_position_open/replace_position.
+            _intent_is_exit = False
+            try:
+                _exit_intent_strategy = str(getattr(intent, "strategy", "") or "")
+                _exit_intent_symbol = str(getattr(intent, "symbol", "") or "")
+                _exit_intent_side = str(getattr(intent, "side", "") or "")
+                _exit_orig_sig = None
+                for _ek, _esig in (routed_signal_map or {}).items():
+                    _eks, _eksy, _eksi, _ = _ek
+                    if (
+                        _eks == _exit_intent_strategy
+                        and _eksy == _exit_intent_symbol
+                        and _eksi == _exit_intent_side
+                    ):
+                        _exit_orig_sig = _esig
+                        break
+                _exit_meta = getattr(_exit_orig_sig, "meta", None) if _exit_orig_sig else None
+                if isinstance(_exit_meta, dict):
+                    _intent_is_exit = bool(
+                        _exit_meta.get("exit")
+                        or _exit_meta.get("reason") == "max_hold_exit"
+                        or _exit_meta.get("intent") in ("exit", "close", "reduce")
+                    )
+            except Exception:
+                _intent_is_exit = False
+
+            if _intent_is_exit:
+                logger.info(
+                    "EXIT intent → %s %s %s qty=%s — guard close deferred to fill confirmation",
+                    getattr(intent, "symbol", None),
+                    getattr(intent, "sec_type", None),
+                    getattr(intent, "side", None),
+                    getattr(intent, "quantity", None),
+                )
+            elif is_flip_signal(intent):
                 logger.info(
                     "FLIP intent → %s %s %s qty=%s",
                     getattr(intent, "symbol", None),
@@ -1883,6 +1924,50 @@ def run_once(logger: logging.Logger) -> None:
                             ev.symbol, ev.status, ev.fill_price, ev.asset_class,
                             paths.get("fills_path", ""),
                         )
+
+                        # GAP-A001: close-confirmation for exit-intents.
+                        # When the originating signal is an exit (max_hold or
+                        # explicit close) AND the resulting fill is trusted
+                        # (status=paper_fill, fill_id present, not pnl_untrusted),
+                        # close the guard entry now. Untrusted closes leave the
+                        # guard open per ISSUE-29 — no phantom closes.
+                        if _intent_is_exit:
+                            try:
+                                _ev_extra = ev.extra if isinstance(ev.extra, dict) else {}
+                                _close_evidence = {
+                                    "fill_id": str(paths.get("fill_id", "")) if isinstance(paths, dict) else "",
+                                    "status": str(getattr(ev, "status", "") or "").strip().lower(),
+                                    "pnl_untrusted": bool(_ev_extra.get("pnl_untrusted")),
+                                    "reject": bool(getattr(ev, "reject", False)),
+                                    "tags": list(ev.tags) if ev.tags else [],
+                                    "extra": dict(_ev_extra),
+                                }
+                                _closed = mark_position_closed(intent, _close_evidence)
+                                if _closed:
+                                    logger.info(
+                                        "EXIT_GUARD_CLOSED strategy=%s symbol=%s side=%s "
+                                        "fill_id=%s — alpha_options BAG SELL close confirmed",
+                                        getattr(intent, "strategy", "?"),
+                                        getattr(intent, "symbol", "?"),
+                                        getattr(intent, "side", "?"),
+                                        _close_evidence["fill_id"],
+                                    )
+                                else:
+                                    logger.warning(
+                                        "EXIT_GUARD_NOT_CLOSED strategy=%s symbol=%s "
+                                        "status=%s pnl_untrusted=%s reject=%s — "
+                                        "guard left open; will retry on next cycle",
+                                        getattr(intent, "strategy", "?"),
+                                        getattr(intent, "symbol", "?"),
+                                        _close_evidence["status"],
+                                        _close_evidence["pnl_untrusted"],
+                                        _close_evidence["reject"],
+                                    )
+                            except Exception as _close_err:
+                                logger.warning(
+                                    "EXIT_GUARD_CLOSE_FAILED (non-fatal): %s",
+                                    _close_err,
+                                )
 
 #                         # Real-time Telegram trade alert — best effort only,
 #                         # must never block execution or evidence persistence.
