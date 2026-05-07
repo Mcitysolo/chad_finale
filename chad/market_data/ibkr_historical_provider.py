@@ -11,9 +11,10 @@ polygon_daily_bars_backfill.py for seamless consumer compatibility.
 Usage:
     from ib_insync import IB
     from chad.market_data.ibkr_historical_provider import IBKRHistoricalProvider
+    from chad.execution.ibkr_client_ids import HISTORICAL_PROVIDER
 
     ib = IB()
-    ib.connect('127.0.0.1', 4002, clientId=9034)
+    ib.connect('127.0.0.1', 4002, clientId=HISTORICAL_PROVIDER)
     provider = IBKRHistoricalProvider(ib)
     bars = provider.fetch_daily_bars('SPY', days=400)
     results = provider.backfill_universe(['SPY', 'QQQ', 'AAPL'])

@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from chad.execution.ibkr_client_ids import (
+    PRICE_CACHE_REFRESH as _IBKR_PRICE_CACHE_REFRESH_CLIENT_ID,
+)
+
 
 DEFAULT_TTL_SECONDS = 300
 DEFAULT_TAIL_LINES = 20_000
@@ -256,7 +260,7 @@ def _refresh_ibkr(runtime_dir: Path, ttl_seconds: int) -> int:
 
     ib = IB()
     try:
-        ib.connect("127.0.0.1", 4002, clientId=9035, timeout=15)
+        ib.connect("127.0.0.1", 4002, clientId=_IBKR_PRICE_CACHE_REFRESH_CLIENT_ID, timeout=15)
         ib.reqMarketDataType(4)  # delayed-frozen for weekend/off-hours
         provider = IBKRPriceProvider(ib)
 

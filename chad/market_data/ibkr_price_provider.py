@@ -10,9 +10,10 @@ Thread-safe, cache-backed, with delayed-data fallback.
 Usage:
     from ib_insync import IB
     from chad.market_data.ibkr_price_provider import IBKRPriceProvider
+    from chad.execution.ibkr_client_ids import PRICE_PROVIDER
 
     ib = IB()
-    ib.connect('127.0.0.1', 4002, clientId=9030)
+    ib.connect('127.0.0.1', 4002, clientId=PRICE_PROVIDER)
     provider = IBKRPriceProvider(ib)
     snap = provider.get_snapshot('SPY')
     print(snap.last, snap.close, snap.source)
