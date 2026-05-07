@@ -50,6 +50,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_TRADES = REPO_ROOT / "data" / "trades"
 RUNTIME_DIR = REPO_ROOT / "runtime"
 RUNTIME_SCR_PATH = RUNTIME_DIR / "scr_state.json"
+RUNTIME_VAR_STATE_PATH = RUNTIME_DIR / "var_state.json"
+RUNTIME_DRAWDOWN_STATE_PATH = RUNTIME_DIR / "drawdown_state.json"
 
 DEFAULT_HOST = os.environ.get("CHAD_METRICS_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.environ.get("CHAD_METRICS_PORT", "9620"))
@@ -458,6 +460,37 @@ def _redis_lines() -> List[MetricLine]:
     return out
 
 
+def _var_drawdown_lines() -> List[MetricLine]:
+    """Report-only VaR + drawdown gauges sourced from runtime state files (GAP-015A/016A)."""
+    out: List[MetricLine] = []
+
+    var_obj = _read_json_file(RUNTIME_VAR_STATE_PATH) or {}
+    var_status = str(var_obj.get("status") or "missing").lower()
+    var_95 = _coerce_float(var_obj.get("var_95_1day_usd", 0.0), 0.0)
+    var_99 = _coerce_float(var_obj.get("var_99_1day_usd", 0.0), 0.0)
+    var_pct = _coerce_float(var_obj.get("var_pct_of_equity", 0.0), 0.0)
+    var_symbols = _coerce_float(var_obj.get("symbol_count", 0.0), 0.0)
+    out.append(MetricLine("chad_var_95_1day_usd", {}, _finite_or_zero(var_95)))
+    out.append(MetricLine("chad_var_99_1day_usd", {}, _finite_or_zero(var_99)))
+    out.append(MetricLine("chad_var_pct_of_equity", {}, _finite_or_zero(var_pct)))
+    out.append(MetricLine("chad_var_symbol_count", {}, _finite_or_zero(var_symbols)))
+    out.append(MetricLine("chad_var_status_ok", {}, 1.0 if var_status == "ok" else 0.0))
+
+    dd_obj = _read_json_file(RUNTIME_DRAWDOWN_STATE_PATH) or {}
+    dd_status = str(dd_obj.get("status") or "missing").lower()
+    dd_pct = _coerce_float(dd_obj.get("drawdown_pct", 0.0), 0.0)
+    dd_threshold = _coerce_float(dd_obj.get("halt_threshold_pct", 0.0), 0.0)
+    dd_halt = bool(dd_obj.get("halt", False))
+    dd_enforce = bool(dd_obj.get("enforcement_active", False))
+    out.append(MetricLine("chad_drawdown_pct", {}, _finite_or_zero(dd_pct)))
+    out.append(MetricLine("chad_drawdown_halt_threshold_pct", {}, _finite_or_zero(dd_threshold)))
+    out.append(MetricLine("chad_drawdown_halt_active", {}, 1.0 if dd_halt else 0.0))
+    out.append(MetricLine("chad_drawdown_enforcement_active", {}, 1.0 if dd_enforce else 0.0))
+    out.append(MetricLine("chad_drawdown_status_ok", {}, 1.0 if dd_status == "ok" else 0.0))
+
+    return out
+
+
 def collect_metrics(*, days_back: int, max_trades: int) -> List[MetricLine]:
     out: List[MetricLine] = []
     out.extend(_paper_rollup_metrics(None, days_back=days_back, max_trades=max_trades))
@@ -465,6 +498,7 @@ def collect_metrics(*, days_back: int, max_trades: int) -> List[MetricLine]:
     out.extend(_paper_strategy_lines(trades_raw))
     out.extend(_scr_lines())
     out.extend(_redis_lines())
+    out.extend(_var_drawdown_lines())
     return out
 
 
