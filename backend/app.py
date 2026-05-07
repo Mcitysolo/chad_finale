@@ -82,6 +82,14 @@ async def _on_startup() -> None:
     notify_ready()
 
 
+# Lightweight liveness probe (GAP-017A).
+# Registered BEFORE the root-mount so it is matched ahead of the gateway.
+# Must remain trivial: no runtime file reads, no broker/DB/SCR/shadow calls.
+@app.get("/healthz", include_in_schema=False, tags=["system"])
+def healthz() -> Dict[str, str]:
+    return {"status": "ok", "service": "chad-backend"}
+
+
 # Mount the API Gateway at the root.
 # All routes such as /health, /risk-state, /live-gate, /shadow, and the
 # Phase-7-disabled /orders endpoint come from backend.api_gateway.
