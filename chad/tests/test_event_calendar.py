@@ -138,10 +138,20 @@ def test_event_risk_gate_without_calendar_passes():
 
 def test_run_all_gates_includes_gate_5(tmp_path: Path):
     # High urgency + inside window → gate 5 rejects.
-    now = datetime(2026, 5, 7, 6, 0, tzinfo=timezone.utc)
+    # `now` is dynamic so `stale_intent_gate` (which uses wall-clock UTC and
+    # is not given the test's `now` by run_all_gates) doesn't reject the
+    # intent before gate 5 runs. The FOMC event is placed 12h ahead so the
+    # 24h suppression window still contains `now`.
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    event_dt = now + timedelta(hours=12)
     cal = _mk_calendar(
         tmp_path,
-        [{"date": "2026-05-07", "time": "18:00", "name": "FOMC", "suppress_hours": 24}],
+        [{
+            "date": event_dt.date().isoformat(),
+            "time": event_dt.strftime("%H:%M"),
+            "name": "FOMC",
+            "suppress_hours": 24,
+        }],
     )
 
     @dataclass
