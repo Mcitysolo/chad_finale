@@ -753,6 +753,23 @@ def run_once(logger: logging.Logger) -> None:
         "guard_rejections": [],
     }
 
+    # GAP-025: routing diagnostics tracker. Observational only — never
+    # affects routing decisions. Construction failure-soft so any error
+    # leaves the cycle unaffected (writer falls back to disk-only data).
+    _routing_diag = None
+    try:
+        from chad.ops.strategy_routing_diagnostics import (
+            RoutingDiagnostics as _RoutingDiagnostics,
+        )
+        _routing_diag = _RoutingDiagnostics()
+        # CHAD has no dedicated per-strategy spam governor; the
+        # signal_throttle global trim is observed at its own stage but
+        # is not strategy-specific, so the spam_governor stage is not
+        # present in this code path.
+        _routing_diag.mark_stage_not_present("signals_after_spam_governor")
+    except Exception:  # noqa: BLE001
+        _routing_diag = None
+
     # Phase-8 Session 5 (F4): edge decay monitor — halt strategies whose
     # recent trades show a run of consecutive losses. Writes
     # runtime/strategy_allocations.json atomically. Non-fatal — a broken
@@ -887,6 +904,15 @@ def run_once(logger: logging.Logger) -> None:
         if is_always_active_routing():
             all_result = build_all_live_signals(logger)
             routed_signals = all_result.all_signals
+            # GAP-025: record initial (pre-halt-filter) signal count.
+            if _routing_diag is not None:
+                try:
+                    _routing_diag.observe_signals(
+                        "signals_generated_this_cycle", routed_signals
+                    )
+                except Exception:
+                    pass
+            _pre_halt_signals = list(routed_signals or [])
             if _halted_strategies and routed_signals:
                 _before_count = len(routed_signals)
                 routed_signals = [
@@ -899,6 +925,18 @@ def run_once(logger: logging.Logger) -> None:
                         "EDGE_DECAY_FILTERED dropped=%d halted=%s",
                         _dropped, sorted(_halted_strategies),
                     )
+            # GAP-025: post-halt-filter count + drop attribution.
+            if _routing_diag is not None:
+                try:
+                    _routing_diag.observe_drop(
+                        _pre_halt_signals, routed_signals or [], "edge_decay"
+                    )
+                    _routing_diag.observe_signals(
+                        "signals_after_edge_decay_or_halt_filter",
+                        routed_signals,
+                    )
+                except Exception:
+                    pass
             routed_signal_map = _build_router_signal_map(list(routed_signals or []))
             decision = all_result.decision
             strategy_detail["available_strategies"] = decision.available_counts
@@ -922,6 +960,15 @@ def run_once(logger: logging.Logger) -> None:
         else:
             result = build_live_signals(logger)
             routed_signals = result.signals
+            # GAP-025: record initial (pre-halt-filter) signal count.
+            if _routing_diag is not None:
+                try:
+                    _routing_diag.observe_signals(
+                        "signals_generated_this_cycle", routed_signals
+                    )
+                except Exception:
+                    pass
+            _pre_halt_signals = list(routed_signals or [])
             if _halted_strategies and routed_signals:
                 _before_count = len(routed_signals)
                 routed_signals = [
@@ -934,6 +981,18 @@ def run_once(logger: logging.Logger) -> None:
                         "EDGE_DECAY_FILTERED dropped=%d halted=%s",
                         _dropped, sorted(_halted_strategies),
                     )
+            # GAP-025: post-halt-filter count + drop attribution.
+            if _routing_diag is not None:
+                try:
+                    _routing_diag.observe_drop(
+                        _pre_halt_signals, routed_signals or [], "edge_decay"
+                    )
+                    _routing_diag.observe_signals(
+                        "signals_after_edge_decay_or_halt_filter",
+                        routed_signals,
+                    )
+                except Exception:
+                    pass
             routed_signal_map = _build_router_signal_map(list(routed_signals or []))
             decision = result.decision
             strategy_detail["available_strategies"] = decision.available_counts
@@ -977,6 +1036,57 @@ def run_once(logger: logging.Logger) -> None:
                 "WEEKEND_GATE blocked=%d equity signals (market closed)",
                 _filtered_count,
             )
+
+    # ------------------------------------------------------------------
+    # GAP-026: per-strategy daily realized PnL guard. Report-only by
+    # default — every cycle a WARNING line is logged for any strategy
+    # whose today-window realized PnL is at/below its configured loss
+    # limit. CHAD_PER_STRATEGY_LOSS_LIMIT_ENFORCE=1 turns this into a
+    # suppression that drops fresh entry signals from breached
+    # strategies; exits / closes / reductions / hedges always pass.
+    # The today-window is anchored to the active epoch start so prior
+    # epoch losses cannot trigger current-day suppression. Failure-soft.
+    # ------------------------------------------------------------------
+    _loss_guard = None
+    try:
+        from chad.risk.per_strategy_loss_guard import (
+            PerStrategyLossGuard as _PerStrategyLossGuard,
+        )
+        _loss_guard = _PerStrategyLossGuard()
+        _loss_guard.report(logger)
+        _pre_lg_signals = list(routed_signals or [])
+        if _loss_guard.enforce and routed_signals:
+            _pre_lg = len(routed_signals)
+            routed_signals, _ = _loss_guard.filter_signals(
+                list(routed_signals), logger
+            )
+            _lg_suppressed = _pre_lg - len(routed_signals)
+            if _lg_suppressed:
+                logger.warning(
+                    "PER_STRATEGY_LOSS_GUARD enforce_suppressed=%d remaining=%d",
+                    _lg_suppressed, len(routed_signals),
+                )
+        # GAP-025: post-loss-guard count + drop attribution (only attributes
+        # drops when enforce mode actually filtered). Always recorded so the
+        # stage shows up as observed in the diagnostic, even in report-only
+        # mode (with zero drops).
+        if _routing_diag is not None:
+            try:
+                _routing_diag.observe_drop(
+                    _pre_lg_signals,
+                    routed_signals or [],
+                    "per_strategy_loss_limit",
+                )
+                _routing_diag.observe_signals(
+                    "signals_after_loss_guard_report_only_or_enforced",
+                    routed_signals,
+                )
+            except Exception:
+                pass
+    except Exception as _lg_err:  # noqa: BLE001
+        logger.debug(
+            "per_strategy_loss_guard failed (non-fatal): %s", _lg_err
+        )
 
     # Signal throttle — apply trim AFTER routing decisions are made so
     # only submission is capped. Exits/risk-reducing signals are NEVER
@@ -1044,6 +1154,7 @@ def run_once(logger: logging.Logger) -> None:
     try:
         from chad.execution.net_exposure_gate import run_gate as _run_net_exposure_gate
         _pre_gate_count = len(routed_signals or [])
+        _pre_neg_signals = list(routed_signals or [])
         routed_signals, _gate_decisions = _run_net_exposure_gate(list(routed_signals or []))
         _blocked = sum(
             1 for d in _gate_decisions
@@ -1054,6 +1165,19 @@ def run_once(logger: logging.Logger) -> None:
                 "NET_EXPOSURE_GATE blocked=%d remaining=%d",
                 _blocked, len(routed_signals),
             )
+        # GAP-025: post-net-exposure count + drop attribution.
+        if _routing_diag is not None:
+            try:
+                _routing_diag.observe_drop(
+                    _pre_neg_signals,
+                    routed_signals or [],
+                    "net_exposure",
+                )
+                _routing_diag.observe_signals(
+                    "signals_after_net_exposure_gate", routed_signals
+                )
+            except Exception:
+                pass
     except Exception as _gate_err:
         logger.debug(
             "net_exposure_gate_failed err=%s — proceeding without gate",
@@ -1110,6 +1234,7 @@ def run_once(logger: logging.Logger) -> None:
         from chad.execution.strategy_throttle_gate import (
             run_throttle_gate as _run_throttle_gate,
         )
+        _pre_throttle_signals = list(routed_signals or [])
         routed_signals, _throttle_decisions = _run_throttle_gate(
             list(routed_signals or [])
         )
@@ -1122,6 +1247,19 @@ def run_once(logger: logging.Logger) -> None:
                 "STRATEGY_THROTTLE_GATE throttled=%d remaining=%d",
                 _throttled, len(routed_signals),
             )
+        # GAP-025: post-strategy-throttle count + drop attribution.
+        if _routing_diag is not None:
+            try:
+                _routing_diag.observe_drop(
+                    _pre_throttle_signals,
+                    routed_signals or [],
+                    "strategy_throttle",
+                )
+                _routing_diag.observe_signals(
+                    "signals_after_strategy_throttle", routed_signals
+                )
+            except Exception:
+                pass
     except Exception as _throttle_err:
         logger.debug(
             "strategy_throttle_gate_failed err=%s — proceeding",
@@ -1373,6 +1511,7 @@ def run_once(logger: logging.Logger) -> None:
         from chad.portfolio.regime_activation import filter_intents_by_regime
         from chad.analytics.regime_classifier import read_regime_state
         _regime_now = str(read_regime_state().get("regime", "unknown"))
+        _pre_regime_intents = list(intents or []) + list(kraken_intents or [])
         _kept_ibkr, _dropped_ibkr = filter_intents_by_regime(intents, _regime_now)
         _kept_kr, _dropped_kr = filter_intents_by_regime(kraken_intents, _regime_now)
         if _dropped_ibkr or _dropped_kr:
@@ -1391,6 +1530,20 @@ def run_once(logger: logging.Logger) -> None:
                 )
         intents = list(_kept_ibkr)
         kraken_intents = list(_kept_kr)
+        # GAP-025: post-regime-gate count + drop attribution. Stage runs
+        # on intents (not raw signals) — the strategy attribute is still
+        # populated, so per-strategy attribution is preserved.
+        if _routing_diag is not None:
+            try:
+                _post_regime = list(intents) + list(kraken_intents)
+                _routing_diag.observe_drop(
+                    _pre_regime_intents, _post_regime, "regime_inactive"
+                )
+                _routing_diag.observe_signals(
+                    "signals_after_regime_gate", _post_regime
+                )
+            except Exception:
+                pass
     except Exception as _rg_err:  # noqa: BLE001
         logger.warning("regime_gate failed (fail-open, non-fatal): %s", _rg_err)
 
@@ -1771,6 +1924,26 @@ def run_once(logger: logging.Logger) -> None:
             continue
     if emitted == 0:
         logger.info("All intents skipped by signal/position guard.")
+
+    # ------------------------------------------------------------------
+    # GAP-025: routing diagnostics. Pure observer — writes
+    # runtime/strategy_routing_diagnostics.json from disk-derived state
+    # (fills, closed trades, allocations, dynamic_caps) PLUS the
+    # per-cycle stage counts and block-reason attribution recorded by
+    # the tracker that observed each routing/filter step above.
+    # Failure-soft; never affects routing or runtime state outside the
+    # diagnostic artifact.
+    # ------------------------------------------------------------------
+    try:
+        from chad.ops.strategy_routing_diagnostics import (
+            write_diagnostics as _write_routing_diagnostics,
+        )
+        _write_routing_diagnostics(_routing_diag)
+    except Exception as _diag_err:  # noqa: BLE001
+        logger.debug(
+            "strategy_routing_diagnostics failed (non-fatal): %s",
+            _diag_err,
+        )
 
 
 def _init_redis_stop_subscriber(logger: logging.Logger) -> None:

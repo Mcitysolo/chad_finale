@@ -1,0 +1,26 @@
+{
+  "schema_version": "per_strategy_loss_limits.v1",
+  "notes": "GAP-026 conservative report-only defaults. Limits are negative USD values; if today's per-strategy realized PnL <= the configured limit, new entry signals are blocked when CHAD_PER_STRATEGY_LOSS_LIMIT_ENFORCE=1. Default mode is report_only — no suppression unless the env flag is set. Exits, reductions, hedges, and protective/liquidation actions are NEVER suppressed. Daily windows are evaluated against the active epoch start (runtime/epoch_state.json) so contaminated Epoch 1 PnL cannot trigger Epoch 2 suppression.",
+  "default_mode": "report_only",
+  "enforcement_env": "CHAD_PER_STRATEGY_LOSS_LIMIT_ENFORCE",
+  "default_limit_usd": -250.0,
+  "limits_usd": {
+    "alpha": -300.0,
+    "alpha_crypto": -150.0,
+    "alpha_forex": -150.0,
+    "alpha_futures": -300.0,
+    "alpha_intraday": -200.0,
+    "alpha_options": -200.0,
+    "beta": -250.0,
+    "beta_trend": -250.0,
+    "delta": -200.0,
+    "delta_pairs": -150.0,
+    "gamma": -200.0,
+    "gamma_futures": -250.0,
+    "gamma_reversion": -200.0,
+    "omega": -200.0,
+    "omega_macro": -200.0,
+    "omega_momentum_options": -200.0,
+    "omega_vol": -150.0
+  }
+}
