@@ -132,6 +132,25 @@ _KNOWN_FUTURES_ROOTS = (
 
 PRICE_CACHE_PATH = RUNTIME_DIR / "price_cache.json"
 
+# Liquid US ETFs / equities that, in 2026, trade well above $100 per share.
+# A fill with fill_price=100.0 on any of these is the canonical fingerprint
+# of the paper-mode "no live price" placeholder fallback. Used by the
+# placeholder-without-price-cache guard in normalize_paper_fill_evidence
+# to mark such fills untrusted even when price_cache has no entry to
+# compare against (so the existing 50% deviation guard cannot fire).
+_LIQUID_PRICED_EQUITIES = frozenset({
+    "SPY", "QQQ", "IWM", "DIA", "VTI", "VOO", "VEA", "VWO",
+    "EFA", "EEM", "GLD", "SLV", "TLT", "IEF", "LQD", "HYG",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
+    "XLB", "XLRE", "ARKK", "SOXX", "SMH",
+    "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN", "META", "NVDA",
+    "TSLA", "BRK.B", "AVGO", "LLY", "JPM", "V", "MA", "UNH",
+    "XOM", "JNJ", "WMT", "PG", "HD", "COST", "ORCL",
+})
+
+_PLACEHOLDER_FILL_PRICE = 100.0
+_PLACEHOLDER_EQUITY_ASSET_CLASSES = frozenset({"equity", "etf", "stock", "stk"})
+
 
 # =============================================================================
 # Helpers
@@ -1466,12 +1485,48 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
             if expected > 0.0:
                 ev.fill_price = expected
 
-    # 5) Price-sanity guard: when both proposed fill_price and a cached
+    # 5a) Placeholder-without-price-cache guard. The 50%-deviation guard below
+    # only fires when price_cache.json has a positive reference price; if the
+    # cache is missing/empty/stale (the 2026-05-03..05-08 SPY/delta incident
+    # pattern), a fill_price=100.0 placeholder on a liquid equity/ETF would
+    # otherwise sail through. Hard-flag untrusted when:
+    #   * asset_class is equity/etf/stock/stk-like AND
+    #   * symbol is in the liquid-priced equity/ETF allowlist AND
+    #   * fill_price == _PLACEHOLDER_FILL_PRICE (100.0) AND
+    #   * expected_price either == 100.0 or is missing/zero AND
+    #   * cached <= 0.0 (no valid price_cache entry to compare against)
+    # The fill is still persisted (audit chain preserved) but cannot enter
+    # trusted FIFO / SCR. Mark untrusted rather than reject — keeps the
+    # current convention used by the 50% deviation guard.
+    final_fill = _safe_float(ev.fill_price, 0.0)
+    final_expected = _safe_float(ev.expected_price, 0.0)
+    asset_class_norm = _safe_str(ev.asset_class, "").strip().lower()
+    symbol_norm = _safe_str(ev.symbol, "").strip().upper()
+    if (
+        cached <= 0.0
+        and asset_class_norm in _PLACEHOLDER_EQUITY_ASSET_CLASSES
+        and symbol_norm in _LIQUID_PRICED_EQUITIES
+        and abs(final_fill - _PLACEHOLDER_FILL_PRICE) < 1e-9
+        and (final_expected == 0.0 or abs(final_expected - _PLACEHOLDER_FILL_PRICE) < 1e-9)
+    ):
+        try:
+            if not isinstance(ev.extra, dict):
+                ev.extra = dict(ev.extra) if ev.extra else {}
+            ev.extra["pnl_untrusted"] = True
+            ev.extra["pnl_untrusted_reason"] = "placeholder_price_without_price_cache"
+            tags_list = list(ev.tags) if ev.tags else []
+            for t in ("pnl_untrusted", "placeholder_price"):
+                if t not in tags_list:
+                    tags_list.append(t)
+            ev.tags = tuple(tags_list)
+        except Exception:
+            pass
+
+    # 5b) Price-sanity guard: when both proposed fill_price and a cached
     # reference price are available and they diverge by >50%, the proposed
     # fill is almost certainly a placeholder (e.g. fill_price=100.0 for
     # SPY when SPY is actually 720). Flag untrusted instead of silently
     # accepting the bogus price as realized PnL feedstock.
-    final_fill = _safe_float(ev.fill_price, 0.0)
     if cached > 0.0 and final_fill > 0.0:
         try:
             deviation = abs(final_fill - cached) / cached

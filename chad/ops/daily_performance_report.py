@@ -178,11 +178,47 @@ def is_untrusted_entry_only(payload: Dict[str, Any]) -> bool:
     return False
 
 
-def extract_trade_row(obj: Dict[str, Any]) -> Optional[TradeRow]:
+def _record_in_quarantine(
+    obj: Dict[str, Any],
+    payload: Dict[str, Any],
+    bad_fills: set,
+    bad_hashes: set,
+) -> bool:
+    """True if the record matches the sidecar / manifest quarantine union."""
+    if not bad_fills and not bad_hashes:
+        return False
+    rh = obj.get("record_hash") if isinstance(obj, dict) else None
+    if isinstance(rh, str) and rh in bad_hashes:
+        return True
+    if not isinstance(payload, dict):
+        return False
+    fid = payload.get("fill_id")
+    if isinstance(fid, str) and fid in bad_fills:
+        return True
+    fids = payload.get("fill_ids")
+    if isinstance(fids, list):
+        for f in fids:
+            if isinstance(f, str) and f in bad_fills:
+                return True
+    return False
+
+
+def extract_trade_row(
+    obj: Dict[str, Any],
+    *,
+    quarantined_fill_ids: Optional[set] = None,
+    quarantined_record_hashes: Optional[set] = None,
+) -> Optional[TradeRow]:
     p = _payload(obj)
 
     # Skip entry-only "untrusted" rows so we report real realized outcomes.
     if is_untrusted_entry_only(p):
+        return None
+    if _record_in_quarantine(
+        obj, p,
+        quarantined_fill_ids or set(),
+        quarantined_record_hashes or set(),
+    ):
         return None
 
     pnl_val = first_present(p, ["pnl", "pnl_usd", "realized_pnl", "profit", "profit_usd"])
@@ -296,9 +332,26 @@ def run() -> Tuple[Path, Path]:
     skipped = 0
     total_lines = 0
 
+    # Quarantine awareness: load sidecar + manifest exclusion sets once per
+    # report run. Fail-open — if the loader breaks, fall back to the legacy
+    # untrusted-only filter rather than blocking the report.
+    try:
+        from chad.utils.quarantine import get_exclusion_sets
+        bad_fills, bad_hashes = get_exclusion_sets(
+            runtime_dir=REPO_ROOT / "runtime",
+            fills_dir=REPO_ROOT / "data" / "fills",
+            trades_dir=TRADES_DIR,
+        )
+    except Exception:
+        bad_fills, bad_hashes = set(), set()
+
     for obj in read_ndjson(ledger):
         total_lines += 1
-        tr = extract_trade_row(obj)
+        tr = extract_trade_row(
+            obj,
+            quarantined_fill_ids=bad_fills,
+            quarantined_record_hashes=bad_hashes,
+        )
         if tr is None:
             skipped += 1
             continue

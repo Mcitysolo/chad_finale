@@ -216,13 +216,34 @@ def _payload_indicates_placeholder(payload: Dict[str, Any]) -> bool:
     return False
 
 
-def _extract_fill(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Pull the inner payload of a FILLS_*.ndjson record into a flat dict."""
+def _extract_fill(
+    obj: Dict[str, Any],
+    *,
+    quarantined_fill_ids: Optional[set] = None,
+    quarantined_record_hashes: Optional[set] = None,
+) -> Optional[Dict[str, Any]]:
+    """Pull the inner payload of a FILLS_*.ndjson record into a flat dict.
+
+    Skips records that match the sidecar quarantine (data/fills/quarantine_*.json)
+    when *quarantined_fill_ids* / *quarantined_record_hashes* are supplied —
+    callers in this module pass a set built once per cycle so per-line lookups
+    stay O(1).
+    """
     payload = obj.get("payload") if isinstance(obj, dict) else None
     if not isinstance(payload, dict):
         payload = obj if isinstance(obj, dict) else None
     if not isinstance(payload, dict):
         return None
+
+    # Sidecar quarantine: drop pinned poisoned fills before any FIFO matching.
+    if quarantined_record_hashes:
+        rh = obj.get("record_hash") if isinstance(obj, dict) else None
+        if isinstance(rh, str) and rh in quarantined_record_hashes:
+            return None
+    if quarantined_fill_ids:
+        fid = payload.get("fill_id")
+        if isinstance(fid, str) and fid in quarantined_fill_ids:
+            return None
 
     if payload.get("reject") is True:
         return None
@@ -538,6 +559,23 @@ class TradeCloser:
         if not path.exists():
             return []
 
+        # Load sidecar quarantine sets once per call. Failure is non-fatal —
+        # the existing placeholder/untrusted checks in _extract_fill remain
+        # the primary defense; the sidecar is forensic pinning of known
+        # historical pollution.
+        quarantined_fill_ids: set = set()
+        quarantined_record_hashes: set = set()
+        try:
+            from chad.analytics.quarantine import get_sidecar_exclusion_sets
+            quarantined_fill_ids, quarantined_record_hashes = (
+                get_sidecar_exclusion_sets(
+                    fills_dir=self.fills_dir,
+                    trades_dir=self.trades_dir,
+                )
+            )
+        except Exception:
+            quarantined_fill_ids, quarantined_record_hashes = set(), set()
+
         closed_all: List[ClosedTrade] = []
         for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = raw.strip()
@@ -547,7 +585,11 @@ class TradeCloser:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            fill = _extract_fill(obj)
+            fill = _extract_fill(
+                obj,
+                quarantined_fill_ids=quarantined_fill_ids,
+                quarantined_record_hashes=quarantined_record_hashes,
+            )
             if fill is None:
                 continue
             if fill["fill_id"] in self.processed_fill_ids:

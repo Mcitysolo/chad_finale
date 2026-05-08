@@ -184,11 +184,18 @@ def compute_today_realized_pnl(
     *,
     now: Optional[datetime] = None,
     trades_dir: Optional[Path] = None,
+    fills_dir: Optional[Path] = None,
 ) -> Dict[str, float]:
     """
     Sum realized PnL per strategy from closed-trade records whose
     exit_time_utc falls within the (epoch_start, midnight)-anchored
     today window. Returns empty dict if no records / files missing.
+
+    Quarantine awareness: closed-trade records whose ``record_hash`` or
+    any element of ``payload.fill_ids`` matches an entry in the union
+    returned by ``chad.utils.quarantine.get_exclusion_sets`` are skipped.
+    This blocks phantom delta SPY closed trades (the 2026-05-08 incident
+    pattern) from contaminating per-strategy today-PnL.
     """
     window_start = _today_window_start(now)
     end = (now or datetime.now(timezone.utc))
@@ -196,6 +203,19 @@ def compute_today_realized_pnl(
     out: Dict[str, float] = {}
     if not src_dir.is_dir():
         return out
+
+    # Quarantine awareness: load exclusion sets once per call. Failure
+    # here must not block today-PnL computation (returns empty sets).
+    try:
+        from chad.utils.quarantine import get_exclusion_sets, is_record_quarantined
+        bad_fills, bad_hashes = get_exclusion_sets(
+            runtime_dir=REPO_ROOT / "runtime",
+            fills_dir=Path(fills_dir) if fills_dir is not None else REPO_ROOT / "data" / "fills",
+            trades_dir=src_dir,
+        )
+    except Exception:
+        bad_fills, bad_hashes = set(), set()
+        is_record_quarantined = None  # type: ignore[assignment]
 
     # Only scan files plausibly within today's window — match by name
     # prefix where possible to keep this O(today's file).
@@ -210,6 +230,10 @@ def compute_today_realized_pnl(
             try:
                 rec = json.loads(line)
             except Exception:
+                continue
+            if is_record_quarantined is not None and is_record_quarantined(
+                rec, bad_fills, bad_hashes
+            ):
                 continue
             payload = rec.get("payload", rec)
             if not isinstance(payload, Mapping):

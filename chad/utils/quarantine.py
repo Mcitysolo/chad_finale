@@ -198,6 +198,7 @@ def get_untrusted_fill_ids_from_fills(
 def get_exclusion_sets(
     runtime_dir: Optional[Path] = None,
     fills_dir: Optional[Path] = None,
+    trades_dir: Optional[Path] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Return ``(invalid_fill_ids, invalid_trade_hashes)`` as the union
     of:
@@ -206,15 +207,31 @@ def get_exclusion_sets(
         (live source-of-truth — Epoch 2 untrusted fills may not yet
         be in any manifest, so the fills scan is required to keep
         derived closed trades from re-entering SCR/pnl_state).
+      * ``data/fills/quarantine_*.json`` and ``data/trades/quarantine_*.json``
+        sidecars (forensic pin for historical pollution that slipped
+        through before the upstream guard was added).
 
     Fail-safe: each loader is independent — a failure in one branch
-    does not prevent the other from contributing.
+    does not prevent the others from contributing.
     """
     fill_ids, trade_hashes = get_quarantine_sets(runtime_dir=runtime_dir)
     try:
         fill_ids = fill_ids | get_untrusted_fill_ids_from_fills(fills_dir=fills_dir)
     except Exception as exc:  # noqa: BLE001 — must never break publishers
         LOG.warning("untrusted_fills_scan_failed err=%s — using manifest only", exc)
+    try:
+        # Local import keeps a chad.utils -> chad.analytics dependency
+        # contained to this single function instead of the module top.
+        from chad.analytics.quarantine import get_sidecar_exclusion_sets
+
+        side_fill_ids, side_trade_hashes = get_sidecar_exclusion_sets(
+            fills_dir=fills_dir,
+            trades_dir=trades_dir,
+        )
+        fill_ids = fill_ids | side_fill_ids
+        trade_hashes = trade_hashes | side_trade_hashes
+    except Exception as exc:  # noqa: BLE001 — must never break publishers
+        LOG.warning("quarantine_sidecar_load_failed err=%s — using base sets only", exc)
     return fill_ids, trade_hashes
 
 
