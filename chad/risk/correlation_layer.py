@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 ROOT = Path("/home/ubuntu/chad_finale")
 RUNTIME = ROOT / "runtime"
@@ -54,18 +54,21 @@ def normalize(weights: Dict[str, float]) -> Dict[str, float]:
     return {k: float(v) / total for k, v in weights.items()}
 
 
-def main() -> int:
-    quarantine = read_json(Q_PATH, {})
-    cycle = read_json(CYCLE_PATH, {})
+def compute_overlay(
+    quarantine_path: Path = Q_PATH,
+    cycle_path: Path = CYCLE_PATH,
+) -> Dict[str, Any]:
+    """Compute correlation overlay payload from inputs. Raises if quarantine_weights missing."""
+    quarantine = read_json(quarantine_path, {})
+    cycle = read_json(cycle_path, {})  # currently informational only
 
     weights = quarantine.get("quarantine_weights") or {}
     if not isinstance(weights, dict) or not weights:
-        raise SystemExit("quarantine_weights missing")
+        raise RuntimeError("quarantine_weights missing")
 
     weights = {k: float(v) for k, v in weights.items()}
     notes: Dict[str, Any] = {}
 
-    # apply group caps
     adjusted = dict(weights)
     for group_name, members in GROUPS.items():
         total_group = sum(adjusted.get(m, 0.0) for m in members)
@@ -92,10 +95,10 @@ def main() -> int:
 
     adjusted = normalize(adjusted)
 
-    out = {
+    return {
         "ts_utc": iso_z(),
-        "source_quarantine": str(Q_PATH),
-        "source_cycle": str(CYCLE_PATH),
+        "source_quarantine": str(quarantine_path),
+        "source_cycle": str(cycle_path),
         "group_caps": GROUP_CAPS,
         "input_quarantine_weights": weights,
         "correlation_governed_weights": adjusted,
@@ -103,8 +106,34 @@ def main() -> int:
         "note": "Use correlation_governed_weights as final published allocation if available.",
     }
 
-    atomic_write_json(OUT_PATH, out)
-    print(json.dumps(out, indent=2, sort_keys=True))
+
+def refresh(
+    quarantine_path: Path = Q_PATH,
+    cycle_path: Path = CYCLE_PATH,
+    out_path: Path = OUT_PATH,
+) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+    """
+    Producer entry. Compute overlay and atomically write out_path.
+
+    Returns (ok, reason_if_not_ok, payload).
+    Never raises — callers can decide how to react.
+    """
+    try:
+        payload = compute_overlay(quarantine_path=quarantine_path, cycle_path=cycle_path)
+    except Exception as exc:
+        return False, str(exc), {}
+    try:
+        atomic_write_json(out_path, payload)
+    except Exception as exc:
+        return False, f"write_failed: {exc}", payload
+    return True, None, payload
+
+
+def main() -> int:
+    ok, reason, payload = refresh()
+    if not ok:
+        raise SystemExit(reason or "correlation overlay refresh failed")
+    print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
 
