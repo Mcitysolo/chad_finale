@@ -96,6 +96,10 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
     "chad/portfolio/ibkr_paper_fill_harvester.py",
     "chad/portfolio/ibkr_paper_ledger_watcher.py",
     "chad/portfolio/ibkr_portfolio_collector_v2.py",
+    # Phase 1B.6 (GAP-A019) Batch 4: advisory engine — pulls live
+    # USDCAD FX rate via reqMktData for advisory context. No
+    # order-affecting calls.
+    "chad/intel/advisory_engine.py",
 )
 
 # Production source files still importing ib_insync that are explicitly
@@ -108,7 +112,6 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
     "chad/core/paper_shadow_runner.py",
     "chad/execution/ibkr_adapter.py",
     "chad/execution/ibkr_trade_router.py",
-    "chad/intel/advisory_engine.py",
 )
 
 
@@ -133,9 +136,7 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
 # Files NOT in this list because they are EXECUTION_PATH (place orders):
 #   chad/core/paper_position_closer.py, chad/core/paper_shadow_runner.py,
 #   chad/execution/ibkr_trade_router.py.
-PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = (
-    "chad/intel/advisory_engine.py",
-)
+PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------

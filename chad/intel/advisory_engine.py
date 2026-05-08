@@ -104,7 +104,7 @@ def _load_live_fx_usdcad() -> Optional[Dict[str, Any]]:
     from datetime import datetime, timezone
 
     try:
-        from ib_insync import IB
+        from ib_async import IB
         from chad.market_data.ibkr_price_provider import IBKRPriceProvider
 
         ib = IB()
