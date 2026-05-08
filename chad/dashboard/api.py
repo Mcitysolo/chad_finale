@@ -270,7 +270,7 @@ class StateBuilder:
 
     def _ibkr_snapshot(self) -> tuple[bool, list]:
         try:
-            from ib_insync import IB  # type: ignore
+            from ib_async import IB  # type: ignore
         except Exception:
             return False, self._last_known_positions
         ib = IB()

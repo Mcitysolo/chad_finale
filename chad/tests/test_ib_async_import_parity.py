@@ -66,6 +66,11 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
     # Phase 1B.1 (GAP-A019): READ_ONLY_BROKER health endpoint —
     # managedAccounts + reqCurrentTime, no order-affecting calls.
     "backend/ibkr.py",
+    # Phase 1B.2 (GAP-A019) Batch 1: low-risk read-only utilities —
+    # CLI healthcheck, broker position reader, dashboard snapshot.
+    "chad/core/broker_position_sync.py",
+    "chad/core/ibkr_healthcheck.py",
+    "chad/dashboard/api.py",
 )
 
 # Production source files still importing ib_insync that are explicitly
@@ -73,12 +78,9 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
 # disallow-listed category. Phase 2 will migrate these with dedicated
 # IBKR safety tests.
 PHASE2_DEFERRED_FILES: tuple[str, ...] = (
-    "chad/core/broker_position_sync.py",
-    "chad/core/ibkr_healthcheck.py",
     "chad/core/live_loop.py",
     "chad/core/paper_position_closer.py",
     "chad/core/paper_shadow_runner.py",
-    "chad/dashboard/api.py",
     "chad/execution/ibkr_adapter.py",
     "chad/execution/ibkr_trade_router.py",
     "chad/intel/advisory_engine.py",
@@ -120,9 +122,6 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
 #   chad/core/paper_position_closer.py, chad/core/paper_shadow_runner.py,
 #   chad/execution/ibkr_trade_router.py.
 PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = (
-    "chad/core/broker_position_sync.py",
-    "chad/core/ibkr_healthcheck.py",
-    "chad/dashboard/api.py",
     "chad/intel/advisory_engine.py",
     "chad/market_data/ibkr_bar_provider.py",
     "chad/market_data/ibkr_historical_provider.py",

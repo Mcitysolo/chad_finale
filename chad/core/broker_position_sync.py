@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 try:
-    from ib_insync import IB
+    from ib_async import IB
 except ImportError:
     IB = None
 

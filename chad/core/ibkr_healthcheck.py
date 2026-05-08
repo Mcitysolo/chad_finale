@@ -110,8 +110,8 @@ def _healthcheck(host: str, port: int, client_id: int, timeout_s: float, quiet_i
     start = time.perf_counter()
 
     try:
-        from ib_insync import IB  # type: ignore[import]
-        from ib_insync import ib as ib_mod  # type: ignore[import]
+        from ib_async import IB  # type: ignore[import]
+        from ib_async import ib as ib_mod  # type: ignore[import]
     except Exception as exc:
         return IBKRHealthStatus(
             ok=False,
