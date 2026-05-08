@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -121,6 +122,97 @@ def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout_s: float = _B
         raise error_box[0]
 
     return result_box[0] if result_box else None
+
+
+# ---------------------------------------------------------------------------
+# Qualified-contract cache
+# ---------------------------------------------------------------------------
+
+_QUALIFY_CACHE_TTL_ENV = "CHAD_IBKR_QUALIFY_CACHE_TTL_SECONDS"
+_QUALIFY_CACHE_TTL_DEFAULT_S = 24 * 3600.0
+
+
+def _resolve_qualify_cache_ttl_seconds() -> float:
+    raw = os.environ.get(_QUALIFY_CACHE_TTL_ENV)
+    if raw is None or raw == "":
+        return _QUALIFY_CACHE_TTL_DEFAULT_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _QUALIFY_CACHE_TTL_DEFAULT_S
+
+
+class _QualifyCache:
+    """Process-local TTL cache for IBKR qualified contracts.
+
+    Avoids repeated qualifyContracts() round-trips on identical contract
+    identities within the configured TTL window. ttl_seconds<=0 disables the
+    cache entirely (every lookup is a miss; nothing is stored).
+
+    Cache keys are derived from stable contract identity fields only:
+    symbol, secType, exchange, currency, lastTradeDateOrContractMonth,
+    strike, right, multiplier. Fail-soft: any error during key derivation
+    is treated as an uncacheable contract.
+    """
+
+    def __init__(self, *, ttl_seconds: float, now_fn: "NowFn") -> None:
+        self._ttl_seconds = float(ttl_seconds)
+        self._now_fn = now_fn
+        self._lock = threading.Lock()
+        self._entries: Dict[Tuple[str, ...], Tuple[float, Any]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return self._ttl_seconds > 0.0
+
+    @property
+    def ttl_seconds(self) -> float:
+        return self._ttl_seconds
+
+    def _key(self, contract: Any) -> Optional[Tuple[str, ...]]:
+        try:
+            return (
+                str(getattr(contract, "symbol", "") or "").upper(),
+                str(getattr(contract, "secType", "") or "").upper(),
+                str(getattr(contract, "exchange", "") or "").upper(),
+                str(getattr(contract, "currency", "") or "").upper(),
+                str(getattr(contract, "lastTradeDateOrContractMonth", "") or ""),
+                str(getattr(contract, "strike", "") or ""),
+                str(getattr(contract, "right", "") or "").upper(),
+                str(getattr(contract, "multiplier", "") or ""),
+            )
+        except BaseException:  # noqa: BLE001
+            return None
+
+    def get(self, contract: Any) -> Optional[Any]:
+        if not self.enabled:
+            return None
+        key = self._key(contract)
+        if key is None:
+            return None
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            stored_at, qualified = entry
+            now_ts = self._now_fn().timestamp()
+            if (now_ts - stored_at) > self._ttl_seconds:
+                self._entries.pop(key, None)
+                return None
+            return qualified
+
+    def store(self, contract: Any, qualified: Any) -> None:
+        if not self.enabled or qualified is None:
+            return
+        key = self._key(contract)
+        if key is None:
+            return
+        with self._lock:
+            self._entries[key] = (self._now_fn().timestamp(), qualified)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1247,10 @@ class IbkrAdapter:
         self._lock = threading.RLock()
         self._resolver = _ContractResolver(self._config, self._now_fn)
         self._order_factory = _OrderFactory(self._config)
+        self._qualify_cache = _QualifyCache(
+            ttl_seconds=_resolve_qualify_cache_ttl_seconds(),
+            now_fn=self._now_fn,
+        )
         self._idempotency = (
             _SQLiteIdempotencyStore(self._config.resolved_state_db_path())
             if self._config.enable_idempotency
@@ -1670,12 +1766,29 @@ class IbkrAdapter:
         raise SubmissionError(f"Failed to submit order for {intent.symbol}: {last_exc}") from last_exc
 
     def _qualify_if_possible(self, ib: IBLike, contract: Any) -> Any:
+        cached = self._qualify_cache.get(contract)
+        if cached is not None:
+            LOGGER.info(
+                "IBKR_QUALIFY_CACHE_HIT symbol=%s sec_type=%s",
+                getattr(contract, "symbol", ""),
+                getattr(contract, "secType", ""),
+            )
+            return cached
         try:
             qualified = list(_call_with_timeout(ib.qualifyContracts, contract, label="qualifyContracts") or [])
         except BaseException as exc:  # noqa: BLE001
             LOGGER.warning("ibkr.qualify_contract_failed", extra={"error": str(exc)})
             return contract
-        return qualified[0] if qualified else contract
+        if qualified:
+            result = qualified[0]
+            self._qualify_cache.store(contract, result)
+            LOGGER.info(
+                "IBKR_QUALIFY_CACHE_STORE symbol=%s sec_type=%s",
+                getattr(contract, "symbol", ""),
+                getattr(contract, "secType", ""),
+            )
+            return result
+        return contract
 
     # ------------------------------------------------------------------
     # Result helpers
