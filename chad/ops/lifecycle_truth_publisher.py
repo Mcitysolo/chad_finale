@@ -314,8 +314,8 @@ def build_positions_truth(
     replay_state = _read_json_best_effort(runtime_dir / "lifecycle_replay_state.json")
     replay_coverage = _read_json_best_effort(runtime_dir / "lifecycle_replay_coverage.json")
 
-    reconciliation_status = str(reconciliation.get("status") or "").strip().upper()
-    reconciliation_green = reconciliation_status == "GREEN"
+    reconciliation_status_upstream = str(reconciliation.get("status") or "").strip().upper()
+    upstream_green = reconciliation_status_upstream == "GREEN"
 
     ledger_open = ledger_state.get("open")
     if not isinstance(ledger_open, dict):
@@ -355,8 +355,59 @@ def build_positions_truth(
 
     scope_mismatch = replay_coverage_status == "SCOPE_MISMATCH_MANUAL_VS_PAPER_EXEC"
 
+    qty_mismatches_count = int(len(qty_mismatches))
+    missing_from_replay_count = int(len(missing_from_replay))
+
+    # GAP-A009: classify reconciliation_status with replay/scope evidence.
+    # RED   = upstream RED, or quantity/symbol mismatches detected.
+    # YELLOW = scope mismatch OR replay not confirmed.
+    # GREEN = upstream GREEN AND replay confirmed AND no scope mismatch AND no qty/symbol mismatches.
+    if reconciliation_status_upstream == "RED" or qty_mismatches_count > 0 or missing_from_replay_count > 0:
+        reconciliation_status = "RED"
+        if reconciliation_status_upstream == "RED":
+            reconciliation_status_reason = (
+                f"UPSTREAM_RED: snapshot={snapshot_positions_count} "
+                f"replay={replay_positions_count} ledger={ledger_state_positions_count}"
+            )
+        else:
+            reconciliation_status_reason = (
+                f"QTY_OR_SYMBOL_MISMATCH: qty_mismatches={qty_mismatches_count} "
+                f"missing_from_replay={missing_from_replay_count} "
+                f"snapshot={snapshot_positions_count} replay={replay_positions_count} "
+                f"ledger={ledger_state_positions_count}"
+            )
+    elif scope_mismatch:
+        reconciliation_status = "YELLOW"
+        reconciliation_status_reason = (
+            f"SCOPE_MISMATCH_MANUAL_VS_PAPER_EXEC: snapshot={snapshot_positions_count} "
+            f"replay={replay_positions_count} ledger={ledger_state_positions_count}"
+        )
+    elif not replay_match_confirmed:
+        reconciliation_status = "YELLOW"
+        reconciliation_status_reason = (
+            f"REPLAY_NOT_CONFIRMED: replay_coverage_status={replay_coverage_status or 'UNKNOWN'} "
+            f"snapshot={snapshot_positions_count} replay={replay_positions_count} "
+            f"ledger={ledger_state_positions_count}"
+        )
+    elif upstream_green:
+        reconciliation_status = "GREEN"
+        reconciliation_status_reason = (
+            f"GREEN_CONFIRMED: snapshot={snapshot_positions_count} "
+            f"replay={replay_positions_count} ledger={ledger_state_positions_count}"
+        )
+    else:
+        # Upstream is missing/unknown — surface it explicitly.
+        reconciliation_status = "YELLOW"
+        reconciliation_status_reason = (
+            f"UPSTREAM_NOT_GREEN: upstream={reconciliation_status_upstream or 'UNKNOWN'} "
+            f"snapshot={snapshot_positions_count} replay={replay_positions_count} "
+            f"ledger={ledger_state_positions_count}"
+        )
+
+    reconciliation_green = reconciliation_status == "GREEN"
+
     truth_ok = bool(
-        reconciliation_green
+        upstream_green
         and bool(ledger_state)
         and snapshot_positions_count > 0
         and ledger_state_positions_count == snapshot_positions_count
@@ -390,6 +441,8 @@ def build_positions_truth(
             "fees_newest_mtime_unix": fees_evidence.newest_mtime_unix,
             "fees_line_count_hint": int(fees_evidence.line_count_hint),
             "reconciliation_status": reconciliation_status,
+            "reconciliation_status_reason": reconciliation_status_reason,
+            "reconciliation_status_upstream": reconciliation_status_upstream,
             "reconciliation_green": bool(reconciliation_green),
             "reconciliation_ts_utc": reconciliation.get("ts_utc"),
             "ledger_state_present": bool(ledger_state),
