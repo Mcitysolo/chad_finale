@@ -797,6 +797,16 @@ def evaluate_live_gate() -> LiveGateDecision:
     reasons: List[str] = []
 
     exec_cfg = _load_execution_config()
+
+    # Side-effect: refresh runtime/execution_environment.json from the active
+    # process env so SSOT consumers see the truth even when the gate later
+    # short-circuits. Fail-soft — never affects gate decision.
+    try:
+        from chad.ops.execution_environment_publisher import publish_once_safe
+        publish_once_safe(_runtime_dir())
+    except Exception:
+        pass
+
     mode_state = _load_mode_state(exec_cfg)
     shadow = _load_shadow_state()
     operator = _load_operator_intent()
