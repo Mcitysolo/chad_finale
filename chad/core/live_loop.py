@@ -466,6 +466,8 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
         open_count += 1
 
     for key, entry in list(guard_state.items()):
+        if str(key).startswith("_") or not isinstance(entry, dict):
+            continue
         strategy = str(entry.get("strategy", ""))
         symbol = str(entry.get("symbol", "")).upper()
         if strategy == "broker_sync":
@@ -526,6 +528,8 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
 
     # Close guard entries that the broker no longer holds
     for key, entry in list(guard_state.items()):
+        if str(key).startswith("_") or not isinstance(entry, dict):
+            continue
         if not entry.get("open"):
             continue
         symbol = entry.get("symbol", "")
@@ -568,7 +572,7 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
                 "corrections_closed": corrections_closed,
                 "corrections_opened": corrections_opened,
                 "broker_position_count": len(broker_symbols),
-                "guard_open_count": sum(1 for e in guard_state.values() if e.get("open")),
+                "guard_open_count": sum(1 for e in guard_state.values() if isinstance(e, dict) and e.get("open")),
             },
         )
     else:
@@ -578,7 +582,7 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
                 "corrections_closed": 0,
                 "corrections_opened": 0,
                 "broker_position_count": len(broker_symbols),
-                "guard_open_count": sum(1 for e in guard_state.values() if e.get("open")),
+                "guard_open_count": sum(1 for e in guard_state.values() if isinstance(e, dict) and e.get("open")),
                 "status": "no_corrections_needed",
             },
         )

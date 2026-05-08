@@ -178,6 +178,43 @@ def test_rebuild_preserves_broker_sync_when_no_strategy_entry_for_symbol(tmp_pat
     assert state["alpha|SPY"]["open"] is True
 
 
+def test_rebuild_skips_top_level_meta_keys(tmp_path, monkeypatch):
+    """
+    Regression: position_guard.json carries top-level meta keys
+    (`_version` int, `_written_by` str). The rebuild loop must
+    skip non-dict / underscore-prefixed entries instead of calling
+    .get() on them, which threw 'int object has no attribute get'.
+    """
+    import logging
+    from chad.core import live_loop
+
+    guard_path = tmp_path / "position_guard.json"
+    tc_path = tmp_path / "trade_closer_state.json"
+    monkeypatch.setattr(position_guard, "STATE_PATH", guard_path)
+    monkeypatch.setattr(live_loop, "_TRADE_CLOSER_STATE_PATH", tc_path)
+
+    _seed(guard_path, {
+        "_version": 1777809122323,
+        "_written_by": "position_guard",
+        "alpha|SPY": {
+            "open": True, "strategy": "alpha", "symbol": "SPY",
+            "side": "BUY", "quantity": 5.0, "last_state": "OPEN",
+        },
+    })
+    _seed_trade_closer(tc_path, [{
+        "strategy": "alpha", "symbol": "SPY", "sec_type": "STK",
+        "lots": [{"side": "BUY", "quantity": 5.0,
+                  "fill_price": 700.0, "lot_ts_utc": "2026-04-20T00:00:00Z",
+                  "fill_id": "test-fill-meta"}],
+    }])
+
+    live_loop._rebuild_guard_from_paper_ledger(logging.getLogger("test"))
+
+    state = _load(guard_path)
+    assert state["alpha|SPY"]["open"] is True
+    assert state["alpha|SPY"]["quantity"] == 5.0
+
+
 def test_mark_position_open_partial_attribution_reduces_broker_sync(tmp_state):
     """ISSUE-56 v2: partial same-side attribution reduces broker_sync, keeps open."""
     _seed(tmp_state, {
