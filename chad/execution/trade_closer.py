@@ -158,6 +158,64 @@ def _safe_float(v: Any) -> Optional[float]:
     return f
 
 
+# Statuses we consider trusted enough to feed FIFO matching. Anything else
+# (pending, submitted, error, unknown, rejected, cancelled, ...) is skipped.
+_TRUSTED_FILL_STATUSES = frozenset({"filled", "paper_fill", "dry_run"})
+
+# Keywords that — when found in a tag, source string, or extra marker —
+# indicate the fill is a placeholder/fallback/synthetic rather than a real
+# execution. Matched as case-insensitive substrings.
+_PLACEHOLDER_MARKERS = (
+    "placeholder",
+    "fallback",
+    "synthetic",
+    "untrusted",
+)
+
+# Default fill_price the paper executor falls back to when no live market
+# price is available. Real fills land on a live market price; a $100.00
+# fill_price paired with a placeholder indicator is the canonical fingerprint
+# of a phantom fill (see 2026-05-08 SPY delta incident).
+_PLACEHOLDER_FILL_PRICE = 100.0
+
+
+def _str_has_placeholder_marker(value: Any) -> bool:
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    if not s:
+        return False
+    return any(m in s for m in _PLACEHOLDER_MARKERS)
+
+
+def _payload_indicates_placeholder(payload: Dict[str, Any]) -> bool:
+    """True if tags / source / extra signal a placeholder or fallback fill."""
+    tags = payload.get("tags")
+    if isinstance(tags, (list, tuple)):
+        for t in tags:
+            if _str_has_placeholder_marker(t):
+                return True
+    if _str_has_placeholder_marker(payload.get("source")):
+        return True
+    extra = payload.get("extra")
+    if isinstance(extra, dict):
+        for k in (
+            "placeholder",
+            "is_placeholder",
+            "fallback",
+            "is_fallback",
+            "synthetic",
+            "is_synthetic",
+        ):
+            if bool(extra.get(k)):
+                return True
+        if _str_has_placeholder_marker(extra.get("source")):
+            return True
+        if _str_has_placeholder_marker(extra.get("pnl_untrusted_reason")):
+            return True
+    return False
+
+
 def _extract_fill(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Pull the inner payload of a FILLS_*.ndjson record into a flat dict."""
     payload = obj.get("payload") if isinstance(obj, dict) else None
@@ -168,8 +226,18 @@ def _extract_fill(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     if payload.get("reject") is True:
         return None
-    status = str(payload.get("status", "")).lower()
+    status = str(payload.get("status", "")).strip().lower()
     if status in ("rejected", "cancelled", "canceled"):
+        return None
+    # Status allowlist: any non-empty status that is not blessed as trusted
+    # (filled / paper_fill / dry_run) is a pending/error/unknown shape and
+    # must not enter FIFO matching.
+    if status and status not in _TRUSTED_FILL_STATUSES:
+        return None
+
+    # Source allowlist: a source string smelling of placeholder/fallback is
+    # rejected outright regardless of fill_price.
+    if _str_has_placeholder_marker(payload.get("source")):
         return None
 
     # Skip untrusted fills (e.g. placeholder fill_price flagged by the
@@ -185,6 +253,23 @@ def _extract_fill(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         str(t).strip().lower() == "pnl_untrusted" for t in tags_list
     ):
         return None
+
+    # Placeholder fill_price guard. The 2026-05-08 incident produced 22 fake
+    # delta SELL trades where opening fills landed at fill_price=100.0 with
+    # extra.expected_price=100.0 — the executor's "no live price" fallback
+    # fired, but the upstream price-sanity check could not catch it because
+    # price_cache had no SPY entry to compare against. Defense in depth: if
+    # fill_price equals the placeholder default AND any placeholder/fallback/
+    # synthetic indicator is present, OR the strategy's expected_price also
+    # defaulted to 100.0, refuse the fill.
+    px_for_guard = _safe_float(payload.get("fill_price"))
+    if px_for_guard is not None and abs(px_for_guard - _PLACEHOLDER_FILL_PRICE) < 1e-9:
+        if _payload_indicates_placeholder(payload):
+            return None
+        if isinstance(extra, dict):
+            exp = _safe_float(extra.get("expected_price"))
+            if exp is not None and abs(exp - _PLACEHOLDER_FILL_PRICE) < 1e-9:
+                return None
 
     fill_id = payload.get("fill_id")
     if not fill_id:
@@ -261,6 +346,12 @@ class TradeCloser:
     # ---- state ----------------------------------------------------------
 
     def load_state(self) -> None:
+        # Always seed processed_fill_ids from any existing trade_history files
+        # first. If the state file is missing or corrupted, this still prevents
+        # a fill_id already consumed in a prior closed_trade from being matched
+        # again into a new closed_trade.
+        self.seed_processed_from_trade_history()
+
         if not self.state_path.exists():
             return
         try:
@@ -270,7 +361,8 @@ class TradeCloser:
         if not isinstance(data, dict):
             return
 
-        self.processed_fill_ids = set(data.get("processed_fill_ids", []) or [])
+        # Union with what we already seeded from history above.
+        self.processed_fill_ids |= set(data.get("processed_fill_ids", []) or [])
         self.queues = defaultdict(deque)
         for entry in data.get("queues", []) or []:
             try:
@@ -318,6 +410,56 @@ class TradeCloser:
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         tmp.replace(self.state_path)
+
+    # ---- duplicate-fill protection --------------------------------------
+
+    def seed_processed_from_trade_history(self) -> int:
+        """
+        Seed processed_fill_ids from every fill_id already recorded in any
+        existing trade_history_*.ndjson under self.trades_dir.
+
+        This is a defense-in-depth check: if the persisted state file is lost
+        or rebuilt, a fill_id that was already consumed in a prior closed_trade
+        record must not generate another closed_trade on a re-run.
+
+        Returns the number of fill_ids newly added to the processed set.
+        """
+        added = 0
+        if not self.trades_dir.exists():
+            return 0
+        try:
+            history_files = sorted(self.trades_dir.glob("trade_history_*.ndjson"))
+        except Exception:
+            return 0
+        for hpath in history_files:
+            try:
+                text = hpath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = obj.get("payload") if isinstance(obj, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("schema_version") != "closed_trade.v1":
+                    continue
+                fids = payload.get("fill_ids")
+                if not isinstance(fids, (list, tuple)):
+                    continue
+                for fid in fids:
+                    if not fid:
+                        continue
+                    fid_str = str(fid)
+                    if fid_str not in self.processed_fill_ids:
+                        self.processed_fill_ids.add(fid_str)
+                        added += 1
+        return added
 
     # ---- core processing ------------------------------------------------
 

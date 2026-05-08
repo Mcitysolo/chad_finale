@@ -449,6 +449,179 @@ def test_trade_closer_dedupes_duplicate_fill_ids(tmp_path):
     assert closed_again == []
 
 
+# ---------------------------------------------------------------------------
+# Placeholder / fallback / duplicate-fill protection (2026-05-08 incident)
+# ---------------------------------------------------------------------------
+
+def test_trade_closer_skips_placeholder_100_fill(tmp_path):
+    """Reproduces the 2026-05-08 SPY delta incident: opening fills landed at
+    fill_price=100.0 with extra.expected_price=100.0 because price_cache had
+    no SPY entry and the executor fell back to the strategy's default expected
+    price. trade_closer must refuse such fills BEFORE they enter FIFO matching
+    so the real closing fill at $731.44 cannot generate a phantom -$6314 SELL
+    close. No closed_trade may be produced."""
+    closer = _make_closer(tmp_path)
+
+    # Opening SELL with the placeholder fingerprint: fill_price == expected
+    # == 100.0. No other untrusted markers — exact shape from FILLS_20260503.
+    placeholder_open = _fill("p_open", "SELL", 10, 100.0, symbol="SPY", seq=1)
+    placeholder_open["payload"]["status"] = "filled"
+    placeholder_open["payload"]["source"] = "paper_trade_executor"
+    placeholder_open["payload"]["tags"] = ["paper", "filled", "delta", "equity"]
+    placeholder_open["payload"]["extra"] = {
+        "source_strategies": ["delta"],
+        "slippage_bps": 0.0,
+        "latency_ms": 0.0,
+        "expected_price": 100.0,
+    }
+
+    # Real closing fill at the actual SPY price. With the placeholder open
+    # rejected, this must NOT generate a closed trade — it just opens a new
+    # BUY-side lot.
+    real_close = _fill("p_close", "BUY", 10, 731.44, symbol="SPY", seq=2)
+    real_close["payload"]["status"] = "paper_fill"
+    real_close["payload"]["source"] = "paper_trade_executor"
+    real_close["payload"]["tags"] = ["paper", "filled", "delta", "etf"]
+    real_close["payload"]["extra"] = {
+        "source_strategies": ["delta"],
+        "slippage_bps": 0.0,
+        "latency_ms": 0.0,
+        "expected_price": 733.83,
+    }
+
+    _write_fills(
+        tmp_path / "fills" / "FILLS_20260508.ndjson",
+        [placeholder_open, real_close],
+    )
+    closer.load_state()
+    closed = closer.process_fills("20260508")
+
+    assert closed == [], (
+        "placeholder fill at $100 must be skipped; got phantom closes: "
+        f"{[(c.side, c.entry_price, c.exit_price, c.pnl) for c in closed]}"
+    )
+    assert "p_open" not in closer.processed_fill_ids
+    # The real fill is processed and held as a fresh open lot.
+    assert "p_close" in closer.processed_fill_ids
+    key = ("alpha_test", "SPY")
+    assert sum(lot["quantity"] for lot in closer.queues[key]) == 10
+
+
+def test_trade_closer_skips_pnl_untrusted_fill(tmp_path):
+    """Variants where pnl_untrusted is set at extra, payload, or tags level
+    must all be rejected before FIFO matching."""
+    closer = _make_closer(tmp_path)
+
+    via_extra = _fill("u1", "SELL", 5, 100.0, symbol="SPY", seq=1)
+    via_extra["payload"]["extra"] = {
+        "pnl_untrusted": True,
+        "pnl_untrusted_reason": "fill_price=100.0 deviates 86% from price_cache=720.0",
+    }
+
+    via_payload = _fill("u2", "SELL", 5, 100.0, symbol="SPY", seq=2)
+    via_payload["payload"]["pnl_untrusted"] = True
+
+    via_tag = _fill("u3", "SELL", 5, 100.0, symbol="SPY", seq=3)
+    via_tag["payload"]["tags"] = ["paper", "filled", "pnl_untrusted"]
+
+    # Real closing fill — must not match because no untrusted lot is queued.
+    real_close = _fill("real_close", "BUY", 5, 720.0, symbol="SPY", seq=4)
+
+    _write_fills(
+        tmp_path / "fills" / "FILLS_20260508.ndjson",
+        [via_extra, via_payload, via_tag, real_close],
+    )
+    closer.load_state()
+    closed = closer.process_fills("20260508")
+
+    assert closed == []
+    for fid in ("u1", "u2", "u3"):
+        assert fid not in closer.processed_fill_ids
+    assert "real_close" in closer.processed_fill_ids
+
+
+def test_trade_closer_does_not_reuse_consumed_fill_id(tmp_path):
+    """A fill_id that already appears in an existing trade_history closed_trade
+    record must be skipped from new FIFO matching. Defends against state-file
+    loss / corruption where the FIFO queue might be rebuilt and a previously
+    consumed fill_id could otherwise re-match."""
+    closer = _make_closer(tmp_path)
+
+    # Round 1: real BUY/SELL pair → one closed trade.
+    fills_r1 = [
+        _fill("open_r1", "BUY", 1, 5000.0, symbol="MES", seq=1),
+        _fill("close_r1", "SELL", 1, 5010.0, symbol="MES", seq=2),
+    ]
+    _write_fills(tmp_path / "fills" / "FILLS_20260408.ndjson", fills_r1)
+    closer.load_state()
+    closed_r1 = closer.process_fills("20260408")
+    assert len(closed_r1) == 1
+    closer.write_trade_history(closed_r1, "20260408")
+
+    # Simulate state-file loss between runs by deleting it. The trade_history
+    # file remains as the durable record of what was already consumed.
+    closer.save_state()
+    if closer.state_path.exists():
+        closer.state_path.unlink()
+
+    # Round 2: a fresh closer instance with empty in-memory state. The same
+    # fill_ids reappear in a same-day re-replay (e.g., harvester re-emit).
+    # Without the trade_history seed, the FIFO matcher would rebuild a phantom
+    # close for this pair. With the seed, both fill_ids are already in
+    # processed_fill_ids and produce nothing.
+    closer2 = _make_closer(tmp_path)
+    closer2.load_state()
+    assert "open_r1" in closer2.processed_fill_ids
+    assert "close_r1" in closer2.processed_fill_ids
+
+    closed_r2 = closer2.process_fills("20260408")
+    assert closed_r2 == [], (
+        "fill_ids already consumed in a prior closed_trade must not generate "
+        f"another close; got: {closed_r2}"
+    )
+
+
+def test_trade_closer_real_fill_still_closes_normally(tmp_path):
+    """Sanity: the new placeholder/status/source guards must NOT regress real,
+    well-formed fills. A normal BUY-then-SELL pair on SPY at realistic prices
+    with status=paper_fill still produces exactly one closed trade."""
+    closer = _make_closer(tmp_path)
+
+    open_buy = _fill("real_open", "BUY", 10, 720.50, symbol="SPY", seq=1)
+    open_buy["payload"]["status"] = "paper_fill"
+    open_buy["payload"]["source"] = "paper_trade_executor"
+    open_buy["payload"]["tags"] = ["paper", "filled", "delta", "etf"]
+    open_buy["payload"]["extra"] = {
+        "source_strategies": ["delta"],
+        "expected_price": 721.00,
+    }
+
+    close_sell = _fill("real_close", "SELL", 10, 731.44, symbol="SPY", seq=2)
+    close_sell["payload"]["status"] = "paper_fill"
+    close_sell["payload"]["source"] = "paper_trade_executor"
+    close_sell["payload"]["tags"] = ["paper", "filled", "delta", "etf"]
+    close_sell["payload"]["extra"] = {
+        "source_strategies": ["delta"],
+        "expected_price": 733.83,
+    }
+
+    _write_fills(
+        tmp_path / "fills" / "FILLS_20260508.ndjson",
+        [open_buy, close_sell],
+    )
+    closer.load_state()
+    closed = closer.process_fills("20260508")
+
+    assert len(closed) == 1
+    ct = closed[0]
+    assert ct.side == "BUY"
+    assert ct.entry_price == pytest.approx(720.50)
+    assert ct.exit_price == pytest.approx(731.44)
+    assert ct.quantity == 10
+    # SPY multiplier == 1.0 → pnl = (731.44 - 720.50) * 10 = 109.4
+    assert ct.pnl == pytest.approx((731.44 - 720.50) * 10)
+
+
 def test_preserve_existing_fill_id_when_present(tmp_path):
     """
     When a lot already has a fill_id, load_state() must not overwrite it.
