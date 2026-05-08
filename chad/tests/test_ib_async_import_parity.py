@@ -71,6 +71,20 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
     "chad/core/broker_position_sync.py",
     "chad/core/ibkr_healthcheck.py",
     "chad/dashboard/api.py",
+    # Phase 1B.4 (GAP-A019) Batch 2 retry: market-data providers —
+    # historical bars, snapshot prices, FX rates, options chain
+    # metadata. All use IBKR exclusively for read-only data fetches
+    # (reqHistoricalData / reqMktData / reqContractDetails /
+    # reqSecDefOptParams / qualifyContracts). Re-attempted after the
+    # _install_fake_ib_insync helper was extended (commit 19b2fd5)
+    # to patch both ib_insync and ib_async namespaces.
+    "chad/market_data/ibkr_bar_provider.py",
+    "chad/market_data/ibkr_historical_provider.py",
+    "chad/market_data/ibkr_price_provider.py",
+    "chad/market_data/nightly_bars_refresh.py",
+    "chad/market_data/options_chain_refresh.py",
+    "chad/market_data/price_cache_refresh.py",
+    "chad/options/chain_provider.py",
 )
 
 # Production source files still importing ib_insync that are explicitly
@@ -84,16 +98,9 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
     "chad/execution/ibkr_adapter.py",
     "chad/execution/ibkr_trade_router.py",
     "chad/intel/advisory_engine.py",
-    "chad/market_data/ibkr_bar_provider.py",
-    "chad/market_data/ibkr_historical_provider.py",
-    "chad/market_data/ibkr_price_provider.py",
-    "chad/market_data/nightly_bars_refresh.py",
-    "chad/market_data/options_chain_refresh.py",
-    "chad/market_data/price_cache_refresh.py",
     "chad/ops/ibkr_broker_events_collector.py",
     "chad/ops/portfolio_snapshot_publisher.py",
     "chad/ops/reconciliation_publisher.py",
-    "chad/options/chain_provider.py",
     "chad/portfolio/ibkr_paper_fill_harvester.py",
     "chad/portfolio/ibkr_paper_ledger_watcher.py",
     "chad/portfolio/ibkr_portfolio_collector_v2.py",
@@ -123,16 +130,9 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
 #   chad/execution/ibkr_trade_router.py.
 PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = (
     "chad/intel/advisory_engine.py",
-    "chad/market_data/ibkr_bar_provider.py",
-    "chad/market_data/ibkr_historical_provider.py",
-    "chad/market_data/ibkr_price_provider.py",
-    "chad/market_data/nightly_bars_refresh.py",
-    "chad/market_data/options_chain_refresh.py",
-    "chad/market_data/price_cache_refresh.py",
     "chad/ops/ibkr_broker_events_collector.py",
     "chad/ops/portfolio_snapshot_publisher.py",
     "chad/ops/reconciliation_publisher.py",
-    "chad/options/chain_provider.py",
     "chad/portfolio/ibkr_paper_fill_harvester.py",
     "chad/portfolio/ibkr_paper_ledger_watcher.py",
     "chad/portfolio/ibkr_portfolio_collector_v2.py",

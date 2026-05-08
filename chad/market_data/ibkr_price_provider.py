@@ -8,7 +8,7 @@ Replaces Polygon snapshot/FX calls with direct IBKR reqMktData.
 Thread-safe, cache-backed, with delayed-data fallback.
 
 Usage:
-    from ib_insync import IB
+    from ib_async import IB
     from chad.market_data.ibkr_price_provider import IBKRPriceProvider
     from chad.execution.ibkr_client_ids import PRICE_PROVIDER
 
@@ -164,7 +164,7 @@ class IBKRPriceProvider:
 
     def _make_contract(self, symbol: str, sec_type: str = "STK") -> Any:
         """Create ib_insync contract for symbol."""
-        from ib_insync import Stock, Forex, Future
+        from ib_async import Stock, Forex, Future
 
         sym = symbol.strip().upper()
         if sec_type == "FX":
@@ -301,7 +301,7 @@ class IBKRPriceProvider:
 
         Uses IBKR Forex contract. Returns 0.0 on failure.
         """
-        from ib_insync import Forex
+        from ib_async import Forex
 
         pair = pair.strip().upper()
         try:

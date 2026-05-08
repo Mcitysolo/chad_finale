@@ -250,7 +250,7 @@ def _load_futures_universe() -> list:
 
 def _refresh_ibkr(runtime_dir: Path, ttl_seconds: int) -> int:
     """Refresh price_cache.json using IBKR snapshots (equities + futures)."""
-    from ib_insync import IB
+    from ib_async import IB
     from chad.market_data.ibkr_price_provider import IBKRPriceProvider
 
     out_path = runtime_dir / "price_cache.json"

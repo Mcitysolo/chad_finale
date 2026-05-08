@@ -184,7 +184,7 @@ def _make_ib_contract(symbol: str, ib: Any = None) -> Any:
     then uses reqContractDetails to resolve the front-month expiry.
     SIL maps to IBKR symbol SI (Silver futures) with tradingClass 'SIL'.
     """
-    from ib_insync import Stock, Future
+    from ib_async import Stock, Future
 
     sym = symbol.strip().upper()
 
@@ -650,7 +650,7 @@ def run_daemon(
     reqHistoricalData works on paper accounts without market-data
     subscriptions, unlike reqRealTimeBars which fails with Error 420.
     """
-    from ib_insync import IB
+    from ib_async import IB
 
     resolved_universe = list(universe) if universe else _load_universe_from_config()
 

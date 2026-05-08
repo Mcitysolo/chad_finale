@@ -131,7 +131,7 @@ def _spot_price_from_bars(symbol: str) -> float | None:
 
 def _fetch_spy_price(ib: Any, symbol: str) -> float:
     """Fetch current price via market data snapshot, fall back to bar data."""
-    from ib_insync import Stock
+    from ib_async import Stock
 
     stock = Stock(symbol, "SMART", "USD")
     try:
@@ -208,7 +208,7 @@ def _fetch_chain_via_contract_details(
     +/- PRICE_PCT_WINDOW of spot, restricted to the nearest MAX_EXPIRIES
     expiries. Returns (expirations, strikes, exchange).
     """
-    from ib_insync import Option
+    from ib_async import Option
 
     template = Option(
         symbol=symbol,
@@ -337,9 +337,9 @@ def _atomic_write(cache_path: Path, cache_doc: Dict[str, Any]) -> None:
 
 def run(symbols: Sequence[str]) -> int:
     try:
-        from ib_insync import IB
+        from ib_async import IB
     except Exception as exc:
-        _log(f"ERROR ib_insync import failed: {exc}")
+        _log(f"ERROR ib_async import failed: {exc}")
         return 1
 
     ib = IB()

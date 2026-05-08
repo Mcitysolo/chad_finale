@@ -9,7 +9,7 @@ Writes to data/bars/1d/ and data/bars/1m/ in the same format as
 polygon_daily_bars_backfill.py for seamless consumer compatibility.
 
 Usage:
-    from ib_insync import IB
+    from ib_async import IB
     from chad.market_data.ibkr_historical_provider import IBKRHistoricalProvider
     from chad.execution.ibkr_client_ids import HISTORICAL_PROVIDER
 
@@ -217,7 +217,7 @@ class IBKRHistoricalProvider:
         return schedule[-1]  # fallback to last known expiry
 
     def _make_contract(self, symbol: str, sec_type: str = "STK") -> Any:
-        from ib_insync import Stock, Future
+        from ib_async import Stock, Future
 
         sym = symbol.strip().upper()
 

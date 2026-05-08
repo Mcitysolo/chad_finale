@@ -169,7 +169,7 @@ def _run_ibkr(
 ) -> bool:
     """Run IBKR fetches. Returns False if connection failed entirely."""
     try:
-        from ib_insync import IB
+        from ib_async import IB
         from chad.market_data.ibkr_historical_provider import IBKRHistoricalProvider
     except ImportError as e:
         _log("IBKR", f"FAILED import error: {e}")

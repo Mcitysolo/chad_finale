@@ -236,7 +236,7 @@ class IBKRChainProvider:
 
         Requires the underlying to be qualified first to get its conId.
         """
-        from ib_insync import Stock
+        from ib_async import Stock
 
         underlying = Stock(symbol, "SMART", "USD")
         qualified = self._ib.qualifyContracts(underlying)
