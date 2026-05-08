@@ -25,15 +25,17 @@ Gating semantics:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 _KRAKEN_EXECUTOR = None  # lazy singleton
+_PAPER_EVIDENCE_STORE = None  # lazy IdempotencyStore for paper-kraken dedup
 
 
 def resolve_kraken_mode() -> str:
@@ -117,6 +119,270 @@ def log_kraken_fill(payload: Dict[str, Any]) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Paper-Kraken evidence helpers
+# ---------------------------------------------------------------------------
+#
+# Why this exists:
+#   In paper_kraken mode, KrakenExecutor calls Kraken with validate_only=True.
+#   Kraken's validate-only response carries no txids, so the live txid-gated
+#   trade-history / FILLS writers in kraken_executor.py never fire. SCR /
+#   daily reports / strategy_routing_diagnostics read trade_history_*.ndjson
+#   and FILLS_*.ndjson — without records there, alpha_crypto stays
+#   zero_fill_epoch2=true even though it generated, gated, and validated
+#   intents successfully.
+#
+#   This patch writes standard CHAD paper evidence at the dispatcher layer
+#   (kraken_execution.execute_kraken_intents) when a validate-only call
+#   succeeded, the risk gate allowed it, and txids were empty. Live
+#   semantics are untouched: the existing executor txid path still runs
+#   end-to-end for live=True, and we never fabricate live txids.
+#
+#   Dedup uses the existing IdempotencyStore (SQLite-backed at
+#   runtime/exec_state_paper.sqlite3) so paper evidence is written at most
+#   once per (strategy, pair, side, volume, price, UTC minute bucket) even
+#   across live-loop restarts. Advancing the minute bucket admits a new
+#   record, matching the spec.
+
+_PAPER_EVIDENCE_TABLE = "kraken_paper_evidence"
+
+
+def _get_paper_evidence_store():
+    """Lazy-instantiate the IdempotencyStore for paper-kraken dedup."""
+    global _PAPER_EVIDENCE_STORE
+    if _PAPER_EVIDENCE_STORE is not None:
+        return _PAPER_EVIDENCE_STORE
+    from chad.execution.idempotency_store import IdempotencyStore, default_paper_db_path
+    db_path = default_paper_db_path(Path("/home/ubuntu/chad_finale"))
+    _PAPER_EVIDENCE_STORE = IdempotencyStore(db_path, table=_PAPER_EVIDENCE_TABLE)
+    return _PAPER_EVIDENCE_STORE
+
+
+def _kraken_paper_minute_bucket(ts: Optional[float] = None) -> str:
+    """UTC minute bucket as YYYYMMDDHHMM. Idempotent within the same minute."""
+    return time.strftime("%Y%m%d%H%M", time.gmtime(ts))
+
+
+def _resolve_paper_evidence_price(intent: object) -> float:
+    """Best-effort price for paper evidence: intent.price → notional/volume → expected_price."""
+    price = getattr(intent, "price", None)
+    try:
+        if price is not None:
+            p = float(price)
+            if p > 0.0:
+                return p
+    except (TypeError, ValueError):
+        pass
+    try:
+        vol = float(getattr(intent, "volume", 0.0) or 0.0)
+        notional = float(getattr(intent, "notional_estimate", 0.0) or 0.0)
+        if vol > 0.0 and notional > 0.0:
+            return notional / vol
+    except (TypeError, ValueError):
+        pass
+    try:
+        exp = float(getattr(intent, "expected_price", 0.0) or 0.0)
+        if exp > 0.0:
+            return exp
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def _paper_synthetic_txid(intent: object, price_used: float, *, bucket: Optional[str] = None) -> str:
+    """Deterministic, paper-only synthetic txid.
+
+    Hash inputs:
+        strategy | pair | side | volume | price | UTC minute bucket
+    """
+    strategy = str(getattr(intent, "strategy", "") or "")
+    pair = str(getattr(intent, "pair", "") or "")
+    side = str(getattr(intent, "side", "") or "")
+    try:
+        volume = float(getattr(intent, "volume", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        volume = 0.0
+    minute_bucket = bucket if bucket is not None else _kraken_paper_minute_bucket()
+    raw = "|".join([
+        strategy,
+        pair,
+        side,
+        f"{volume:.10f}",
+        f"{float(price_used or 0.0):.10f}",
+        minute_bucket,
+    ])
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"PAPER-KRAKEN-{digest}"
+
+
+def _kraken_pair_to_canonical(pair: str) -> str:
+    """SOLUSD -> SOL-USD, XBTUSD -> BTC-USD, etc. Falls back to the input on miss."""
+    try:
+        from chad.portfolio.kraken_trade_result_logger import _canonical_symbol_for_pair
+        return _canonical_symbol_for_pair(pair)
+    except Exception:
+        return (pair or "").strip().upper()
+
+
+def _write_paper_kraken_evidence(
+    logger: logging.Logger,
+    intent: object,
+    risk_result: object,
+    resp: object,
+) -> Dict[str, Any]:
+    """Write trade_history + FILLS paper evidence for one validated intent.
+
+    Idempotent per (strategy, pair, side, volume, price, UTC minute bucket).
+    Returns a small status dict for logging / tests.
+    """
+    price_used = _resolve_paper_evidence_price(intent)
+    bucket = _kraken_paper_minute_bucket()
+    synthetic_txid = _paper_synthetic_txid(intent, price_used, bucket=bucket)
+
+    # --- Dedup gate ---
+    payload_hash = hashlib.sha256(
+        "|".join([
+            str(getattr(intent, "strategy", "") or ""),
+            str(getattr(intent, "pair", "") or ""),
+            str(getattr(intent, "side", "") or ""),
+            f"{float(getattr(intent, 'volume', 0.0) or 0.0):.10f}",
+            f"{price_used:.10f}",
+            bucket,
+        ]).encode("utf-8")
+    ).hexdigest()
+
+    try:
+        store = _get_paper_evidence_store()
+        mark = store.mark_once(
+            trade_id=synthetic_txid,
+            payload_hash=payload_hash,
+            meta={
+                "source": "kraken_paper_evidence",
+                "strategy": str(getattr(intent, "strategy", "") or ""),
+                "pair": str(getattr(intent, "pair", "") or ""),
+                "minute_bucket": bucket,
+            },
+        )
+    except Exception as exc:
+        logger.warning("KRAKEN_PAPER_EVIDENCE_DEDUP_FAILED: %s", exc)
+        return {"written": False, "reason": "dedup_store_error", "txid": synthetic_txid}
+
+    if not mark.inserted:
+        logger.info(
+            "KRAKEN_PAPER_EVIDENCE_DEDUP txid=%s reason=%s strategy=%s pair=%s",
+            synthetic_txid,
+            mark.reason,
+            getattr(intent, "strategy", None),
+            getattr(intent, "pair", None),
+        )
+        return {"written": False, "reason": mark.reason, "txid": synthetic_txid}
+
+    # --- Trade history (KrakenTradeEvent paper mode) ---
+    trade_history_path = ""
+    try:
+        from chad.portfolio.kraken_trade_result_logger import (
+            KrakenTradeEvent,
+            log_kraken_trade_event,
+        )
+        ev = KrakenTradeEvent(
+            strategy=str(getattr(intent, "strategy", "alpha_crypto") or "alpha_crypto"),
+            pair=str(getattr(intent, "pair", "") or ""),
+            side=str(getattr(intent, "side", "") or ""),
+            ordertype=str(getattr(intent, "ordertype", "") or ""),
+            volume=float(getattr(intent, "volume", 0.0) or 0.0),
+            notional_estimate=float(getattr(intent, "notional_estimate", 0.0) or 0.0),
+            txid=synthetic_txid,
+            raw=dict(getattr(resp, "raw", {}) or {}),
+        )
+        trade_history_path = log_kraken_trade_event(
+            ev,
+            paper=True,
+            fill_price=price_used,
+            expected_price=price_used,
+        )
+    except Exception as exc:
+        logger.warning("KRAKEN_PAPER_TRADE_HISTORY_FAILED: %s", exc)
+
+    # --- Paper exec evidence (FILLS_/FEES_/EXECUTION_METRICS_) ---
+    fills_path = ""
+    try:
+        from chad.execution.paper_exec_evidence_writer import (
+            PaperExecEvidence,
+            write_paper_exec_evidence,
+        )
+        canonical_symbol = _kraken_pair_to_canonical(str(getattr(intent, "pair", "") or ""))
+        volume = float(getattr(intent, "volume", 0.0) or 0.0)
+        notional = float(getattr(intent, "notional_estimate", 0.0) or 0.0)
+        if notional <= 0.0 and volume > 0.0 and price_used > 0.0:
+            notional = volume * price_used
+
+        ev = PaperExecEvidence(
+            symbol=canonical_symbol,
+            side=str(getattr(intent, "side", "") or "BUY").upper(),
+            quantity=volume,
+            fill_price=price_used,
+            notional=notional,
+            strategy=str(getattr(intent, "strategy", "alpha_crypto") or "alpha_crypto"),
+            broker="kraken_paper",
+            venue="kraken_paper",
+            account_id="KRAKEN_PAPER",
+            is_live=False,
+            asset_class="crypto",
+            order_type=str(getattr(intent, "ordertype", "SIM") or "SIM"),
+            status="paper_fill",
+            expected_price=price_used,
+            execution_id=synthetic_txid,
+            tags=[
+                "kraken_paper",
+                "validate_only",
+                "paper_fill",
+                "pnl_untrusted",
+            ],
+            extra={
+                "source": "kraken_paper_evidence",
+                "synthetic_txid": synthetic_txid,
+                "pair": str(getattr(intent, "pair", "") or ""),
+                "minute_bucket": bucket,
+                "validate_only": True,
+                "pnl_untrusted": True,
+                "pnl_untrusted_reason": "kraken_paper_validate_only_no_realized_fill",
+                "risk_allowed": bool(getattr(risk_result, "allowed", False)),
+                "risk_adjusted_notional": float(
+                    getattr(risk_result, "adjusted_notional", 0.0) or 0.0
+                ),
+                "raw_response": dict(getattr(resp, "raw", {}) or {}),
+            },
+            source="kraken_paper_evidence",
+        )
+        meta = write_paper_exec_evidence(ev)
+        fills_path = str(meta.get("fills_path", "") or "")
+    except Exception as exc:
+        logger.warning("KRAKEN_PAPER_FILLS_EVIDENCE_FAILED: %s", exc)
+
+    logger.info(
+        "KRAKEN_PAPER_EVIDENCE_WRITTEN txid=%s strategy=%s pair=%s side=%s "
+        "volume=%s price=%s bucket=%s trade_history=%s fills=%s",
+        synthetic_txid,
+        getattr(intent, "strategy", None),
+        getattr(intent, "pair", None),
+        getattr(intent, "side", None),
+        getattr(intent, "volume", None),
+        price_used,
+        bucket,
+        trade_history_path or "<skipped>",
+        fills_path or "<skipped>",
+    )
+    return {
+        "written": True,
+        "reason": "inserted",
+        "txid": synthetic_txid,
+        "minute_bucket": bucket,
+        "trade_history_path": trade_history_path,
+        "fills_path": fills_path,
+        "price_used": price_used,
+    }
+
+
 def execute_kraken_intents(logger: logging.Logger, kraken_intents: List[object]) -> None:
     """
     Execute Kraken (CRYPTO) intents through KrakenExecutor.
@@ -181,6 +447,29 @@ def execute_kraken_intents(logger: logging.Logger, kraken_intents: List[object])
                 payload["pair"], payload["side"], payload["volume"],
                 payload["risk_allowed"], txids,
             )
+
+            # Paper-Kraken evidence write: when a validate-only call succeeded
+            # against a risk-allowed intent and Kraken returned no txids (the
+            # expected validate_only=True shape), persist standard CHAD paper
+            # evidence so SCR / daily reports / strategy_routing_diagnostics
+            # see the activity. Live txid path is unchanged; if txids are
+            # present we never duplicate.
+            if (
+                mode == "paper_kraken"
+                and not live
+                and bool(getattr(risk_result, "allowed", False))
+                and resp is not None
+                and not txids
+            ):
+                try:
+                    _write_paper_kraken_evidence(logger, intent, risk_result, resp)
+                except Exception as exc:
+                    logger.warning(
+                        "KRAKEN_PAPER_EVIDENCE_WRITE_FAILED pair=%s side=%s: %s",
+                        getattr(intent, "pair", None),
+                        getattr(intent, "side", None),
+                        exc,
+                    )
         except Exception as exc:
             logger.warning(
                 "KRAKEN_INTENT_FAILED pair=%s side=%s vol=%s: %s",

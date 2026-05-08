@@ -69,56 +69,118 @@ class KrakenTradeEvent:
     raw: Dict[str, Any]
 
 
+# CHAD canonical reverse map for Kraken altnames. Used so paper evidence
+# records carry the same canonical symbol form as the rest of the lane
+# (SOLUSD -> SOL-USD, XBTUSD -> BTC-USD, etc.) instead of the broker
+# altname. Live records keep their existing derivation for backward
+# compatibility.
+_KRAKEN_ALTNAME_TO_CANONICAL: Dict[str, str] = {
+    "XBTUSD": "BTC-USD",
+    "XXBTZUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+    "XETHZUSD": "ETH-USD",
+    "SOLUSD": "SOL-USD",
+    "XBTCAD": "BTC-CAD",
+    "XXBTZCAD": "BTC-CAD",
+    "ETHCAD": "ETH-CAD",
+    "XETHZCAD": "ETH-CAD",
+}
+
+
+def _canonical_symbol_for_pair(pair: str) -> str:
+    p = (pair or "").strip().upper()
+    if p in _KRAKEN_ALTNAME_TO_CANONICAL:
+        return _KRAKEN_ALTNAME_TO_CANONICAL[p]
+    if p.startswith("X") and "Z" in p:
+        return p.split("Z", 1)[0]
+    return p
+
+
 def log_kraken_trade_event(
     event: KrakenTradeEvent,
     *,
     account_id: Optional[str] = None,
+    paper: bool = False,
+    fill_price: float = 0.0,
+    expected_price: float = 0.0,
 ) -> str:
     """
     Convert a KrakenTradeEvent into a CHAD TradeResult record and append to ledger.
+
+    paper=False (default) preserves the live wiring: broker="kraken",
+    is_live=True, and the legacy altname-stripped display symbol.
+
+    paper=True writes a paper-mode TradeResult with broker="kraken_paper",
+    is_live=False, the canonical symbol form (SOLUSD -> SOL-USD), and
+    tags identifying the validate-only origin. PnL stays 0.0 / untrusted —
+    we never invent realized PnL on a validate-only response.
 
     Returns:
       log_path (string path) returned by log_trade_result
     """
     now = _utc_now_iso()
 
-    # Derive a display symbol. For Kraken pairs like XXBTZCAD -> XXBT.
-    # If format unexpected, keep full pair.
-    sym = event.pair
-    if sym.startswith("X") and "Z" in sym:
-        # Common Kraken format: XXBTZCAD (base=XXBT)
-        sym = sym.split("Z", 1)[0]
+    if paper:
+        sym = _canonical_symbol_for_pair(event.pair)
+        broker = "kraken_paper"
+        is_live = False
+        tags = [
+            "kraken_paper",
+            "pnl_untrusted",
+            "validate_only",
+            event.strategy,
+            event.side.lower(),
+            event.ordertype.lower(),
+        ]
+        extra: Dict[str, Any] = {
+            "source": "kraken_executor",
+            "txid": event.txid,
+            "pair": event.pair,
+            "ordertype": event.ordertype,
+            "raw": event.raw,
+            "pnl_untrusted": True,
+            "pnl_untrusted_reason": "kraken_paper_validate_only_no_realized_fill",
+            "validate_only": True,
+            "expected_price": float(expected_price or 0.0),
+        }
+    else:
+        # Derive a display symbol. For Kraken pairs like XXBTZCAD -> XXBT.
+        # If format unexpected, keep full pair.
+        sym = event.pair
+        if sym.startswith("X") and "Z" in sym:
+            sym = sym.split("Z", 1)[0]
 
-    tags = [
-        "kraken_live",
-        "pnl_untrusted",
-        event.strategy,
-        event.side.lower(),
-        event.ordertype.lower(),
-    ]
-
-    extra: Dict[str, Any] = {
-        "source": "kraken_executor",
-        "txid": event.txid,
-        "pair": event.pair,
-        "ordertype": event.ordertype,
-        "raw": event.raw,
-        "pnl_untrusted": True,
-        "pnl_untrusted_reason": "kraken_fill_price_and_realized_pnl_not_available_yet",
-    }
+        broker = "kraken"
+        is_live = True
+        tags = [
+            "kraken_live",
+            "pnl_untrusted",
+            event.strategy,
+            event.side.lower(),
+            event.ordertype.lower(),
+        ]
+        extra = {
+            "source": "kraken_executor",
+            "txid": event.txid,
+            "pair": event.pair,
+            "ordertype": event.ordertype,
+            "raw": event.raw,
+            "pnl_untrusted": True,
+            "pnl_untrusted_reason": "kraken_fill_price_and_realized_pnl_not_available_yet",
+        }
 
     tr = TradeResult(
         strategy=event.strategy,
         symbol=sym,
         side=event.side.upper(),
         quantity=float(event.volume),
-        fill_price=0.0,  # unknown at this layer; fill details come later
+        fill_price=float(fill_price or 0.0),
         notional=float(event.notional_estimate),
-        pnl=0.0,  # unknown for now; treated as trusted but neutral
+        pnl=0.0,
         entry_time_utc=now,
         exit_time_utc=now,
-        is_live=True,
-        broker="kraken",
+        is_live=is_live,
+        broker=broker,
         account_id=account_id,
         regime=resolve_regime_label(now_utc=datetime.now(timezone.utc)),
         tags=tags,
