@@ -205,7 +205,15 @@ def test_fetch_chain_via_contract_details_success_returns_data(
 def _install_fake_ib_insync(
     monkeypatch: pytest.MonkeyPatch, fake_ib: _FakeIB
 ) -> None:
-    """Inject a minimal ib_insync substitute that never opens a socket."""
+    """Inject a minimal IB substitute under both ib_insync and ib_async.
+
+    GAP-A019: Phase 1 migrations swap production imports from ib_insync to
+    ib_async one file at a time. To keep this fake fixture usable across
+    both pre- and post-migration source, the same module object is bound
+    under both names in sys.modules. Lazy imports inside production
+    (``from ib_insync import IB`` or ``from ib_async import IB``) both
+    resolve to the same fake and never open a real socket.
+    """
 
     fake_module = types.ModuleType("ib_insync")
 
@@ -228,6 +236,7 @@ def _install_fake_ib_insync(
     fake_module.Stock = _Stock  # type: ignore[attr-defined]
     fake_module.Option = _Option  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "ib_insync", fake_module)
+    monkeypatch.setitem(sys.modules, "ib_async", fake_module)
 
 
 def test_options_chain_refresh_times_out_cleanly(
@@ -302,3 +311,38 @@ def test_options_chain_refresh_success_writes_populated_cache(
     assert spy["strikes"], "expected at least one strike"
     # Success path should NOT produce an error field.
     assert "error" not in payload
+
+
+def test_install_fake_ib_intercepts_both_namespaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared fake must intercept ib_insync AND ib_async imports.
+
+    GAP-A019 phase 1 migrations swap production imports between the two
+    libraries one file at a time. A single fixture call has to satisfy
+    both lazy ``from ib_insync import IB`` (pre-migration) and
+    ``from ib_async import IB`` (post-migration) so future batches do
+    not regress against real-broker test runs.
+    """
+    import importlib
+
+    fake_ib = _FakeIB(mode="success", spot=100.0)
+    _install_fake_ib_insync(monkeypatch, fake_ib)
+
+    insync = importlib.import_module("ib_insync")
+    asyncmod = importlib.import_module("ib_async")
+
+    # Same fake module bound under both names — single source of truth
+    # so attribute lookups stay in lockstep.
+    assert insync is asyncmod
+
+    # IB() factory returns the injected fake under either name.
+    assert insync.IB() is fake_ib
+    assert asyncmod.IB() is fake_ib
+
+    # Stock / Option symbols resolve under either name (covers the
+    # ``from ib_async import Stock, Option`` pattern used by
+    # options_chain_refresh.py).
+    assert insync.Stock("SPY", "SMART", "USD").symbol == "SPY"
+    assert asyncmod.Stock("SPY", "SMART", "USD").symbol == "SPY"
+    assert asyncmod.Option(symbol="SPY", strike=500.0).symbol == "SPY"
