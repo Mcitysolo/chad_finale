@@ -1,14 +1,37 @@
-"""GAP-007 ib_async migration — install + import-parity validation.
+"""GAP-007 / GAP-A019 ib_async migration — install + import-parity validation.
 
 Phase 0 validated that ib_async can be installed and imported alongside
-ib_insync. Phase 1 begins migrating low-risk source imports, but in this
-codebase every current ib_insync importer is on an active broker path
-(connection, positions/fills, order placement, market-data) or is in an
-explicitly-excluded category (live_loop, ibkr_adapter, gateway health,
-broker collectors/publishers, fill harvesting, portfolio snapshot,
-price cache, options chain, execution). No production source file met
-the strict Phase 1 low-risk criteria, so PHASE1_MIGRATED_FILES is empty
-and every existing importer is recorded in PHASE2_DEFERRED_FILES.
+ib_insync. Phase 1 begins migrating low-risk source imports.
+
+GAP-A019 Phase 1A re-classification (audit only — no production imports
+were edited in this pass):
+
+The previous classification recorded every ib_insync importer in
+PHASE2_DEFERRED_FILES on the basis that every importer is on an active
+broker path. A finer-grained re-audit (read-only grep of every importer)
+shows three distinct usage profiles:
+
+- EXECUTION_PATH — places, cancels, or modifies orders (placeOrder,
+  cancelOrder, MarketOrder/LimitOrder/whatIfOrder). These remain
+  Phase 2 and MUST NOT migrate without a dedicated execution-path
+  safety harness.
+- MARKET_DATA / READ_ONLY_BROKER / PORTFOLIO_RECONCILIATION — connects
+  to IBKR but only reads (positions(), fills(), accountSummary(),
+  reqHistoricalData, reqMktData, reqContractDetails, reqCurrentTime,
+  managedAccounts, qualifyContracts). No order-affecting calls.
+  Verified by grep across each file: zero matches for placeOrder,
+  cancelOrder, modifyOrder, MarketOrder, LimitOrder, StopOrder,
+  bracketOrder, whatIfOrder, oneCancelsAll, reqGlobalCancel, or reqIds.
+
+The 18 read-only files are recorded as PROPOSED_PHASE1_CANDIDATES.
+They are NOT migrated by this audit — PHASE2_DEFERRED_FILES is the
+only enforced ledger and remains unchanged. Migrating each candidate
+is a separate, single-file change with its own verification.
+
+Files explicitly excluded from any Phase 1 candidacy regardless of
+audit findings (mandated Phase 2): chad/execution/ibkr_adapter.py,
+chad/core/live_loop.py, chad/core/orchestrator.py,
+chad/execution/execution_pipeline.py.
 
 The Phase 1 contract enforced here:
 - No file in PHASE1_MIGRATED_FILES may import ib_insync.
@@ -16,6 +39,9 @@ The Phase 1 contract enforced here:
   removing one is an explicit, reviewed action).
 - Every production source file that imports ib_insync must appear in
   PHASE2_DEFERRED_FILES (no silent additions).
+- PROPOSED_PHASE1_CANDIDATES is a documentation-only subset of
+  PHASE2_DEFERRED_FILES; it carries no enforcement until a file is
+  promoted into PHASE1_MIGRATED_FILES by an explicit migration commit.
 """
 
 import os
@@ -53,6 +79,49 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
     "chad/dashboard/api.py",
     "chad/execution/ibkr_adapter.py",
     "chad/execution/ibkr_trade_router.py",
+    "chad/intel/advisory_engine.py",
+    "chad/market_data/ibkr_bar_provider.py",
+    "chad/market_data/ibkr_historical_provider.py",
+    "chad/market_data/ibkr_price_provider.py",
+    "chad/market_data/nightly_bars_refresh.py",
+    "chad/market_data/options_chain_refresh.py",
+    "chad/market_data/price_cache_refresh.py",
+    "chad/ops/ibkr_broker_events_collector.py",
+    "chad/ops/portfolio_snapshot_publisher.py",
+    "chad/ops/reconciliation_publisher.py",
+    "chad/options/chain_provider.py",
+    "chad/portfolio/ibkr_paper_fill_harvester.py",
+    "chad/portfolio/ibkr_paper_ledger_watcher.py",
+    "chad/portfolio/ibkr_portfolio_collector_v2.py",
+)
+
+
+# GAP-A019 Phase 1A re-classification candidates. Documentation-only.
+#
+# These files were verified by re-audit to have NO order-affecting calls
+# (no placeOrder / cancelOrder / modifyOrder / MarketOrder / LimitOrder /
+# StopOrder / bracketOrder / whatIfOrder / oneCancelsAll /
+# reqGlobalCancel / reqIds). They use the IBKR connection only for
+# market data, account/positions/fills reads, or contract qualification.
+#
+# Listing here records that they are eligible for Phase 1 migration in
+# subsequent single-file commits — it does NOT migrate them. They remain
+# in PHASE2_DEFERRED_FILES until each is moved by an explicit migration
+# commit (and added to PHASE1_MIGRATED_FILES).
+#
+# Files explicitly excluded from candidacy regardless of read-only status
+# (mandated Phase 2 by GAP-A019 scope): chad/execution/ibkr_adapter.py,
+# chad/core/live_loop.py, chad/core/orchestrator.py,
+# chad/execution/execution_pipeline.py.
+#
+# Files NOT in this list because they are EXECUTION_PATH (place orders):
+#   chad/core/paper_position_closer.py, chad/core/paper_shadow_runner.py,
+#   chad/execution/ibkr_trade_router.py.
+PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = (
+    "backend/ibkr.py",
+    "chad/core/broker_position_sync.py",
+    "chad/core/ibkr_healthcheck.py",
+    "chad/dashboard/api.py",
     "chad/intel/advisory_engine.py",
     "chad/market_data/ibkr_bar_provider.py",
     "chad/market_data/ibkr_historical_provider.py",
@@ -233,6 +302,33 @@ def test_remaining_ib_insync_imports_are_explicitly_allowlisted():
         "Production files importing ib_insync must appear in "
         "PHASE2_DEFERRED_FILES (or be migrated and recorded in "
         f"PHASE1_MIGRATED_FILES). Unexpected importers: {unexpected}"
+    )
+
+
+def test_proposed_phase1_candidates_are_subset_of_phase2_deferred():
+    """PROPOSED_PHASE1_CANDIDATES is a documentation-only audit artifact.
+
+    Until a candidate is migrated by an explicit single-file commit,
+    it must remain in PHASE2_DEFERRED_FILES. Drift here would mean the
+    audit list silently became a migration ledger.
+    """
+    deferred = set(PHASE2_DEFERRED_FILES)
+    migrated = set(PHASE1_MIGRATED_FILES)
+    candidates = set(PROPOSED_PHASE1_CANDIDATES)
+
+    not_deferred = sorted(candidates - deferred)
+    leaked_into_migrated = sorted(candidates & migrated)
+
+    assert not_deferred == [], (
+        "PROPOSED_PHASE1_CANDIDATES entries must still be tracked in "
+        "PHASE2_DEFERRED_FILES until they are migrated by an explicit "
+        f"commit. Missing from PHASE2_DEFERRED_FILES: {not_deferred}"
+    )
+    assert leaked_into_migrated == [], (
+        "Once a file is migrated it should be removed from "
+        "PROPOSED_PHASE1_CANDIDATES (move it cleanly into "
+        "PHASE1_MIGRATED_FILES). Found in both: "
+        f"{leaked_into_migrated}"
     )
 
 
