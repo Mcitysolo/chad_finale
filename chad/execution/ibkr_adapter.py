@@ -1331,6 +1331,9 @@ class IbkrAdapter:
         limit_price_raw = getattr(raw_intent, "limit_price", None)
         limit_price = None if limit_price_raw is None else _safe_float(limit_price_raw, float("nan"))
 
+        raw_meta = getattr(raw_intent, "meta", None)
+        meta: Dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
+
         return NormalizedIntent(
             strategy=strategy,
             symbol=symbol,
@@ -1345,7 +1348,7 @@ class IbkrAdapter:
             source_strategies=(strategy,),
             created_at=self._now_fn(),
             limit_price=limit_price,
-            meta={},
+            meta=meta,
         )
 
     # ------------------------------------------------------------------

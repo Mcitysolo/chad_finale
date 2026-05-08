@@ -62,6 +62,10 @@ from chad.analytics.timeframe_confirmation import (
 from chad.analytics.vote_collector import get_default_collector as _get_vote_collector
 from chad.execution.ibkr_executor import StrategyTradeIntent as IBKRStrategyTradeIntent
 from chad.execution.intent_schema import utc_now_iso
+from chad.market_data.futures_contract_resolver import (
+    SOURCE_NAME as _FUTURES_RESOLVER_SOURCE,
+    resolve_contract_month as _resolve_contract_month,
+)
 from chad.execution.order_type_selector import (
     compute_aggressive_limit_price,
     estimate_spread_pct,
@@ -1146,6 +1150,37 @@ def build_ibkr_intents_from_plan(
             e4_limit_price = float(order.price)
         e4_order_type = order_params["order_type"]
 
+        # Carry through any planner-attached metadata (BAG/COMBO legs for
+        # options, etc.). For futures, attach a deterministic contract_month
+        # so the IBKR adapter does not need to call reqContractDetails in
+        # the hot path (P0-1).
+        intent_meta: Dict[str, Any] = {}
+        if isinstance(getattr(order, "metadata", None), Mapping):
+            intent_meta.update(order.metadata)
+
+        if spec.sec_type == "FUT":
+            existing_month = str(intent_meta.get("contract_month") or "").strip()
+            if not existing_month:
+                resolved_month = _resolve_contract_month(broker_symbol)
+                # Emit on the live_loop logger so this audit marker surfaces in
+                # journalctl alongside SUBMITTED/EVIDENCE_WRITTEN. The pipeline
+                # logger has no handler in the running daemon.
+                _live_log = logging.getLogger("chad.live_loop")
+                if resolved_month:
+                    resolved_at = utc_now_iso()
+                    intent_meta["contract_month"] = resolved_month
+                    intent_meta["contract_month_source"] = _FUTURES_RESOLVER_SOURCE
+                    intent_meta["contract_month_resolved_at_utc"] = resolved_at
+                    _live_log.info(
+                        "FUTURES_CONTRACT_MONTH_RESOLVED symbol=%s contract_month=%s source=%s",
+                        broker_symbol, resolved_month, _FUTURES_RESOLVER_SOURCE,
+                    )
+                else:
+                    _live_log.warning(
+                        "FUTURES_CONTRACT_MONTH_UNRESOLVED symbol=%s — adapter will reject",
+                        broker_symbol,
+                    )
+
         intent = IBKRStrategyTradeIntent(
             strategy=strategy_name,
             symbol=broker_symbol,
@@ -1169,6 +1204,7 @@ def build_ibkr_intents_from_plan(
             ),
             order_urgency=str(getattr(order, "order_urgency", "normal")),
             bar_timestamp=bar_ts_raw,
+            meta=intent_meta,
         )
 
         # Routing gates (Phase-8 Session 2: A4/E2/E5/R7 + Session 8 full

@@ -74,6 +74,11 @@ class StrategyTradeIntent:
     # Empty string preserves the Session-2 None-passthrough behavior.
     bar_timestamp: str = ""
 
+    # Free-form metadata propagated to the adapter. Required for futures
+    # (contract_month) and options (expiry/strike/right). Default empty
+    # dict keeps every existing construction site backward-compatible.
+    meta: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class RiskGateResult:
