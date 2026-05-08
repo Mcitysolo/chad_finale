@@ -59,18 +59,20 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Phase 1 migration ledger
 # ---------------------------------------------------------------------------
 
-# Files migrated from ib_insync to ib_async in Phase 1. Empty in this batch:
-# no production source file met the strict low-risk criteria (see module
-# docstring). Future Phase 1 follow-ups append paths here as new low-risk
-# candidates are validated.
-PHASE1_MIGRATED_FILES: tuple[str, ...] = ()
+# Files migrated from ib_insync to ib_async in Phase 1. Each entry was
+# previously in PHASE2_DEFERRED_FILES and was promoted via a single-file
+# migration commit after passing the parity-test invariants below.
+PHASE1_MIGRATED_FILES: tuple[str, ...] = (
+    # Phase 1B.1 (GAP-A019): READ_ONLY_BROKER health endpoint —
+    # managedAccounts + reqCurrentTime, no order-affecting calls.
+    "backend/ibkr.py",
+)
 
 # Production source files still importing ib_insync that are explicitly
 # deferred to Phase 2. Each entry is on an active broker path or in a
 # disallow-listed category. Phase 2 will migrate these with dedicated
 # IBKR safety tests.
 PHASE2_DEFERRED_FILES: tuple[str, ...] = (
-    "backend/ibkr.py",
     "chad/core/broker_position_sync.py",
     "chad/core/ibkr_healthcheck.py",
     "chad/core/live_loop.py",
@@ -118,7 +120,6 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
 #   chad/core/paper_position_closer.py, chad/core/paper_shadow_runner.py,
 #   chad/execution/ibkr_trade_router.py.
 PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = (
-    "backend/ibkr.py",
     "chad/core/broker_position_sync.py",
     "chad/core/ibkr_healthcheck.py",
     "chad/dashboard/api.py",

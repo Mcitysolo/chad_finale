@@ -32,7 +32,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException
 def _lazy_ib() -> "type[object]":
-    from ib_insync import IB  # type: ignore
+    from ib_async import IB  # type: ignore
     return IB
 
 IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
@@ -51,7 +51,7 @@ def _ensure_event_loop() -> None:
     Ensure the current thread has an asyncio event loop.
 
     FastAPI runs path handlers in AnyIO worker threads that may not have
-    a default event loop. ib_insync internally calls asyncio.get_event_loop(),
+    a default event loop. ib_async internally calls asyncio.get_event_loop(),
     so we create and set one if needed.
     """
     try:
