@@ -66,7 +66,7 @@ class IBKRPortfolioCollector:
         """
         Returns NetLiquidation (USD) for the configured account, or sum across accounts if not set.
         """
-        from ib_insync import IB  # type: ignore[import]
+        from ib_async import IB  # type: ignore[import]
 
         ib = IB()
         try:
@@ -166,7 +166,7 @@ class IBKRPortfolioCollector:
 
         This is the broker-authority source for reconciliation.
         """
-        from ib_insync import IB  # type: ignore[import]
+        from ib_async import IB  # type: ignore[import]
 
         path = positions_path or self._default_positions_path()
         ib = IB()

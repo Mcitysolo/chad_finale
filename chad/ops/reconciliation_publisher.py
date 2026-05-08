@@ -210,7 +210,7 @@ def _load_guard_breakdown() -> Dict[str, Dict[str, float]]:
 
 def _load_broker_positions() -> Dict[str, float]:
     """Connect to IBKR with clientId=83 and return signed positions by symbol."""
-    from ib_insync import IB
+    from ib_async import IB
 
     ib = IB()
     try:

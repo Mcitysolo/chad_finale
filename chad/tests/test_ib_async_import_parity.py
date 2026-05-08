@@ -85,6 +85,17 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
     "chad/market_data/options_chain_refresh.py",
     "chad/market_data/price_cache_refresh.py",
     "chad/options/chain_provider.py",
+    # Phase 1B.5 (GAP-A019) Batch 3: reconciliation / ledger readers —
+    # broker events collector, portfolio + reconciliation publishers,
+    # paper fill harvester / ledger watcher, portfolio collector v2.
+    # All connect read-only (positions(), fills(), accountSummary,
+    # commissionReports) with no order-affecting calls.
+    "chad/ops/ibkr_broker_events_collector.py",
+    "chad/ops/portfolio_snapshot_publisher.py",
+    "chad/ops/reconciliation_publisher.py",
+    "chad/portfolio/ibkr_paper_fill_harvester.py",
+    "chad/portfolio/ibkr_paper_ledger_watcher.py",
+    "chad/portfolio/ibkr_portfolio_collector_v2.py",
 )
 
 # Production source files still importing ib_insync that are explicitly
@@ -98,12 +109,6 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
     "chad/execution/ibkr_adapter.py",
     "chad/execution/ibkr_trade_router.py",
     "chad/intel/advisory_engine.py",
-    "chad/ops/ibkr_broker_events_collector.py",
-    "chad/ops/portfolio_snapshot_publisher.py",
-    "chad/ops/reconciliation_publisher.py",
-    "chad/portfolio/ibkr_paper_fill_harvester.py",
-    "chad/portfolio/ibkr_paper_ledger_watcher.py",
-    "chad/portfolio/ibkr_portfolio_collector_v2.py",
 )
 
 
@@ -130,12 +135,6 @@ PHASE2_DEFERRED_FILES: tuple[str, ...] = (
 #   chad/execution/ibkr_trade_router.py.
 PROPOSED_PHASE1_CANDIDATES: tuple[str, ...] = (
     "chad/intel/advisory_engine.py",
-    "chad/ops/ibkr_broker_events_collector.py",
-    "chad/ops/portfolio_snapshot_publisher.py",
-    "chad/ops/reconciliation_publisher.py",
-    "chad/portfolio/ibkr_paper_fill_harvester.py",
-    "chad/portfolio/ibkr_paper_ledger_watcher.py",
-    "chad/portfolio/ibkr_portfolio_collector_v2.py",
 )
 
 

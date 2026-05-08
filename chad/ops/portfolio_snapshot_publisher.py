@@ -59,7 +59,7 @@ def _ibkr_equity_usd() -> Optional[float]:
 
     Returns USD equity or None on failure.
     """
-    from ib_insync import IB, Forex
+    from ib_async import IB, Forex
 
     ib = IB()
     try:

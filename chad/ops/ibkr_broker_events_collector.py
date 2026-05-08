@@ -246,9 +246,9 @@ class IbkrConn:
 
 def connect_ibkr(cfg: IbkrConn):
     try:
-        from ib_insync import IB  # type: ignore
+        from ib_async import IB  # type: ignore
     except Exception as e:
-        raise RuntimeError("missing_dependency: ib_insync") from e
+        raise RuntimeError("missing_dependency: ib_async") from e
 
     last: Optional[Exception] = None
     for attempt in range(cfg.connect_retries + 1):

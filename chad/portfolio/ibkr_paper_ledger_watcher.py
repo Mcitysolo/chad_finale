@@ -61,8 +61,8 @@ from chad.core.regime_tag import resolve_regime_label
 from chad.utils.telegram_notify import NotifyError, notify
 
 try:
-    # Existing CHAD installs typically already have ib_insync.
-    from ib_insync import IB, Fill  # type: ignore
+    # Existing CHAD installs typically already have ib_async.
+    from ib_async import IB, Fill  # type: ignore
 except Exception:  # pragma: no cover - safe runtime fallback
     IB = None  # type: ignore
     Fill = Any  # type: ignore
@@ -663,7 +663,7 @@ class OpenStateStore:
 class IBSyncBrokerGateway:
     def __init__(self, host: str, port: int, client_id: int) -> None:
         if IB is None:
-            raise RuntimeError("ib_insync is not available in this environment")
+            raise RuntimeError("ib_async is not available in this environment")
         self._host = host
         self._port = port
         self._client_id = client_id

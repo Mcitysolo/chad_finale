@@ -264,7 +264,7 @@ def append_hash_chained_record(path: Path, payload: Dict[str, Any]) -> Dict[str,
 # ---------------------------------------------------------------------------
 
 def connect_ibkr():
-    from ib_insync import IB, util
+    from ib_async import IB, util
     util.patchAsyncio()
     ib = IB()
     ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID, timeout=15)
