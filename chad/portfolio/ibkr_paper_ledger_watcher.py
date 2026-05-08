@@ -79,6 +79,11 @@ ENV_FILE = Path("/etc/chad/telegram.env")
 DEFAULT_STATE_PATH = ROOT / "runtime" / "ibkr_paper_ledger_state.json"
 DEFAULT_REPORTS_DIR = ROOT / "reports" / "ledger"
 DEFAULT_TRADES_DIR = ROOT / "data" / "trades"
+DEFAULT_FILLS_DIR = ROOT / "data" / "fills"
+
+# GAP-A003: forward-only matcher for snapshot-diff closes.
+SNAPSHOT_DIFF_MATCHER_NAME = "snapshot_diff_fifo_v1"
+SNAPSHOT_DIFF_MATCHER_LOOKBACK_DAYS = 7
 
 LOGGER = logging.getLogger("chad.ibkr_paper_ledger_watcher")
 
@@ -172,6 +177,246 @@ def dedupe_keep_order(values: Iterable[str]) -> List[str]:
     return out
 
 
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    s = safe_str(value)
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _iter_ndjson(path: Path) -> Iterable[Dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj
+    except OSError:
+        return
+
+
+def _extract_payload(envelope: Mapping[str, Any]) -> Dict[str, Any]:
+    payload = envelope.get("payload") if isinstance(envelope, Mapping) else None
+    if isinstance(payload, dict):
+        return payload
+    return dict(envelope) if isinstance(envelope, Mapping) else {}
+
+
+# =============================================================================
+# GAP-A003: Snapshot-diff close fill matcher
+# =============================================================================
+
+@dataclass(slots=True, frozen=True)
+class MatchedOpeningFill:
+    fill_id: str
+    fill_price: float
+    quantity: float
+    fill_time_utc: str
+    source_path: str
+    contract_multiplier: float
+
+
+def collect_consumed_open_fill_ids(
+    trades_dir: Path,
+    *,
+    lookback_days: int = SNAPSHOT_DIFF_MATCHER_LOOKBACK_DAYS,
+    reference_time: Optional[datetime] = None,
+) -> set[str]:
+    """
+    Walk closed_trade.v1 records under trades_dir and return the set of opening
+    fill IDs already consumed by a prior close. Used by the snapshot-diff
+    matcher to prevent double-matching the same opening fill twice.
+    """
+    consumed: set[str] = set()
+    if not trades_dir.exists():
+        return consumed
+
+    ref = reference_time or utc_now()
+    cutoff = ref - timedelta(days=int(lookback_days) + 1)
+
+    for path in sorted(trades_dir.glob("trade_history_*.ndjson")):
+        try:
+            stem_date = path.stem.rsplit("_", 1)[-1]
+            file_dt = datetime.strptime(stem_date, "%Y%m%d").replace(tzinfo=timezone.utc)
+            if file_dt < cutoff - timedelta(days=1):
+                continue
+            if file_dt > ref + timedelta(days=2):
+                continue
+        except Exception:
+            pass
+
+        for envelope in _iter_ndjson(path):
+            payload = _extract_payload(envelope)
+            if not payload:
+                continue
+
+            fids = payload.get("fill_ids")
+            if isinstance(fids, list):
+                for fid in fids:
+                    s = safe_str(fid)
+                    if s:
+                        consumed.add(s)
+
+            entry_fid = safe_str(payload.get("entry_fill_id"))
+            if entry_fid:
+                consumed.add(entry_fid)
+
+            extra = payload.get("extra")
+            if isinstance(extra, dict):
+                m = safe_str(extra.get("matched_open_fill_id"))
+                if m:
+                    consumed.add(m)
+                ex_fids = extra.get("fill_ids")
+                if isinstance(ex_fids, list):
+                    for fid in ex_fids:
+                        s = safe_str(fid)
+                        if s:
+                            consumed.add(s)
+                ex_entry = safe_str(extra.get("entry_fill_id"))
+                if ex_entry:
+                    consumed.add(ex_entry)
+    return consumed
+
+
+def _fill_qualifies_as_open(
+    fill: Mapping[str, Any],
+    *,
+    strategy: str,
+    symbol: str,
+    expected_open_side: str,
+    close_time: datetime,
+    consumed_ids: set[str],
+) -> Tuple[bool, Optional[datetime]]:
+    fid = safe_str(fill.get("fill_id"))
+    if not fid or fid in consumed_ids:
+        return False, None
+
+    if normalize_strategy(fill.get("strategy"), "") != normalize_strategy(strategy, ""):
+        return False, None
+    if safe_str(fill.get("symbol")).upper() != safe_str(symbol).upper():
+        return False, None
+    if safe_str(fill.get("side")).upper() != safe_str(expected_open_side).upper():
+        return False, None
+
+    status = safe_str(fill.get("status")).lower()
+    if status not in {"paper_fill", "filled"}:
+        return False, None
+
+    if bool(fill.get("reject")):
+        return False, None
+
+    if bool(fill.get("pnl_untrusted")):
+        return False, None
+    extra = fill.get("extra")
+    if isinstance(extra, dict) and bool(extra.get("pnl_untrusted")):
+        return False, None
+
+    tags = fill.get("tags")
+    if isinstance(tags, list):
+        for tag in tags:
+            if safe_str(tag).strip().lower() == "pnl_untrusted":
+                return False, None
+
+    fill_ts = _parse_iso_utc(fill.get("fill_time_utc"))
+    if fill_ts is None or fill_ts > close_time:
+        return False, None
+
+    return True, fill_ts
+
+
+def find_matched_opening_fill_for_snapshot_close(
+    *,
+    strategy: str,
+    symbol: str,
+    expected_open_side: str,
+    close_time: datetime,
+    consumed_ids: set[str],
+    fills_dir: Path,
+    lookback_days: int = SNAPSHOT_DIFF_MATCHER_LOOKBACK_DAYS,
+) -> Optional[MatchedOpeningFill]:
+    """
+    Forward-only deterministic matcher for snapshot-diff closes.
+
+    Scans data/fills/FILLS_*.ndjson within lookback window and returns the most
+    recent unmatched opening fill that matches strategy + symbol + side + status
+    constraints. Returns None when no deterministic match exists.
+    """
+    if not fills_dir.exists():
+        return None
+
+    cutoff = close_time - timedelta(days=int(lookback_days))
+    candidates: List[Tuple[datetime, Mapping[str, Any], Path]] = []
+
+    for path in sorted(fills_dir.glob("FILLS_*.ndjson")):
+        try:
+            date_str = path.stem.split("_", 1)[1]
+            file_dt = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+            if file_dt < cutoff - timedelta(days=1):
+                continue
+            if file_dt > close_time + timedelta(days=1):
+                continue
+        except Exception:
+            pass
+
+        for envelope in _iter_ndjson(path):
+            payload = _extract_payload(envelope)
+            if not payload:
+                continue
+            ok, ts = _fill_qualifies_as_open(
+                payload,
+                strategy=strategy,
+                symbol=symbol,
+                expected_open_side=expected_open_side,
+                close_time=close_time,
+                consumed_ids=consumed_ids,
+            )
+            if not ok or ts is None or ts < cutoff:
+                continue
+            candidates.append((ts, payload, path))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    ts, fill, src_path = candidates[0]
+
+    fill_price = safe_float(fill.get("fill_price"), 0.0)
+    quantity = safe_float(fill.get("quantity"), 0.0)
+    if fill_price <= 0.0 or quantity <= 0.0:
+        return None
+
+    multiplier = safe_float(fill.get("contract_multiplier"), 0.0)
+    if multiplier <= 0.0:
+        ex = fill.get("extra")
+        if isinstance(ex, dict):
+            multiplier = safe_float(ex.get("contract_multiplier"), 0.0)
+    if multiplier <= 0.0:
+        multiplier = 1.0
+
+    return MatchedOpeningFill(
+        fill_id=safe_str(fill.get("fill_id")),
+        fill_price=fill_price,
+        quantity=quantity,
+        fill_time_utc=safe_str(fill.get("fill_time_utc")),
+        source_path=str(src_path),
+        contract_multiplier=multiplier,
+    )
+
+
 # =============================================================================
 # Interfaces / protocols
 # =============================================================================
@@ -207,7 +452,9 @@ class LedgerConfig:
     ibkr_client_id: int = 0
 
     trades_dir: Path = DEFAULT_TRADES_DIR
+    fills_dir: Path = DEFAULT_FILLS_DIR
     exec_window_seconds: float = 90.0
+    matcher_lookback_days: int = SNAPSHOT_DIFF_MATCHER_LOOKBACK_DAYS
 
     plan_artifact_path: Path = PLAN_ARTIFACT_DEFAULT
     notify_on_write: bool = False
@@ -232,7 +479,11 @@ class LedgerConfig:
             ibkr_port=safe_int(ibkr.get("port"), 4002),
             ibkr_client_id=safe_int(ibkr.get("client_id"), 0),
             trades_dir=Path(str(raw.get("trades_dir") or DEFAULT_TRADES_DIR)),
+            fills_dir=Path(str(raw.get("fills_dir") or DEFAULT_FILLS_DIR)),
             exec_window_seconds=max(1.0, safe_float(raw.get("exec_window_seconds"), 90.0)),
+            matcher_lookback_days=max(
+                1, safe_int(raw.get("matcher_lookback_days"), SNAPSHOT_DIFF_MATCHER_LOOKBACK_DAYS)
+            ),
             plan_artifact_path=Path(str(raw.get("plan_artifact_path") or PLAN_ARTIFACT_DEFAULT)),
             notify_on_write=bool(raw.get("notify_on_write", False)),
             notify_on_error=bool(raw.get("notify_on_error", True)),
@@ -633,6 +884,7 @@ class PaperLedgerWatcher:
         qty_open = safe_float(rec.get("qty"), 0.0)
         avg_cost = safe_float(rec.get("avg_cost"), 0.0)
         notional = abs(qty_open) * avg_cost
+        # `side` reflects the OPEN side of the position (BUY for long open, SELL for short open).
         side = "BUY" if qty_open > 0 else "SELL"
 
         strategy, source_strategies, attribution_source = self._attribution.resolve_close_strategy(rec, symbol)
@@ -655,18 +907,67 @@ class PaperLedgerWatcher:
             "plan_now_iso": rec.get("plan_now_iso"),
             "source_strategies": source_strategies,
             "attribution_source": attribution_source,
-            "pnl_untrusted": True,
-            "pnl_untrusted_reason": "symbol_close_detected_without_fill_matcher",
         }
+
+        # GAP-A003: try forward-only deterministic matcher to upgrade close trust.
+        match_result = self._try_match_snapshot_diff_close(
+            strategy=strategy,
+            symbol=symbol,
+            expected_open_side=side,
+            close_time=now,
+        )
+
+        quantity = abs(qty_open)
+        fill_price = avg_cost
+        pnl = 0.0
+
+        if match_result is not None:
+            matched = match_result
+            entry_price = matched.fill_price
+            exit_price = avg_cost
+            matched_qty = min(matched.quantity, abs(qty_open)) if matched.quantity > 0 else abs(qty_open)
+            multiplier = matched.contract_multiplier
+            if side == "BUY":
+                gross_pnl = (exit_price - entry_price) * matched_qty * multiplier
+            else:
+                gross_pnl = (entry_price - exit_price) * matched_qty * multiplier
+            quantity = matched_qty
+            fill_price = exit_price
+            pnl = gross_pnl
+            notional = matched_qty * exit_price
+            extra.update({
+                "pnl_untrusted": False,
+                "matched_open_fill_id": matched.fill_id,
+                "matched_open_fill_time_utc": matched.fill_time_utc,
+                "matched_open_fill_source": matched.source_path,
+                "matcher": SNAPSHOT_DIFF_MATCHER_NAME,
+                "pnl_trusted_reason": "matched_opening_fill_for_snapshot_diff_close",
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "contract_multiplier": multiplier,
+                "gross_pnl": gross_pnl,
+            })
+            report.add_detail(
+                event="snapshot_diff_close_trusted",
+                symbol=symbol,
+                strategy=strategy,
+                matched_open_fill_id=matched.fill_id,
+                matcher=SNAPSHOT_DIFF_MATCHER_NAME,
+            )
+        else:
+            extra.update({
+                "pnl_untrusted": True,
+                "pnl_untrusted_reason": "symbol_close_detected_without_fill_matcher",
+            })
 
         tr = TradeResult(
             strategy=strategy,
             symbol=symbol,
             side=side,
-            quantity=abs(qty_open),
-            fill_price=avg_cost,
+            quantity=quantity,
+            fill_price=fill_price,
             notional=notional,
-            pnl=0.0,
+            pnl=pnl,
             entry_time_utc=safe_str(rec.get("opened_at_utc"), iso_z(now)),
             exit_time_utc=iso_z(now),
             is_live=False,
@@ -687,10 +988,49 @@ class PaperLedgerWatcher:
             source_strategies=source_strategies,
             attribution_source=attribution_source,
             log_path=str(log_path),
+            pnl_untrusted=bool(extra.get("pnl_untrusted")),
         )
 
         if self._cfg.notify_on_write:
             self._safe_notify_write(symbol, strategy, log_path)
+
+    def _try_match_snapshot_diff_close(
+        self,
+        *,
+        strategy: str,
+        symbol: str,
+        expected_open_side: str,
+        close_time: datetime,
+    ) -> Optional[MatchedOpeningFill]:
+        """
+        Failure-soft wrapper around the GAP-A003 snapshot-diff matcher.
+
+        Any error (corrupt fill record, unreadable trade history, parse failure)
+        falls back to None — the caller then preserves the legacy untrusted
+        close behavior.
+        """
+        try:
+            consumed = collect_consumed_open_fill_ids(
+                self._cfg.trades_dir,
+                lookback_days=self._cfg.matcher_lookback_days,
+                reference_time=close_time,
+            )
+            return find_matched_opening_fill_for_snapshot_close(
+                strategy=strategy,
+                symbol=symbol,
+                expected_open_side=expected_open_side,
+                close_time=close_time,
+                consumed_ids=consumed,
+                fills_dir=self._cfg.fills_dir,
+                lookback_days=self._cfg.matcher_lookback_days,
+            )
+        except Exception:
+            LOGGER.exception(
+                "snapshot_diff_fifo_v1 matcher errored for symbol=%s strategy=%s — falling back to untrusted",
+                symbol,
+                strategy,
+            )
+            return None
 
     def _serialize_open_record(self, rec: OpenPositionRecord) -> Dict[str, Any]:
         return {
