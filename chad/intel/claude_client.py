@@ -68,7 +68,7 @@ OLLAMA_MIN_RAM_MB: int = int(
 _MODEL_COST_PER_1K_TOKENS: dict = {
     "claude-haiku-4-5-20251001": 0.001,
     "claude-sonnet-4-6": 0.003,
-    "claude-opus-4-6": 0.015,
+    "claude-opus-4-7": 0.015,
 }
 _DEFAULT_COST_PER_1K = 0.003  # conservative default
 

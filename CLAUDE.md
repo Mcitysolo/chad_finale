@@ -37,7 +37,7 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 1. OS reboot — no pending kernel update as of 2026-04-21 (kernel 6.17.0-1009-aws current; reboot deferred to next actual kernel update)
 2. Disk cleanup — prune backup archives to below 75% usage
 3. IB Gateway latency — investigate and resolve dangerous (>750ms) classification
-4. Verify all 82 tests pass after reboot
+4. Verify all 1360 tests pass after reboot
 5. Run full_cycle_preview.py --dry-run clean
 6. Confirm live_readiness.json flips to ready_for_live: true
 7. Review open paper positions (MES short) before mode switch
