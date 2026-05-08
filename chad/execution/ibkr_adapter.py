@@ -733,14 +733,44 @@ class _ContractResolver:
         kwargs: Dict[str, Any] = {}
         if primary_exchange:
             kwargs["primaryExchange"] = primary_exchange
-        contract = Stock(intent.symbol, intent.exchange, intent.currency, **kwargs)
+
+        # Defensive normalization (IBKR Error 321 fix): every STK contract
+        # submitted to IBKR must carry an explicit exchange and currency, or
+        # IB rejects with "Missing order exchange". Strategy-level intents
+        # (e.g. reconciler close intents) do not always populate these
+        # fields, so fall back to intent.meta then to configured defaults
+        # (SMART / USD). Explicit non-empty values are preserved verbatim.
+        meta_exchange = _safe_upper(intent.meta.get("exchange")) if intent.meta else ""
+        meta_currency = _safe_upper(intent.meta.get("currency")) if intent.meta else ""
+        intent_exchange = _safe_upper(intent.exchange)
+        intent_currency = _safe_upper(intent.currency)
+        exchange = (
+            intent_exchange
+            or meta_exchange
+            or _safe_upper(self._config.default_stock_exchange)
+            or "SMART"
+        )
+        currency = (
+            intent_currency
+            or meta_currency
+            or _safe_upper(self._config.default_stock_currency)
+            or "USD"
+        )
+        normalized = (exchange != intent_exchange) or (currency != intent_currency)
+
+        contract = Stock(intent.symbol, exchange, currency, **kwargs)
         summary = {
             "symbol": intent.symbol,
             "sec_type": "STK",
-            "exchange": intent.exchange,
-            "currency": intent.currency,
+            "exchange": exchange,
+            "currency": currency,
             "primary_exchange": primary_exchange,
         }
+        if normalized:
+            LOGGER.info(
+                "IBKR_CONTRACT_NORMALIZED symbol=%s sec_type=STK exchange=%s currency=%s",
+                intent.symbol, exchange, currency,
+            )
         return _ResolvedContract(contract=contract, summary=summary)
 
     def _resolve_forex(self, intent: NormalizedIntent) -> _ResolvedContract:
@@ -1333,6 +1363,19 @@ class IbkrAdapter:
 
         raw_meta = getattr(raw_intent, "meta", None)
         meta: Dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
+
+        # IBKR Error 321 fix: ensure STK intents always have an exchange and
+        # currency before they reach the resolver. Some intent producers
+        # (e.g. position_reconciler close intents) construct minimal objects
+        # that omit these fields entirely. Preserve explicit values; fall
+        # back to intent.meta; finally default to SMART / USD. Futures and
+        # other sec_types are handled by their own resolvers and must not
+        # be touched here so contract_month safety is preserved.
+        if sec_type == "STK":
+            if not exchange:
+                exchange = _safe_upper(meta.get("exchange")) or "SMART"
+            if not currency:
+                currency = _safe_upper(meta.get("currency")) or "USD"
 
         return NormalizedIntent(
             strategy=strategy,
