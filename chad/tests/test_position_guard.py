@@ -213,6 +213,88 @@ def test_mark_position_open_opposite_side_does_not_reduce(tmp_state):
     assert state["delta|SPY"]["side"] == "SELL"
 
 
+def test_close_stale_position_from_broker_truth_targets_only_named_entry(tmp_state):
+    """Stale broker-truth close must mutate only the (strategy, symbol) key.
+
+    Models the GAP-A001 follow-up: alpha_options|SPY is stale legacy state
+    while the SPY STK position and other strategies on SPY remain valid.
+    """
+    _seed(tmp_state, {
+        "alpha_options|SPY": {
+            "open": True, "strategy": "alpha_options", "symbol": "SPY",
+            "side": "BUY", "quantity": 0.5, "last_state": "MAINTAINED",
+        },
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 30.0, "last_state": "OPEN",
+        },
+        "alpha|SPY": {
+            "open": True, "strategy": "alpha", "symbol": "SPY",
+            "side": "BUY", "quantity": 6.0, "last_state": "MAINTAINED",
+        },
+        "alpha_options|QQQ": {
+            "open": True, "strategy": "alpha_options", "symbol": "QQQ",
+            "side": "BUY", "quantity": 1.0, "last_state": "OPEN",
+        },
+    })
+    evidence = {
+        "broker_account": "DUK902770",
+        "broker_sec_types_seen_for_symbol": ["STK"],
+        "no_matching_sec_types": ["OPT", "BAG"],
+        "operator_timestamp_utc": "2026-05-08T00:00:00+00:00",
+        "source": "manual_operator_reconciliation_after_gap_a001",
+    }
+
+    result = position_guard.close_stale_position_from_broker_truth(
+        "alpha_options", "SPY",
+        reason="broker_truth_no_matching_options_position",
+        evidence=evidence,
+    )
+    assert result is True
+
+    state = _load(tmp_state)
+
+    # Targeted entry closed with full audit trail, no fake fill.
+    closed = state["alpha_options|SPY"]
+    assert closed["open"] is False
+    assert closed["last_state"] == "CLOSED"
+    assert closed["closed_by"] == "broker_truth_no_matching_options_position"
+    assert closed["closed_reason"] == "stale_guard_entry"
+    assert closed["closed_evidence"] == evidence
+    assert "closed_fill_id" not in closed, "must not fabricate a fill id"
+
+    # Unrelated SPY stock and other-strategy entries are untouched.
+    assert state["broker_sync|SPY"]["open"] is True
+    assert state["broker_sync|SPY"]["quantity"] == 30.0
+    assert "closed_by" not in state["broker_sync|SPY"]
+    assert state["alpha|SPY"]["open"] is True
+    assert state["alpha|SPY"]["quantity"] == 6.0
+    assert "closed_by" not in state["alpha|SPY"]
+
+    # Unrelated alpha_options strategy on a different symbol is untouched.
+    assert state["alpha_options|QQQ"]["open"] is True
+    assert "closed_by" not in state["alpha_options|QQQ"]
+
+
+def test_close_stale_position_from_broker_truth_missing_key_is_noop(tmp_state):
+    """No mutation and no exception if the key does not exist."""
+    _seed(tmp_state, {
+        "alpha|SPY": {
+            "open": True, "strategy": "alpha", "symbol": "SPY",
+            "side": "BUY", "quantity": 6.0, "last_state": "OPEN",
+        },
+    })
+    result = position_guard.close_stale_position_from_broker_truth(
+        "alpha_options", "SPY",
+        reason="broker_truth_no_matching_options_position",
+        evidence={"source": "test"},
+    )
+    assert result is False
+    state = _load(tmp_state)
+    assert "alpha_options|SPY" not in state
+    assert state["alpha|SPY"]["open"] is True
+
+
 def test_rebuild_partial_attribution_multi_strategy(tmp_path, monkeypatch):
     """ISSUE-56 v2: rebuild reduces broker_sync across multiple strategy claims."""
     import logging

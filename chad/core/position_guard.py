@@ -409,3 +409,37 @@ def reset_from_broker(strategy: str, symbol: str) -> None:
 
 def reset_all_positions() -> None:
     save_state({})
+
+
+def close_stale_position_from_broker_truth(
+    strategy: str,
+    symbol: str,
+    reason: str,
+    evidence: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Close a single stale guard entry reconciled against broker truth.
+
+    Use only after operator-level confirmation that broker truth shows no
+    matching position for (strategy, symbol). No fill is fabricated and no
+    `closed_fill_id` is written — auditability is preserved via the
+    `closed_by`, `closed_reason`, and `closed_evidence` fields.
+
+    Mutates exactly one key (`<strategy>|<symbol>`); other entries are
+    untouched. Returns True iff the entry existed and was mutated;
+    returns False if the key is absent so callers can detect a no-op.
+    """
+    state = _load_state()
+    key = _position_key(strategy, symbol)
+    entry = state.get(key)
+    if not isinstance(entry, dict):
+        return False
+    now_iso = _utc_now_iso()
+    entry["open"] = False
+    entry["updated_at_utc"] = now_iso
+    entry["last_state"] = PositionState.CLOSED.value
+    entry["closed_by"] = str(reason)
+    entry["closed_reason"] = "stale_guard_entry"
+    entry["closed_evidence"] = dict(evidence) if isinstance(evidence, Mapping) else {}
+    entry["_entry_version"] = int(_time.time() * 1000)
+    write_position_guard(state)
+    return True
