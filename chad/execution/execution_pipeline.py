@@ -910,6 +910,11 @@ def build_execution_plan(
                 "long_strike", "short_strike", "long_right", "short_right",
                 "dte", "max_loss_per_contract", "net_debit_estimate",
                 "contracts", "required_asset_class", "engine",
+                # Single-leg OPT contract fields. Without these the IBKR
+                # adapter's _resolve_option cannot build a contract and the
+                # intent fails with ContractResolutionError "requires 'expiry'".
+                "strike", "right", "lastTradeDateOrContractMonth",
+                "exchange", "multiplier",
             )
             signal_meta = {
                 k: survivor_meta[k]
@@ -1158,6 +1163,76 @@ def build_ibkr_intents_from_plan(
         if isinstance(getattr(order, "metadata", None), Mapping):
             intent_meta.update(order.metadata)
 
+        # Effective sec_type — overridden below for OPTIONS when the
+        # survivor signal carries BAG/OPT contract metadata. Adapter
+        # contract validation (expiry/strike/right) is not weakened —
+        # this layer's job is only to (a) preserve strategy-emitted
+        # contract meta at the top level so the adapter can find it,
+        # and (b) skip clearly invalid OPT intents before submit.
+        effective_sec_type = spec.sec_type
+
+        # OPTIONS metadata preservation. alpha_options emits BAG signals
+        # whose contract fields (expiry, long_strike, short_strike,
+        # long_right, short_right, sec_type=BAG) are preserved by
+        # build_execution_plan into order.metadata["signal_meta"] as a
+        # nested dict. The IBKR adapter's _resolve_option / _resolve_combo
+        # reads these at the TOP level of intent.meta, so without this
+        # flatten step every alpha_options OPT intent fails with
+        # "requires 'expiry' in intent.meta". Equally, _resolve_options_spec
+        # hardcodes sec_type="OPT" — for true vertical spreads the
+        # effective sec_type must be "BAG" so the adapter takes the
+        # combo-resolution path.
+        if order.asset_class == AssetClass.OPTIONS:
+            signal_meta = intent_meta.get("signal_meta")
+            if isinstance(signal_meta, Mapping):
+                _OPT_META_KEYS = (
+                    "sec_type", "expiry", "lastTradeDateOrContractMonth",
+                    "strike", "right",
+                    "long_strike", "short_strike", "long_right", "short_right",
+                    "exchange", "multiplier", "spread_id", "spread_type",
+                    "dte", "net_debit_estimate",
+                )
+                for k in _OPT_META_KEYS:
+                    if k in signal_meta and signal_meta[k] is not None and k not in intent_meta:
+                        intent_meta[k] = signal_meta[k]
+            # Normalize lastTradeDateOrContractMonth → expiry (adapter
+            # accepts either, but downstream readers may key on "expiry").
+            if "expiry" not in intent_meta and intent_meta.get("lastTradeDateOrContractMonth"):
+                intent_meta["expiry"] = intent_meta["lastTradeDateOrContractMonth"]
+
+            # Determine effective sec_type from preserved meta. BAG wins
+            # when present; otherwise fall back to OPT (single-leg).
+            meta_sec_type = str(intent_meta.get("sec_type") or "").strip().upper()
+            if meta_sec_type == "BAG":
+                effective_sec_type = "BAG"
+            elif meta_sec_type == "OPT":
+                effective_sec_type = "OPT"
+            else:
+                # Heuristic: if BAG-style strikes are present but sec_type
+                # was not declared, treat as BAG.
+                if intent_meta.get("long_strike") is not None and intent_meta.get("short_strike") is not None:
+                    effective_sec_type = "BAG"
+                else:
+                    effective_sec_type = spec.sec_type  # "OPT" from resolver
+
+            # Pre-submit validation: refuse to send invalid OPT/BAG
+            # intents to the IBKR adapter. Skip with a clear log instead
+            # of letting the adapter raise ContractResolutionError.
+            if effective_sec_type == "BAG":
+                required = ("expiry", "long_strike", "short_strike", "long_right", "short_right")
+            else:
+                required = ("expiry", "strike", "right")
+            missing = [k for k in required if intent_meta.get(k) in (None, "")]
+            if missing:
+                _live_log_options = logging.getLogger("chad.live_loop")
+                _live_log_options.warning(
+                    "OPTIONS_INTENT_SKIPPED_MISSING_CONTRACT_META "
+                    "symbol=%s strategy=%s sec_type=%s missing=%s",
+                    broker_symbol, strategy_name, effective_sec_type,
+                    ",".join(missing),
+                )
+                continue
+
         if spec.sec_type == "FUT":
             existing_month = str(intent_meta.get("contract_month") or "").strip()
             if not existing_month:
@@ -1184,7 +1259,7 @@ def build_ibkr_intents_from_plan(
         intent = IBKRStrategyTradeIntent(
             strategy=strategy_name,
             symbol=broker_symbol,
-            sec_type=spec.sec_type,
+            sec_type=effective_sec_type,
             exchange=spec.exchange,
             currency=spec.currency,
             side=side,
