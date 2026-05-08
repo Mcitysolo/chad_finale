@@ -31,6 +31,59 @@ def test_load_config_missing_file_defaults_disabled(tmp_path: Path):
     assert cfg.enabled is False
 
 
+def test_load_config_reads_ibkr_block(tmp_path: Path):
+    """LedgerConfig.load must pick up host/port/client_id from the ibkr block."""
+    cfg_path = tmp_path / "ibkr_paper_ledger.json"
+    cfg_path.write_text(json.dumps({
+        "enabled": True,
+        "ibkr": {
+            "host": "127.0.0.1",
+            "port": 4002,
+            "client_id": 9040,
+        },
+    }))
+    cfg = LedgerConfig.load(cfg_path)
+    assert cfg.ibkr_host == "127.0.0.1"
+    assert cfg.ibkr_port == 4002
+    assert cfg.ibkr_client_id == 9040
+
+
+def test_load_config_does_not_resolve_to_zero_when_ibkr_block_present(tmp_path: Path):
+    """When the ibkr block is present with a non-zero client_id, the loaded
+    config must not silently fall back to clientId=0 (the IB Gateway wildcard,
+    which is unsafe for the watcher service)."""
+    cfg_path = tmp_path / "ibkr_paper_ledger.json"
+    cfg_path.write_text(json.dumps({
+        "enabled": True,
+        "ibkr": {
+            "host": "127.0.0.1",
+            "port": 4002,
+            "client_id": 9040,
+        },
+    }))
+    cfg = LedgerConfig.load(cfg_path)
+    assert cfg.ibkr_client_id != 0
+    assert cfg.ibkr_client_id == 9040
+
+
+def test_load_config_uses_registry_constant_for_ledger_watcher():
+    """The runtime config in this repo must point at the registered
+    LEDGER_WATCHER client id, so a future rename of the constant fails the
+    test and forces the config to be updated together."""
+    from chad.execution.ibkr_client_ids import LEDGER_WATCHER
+    repo_cfg = Path(__file__).resolve().parents[2] / "runtime" / "ibkr_paper_ledger.json"
+    if not repo_cfg.is_file():
+        # The runtime file is gitignored; skip cleanly when not present.
+        return
+    raw = json.loads(repo_cfg.read_text())
+    ibkr = raw.get("ibkr") or {}
+    assert ibkr.get("client_id") == LEDGER_WATCHER, (
+        f"runtime/ibkr_paper_ledger.json client_id={ibkr.get('client_id')} "
+        f"must equal ibkr_client_ids.LEDGER_WATCHER={LEDGER_WATCHER}"
+    )
+    assert ibkr.get("client_id") != 0, "client_id=0 is unsafe for the watcher"
+
+
 def test_run_once_disabled_writes_report(tmp_path: Path):
     cfg = LedgerConfig(
         enabled=False,

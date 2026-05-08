@@ -130,6 +130,13 @@ ADVISORY_ENGINE: int = 9036
 # Source: chad/dashboard/api.py — `clientId=80`.
 DASHBOARD_API: int = 80
 
+# Paper ledger watcher (read-only oneshot timer service that reconciles
+# runtime ledger state with broker truth). Configured via the `ibkr` block
+# in runtime/ibkr_paper_ledger.json; LedgerConfig.load() reads
+# ibkr.client_id from there. Explicit non-zero id required because
+# clientId=0 is the IB Gateway wildcard and is unsafe.
+LEDGER_WATCHER: int = 9040
+
 
 # ---------------------------------------------------------------------------
 # Programmatic access
@@ -154,6 +161,7 @@ def client_id_map() -> Dict[str, int]:
         "PAPER_SHADOW_RUNNER": PAPER_SHADOW_RUNNER,
         "ADVISORY_ENGINE": ADVISORY_ENGINE,
         "DASHBOARD_API": DASHBOARD_API,
+        "LEDGER_WATCHER": LEDGER_WATCHER,
     }
 
 

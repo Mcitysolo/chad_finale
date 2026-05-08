@@ -52,7 +52,25 @@ EXPECTED_VALUES = {
     "DASHBOARD_API": 80,
     "OPTIONS_CHAIN": 88,
     "NIGHTLY_BARS_REFRESH": 9053,
+    "LEDGER_WATCHER": 9040,
 }
+
+
+def test_ledger_watcher_registered_at_9040() -> None:
+    """LEDGER_WATCHER must be exported as a module constant equal to 9040."""
+    assert hasattr(ibkr_client_ids, "LEDGER_WATCHER")
+    assert ibkr_client_ids.LEDGER_WATCHER == 9040
+    cmap = ibkr_client_ids.client_id_map()
+    assert cmap.get("LEDGER_WATCHER") == 9040
+
+
+def test_all_registered_client_ids_are_unique() -> None:
+    """No two registered client ids may collide (IB Gateway Error 326)."""
+    cmap = ibkr_client_ids.client_id_map()
+    values = list(cmap.values())
+    assert len(values) == len(set(values)), (
+        f"duplicate client ids: {sorted(values)}"
+    )
 
 
 def test_ibkr_client_ids_have_no_collisions() -> None:
