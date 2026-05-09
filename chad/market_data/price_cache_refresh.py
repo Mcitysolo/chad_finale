@@ -227,14 +227,23 @@ def _get_provider() -> str:
 
 
 def _load_universe() -> list:
-    """Load equity/ETF symbol universe from config/universe.json."""
-    universe_path = Path("/home/ubuntu/chad_finale/config/universe.json")
+    """Load equity/ETF symbol universe via the central provider.
+
+    Prefers the live-screened runtime/universe.json (refreshed every ~30 min
+    by chad.analytics.universe_builder); falls back to config/universe.json
+    when runtime is missing/stale/malformed. Returning the same set the
+    screener just vetted means price_cache only fetches symbols the desk is
+    actually trading.
+    """
     try:
-        obj = json.loads(universe_path.read_text(encoding="utf-8"))
-        syms = obj.get("symbols", [])
-        return [str(s).strip().upper() for s in syms if str(s).strip()]
+        from chad.utils.universe_provider import load_active_universe
+        result = load_active_universe()
+        if result.symbols:
+            return list(result.symbols)
     except Exception:
-        return ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "NVDA", "BAC", "GLD", "SH", "IEMG", "VWO"]
+        pass
+    # Last-ditch fallback if the provider itself fails to import or run.
+    return ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "NVDA", "BAC", "GLD", "SH", "IEMG", "VWO"]
 
 
 def _load_futures_universe() -> list:

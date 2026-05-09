@@ -259,18 +259,23 @@ class PortfolioEngine:
         return obj, None
 
     def _fallback_tickers(self) -> List[str]:
-        # 1) config/universe.json
-        u = self.paths.config_dir / "universe.json"
-        obj, err = _read_json(u)
+        # 1) Prefer the live-screened runtime/universe.json via the central
+        #    universe provider; fall back to config/universe.json (any of the
+        #    legacy shapes) when runtime is missing/stale/malformed.
         tickers: List[str] = []
-        if not err and isinstance(obj, dict):
-            for key in ("tickers", "symbols", "universe"):
-                v = obj.get(key)
-                if isinstance(v, list):
-                    tickers = [str(x).strip().upper() for x in v if str(x).strip()]
-                    break
+        try:
+            from chad.utils.universe_provider import load_active_universe
+            result = load_active_universe(
+                runtime_path=self.paths.runtime_dir / "universe.json",
+                config_path=self.paths.config_dir / "universe.json",
+            )
+            tickers = list(result.symbols)
+        except Exception:
+            tickers = []
 
-        # 2) runtime/full_execution_cycle_last.json summary.tick_symbols
+        # 2) Plan-based fallback: runtime/full_execution_cycle_last.json
+        #    summary.tick_symbols, in case neither runtime nor config carried
+        #    a usable list.
         if not tickers:
             p = self.paths.runtime_dir / "full_execution_cycle_last.json"
             plan, perr = _read_json(p)

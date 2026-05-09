@@ -89,31 +89,40 @@ DEFAULT_UNIVERSE = [
 
 
 def _load_universe_from_config() -> List[str]:
-    """Load the full trading universe (equities + futures) from config/universe.json.
+    """Load the full trading universe (equities + futures) for bar subscriptions.
 
-    Falls back to DEFAULT_UNIVERSE if the file is missing or unreadable.
+    Equity/ETF symbols come from the central universe provider, which prefers
+    the live-screened runtime/universe.json over config/universe.json. Futures
+    symbols continue to come straight from config/universe.json — runtime
+    universe carries equities only, and the ``futures`` block is the only
+    source of contract metadata. Falls back to DEFAULT_UNIVERSE on any failure.
     """
     try:
-        obj = json.loads(UNIVERSE_CONFIG_PATH.read_text(encoding="utf-8"))
-        syms: List[str] = []
-        for s in obj.get("symbols", []) or []:
-            if isinstance(s, str) and s.strip():
-                syms.append(s.strip().upper())
-        for entry in obj.get("futures", []) or []:
-            if isinstance(entry, dict):
-                sym = str(entry.get("symbol", "")).strip().upper()
-                if sym:
-                    syms.append(sym)
-        # Deduplicate, preserve order
-        seen = set()
-        out: List[str] = []
-        for s in syms:
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out or list(DEFAULT_UNIVERSE)
+        from chad.utils.universe_provider import load_active_universe
+        equity_syms = list(load_active_universe().symbols)
     except Exception:
-        return list(DEFAULT_UNIVERSE)
+        equity_syms = []
+
+    futures_syms: List[str] = []
+    try:
+        if UNIVERSE_CONFIG_PATH.is_file():
+            obj = json.loads(UNIVERSE_CONFIG_PATH.read_text(encoding="utf-8"))
+            for entry in obj.get("futures", []) or []:
+                if isinstance(entry, dict):
+                    sym = str(entry.get("symbol", "")).strip().upper()
+                    if sym:
+                        futures_syms.append(sym)
+    except Exception:
+        futures_syms = []
+
+    # Deduplicate, preserve order: equities first, then futures.
+    seen = set()
+    out: List[str] = []
+    for s in equity_syms + futures_syms:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out or list(DEFAULT_UNIVERSE)
 
 
 # ---------------------------------------------------------------------------
