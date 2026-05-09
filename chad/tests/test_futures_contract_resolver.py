@@ -183,21 +183,30 @@ class _FakeIB:
         return True
 
 
-def _make_normalized_futures_intent(meta: Dict[str, Any]) -> NormalizedIntent:
+def _make_normalized_futures_intent(
+    meta: Dict[str, Any],
+    *,
+    symbol: str = "MES",
+    exchange: str = "CME",
+    currency: str = "USD",
+    strategy: str = "alpha_futures",
+    limit_price: float = 5800.0,
+    notional_estimate: float = 29000.0,
+) -> NormalizedIntent:
     return NormalizedIntent(
-        strategy="alpha_futures",
-        symbol="MES",
+        strategy=strategy,
+        symbol=symbol,
         sec_type="FUT",
-        exchange="CME",
-        currency="USD",
+        exchange=exchange,
+        currency=currency,
         side="BUY",
         order_type="LMT",
         quantity=1.0,
-        notional_estimate=29000.0,
+        notional_estimate=notional_estimate,
         asset_class="futures",
-        source_strategies=("alpha_futures",),
+        source_strategies=(strategy,),
         created_at=datetime.now(timezone.utc),
-        limit_price=5800.0,
+        limit_price=limit_price,
         meta=meta,
     )
 
@@ -215,5 +224,87 @@ def test_resolve_future_raises_when_contract_month_missing() -> None:
     cfg = IbkrConfig(dry_run=True)
     resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
     intent = _make_normalized_futures_intent({})
+    with pytest.raises(ContractResolutionError):
+        resolver._resolve_future(_FakeIB(), intent)
+
+
+# ---------------------------------------------------------------------------
+# 5) omega_macro futures resolver coverage (M6E / ZN / ZB)
+# ---------------------------------------------------------------------------
+
+
+def test_ibkr_adapter_resolves_m6e_future_with_contract_month() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {"contract_month": "202606"},
+        symbol="M6E",
+        exchange="CME",
+        strategy="omega_macro",
+    )
+    resolved = resolver._resolve_future(_FakeIB(), intent)
+    assert resolved.summary.get("symbol") == "M6E"
+    assert resolved.summary.get("sec_type") == "FUT"
+    assert resolved.summary.get("exchange") == "CME"
+    assert resolved.summary.get("currency") == "USD"
+    assert resolved.summary.get("contract_month") == "202606"
+    assert resolved.summary.get("resolution") == "explicit"
+
+
+def test_ibkr_adapter_resolves_zn_future_with_contract_month() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {"contract_month": "202606"},
+        symbol="ZN",
+        exchange="CBOT",
+        strategy="omega_macro",
+    )
+    resolved = resolver._resolve_future(_FakeIB(), intent)
+    assert resolved.summary.get("symbol") == "ZN"
+    assert resolved.summary.get("sec_type") == "FUT"
+    assert resolved.summary.get("exchange") == "CBOT"
+    assert resolved.summary.get("currency") == "USD"
+    assert resolved.summary.get("contract_month") == "202606"
+    assert resolved.summary.get("resolution") == "explicit"
+
+
+def test_ibkr_adapter_resolves_zb_future_with_contract_month() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {"contract_month": "202606"},
+        symbol="ZB",
+        exchange="CBOT",
+        strategy="omega_macro",
+    )
+    resolved = resolver._resolve_future(_FakeIB(), intent)
+    assert resolved.summary.get("symbol") == "ZB"
+    assert resolved.summary.get("sec_type") == "FUT"
+    assert resolved.summary.get("exchange") == "CBOT"
+    assert resolved.summary.get("currency") == "USD"
+    assert resolved.summary.get("contract_month") == "202606"
+    assert resolved.summary.get("resolution") == "explicit"
+
+
+def test_ibkr_adapter_m6e_missing_contract_month_still_raises() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {}, symbol="M6E", exchange="CME", strategy="omega_macro"
+    )
+    with pytest.raises(ContractResolutionError):
+        resolver._resolve_future(_FakeIB(), intent)
+
+
+def test_ibkr_adapter_unknown_future_still_raises() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {"contract_month": "202606"},
+        symbol="ZZZ",
+        exchange="CME",
+        strategy="omega_macro",
+    )
     with pytest.raises(ContractResolutionError):
         resolver._resolve_future(_FakeIB(), intent)

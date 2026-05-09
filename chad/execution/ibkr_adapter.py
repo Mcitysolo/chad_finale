@@ -285,6 +285,9 @@ class IbkrConfig:
             "MNQ": FuturesContractSpec(symbol="MNQ", exchange="CME", currency="USD", multiplier="2", notes="Micro E-mini Nasdaq-100"),
             "MCL": FuturesContractSpec(symbol="MCL", exchange="NYMEX", currency="USD", multiplier="100", notes="Micro WTI Crude Oil"),
             "MGC": FuturesContractSpec(symbol="MGC", exchange="COMEX", currency="USD", multiplier="10", notes="Micro Gold"),
+            "ZN": FuturesContractSpec(symbol="ZN", exchange="CBOT", currency="USD", multiplier="1000", notes="10-Year T-Note"),
+            "ZB": FuturesContractSpec(symbol="ZB", exchange="CBOT", currency="USD", multiplier="1000", notes="30-Year T-Bond"),
+            "M6E": FuturesContractSpec(symbol="M6E", exchange="CME", currency="USD", multiplier="12500", notes="Micro Euro FX"),
         }
     )
 
