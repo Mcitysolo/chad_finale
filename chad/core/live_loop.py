@@ -493,6 +493,34 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
     )
 
 
+# Roots used to collapse contract-month tickers (e.g. "MESM6", "MESZ6",
+# "MESH7") down to a stable root key for broker_sync guard entries. Without
+# this, a contract roll silently changes the guard key and the prior month's
+# entry is left as a zombie in position_guard.json.
+_BROKER_SYNC_FUTURES_ROOTS: tuple = (
+    "MES", "MNQ", "MCL", "MGC", "M2K", "MYM", "M6E", "ZN", "ZB",
+)
+_CME_MONTH_CODES: frozenset = frozenset("FGHJKMNQUVXZ")
+
+
+def _normalize_broker_sync_symbol(symbol: str) -> str:
+    """Collapse a futures contract-month ticker to its root.
+
+    "MESM6" -> "MES", "M2KZ7" -> "M2K". Non-futures (equities, ETFs) and
+    unrecognised symbols pass through unchanged. Sorts roots longest-first
+    so "MES" wins over any shorter prefix.
+    """
+    if not symbol:
+        return symbol
+    for root in sorted(_BROKER_SYNC_FUTURES_ROOTS, key=len, reverse=True):
+        if symbol == root or not symbol.startswith(root):
+            continue
+        tail = symbol[len(root):]
+        if 2 <= len(tail) <= 3 and tail[0] in _CME_MONTH_CODES and tail[1:].isdigit():
+            return root
+    return symbol
+
+
 def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     """
     Reconcile position_guard.json against actual broker positions.
@@ -522,18 +550,26 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     broker_positions = position_sync.fetch_positions()
     guard_state = _load_state()
 
-    broker_symbols = {sym for sym, pos in broker_positions.items() if abs(pos.quantity) > 1e-9}
+    # Collapse contract-month futures tickers ("MESM6") to their stable root
+    # ("MES") so guard keys survive contract rolls. Equities pass through.
+    broker_symbols = {
+        _normalize_broker_sync_symbol(sym)
+        for sym, pos in broker_positions.items()
+        if abs(pos.quantity) > 1e-9
+    }
     corrections_closed = 0
     corrections_opened = 0
 
-    # Close guard entries that the broker no longer holds
+    # Close guard entries that the broker no longer holds (compare on
+    # normalized symbol so a roll from MESM6 -> MESZ6 does not look like
+    # the position vanished).
     for key, entry in list(guard_state.items()):
         if str(key).startswith("_") or not isinstance(entry, dict):
             continue
         if not entry.get("open"):
             continue
         symbol = entry.get("symbol", "")
-        if symbol and symbol not in broker_symbols:
+        if symbol and _normalize_broker_sync_symbol(symbol) not in broker_symbols:
             entry["open"] = False
             entry["closed_by"] = "broker_truth_rebuild"
             corrections_closed += 1
@@ -544,8 +580,9 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     for sym, bp in broker_positions.items():
         if abs(bp.quantity) < 1e-9:
             continue
+        norm_sym = _normalize_broker_sync_symbol(sym)
         side = "BUY" if bp.quantity > 0 else "SELL"
-        fallback_key = f"broker_sync|{sym}"
+        fallback_key = f"broker_sync|{norm_sym}"
         now_iso = __import__("datetime").datetime.now(
             __import__("datetime").timezone.utc
         ).isoformat()
@@ -556,7 +593,7 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
             "opened_at": prior_opened or now_iso,
             "updated_at_utc": now_iso,
             "strategy": "broker_sync",
-            "symbol": sym,
+            "symbol": norm_sym,
             "side": side,
             "quantity": abs(bp.quantity),
             "source": "broker_truth_rebuild",
