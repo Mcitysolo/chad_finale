@@ -19,7 +19,7 @@ import os as _os
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 import json
 import time as _time
 
@@ -414,6 +414,78 @@ def reset_from_broker(strategy: str, symbol: str) -> None:
 
 def reset_all_positions() -> None:
     save_state({})
+
+
+def detect_guard_vs_broker_truth_drift(
+    state: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Pure read-only detector — flag strategy positions that disagree with broker_sync truth.
+
+    Scans `state` for non-`broker_sync` open entries, then compares each one to
+    the matching `broker_sync|<symbol>` entry. Returns a list of drift records:
+
+      - drift_kind="broker_truth_missing": strategy says open but broker_sync
+        has no open record for the same symbol.
+      - drift_kind="side_mismatch": strategy and broker_sync disagree on side.
+
+    No disk reads, no writes — caller passes the state dict in. Symbol/side
+    comparisons mirror the same `.upper().strip()` normalization used by
+    is_same_side_open / is_flip_signal so the detector cannot be fooled by
+    case or whitespace drift between writers.
+    """
+    if not isinstance(state, Mapping):
+        return []
+
+    broker_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for key, entry in state.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not key.startswith("broker_sync|"):
+            continue
+        if entry.get("open") is not True:
+            continue
+        symbol = str(entry.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        broker_by_symbol[symbol] = entry
+
+    drift: List[Dict[str, Any]] = []
+    for key, entry in state.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if key.startswith("_") or key.startswith("broker_sync|"):
+            continue
+        if entry.get("open") is not True:
+            continue
+        strategy = str(entry.get("strategy", "") or "").strip()
+        symbol = str(entry.get("symbol", "") or "").strip().upper()
+        guard_side = str(entry.get("side", "") or "").strip().upper()
+        if not symbol:
+            continue
+        broker_entry = broker_by_symbol.get(symbol)
+        if broker_entry is None:
+            drift.append({
+                "key": key,
+                "strategy": strategy,
+                "symbol": symbol,
+                "guard_side": guard_side,
+                "broker_side": None,
+                "broker_present": False,
+                "drift_kind": "broker_truth_missing",
+            })
+            continue
+        broker_side = str(broker_entry.get("side", "") or "").strip().upper()
+        if guard_side and broker_side and guard_side != broker_side:
+            drift.append({
+                "key": key,
+                "strategy": strategy,
+                "symbol": symbol,
+                "guard_side": guard_side,
+                "broker_side": broker_side,
+                "broker_present": True,
+                "drift_kind": "side_mismatch",
+            })
+    return drift
 
 
 def close_stale_position_from_broker_truth(

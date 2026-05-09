@@ -105,7 +105,7 @@ def test_position_guard_same_side_does_not_block_flip(tmp_state):
     assert position_guard.is_flip_signal(flip_lower) is True
 
 
-def test_position_guard_same_side_blocks_pyramid_existing_behavior(tmp_state):
+def test_position_guard_same_side_blocks_pyramid(tmp_state):
     """Current behavior: same-side add (pyramid) without explicit bypass is blocked.
 
     Pinned here so a future scale-in/pyramid bypass change has to consciously
@@ -119,6 +119,77 @@ def test_position_guard_same_side_blocks_pyramid_existing_behavior(tmp_state):
     })
     pyramid_intent = _Intent("alpha", "SPY", "SELL", 14.0)
     assert position_guard.is_same_side_open(pyramid_intent) is True
+
+
+def test_guard_vs_broker_truth_drift_detector(tmp_state):
+    """detect_guard_vs_broker_truth_drift is a pure detector — no disk writes.
+
+    Covers three states:
+      - alpha|SPY BUY vs broker_sync|SPY BUY    → no drift
+      - omega|GLD BUY but broker_sync|GLD missing → broker_truth_missing
+      - gamma|TLT SELL vs broker_sync|TLT BUY  → side_mismatch
+    """
+    seed_state = {
+        "alpha|SPY": {
+            "open": True, "strategy": "alpha", "symbol": "SPY",
+            "side": "BUY", "quantity": 5.0, "last_state": "MAINTAINED",
+        },
+        "broker_sync|SPY": {
+            "open": True, "strategy": "broker_sync", "symbol": "SPY",
+            "side": "BUY", "quantity": 5.0,
+        },
+        "omega|GLD": {
+            "open": True, "strategy": "omega", "symbol": "GLD",
+            "side": "BUY", "quantity": 3.0, "last_state": "OPEN",
+        },
+        "gamma|TLT": {
+            "open": True, "strategy": "gamma", "symbol": "TLT",
+            "side": "SELL", "quantity": 7.0, "last_state": "OPEN",
+        },
+        "broker_sync|TLT": {
+            "open": True, "strategy": "broker_sync", "symbol": "TLT",
+            "side": "BUY", "quantity": 7.0,
+        },
+        # Closed entries must be ignored by the detector.
+        "alpha|QQQ": {
+            "open": False, "strategy": "alpha", "symbol": "QQQ",
+            "side": "BUY", "last_state": "CLOSED",
+        },
+    }
+    _seed(tmp_state, seed_state)
+    pre_mtime = tmp_state.stat().st_mtime_ns
+
+    drift = position_guard.detect_guard_vs_broker_truth_drift(seed_state)
+
+    # Detector must NOT touch position_guard.json at all.
+    assert tmp_state.stat().st_mtime_ns == pre_mtime, (
+        "detect_guard_vs_broker_truth_drift mutated position_guard.json — "
+        "it must be a read-only detector."
+    )
+
+    by_kind = {d["drift_kind"]: d for d in drift}
+    assert set(by_kind) == {"broker_truth_missing", "side_mismatch"}, (
+        f"unexpected drift kinds: {sorted(by_kind)}"
+    )
+
+    missing = by_kind["broker_truth_missing"]
+    assert missing["strategy"] == "omega"
+    assert missing["symbol"] == "GLD"
+    assert missing["guard_side"] == "BUY"
+    assert missing["broker_side"] is None
+    assert missing["broker_present"] is False
+
+    mismatch = by_kind["side_mismatch"]
+    assert mismatch["strategy"] == "gamma"
+    assert mismatch["symbol"] == "TLT"
+    assert mismatch["guard_side"] == "SELL"
+    assert mismatch["broker_side"] == "BUY"
+    assert mismatch["broker_present"] is True
+
+    # alpha|SPY (matching broker truth) must NOT appear in drift.
+    assert all(d["key"] != "alpha|SPY" for d in drift)
+    # Closed entry must NOT appear in drift.
+    assert all(d["key"] != "alpha|QQQ" for d in drift)
 
 
 def test_live_loop_same_side_log_includes_strategy():
