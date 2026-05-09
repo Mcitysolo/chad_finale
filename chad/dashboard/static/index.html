@@ -100,12 +100,15 @@ section{margin-top:20px}
 }
 .milestone b{color:var(--text-primary);font-weight:700}
 
-.metrics{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.metrics{display:grid;grid-template-columns:repeat(3, 1fr);gap:16px;}
 .metric-label{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-secondary);}
 .metric-value{font-size:32px;font-weight:800;letter-spacing:-.6px;margin-top:6px;font-variant-numeric:tabular-nums;}
 .metric-value.red{color:var(--red)}
 .metric-value.green{color:var(--green)}
 .metric-sub{font-size:12px;color:var(--text-secondary);margin-top:4px;}
+.paper-stats{display:flex;gap:10px;margin-top:10px;color:var(--text-secondary);font-size:12px;flex-wrap:wrap;align-items:center;}
+.paper-stats .dotsep{color:var(--text-tertiary)}
+.paper-stats b{color:var(--text-primary);font-weight:700;font-variant-numeric:tabular-nums;}
 .sparkline{margin-top:12px;height:30px;width:100%;display:block;color:var(--text-tertiary);}
 .flash-green{animation:flashG .6s ease}
 .flash-red{animation:flashR .6s ease}
@@ -203,6 +206,7 @@ section{margin-top:20px}
 @media (max-width: 980px){
   .strat-grid{grid-template-columns:repeat(3,1fr)}
   .market-row{grid-template-columns:repeat(2,1fr)}
+  .metrics{grid-template-columns:1fr 1fr}
 }
 @media (max-width: 720px){
   .shell{padding:0 16px 48px}
@@ -333,9 +337,19 @@ section{margin-top:20px}
       </svg>
     </div>
     <div class="card">
-      <div class="metric-label">Realized P&amp;L</div>
+      <div class="metric-label">Today Realized P&amp;L</div>
       <div class="metric-value num" id="pnlVal">—</div>
-      <div class="metric-sub" id="pnlSub">Since clean slate</div>
+      <div class="metric-sub" id="pnlSub">Closed trades today</div>
+    </div>
+    <div class="card">
+      <div class="metric-label">Total Paper Performance</div>
+      <div class="metric-value num" id="totalPnlVal">—</div>
+      <div class="metric-sub">Trusted SCR paper sample</div>
+      <div class="paper-stats" id="paperStats">
+        <span><b id="paperEffTrades">—</b> trades</span><span class="dotsep">·</span>
+        <span><b id="paperWinRate">—</b> wins</span><span class="dotsep">·</span>
+        <span><b id="paperSizing">—</b> size</span>
+      </div>
     </div>
   </section>
 
@@ -536,16 +550,46 @@ function renderState(s){
     equityEl.textContent = (p && p.account_value_label) || '—';
   }
   const pnlEl = document.getElementById('pnlVal');
-  const pnlVal = p ? Number(p.realized_pnl || 0) : 0;
-  const pnlPrev = state.lastNums[pnlEl.id];
+  const today = (p && p.today_realized_pnl != null) ? Number(p.today_realized_pnl) : null;
   pnlEl.classList.remove('green','red');
-  if (pnlVal > 0) pnlEl.classList.add('green');
-  if (pnlVal < 0) pnlEl.classList.add('red');
-  animateNumber(pnlEl, pnlVal, {money:true, signed:true});
-  if (pnlPrev != null && pnlPrev !== pnlVal){
-    flash(pnlEl.parentElement, pnlVal - pnlPrev);
+  if (today == null){
+    state.lastNums[pnlEl.id] = null;
+    pnlEl.textContent = '—';
+  } else {
+    if (today > 0) pnlEl.classList.add('green');
+    if (today < 0) pnlEl.classList.add('red');
+    const pnlPrev = state.lastNums[pnlEl.id];
+    animateNumber(pnlEl, today, {money:true, signed:true});
+    if (pnlPrev != null && pnlPrev !== today){
+      flash(pnlEl.parentElement, today - pnlPrev);
+    }
   }
-  document.getElementById('pnlSub').textContent = (p && p.note) || 'Since clean slate';
+  document.getElementById('pnlSub').textContent = 'Closed trades today';
+
+  const totalEl = document.getElementById('totalPnlVal');
+  const total = (p && p.total_paper_pnl != null) ? Number(p.total_paper_pnl) : null;
+  totalEl.classList.remove('green','red');
+  if (total == null){
+    state.lastNums[totalEl.id] = null;
+    totalEl.textContent = '—';
+  } else {
+    if (total > 0) totalEl.classList.add('green');
+    if (total < 0) totalEl.classList.add('red');
+    const totalPrev = state.lastNums[totalEl.id];
+    animateNumber(totalEl, total, {money:true, signed:true});
+    if (totalPrev != null && totalPrev !== total){
+      flash(totalEl.parentElement, total - totalPrev);
+    }
+  }
+  const effTrades = p && p.effective_trades;
+  document.getElementById('paperEffTrades').textContent =
+    (effTrades != null && !isNaN(effTrades)) ? effTrades : '—';
+  const wr = p && p.win_rate;
+  document.getElementById('paperWinRate').textContent =
+    (wr != null && !isNaN(wr)) ? (Math.round(Number(wr) * 100) + '%') : '—';
+  const sf = p && p.sizing_factor;
+  document.getElementById('paperSizing').textContent =
+    (sf != null && !isNaN(sf)) ? (Math.round(Number(sf) * 100) + '%') : '—';
 
   renderStrategies(s.strategies || []);
   renderOpen(s.open_positions || []);

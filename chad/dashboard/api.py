@@ -304,20 +304,64 @@ class StateBuilder:
         if self._portfolio_cache and now - self._portfolio_cache_ts < 30:
             return self._portfolio_cache
         pnl = _load_json(RUNTIME / "pnl_state.json")
+        scr = _load_json(RUNTIME / "scr_state.json")
+        scr_stats = scr.get("stats") or {}
+
         equity = pnl.get("account_equity")
-        realized = pnl.get("realized_pnl", 0.0)
-        realized_label = (
-            f"Up ${abs(realized):,.0f} realized"
-            if realized > 0
-            else f"Down ${abs(realized):,.0f} realized"
-            if realized < 0
-            else "Flat"
-        )
+
+        today_raw = pnl.get("realized_pnl")
+        try:
+            today_realized = float(today_raw) if today_raw is not None else None
+        except (TypeError, ValueError):
+            today_realized = None
+
+        total_raw = scr_stats.get("total_pnl")
+        try:
+            total_paper = float(total_raw) if total_raw is not None else None
+        except (TypeError, ValueError):
+            total_paper = None
+
+        eff_raw = scr_stats.get("effective_trades")
+        try:
+            effective_trades = int(eff_raw) if eff_raw is not None else None
+        except (TypeError, ValueError):
+            effective_trades = None
+
+        wr_raw = scr_stats.get("win_rate")
+        try:
+            win_rate = float(wr_raw) if wr_raw is not None else None
+        except (TypeError, ValueError):
+            win_rate = None
+
+        sf_raw = scr.get("sizing_factor")
+        try:
+            sizing_factor = float(sf_raw) if sf_raw is not None else None
+        except (TypeError, ValueError):
+            sizing_factor = None
+
+        if today_realized is None:
+            realized_label = "—"
+        elif today_realized > 0:
+            realized_label = f"Up ${abs(today_realized):,.0f} realized"
+        elif today_realized < 0:
+            realized_label = f"Down ${abs(today_realized):,.0f} realized"
+        else:
+            realized_label = "Flat"
+
         out = {
             "account_value": equity,
             "account_value_label": _fmt_money(equity),
-            "realized_pnl": round(realized, 2),
+            "realized_pnl": (round(today_realized, 2) if today_realized is not None else None),
             "realized_pnl_label": realized_label,
+            "today_realized_pnl": (round(today_realized, 2) if today_realized is not None else None),
+            "today_realized_pnl_label": _fmt_money_signed(today_realized),
+            "total_paper_pnl": (round(total_paper, 2) if total_paper is not None else None),
+            "total_paper_pnl_label": _fmt_money_signed(total_paper),
+            "effective_trades": effective_trades,
+            "win_rate": (round(win_rate, 4) if win_rate is not None else None),
+            "win_rate_pct_label": (f"{win_rate * 100:.1f}%" if win_rate is not None else "—"),
+            "sizing_factor": (round(sizing_factor, 4) if sizing_factor is not None else None),
+            "sizing_factor_pct_label": (f"{int(round(sizing_factor * 100))}%" if sizing_factor is not None else "—"),
             "open_trades_pnl": 0.0,
             "note": "Practice money",
         }
