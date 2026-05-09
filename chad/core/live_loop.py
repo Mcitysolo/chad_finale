@@ -1027,19 +1027,28 @@ def run_once(logger: logging.Logger) -> None:
         return []
 
     # Weekend gate — drop equity signals on Saturday/Sunday UTC; crypto
-    # strategies pass through unchanged.
+    # strategies pass through unchanged. Pipeline B (equity intent builder
+    # downstream) does NOT consult this gate, so the log line is explicitly
+    # named WEEKEND_GATE_A_FILTERED to make the A/B asymmetry visible to
+    # operators reading strategy diagnostics.
     if _is_weekend and routed_signals:
-        _pre_weekend_count = len(routed_signals)
+        _pre_weekend = list(routed_signals)
         routed_signals = [
             s for s in routed_signals
             if _signal_strategy_name(s) in CRYPTO_STRATEGIES
             or not EQUITY_BLOCKED_ON_WEEKEND
         ]
-        _filtered_count = _pre_weekend_count - len(routed_signals)
+        _filtered_count = len(_pre_weekend) - len(routed_signals)
         if _filtered_count > 0:
+            _kept_ids = {id(s) for s in routed_signals}
+            _dropped_symbols = sorted({
+                str(getattr(s, "symbol", "") or "")
+                for s in _pre_weekend if id(s) not in _kept_ids
+            })
             logger.info(
-                "WEEKEND_GATE blocked=%d equity signals (market closed)",
-                _filtered_count,
+                "WEEKEND_GATE_A_FILTERED dropped=%d symbols=%s "
+                "(pipeline_a only; pipeline_b equity intents not gated here)",
+                _filtered_count, _dropped_symbols,
             )
 
     # ------------------------------------------------------------------
