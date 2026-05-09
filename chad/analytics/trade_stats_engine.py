@@ -124,6 +124,21 @@ def _is_warmup_sim(tags: Sequence[str]) -> bool:
     return any(str(t).strip().lower() == "warmup_sim" for t in (tags or []))
 
 
+def _is_validate_only(tags: Sequence[str], extra: Dict[str, Any]) -> bool:
+    # Audit-only rows written for kraken_paper validate-only responses
+    # (no realized fill, pnl=0). They must remain visible in trade_history
+    # for alpha_crypto attribution but must not pollute the untrusted
+    # bucket — they are intentional, expected, non-PnL audit records.
+    if any(str(t).strip().lower() == "validate_only" for t in (tags or [])):
+        return True
+    try:
+        if bool((extra or {}).get("validate_only")):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 # Strategy names recognised by the tag-based attribution recovery below.
 # Priority order: more specific names first so e.g. "delta_pairs" wins over
 # the prefix "delta" if both happen to appear in the same tag list.
@@ -633,6 +648,7 @@ def load_and_compute(
 
     excluded_manual = 0
     excluded_untrusted = 0
+    excluded_validate_only = 0
 
     # Effective sample selection
     effective: List[ParsedTrade] = []
@@ -645,6 +661,14 @@ def load_and_compute(
             continue
         if _is_manual(tags):
             excluded_manual += 1
+            continue
+        # Validate-only audit rows (kraken_paper validate_only responses with
+        # no realized fill) carry pnl_untrusted=true but are intentional
+        # audit records, not real untrusted fills. Bucket them separately
+        # BEFORE the generic untrusted check so excluded_untrusted reflects
+        # only true untrusted-fill conditions.
+        if _is_validate_only(tags, extra):
+            excluded_validate_only += 1
             continue
         if _is_untrusted(tags, extra):
             excluded_untrusted += 1
@@ -691,6 +715,7 @@ def load_and_compute(
         # exclusion picture, and also expose the discrete counter for
         # operator forensics.
         "excluded_untrusted": int(excluded_untrusted + excluded_quarantined),
+        "excluded_validate_only": int(excluded_validate_only),
         "excluded_quarantined": int(excluded_quarantined),
         "excluded_pre_epoch": int(excluded_pre_epoch),
         "excluded_nonfinite": int(excluded_nonfinite),
