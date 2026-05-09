@@ -192,10 +192,9 @@ def _atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float],
 
 
 def _asset_class(sym: str) -> AssetClass:
-    # Gamma is typically ETFs in your system; keep ETF default, fallback to STOCK
     if sym in {"SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "LQD", "VWO", "IEMG"}:
         return AssetClass.ETF
-    return AssetClass.STOCK
+    return AssetClass.EQUITY
 
 
 # -------------------------
