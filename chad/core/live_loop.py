@@ -1677,13 +1677,17 @@ def run_once(logger: logging.Logger) -> None:
 
             if is_same_side_open(intent):
                 logger.info(
-                    "SKIP suppression=%s → %s %s %s qty=%s",
+                    "SKIP suppression=%s strategy=%s → %s %s %s qty=%s",
                     SuppressionReason.SAME_SIDE_POSITION_OPEN.value,
+                    getattr(intent, "strategy", None),
                     getattr(intent, "symbol", None),
                     getattr(intent, "sec_type", None),
                     getattr(intent, "side", None),
                     getattr(intent, "quantity", None),
-                    extra={"suppression_reason": SuppressionReason.SAME_SIDE_POSITION_OPEN.value},
+                    extra={
+                        "suppression_reason": SuppressionReason.SAME_SIDE_POSITION_OPEN.value,
+                        "strategy": getattr(intent, "strategy", None),
+                    },
                 )
                 continue
 

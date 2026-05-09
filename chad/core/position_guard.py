@@ -192,14 +192,19 @@ def is_same_side_open(intent) -> bool:
     record = get_open_position(intent)
     if not record:
         return False
-    match = str(record.get("side", "")) == _intent_side(intent)
+    record_side = str(record.get("side", "") or "").upper().strip()
+    intent_side = _intent_side(intent).upper().strip()
+    match = record_side != "" and record_side == intent_side
     if match:
-        # Record MAINTAINED state — position unchanged by this signal
-        state = _load_state()
-        key = _position_key(_intent_strategy(intent), _intent_symbol(intent))
-        if key in state:
-            state[key]["last_state"] = PositionState.MAINTAINED.value
-            save_state(state)
+        # Record MAINTAINED state — position unchanged by this signal.
+        # Skip the write when last_state is already MAINTAINED to avoid
+        # write amplification on repeated same-side signals.
+        if str(record.get("last_state", "") or "") != PositionState.MAINTAINED.value:
+            state = _load_state()
+            key = _position_key(_intent_strategy(intent), _intent_symbol(intent))
+            if key in state:
+                state[key]["last_state"] = PositionState.MAINTAINED.value
+                save_state(state)
     return match
 
 
@@ -207,8 +212,8 @@ def is_flip_signal(intent) -> bool:
     record = get_open_position(intent)
     if not record:
         return False
-    open_side = str(record.get("side", ""))
-    new_side = _intent_side(intent)
+    open_side = str(record.get("side", "") or "").upper().strip()
+    new_side = _intent_side(intent).upper().strip()
     return open_side != "" and new_side != "" and open_side != new_side
 
 
