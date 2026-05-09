@@ -98,6 +98,15 @@ PAPER_FILL_HARVESTER: int = 79
 # Source: chad/ops/portfolio_snapshot_publisher.py — `IBKR_CLIENT_ID = 84`.
 PORTFOLIO_SNAPSHOT_PUBLISHER: int = 84
 
+# Positions snapshot publisher (read-only refresh of runtime/positions_snapshot.json).
+# Source: systemd /etc/systemd/system/chad-positions-snapshot.service —
+# `Environment=IBKR_CLIENT_ID=9041`. Invokes
+# `python -m chad.portfolio.ibkr_portfolio_collector_v2 positions`, which
+# calls IBKRPortfolioCollector.collect_positions() with a fresh, read-only
+# IB connection. Distinct from PORTFOLIO_SNAPSHOT_PUBLISHER (equity-only)
+# and PORTFOLIO_COLLECTOR (legacy combined writer, currently disabled).
+POSITIONS_SNAPSHOT: int = 9041
+
 # Reconciliation publisher (compares local position_guard vs broker truth).
 # Source: chad/ops/reconciliation_publisher.py — `IBKR_CLIENT_ID = 83`.
 RECONCILER: int = 83
@@ -155,6 +164,7 @@ def client_id_map() -> Dict[str, int]:
         "PORTFOLIO_COLLECTOR": PORTFOLIO_COLLECTOR,
         "PAPER_FILL_HARVESTER": PAPER_FILL_HARVESTER,
         "PORTFOLIO_SNAPSHOT_PUBLISHER": PORTFOLIO_SNAPSHOT_PUBLISHER,
+        "POSITIONS_SNAPSHOT": POSITIONS_SNAPSHOT,
         "RECONCILER": RECONCILER,
         "BROKER_EVENTS_COLLECTOR": BROKER_EVENTS_COLLECTOR,
         "HEALTHCHECK": HEALTHCHECK,

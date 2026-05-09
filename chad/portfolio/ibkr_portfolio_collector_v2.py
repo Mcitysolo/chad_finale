@@ -237,9 +237,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Optional override for portfolio_snapshot.json path.",
     )
 
+    positions_parser = subparsers.add_parser(
+        "positions",
+        help=(
+            "Refresh runtime/positions_snapshot.json only (read-only). "
+            "Does not touch portfolio_snapshot.json. Intended for the "
+            "chad-positions-snapshot timer."
+        ),
+    )
+    positions_parser.add_argument(
+        "--snapshot-path",
+        type=str,
+        default="",
+        help="Optional override for positions_snapshot.json path.",
+    )
+
     args = parser.parse_args(argv)
 
-    if args.command not in ("print", "collect"):
+    if args.command not in ("print", "collect", "positions"):
         parser.print_help()
         return 2
 
@@ -253,6 +268,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"[IBKR PORTFOLIO] Error: {exc}")
             return 1
         print(val)
+        return 0
+
+    if args.command == "positions":
+        try:
+            override = (
+                Path(args.snapshot_path).expanduser().resolve()
+                if args.snapshot_path
+                else None
+            )
+            out_path = collector.collect_positions(positions_path=override)
+        except Exception as exc:
+            print(f"[IBKR PORTFOLIO] Positions snapshot error: {exc}")
+            return 1
+        try:
+            payload = json.loads(out_path.read_text(encoding="utf-8"))
+            count = int(payload.get("positions_count", 0))
+        except Exception:
+            count = -1
+        print(
+            f"[IBKR PORTFOLIO] Updated positions snapshot: {out_path} "
+            f"positions_count={count}"
+        )
         return 0
 
     # collect
