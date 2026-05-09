@@ -289,6 +289,7 @@ class IbkrConfig:
             "ZB": FuturesContractSpec(symbol="ZB", exchange="CBOT", currency="USD", multiplier="1000", notes="30-Year T-Bond"),
             "M6E": FuturesContractSpec(symbol="M6E", exchange="CME", currency="USD", multiplier="12500", notes="Micro Euro FX"),
             "M2K": FuturesContractSpec(symbol="M2K", exchange="CME", currency="USD", multiplier="5", notes="Micro E-mini Russell 2000"),
+            "MYM": FuturesContractSpec(symbol="MYM", exchange="CBOT", currency="USD", multiplier="0.5", notes="Micro E-mini Dow"),
         }
     )
 

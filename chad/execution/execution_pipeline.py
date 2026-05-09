@@ -644,6 +644,14 @@ def _futures_spec_registry() -> Dict[str, IBKRInstrumentSpec]:
             whole_units=True,
             metadata={"family": "index", "underlier": "RTY", "micro": True},
         ),
+        "MYM": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="CBOT",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "index", "underlier": "YM", "micro": True},
+        ),
     }
 
 

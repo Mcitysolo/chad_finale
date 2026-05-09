@@ -33,6 +33,7 @@ from chad.execution.execution_pipeline import (
     build_ibkr_intents_from_plan,
 )
 from chad.strategies.alpha_futures import ALPHA_FUTURES_UNIVERSE
+from chad.strategies.gamma_futures import GAMMA_FUTURES_UNIVERSE
 from chad.strategies.omega_macro import OMEGA_MACRO_SPECS
 from chad.types import AssetClass, SignalSide, StrategyName
 
@@ -109,7 +110,11 @@ def test_execution_pipeline_omega_macro_intent(symbol, expected_exchange):
 # ---------------------------------------------------------------------------
 
 def test_futures_spec_registry_covers_strategy_universes():
-    universe = set(OMEGA_MACRO_SPECS.keys()) | set(ALPHA_FUTURES_UNIVERSE)
+    universe = (
+        set(OMEGA_MACRO_SPECS.keys())
+        | set(ALPHA_FUTURES_UNIVERSE)
+        | set(GAMMA_FUTURES_UNIVERSE)
+    )
     assert universe, "test universe must be non-empty"
 
     missing = []
@@ -248,4 +253,40 @@ def test_futures_spec_registry_covers_m2k():
     spec = _resolve_futures_spec("M2K")
     assert spec.sec_type == "FUT"
     assert spec.exchange == "CME"
+    assert spec.currency == "USD"
+
+
+# ---------------------------------------------------------------------------
+# Test 7: gamma_futures MYM (Micro E-mini Dow) builds into a FUT intent on CBOT
+# ---------------------------------------------------------------------------
+#
+# Locks in the 2026-05-09 forensic-audit fix that added MYM to
+# ``_futures_spec_registry()``. Same gap class as M2K (commit a2a5841)
+# and the omega_macro fixes: MYM is in GAMMA_FUTURES_UNIVERSE but was
+# missing from the routing registry, so MYM intents dropped silently
+# with INTENT_DROPPED_NO_SPEC.
+
+def test_execution_pipeline_mym_intent():
+    plan = _make_plan("MYM", primary_strategy=StrategyName.GAMMA_FUTURES)
+    intents = build_ibkr_intents_from_plan(plan)
+
+    assert len(intents) == 1, (
+        f"expected exactly one intent for MYM; got {len(intents)} "
+        "(registry must include MYM as a FUT spec)"
+    )
+    intent = intents[0]
+    assert intent.sec_type == "FUT", (
+        f"gamma_futures MYM must route as FUT, got {intent.sec_type!r}"
+    )
+    assert intent.exchange == "CBOT", (
+        f"gamma_futures MYM must route to CBOT, got {intent.exchange!r}"
+    )
+    assert intent.symbol == "MYM"
+
+
+def test_futures_spec_registry_covers_mym():
+    """Regression lock that MYM resolves through ``_resolve_futures_spec``."""
+    spec = _resolve_futures_spec("MYM")
+    assert spec.sec_type == "FUT"
+    assert spec.exchange == "CBOT"
     assert spec.currency == "USD"

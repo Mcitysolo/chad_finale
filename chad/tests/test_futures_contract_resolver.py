@@ -341,3 +341,31 @@ def test_ibkr_adapter_m2k_missing_contract_month_raises() -> None:
     )
     with pytest.raises(ContractResolutionError):
         resolver._resolve_future(_FakeIB(), intent)
+
+
+def test_ibkr_adapter_resolves_mym_future_with_contract_month() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {"contract_month": "202606"},
+        symbol="MYM",
+        exchange="CBOT",
+        strategy="gamma_futures",
+    )
+    resolved = resolver._resolve_future(_FakeIB(), intent)
+    assert resolved.summary.get("symbol") == "MYM"
+    assert resolved.summary.get("sec_type") == "FUT"
+    assert resolved.summary.get("exchange") == "CBOT"
+    assert resolved.summary.get("currency") == "USD"
+    assert resolved.summary.get("contract_month") == "202606"
+    assert resolved.summary.get("resolution") == "explicit"
+
+
+def test_ibkr_adapter_mym_missing_contract_month_raises() -> None:
+    cfg = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(cfg, lambda: datetime.now(timezone.utc))
+    intent = _make_normalized_futures_intent(
+        {}, symbol="MYM", exchange="CBOT", strategy="gamma_futures"
+    )
+    with pytest.raises(ContractResolutionError):
+        resolver._resolve_future(_FakeIB(), intent)
