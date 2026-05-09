@@ -426,7 +426,7 @@ class TradeCloser:
                 for k, v in self.queues.items()
                 if v
             ],
-            "saved_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
+            "saved_at_utc": _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat() + "Z",
         }
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
@@ -639,7 +639,7 @@ class TradeCloser:
             for ct in closed_trades:
                 seq += 1
                 payload = ct.to_payload()
-                ts = _dt.datetime.utcnow().isoformat() + "Z"
+                ts = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat() + "Z"
                 core = {
                     "payload": payload,
                     "prev_hash": prev_hash,

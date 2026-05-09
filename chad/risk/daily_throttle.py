@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -295,7 +295,7 @@ def evaluate_throttle(
     ThrottleDecision
         Accepted signals, rejection reasons, and the final usage snapshot.
     """
-    day = today or datetime.utcnow().date()
+    day = today or datetime.now(timezone.utc).date()
 
     if log_path is not None:
         base_usage = _load_today_notional(log_path, day)

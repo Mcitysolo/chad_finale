@@ -1,6 +1,6 @@
 from typing import Dict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     from ib_async import IB
@@ -48,7 +48,7 @@ class BrokerPositionSync:
                 sec_type=sec_type,
                 quantity=float(p.position),
                 avg_cost=float(p.avgCost),
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
             )
 
         return out

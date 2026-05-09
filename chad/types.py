@@ -36,7 +36,7 @@ Strategies should remain defensive if bars are missing or malformed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import math
@@ -108,7 +108,7 @@ class TradeSignal:
     - meta is optional diagnostic payload.
 
     Backward-compatibility contract:
-    - created_at defaults to datetime.utcnow so older callers remain valid
+    - created_at defaults to a naive UTC datetime so older callers remain valid
     - meta defaults to {} so older callers do not break
     """
     strategy: StrategyName
@@ -117,7 +117,7 @@ class TradeSignal:
     size: float
     confidence: float
     asset_class: AssetClass
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     meta: Dict[str, Any] = field(default_factory=dict)
 # -----------------------------
 # Routed output (Phase 3 contract)
@@ -296,7 +296,7 @@ class BrainStatus:
 
     def heartbeat(self, *, signal_count: int = 0) -> None:
         self.ok = True
-        self.last_heartbeat_utc = datetime.utcnow()
+        self.last_heartbeat_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         self.total_cycles += 1
         if isinstance(signal_count, int) and signal_count > 0:
             self.total_signals += int(signal_count)
@@ -304,7 +304,7 @@ class BrainStatus:
     def record_error(self, reason: str) -> None:
         self.ok = False
         self.total_errors += 1
-        self.last_error_utc = datetime.utcnow()
+        self.last_error_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         self.last_error_reason = str(reason or "unknown_error")
 
 

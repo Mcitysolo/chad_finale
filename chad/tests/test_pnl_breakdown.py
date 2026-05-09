@@ -258,7 +258,7 @@ def test_profit_lock_still_reads_net_pnl_after_breakdown(tmp_path):
         "record_hash": "deadbeef",
     }
     import datetime as _dt
-    today = _dt.datetime.utcnow().strftime("%Y%m%d")
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d")
     (trades_dir / f"trade_history_{today}.ndjson").write_text(
         json.dumps(record) + "\n", encoding="utf-8"
     )
