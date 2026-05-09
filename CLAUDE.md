@@ -5,9 +5,10 @@
 - Canonical root: /home/ubuntu/chad_finale
 - Python binary: python3 (never python)
 - Virtual environment: /home/ubuntu/chad_finale/venv
-- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper; SCR=WARMUP, sizing_factor=0.1, sharpe_like=+1.057, effective_trades=9, win_rate=0.778, total_pnl=+$129.86 (as of 2026-05-06; SCR values are Paper Epoch 2 in-progress — will grow as trades accumulate)
+- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper; SCR=CONFIDENT, sizing_factor=1.0, sharpe_like=+5.825, effective_trades=190, win_rate=0.774, total_pnl=+$9,880 (as of 2026-05-09; Paper Epoch 2 has reached the CONFIDENT band — full sizing applied, paper_only=false, but live activation still gated by live_readiness publisher)
 - Account equity: ~$183,264 USD paper
 - Hardening status: P0-P2 complete, GAP-1 through GAP-25 complete; 2026-04-19/21 Overhaul complete
+- ib_async migration: Phase 1 complete (18 files migrated to ib_async), Phase 2 pending (5 files remaining)
 
 ## Governance Rules — Non-Negotiable
 1. One change at a time. Baseline, change, verify, proceed.
@@ -37,7 +38,7 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 1. OS reboot — no pending kernel update as of 2026-04-21 (kernel 6.17.0-1009-aws current; reboot deferred to next actual kernel update)
 2. Disk cleanup — prune backup archives to below 75% usage
 3. IB Gateway latency — investigate and resolve dangerous (>750ms) classification
-4. Verify all 1360 tests pass after reboot
+4. Verify all 1465 tests pass after reboot
 5. Run full_cycle_preview.py --dry-run clean
 6. Confirm live_readiness.json flips to ready_for_live: true
 7. Review open paper positions (MES short) before mode switch
