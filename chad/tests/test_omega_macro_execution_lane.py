@@ -208,3 +208,44 @@ def test_execution_pipeline_omega_macro_end_to_end():
         # The intent's strategy name comes from PlannedOrder.primary_strategy.value.
         assert str(intent.strategy) == StrategyName.OMEGA_MACRO.value
         assert intent.quantity > 0
+
+
+# ---------------------------------------------------------------------------
+# Test 6: gamma_futures M2K builds into a FUT intent on CME
+# ---------------------------------------------------------------------------
+#
+# Locks in the 2026-05-09 forensic-audit fix that added M2K (Micro E-mini
+# Russell 2000) to ``_futures_spec_registry()``. Same gap class as the
+# omega_macro fix above (commits 53fdb98 / 9e784ee): M2K is in the
+# gamma_futures universe but was missing from the routing registry, so
+# every M2K intent dropped silently with INTENT_DROPPED_NO_SPEC.
+
+def test_execution_pipeline_m2k_intent():
+    plan = _make_plan("M2K", primary_strategy=StrategyName.GAMMA_FUTURES)
+    intents = build_ibkr_intents_from_plan(plan)
+
+    assert len(intents) == 1, (
+        f"expected exactly one intent for M2K; got {len(intents)} "
+        "(registry must include M2K as a FUT spec)"
+    )
+    intent = intents[0]
+    assert intent.sec_type == "FUT", (
+        f"gamma_futures M2K must route as FUT, got {intent.sec_type!r}"
+    )
+    assert intent.exchange == "CME", (
+        f"gamma_futures M2K must route to CME, got {intent.exchange!r}"
+    )
+    assert intent.symbol == "M2K"
+
+
+def test_futures_spec_registry_covers_m2k():
+    """Regression lock that M2K resolves through ``_resolve_futures_spec``.
+
+    Without M2K in the registry, ``build_ibkr_intents_from_plan`` drops the
+    intent with INTENT_DROPPED_NO_SPEC and gamma_futures never reaches the
+    broker. This test fails fast if the registry entry is removed.
+    """
+    spec = _resolve_futures_spec("M2K")
+    assert spec.sec_type == "FUT"
+    assert spec.exchange == "CME"
+    assert spec.currency == "USD"
