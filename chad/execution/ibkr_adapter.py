@@ -1085,18 +1085,27 @@ class _ContractResolver:
             currency=currency,
         )
 
-        # Qualify legs to obtain conIds when IB session is available
+        # Qualify legs to obtain conIds when IB session is available.
+        #
+        # Both legs MUST resolve to non-zero conIds before the BAG is built —
+        # IBKR rejects combo orders whose legs reference conId=0
+        # (Error 321: "combo details for leg '0' are invalid"). When ib is
+        # None we are in dry-run/preview territory; tolerate conId=0 there
+        # because no order is ever submitted on that path.
         long_con_id = 0
         short_con_id = 0
         if ib is not None:
+            qualify_exc: Optional[BaseException] = None
+            qualified: Sequence[Any] = ()
             try:
-                qualified = ib.qualifyContracts(long_opt, short_opt)
-                if qualified and len(qualified) >= 2:
-                    long_opt = qualified[0]
-                    short_opt = qualified[1]
-                long_con_id = getattr(long_opt, "conId", 0) or 0
-                short_con_id = getattr(short_opt, "conId", 0) or 0
-            except Exception as exc:
+                qualified = _call_with_timeout(
+                    ib.qualifyContracts,
+                    long_opt,
+                    short_opt,
+                    label="qualifyContracts.combo_legs",
+                ) or ()
+            except BaseException as exc:  # noqa: BLE001
+                qualify_exc = exc
                 LOGGER.warning(
                     "ibkr_adapter.combo_qualify_failed",
                     extra={
@@ -1106,6 +1115,34 @@ class _ContractResolver:
                         "short_strike": short_strike,
                         "error": str(exc),
                     },
+                )
+
+            if qualify_exc is None and qualified and len(qualified) >= 2:
+                long_opt = qualified[0]
+                short_opt = qualified[1]
+                long_con_id = int(getattr(long_opt, "conId", 0) or 0)
+                short_con_id = int(getattr(short_opt, "conId", 0) or 0)
+
+            if long_con_id <= 0 or short_con_id <= 0:
+                # Refuse to build a BAG with conId=0 legs — IBKR will reject
+                # with Error 321 on submit. Surface a clear marker so the
+                # operator (and the live_loop log scrape) can attribute the
+                # skip directly to leg-qualification failure.
+                LOGGER.warning(
+                    "BAG_INTENT_SKIPPED_UNQUALIFIED_LEG symbol=%s expiry=%s "
+                    "long_strike=%s short_strike=%s long_right=%s short_right=%s "
+                    "long_conId=%s short_conId=%s qualify_error=%s",
+                    intent.symbol, expiry, long_strike, short_strike,
+                    long_right, short_right,
+                    long_con_id, short_con_id,
+                    str(qualify_exc) if qualify_exc is not None else "none",
+                )
+                raise ContractResolutionError(
+                    "BAG_INTENT_SKIPPED_UNQUALIFIED_LEG "
+                    f"symbol={intent.symbol} expiry={expiry} "
+                    f"long_strike={long_strike} short_strike={short_strike} "
+                    f"long_right={long_right} short_right={short_right} "
+                    f"long_conId={long_con_id} short_conId={short_con_id}"
                 )
 
         # Build BAG contract
@@ -1771,6 +1808,20 @@ class IbkrAdapter:
         raise SubmissionError(f"Failed to submit order for {intent.symbol}: {last_exc}") from last_exc
 
     def _qualify_if_possible(self, ib: IBLike, contract: Any) -> Any:
+        # IBKR does not support reqContractDetails / qualifyContracts on BAG
+        # (combo) contracts — only on atomic contracts (STK, FUT, OPT, CASH).
+        # Combo legs are qualified individually inside _resolve_combo before
+        # the BAG is constructed, so the BAG itself must be passed through
+        # unchanged. Calling qualifyContracts on a BAG triggers IBKR
+        # Error 321 ("BAG isn't supported for contract data request").
+        sec_type = _safe_upper(getattr(contract, "secType", ""))
+        if sec_type == "BAG":
+            LOGGER.info(
+                "IBKR_BAG_QUALIFY_SKIPPED symbol=%s sec_type=BAG legs=%d",
+                getattr(contract, "symbol", ""),
+                len(getattr(contract, "comboLegs", []) or []),
+            )
+            return contract
         cached = self._qualify_cache.get(contract)
         if cached is not None:
             LOGGER.info(

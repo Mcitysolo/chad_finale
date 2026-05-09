@@ -719,3 +719,243 @@ class TestResolveCombo:
         from chad.execution.ibkr_adapter import IbkrConfig
         config = IbkrConfig()
         assert "BAG" in config.default_whole_unit_sec_types
+
+
+# ===========================================================================
+# BAG leg qualification — guards against IBKR Error 321 from conId=0 legs
+# ===========================================================================
+
+def _build_bag_intent(meta_overrides: Optional[Dict[str, Any]] = None):
+    """Helper: build a NormalizedIntent for a SPY bull-call BAG."""
+    from chad.execution.ibkr_adapter import NormalizedIntent
+    meta = {
+        "expiry": "20260516",
+        "long_strike": 655.0,
+        "short_strike": 660.0,
+        "long_right": "C",
+        "short_right": "C",
+        "spread_type": "BULL_CALL",
+    }
+    if meta_overrides:
+        meta.update(meta_overrides)
+    return NormalizedIntent(
+        strategy="alpha_options",
+        symbol="SPY",
+        sec_type="BAG",
+        exchange="SMART",
+        currency="USD",
+        side="BUY",
+        order_type="LMT",
+        quantity=1.0,
+        notional_estimate=0.0,
+        asset_class="options",
+        source_strategies=("alpha_options",),
+        created_at=datetime.now(timezone.utc),
+        meta=meta,
+    )
+
+
+class TestBagLegQualification:
+    """Regression guards for the BAG combo-leg qualification fix.
+
+    IBKR rejects combo orders whose comboLegs reference conId=0
+    (Error 321 "combo details for leg '0' are invalid"). _resolve_combo
+    must therefore refuse to build a BAG when ib is present and either
+    leg's conId fails to resolve. Additionally, _qualify_if_possible
+    must never call qualifyContracts on a BAG itself, since IBKR has
+    no reqContractDetails for BAG (Error 321 "BAG isn't supported for
+    contract data request").
+    """
+
+    # --------------------- _qualify_if_possible -----------------------
+
+    def test_qualify_if_possible_skips_bag(self) -> None:
+        """_qualify_if_possible must NOT call ib.qualifyContracts on BAG."""
+        from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+
+        adapter = IbkrAdapter(IbkrConfig(dry_run=True))
+
+        bag = mock.MagicMock()
+        bag.secType = "BAG"
+        bag.symbol = "SPY"
+        bag.comboLegs = [mock.MagicMock(), mock.MagicMock()]
+
+        ib = mock.MagicMock()
+        ib.qualifyContracts = mock.MagicMock(
+            side_effect=AssertionError("qualifyContracts must NOT be called on BAG")
+        )
+
+        result = adapter._qualify_if_possible(ib, bag)
+        assert result is bag, "BAG must pass through unchanged"
+        ib.qualifyContracts.assert_not_called()
+
+    def test_qualify_if_possible_still_qualifies_non_bag(self) -> None:
+        """Sanity: non-BAG contracts continue to be qualified normally."""
+        from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+
+        adapter = IbkrAdapter(IbkrConfig(dry_run=True))
+
+        opt = mock.MagicMock()
+        opt.secType = "OPT"
+        opt.symbol = "SPY"
+
+        qualified = mock.MagicMock()
+        qualified.secType = "OPT"
+        qualified.symbol = "SPY"
+        qualified.conId = 12345
+
+        ib = mock.MagicMock()
+        ib.qualifyContracts.return_value = [qualified]
+
+        result = adapter._qualify_if_possible(ib, opt)
+        ib.qualifyContracts.assert_called_once()
+        assert result is qualified
+
+    # --------------------- _resolve_combo aborts ----------------------
+
+    def test_resolve_combo_aborts_when_leg_qualify_returns_zero_conid(self) -> None:
+        """When qualifyContracts returns contracts with conId=0, raise."""
+        from chad.execution.ibkr_adapter import (
+            ContractResolutionError, IbkrConfig, _ContractResolver,
+        )
+
+        config = IbkrConfig(dry_run=False)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+        intent = _build_bag_intent()
+
+        ib = mock.MagicMock()
+
+        def fake_qualify(*contracts):
+            for c in contracts:
+                c.conId = 0
+            return list(contracts)
+        ib.qualifyContracts.side_effect = fake_qualify
+
+        with pytest.raises(ContractResolutionError, match="BAG_INTENT_SKIPPED_UNQUALIFIED_LEG"):
+            resolver.resolve(ib, intent)
+
+    def test_resolve_combo_aborts_when_leg_qualify_returns_empty(self) -> None:
+        """When qualifyContracts returns an empty list, raise."""
+        from chad.execution.ibkr_adapter import (
+            ContractResolutionError, IbkrConfig, _ContractResolver,
+        )
+
+        config = IbkrConfig(dry_run=False)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+        intent = _build_bag_intent()
+
+        ib = mock.MagicMock()
+        ib.qualifyContracts.return_value = []
+
+        with pytest.raises(ContractResolutionError, match="BAG_INTENT_SKIPPED_UNQUALIFIED_LEG"):
+            resolver.resolve(ib, intent)
+
+    def test_resolve_combo_aborts_when_leg_qualify_raises(self) -> None:
+        """When qualifyContracts raises, _resolve_combo must convert to ContractResolutionError."""
+        from chad.execution.ibkr_adapter import (
+            ContractResolutionError, IbkrConfig, _ContractResolver,
+        )
+
+        config = IbkrConfig(dry_run=False)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+        intent = _build_bag_intent()
+
+        ib = mock.MagicMock()
+        ib.qualifyContracts.side_effect = RuntimeError("simulated qualify failure")
+
+        with pytest.raises(ContractResolutionError, match="BAG_INTENT_SKIPPED_UNQUALIFIED_LEG"):
+            resolver.resolve(ib, intent)
+
+    # --------------------- Cache safety -------------------------------
+
+    def test_resolve_combo_does_not_cache_unqualified_bag(self) -> None:
+        """A failed BAG resolution must NOT poison the resolver cache —
+        a subsequent call with the same intent must retry qualification.
+        """
+        from chad.execution.ibkr_adapter import (
+            ContractResolutionError, IbkrConfig, _ContractResolver,
+        )
+
+        config = IbkrConfig(dry_run=False)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+        intent = _build_bag_intent()
+
+        ib = mock.MagicMock()
+
+        # First call: qualify returns conId=0 → resolver must raise.
+        def fake_qualify_zero(*contracts):
+            for c in contracts:
+                c.conId = 0
+            return list(contracts)
+        ib.qualifyContracts.side_effect = fake_qualify_zero
+
+        with pytest.raises(ContractResolutionError, match="BAG_INTENT_SKIPPED_UNQUALIFIED_LEG"):
+            resolver.resolve(ib, intent)
+
+        first_call_count = ib.qualifyContracts.call_count
+        assert first_call_count >= 1
+
+        # Second call with the same intent: if the failed BAG was cached
+        # the resolver would short-circuit and qualifyContracts would not
+        # be called again. The fix prevents this.
+        def fake_qualify_good(*contracts):
+            for i, c in enumerate(contracts):
+                c.conId = 100 + i
+            return list(contracts)
+        ib.qualifyContracts.side_effect = fake_qualify_good
+
+        resolved = resolver.resolve(ib, intent)
+        assert ib.qualifyContracts.call_count > first_call_count, (
+            "resolver must re-attempt qualification after a failed BAG resolve "
+            "(no cache poisoning)"
+        )
+        assert resolved.summary["sec_type"] == "BAG"
+        assert resolved.summary["long_conId"] == 100
+        assert resolved.summary["short_conId"] == 101
+
+    # --------------------- Submit-path skip log -----------------------
+
+    def test_submit_logs_bag_intent_skipped_unqualified_leg(self, caplog) -> None:
+        """End-to-end: an unqualified BAG must NOT reach placeOrder, and the
+        live logs must contain the BAG_INTENT_SKIPPED_UNQUALIFIED_LEG marker.
+        """
+        import logging
+        from chad.execution.ibkr_adapter import (
+            ContractResolutionError, IbkrConfig, _ContractResolver,
+        )
+
+        config = IbkrConfig(dry_run=False)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+        intent = _build_bag_intent()
+
+        ib = mock.MagicMock()
+
+        def fake_qualify_zero(*contracts):
+            for c in contracts:
+                c.conId = 0
+            return list(contracts)
+        ib.qualifyContracts.side_effect = fake_qualify_zero
+        # placeOrder must NEVER be reached.
+        ib.placeOrder = mock.MagicMock(
+            side_effect=AssertionError("placeOrder must not be called on unqualified BAG")
+        )
+
+        caplog.set_level(logging.WARNING, logger="chad.execution.ibkr_adapter")
+
+        with pytest.raises(ContractResolutionError, match="BAG_INTENT_SKIPPED_UNQUALIFIED_LEG"):
+            resolver.resolve(ib, intent)
+
+        ib.placeOrder.assert_not_called()
+        markers = [
+            rec for rec in caplog.records
+            if "BAG_INTENT_SKIPPED_UNQUALIFIED_LEG" in rec.getMessage()
+        ]
+        assert markers, (
+            "expected at least one log record carrying "
+            "BAG_INTENT_SKIPPED_UNQUALIFIED_LEG marker"
+        )
+        msg = markers[0].getMessage()
+        assert "SPY" in msg
+        assert "20260516" in msg
+        assert "655" in msg
+        assert "660" in msg
