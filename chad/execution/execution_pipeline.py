@@ -612,6 +612,30 @@ def _futures_spec_registry() -> Dict[str, IBKRInstrumentSpec]:
             whole_units=True,
             metadata={"family": "metals", "underlier": "GC", "micro": True},
         ),
+        "ZN": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="CBOT",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "rates", "underlier": "ZN", "micro": False},
+        ),
+        "ZB": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="CBOT",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "rates", "underlier": "ZB", "micro": False},
+        ),
+        "M6E": IBKRInstrumentSpec(
+            sec_type="FUT",
+            exchange="CME",
+            currency="USD",
+            quantity_step=Decimal("1"),
+            whole_units=True,
+            metadata={"family": "fx", "underlier": "6E", "micro": True},
+        ),
     }
 
 
@@ -1033,8 +1057,16 @@ def build_ibkr_intents_from_plan(
                 default_exchange=default_exchange,
                 default_currency=default_currency,
             )
-        except ValueError:
-            # Fail closed. Unsupported instruments stay out of broker intents.
+        except ValueError as _spec_err:
+            # Fail closed. Unsupported instruments stay out of broker intents,
+            # but log so the silent-drop window is observable in audits.
+            LOG.warning(
+                "INTENT_DROPPED_NO_SPEC strategy=%s symbol=%s ac=%s reason=%s",
+                getattr(order, "primary_strategy", "unknown"),
+                getattr(order, "symbol", "unknown"),
+                getattr(order, "asset_class", "unknown"),
+                str(_spec_err),
+            )
             continue
 
         side = "BUY" if order.side is SignalSide.BUY else "SELL"
