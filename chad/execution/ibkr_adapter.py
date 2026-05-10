@@ -1851,8 +1851,73 @@ class IbkrAdapter:
     # ------------------------------------------------------------------
 
     def _compute_idempotency_key(self, intent: NormalizedIntent) -> str:
-        payload = self._intent_payload(intent)
+        payload = self._stable_idempotency_payload(intent)
         return _hash_payload(payload)
+
+    @staticmethod
+    def _stable_idempotency_payload(intent: NormalizedIntent) -> Mapping[str, Any]:
+        """
+        Stable subset of intent fields used to derive the idempotency key.
+
+        Excludes timestamps (created_at), price-derived estimates
+        (notional_estimate), attribution noise (source_strategies), and the
+        free-form meta dict — any of which can change cycle-to-cycle for the
+        same logical order and would otherwise produce a fresh hash on every
+        loop, defeating duplicate-submit suppression and triggering IBKR
+        Error 201.
+        """
+        meta = intent.meta or {}
+        sec_type = (intent.sec_type or "").upper()
+        asset_class = (intent.asset_class or "").lower()
+
+        limit_price = intent.limit_price
+        if limit_price is not None:
+            try:
+                if math.isnan(float(limit_price)) or math.isinf(float(limit_price)):
+                    limit_price = None
+            except (TypeError, ValueError):
+                limit_price = None
+
+        payload: Dict[str, Any] = {
+            "strategy": intent.strategy,
+            "symbol": intent.symbol,
+            "sec_type": sec_type,
+            "exchange": (intent.exchange or "").upper(),
+            "currency": (intent.currency or "").upper(),
+            "side": (intent.side or "").upper(),
+            "order_type": (intent.order_type or "").upper(),
+            "quantity": intent.quantity,
+            "asset_class": asset_class,
+            "limit_price": limit_price,
+        }
+
+        if sec_type == "BAG" or asset_class == "options_spread":
+            payload["bag"] = {
+                "expiry": _safe_str(
+                    meta.get("expiry") or meta.get("lastTradeDateOrContractMonth")
+                ),
+                "long_strike": meta.get("long_strike"),
+                "short_strike": meta.get("short_strike"),
+                "long_right": _safe_upper(_safe_str(meta.get("long_right"))),
+                "short_right": _safe_upper(_safe_str(meta.get("short_right"))),
+            }
+        elif sec_type == "OPT" or asset_class == "options":
+            payload["option"] = {
+                "expiry": _safe_str(
+                    meta.get("expiry") or meta.get("lastTradeDateOrContractMonth")
+                ),
+                "strike": meta.get("strike"),
+                "right": _safe_upper(_safe_str(meta.get("right"))),
+            }
+        elif sec_type == "FUT" or asset_class == "futures":
+            payload["futures"] = {
+                "contract_month": _safe_str(
+                    meta.get("contract_month")
+                    or meta.get("lastTradeDateOrContractMonth")
+                ),
+            }
+
+        return payload
 
     @staticmethod
     def _intent_payload(intent: NormalizedIntent) -> Mapping[str, Any]:
