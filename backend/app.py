@@ -25,7 +25,8 @@ diagnostic shim at /__backend__ for ops verification.
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Dict
 
 from fastapi import FastAPI
 
@@ -51,24 +52,18 @@ LOGGER = logging.getLogger("chad.backend.app")
 # Primary backend app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="CHAD Backend (Phase 7)",
-    version="0.1.0-backend7",
-    description=(
-        "CHAD Backend wrapper that delegates all functionality to the "
-        "hardened CHAD API Gateway. No legacy routers are mounted here."
-    ),
-)
 
-
-@app.on_event("startup")
-async def _on_startup() -> None:
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    Backend startup hook.
+    Backend lifespan hook (replaces the deprecated @app.on_event("startup")).
 
-    * Ensures logging is configured.
-    * Starts systemd watchdog heartbeat if available.
-    * Notifies systemd that the service is READY.
+    Startup:
+      * Ensures logging is configured.
+      * Starts systemd watchdog heartbeat if available.
+      * Notifies systemd that the service is READY.
+
+    Shutdown: no work — watchdog stop is handled by process exit.
     """
     if not LOGGER.handlers:
         logging.basicConfig(
@@ -80,6 +75,19 @@ async def _on_startup() -> None:
     # Start watchdog heartbeat (no-op if ops.watchdog is not present).
     start_watchdog(10.0)
     notify_ready()
+
+    yield
+
+
+app = FastAPI(
+    title="CHAD Backend (Phase 7)",
+    version="0.1.0-backend7",
+    description=(
+        "CHAD Backend wrapper that delegates all functionality to the "
+        "hardened CHAD API Gateway. No legacy routers are mounted here."
+    ),
+    lifespan=_lifespan,
+)
 
 
 # Lightweight liveness probe (GAP-017A).

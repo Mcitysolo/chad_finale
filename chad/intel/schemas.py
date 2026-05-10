@@ -21,7 +21,7 @@ All schemas are:
 """
 
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============================================================================ #
@@ -40,7 +40,8 @@ class ResearchRequestInput(BaseModel):
     scenario_timeframe: str = Field(pattern=r"^(1w|1m|3m)$")
     question: str
 
-    @validator("symbol")
+    @field_validator("symbol")
+    @classmethod
     def symbol_upper(cls, v: str) -> str:
         return v.upper().strip()
 
@@ -59,7 +60,8 @@ class ResearchScenario(BaseModel):
     test_ideas: List[str] = Field(default_factory=list)
     confidence_score: float = Field(ge=0.0, le=1.0)
 
-    @validator("symbol")
+    @field_validator("symbol")
+    @classmethod
     def symbol_upper(cls, v: str) -> str:
         return v.upper().strip()
 
