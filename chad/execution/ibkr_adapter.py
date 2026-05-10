@@ -301,6 +301,14 @@ class IbkrConfig:
     tif: str = "DAY"
     allow_market_orders: bool = True
 
+    # Broker-side open-order guard. Snapshots ib.openTrades() before each
+    # placeOrder so cross-strategy submissions on the same broker lane do not
+    # saturate IBKR's working-order cap and trigger Error 201.
+    enable_open_order_guard: bool = True
+    # Per-lane (sec_type/symbol/side) suppression threshold. Kept below IBKR's
+    # 15-order cap so we leave headroom for in-flight modifications.
+    open_order_cap_per_lane: int = 12
+
     def resolved_state_db_path(self) -> Path:
         if self.state_db_path is not None:
             return self.state_db_path
@@ -1250,6 +1258,154 @@ class _OrderFactory:
 
 
 # ---------------------------------------------------------------------------
+# Broker-side open-order guard
+# ---------------------------------------------------------------------------
+
+# Statuses IBKR returns for orders that still occupy a working-order slot.
+# `inactive` is included with a remaining-quantity check (see _is_working_open_trade).
+_WORKING_OPEN_STATUSES = frozenset({
+    "pendingsubmit",
+    "presubmitted",
+    "submitted",
+    "apipending",
+})
+
+_INACTIVE_OPEN_STATUS = "inactive"
+
+
+def _normalize_lmt_price(value: Any) -> Optional[float]:
+    """Coerce a limit-price-like value to a finite float or None.
+
+    ib_insync uses ~1.8e308 (UNSET_DOUBLE) for unset numeric Order fields, so
+    treat any value above 1e100 as None to avoid mismatching MKT orders.
+    """
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out) or out <= 0.0 or out > 1e100:
+        return None
+    return out
+
+
+def _normalize_strike(value: Any) -> str:
+    """Render a strike-like value as a stable string. Empty/zero collapse to ''."""
+    raw = _safe_str(value, "")
+    if not raw:
+        return ""
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        return raw
+    if f == 0.0 or math.isnan(f) or math.isinf(f):
+        return ""
+    # Use repr-style truncation so 100 and 100.0 collapse to the same string.
+    if f.is_integer():
+        return str(int(f))
+    return f"{f:.6f}".rstrip("0").rstrip(".")
+
+
+def _project_lane_for_sec_type(
+    sec_type: str,
+    *,
+    contract_month: str,
+    strike: str,
+    right: str,
+) -> Tuple[str, str, str]:
+    """Drop contract identity fields that do not apply to a given sec_type so
+    that broker-side and intent-side keys collapse onto the same value when
+    compared.
+    """
+    sec_type = sec_type.upper()
+    if sec_type in ("STK", "CASH"):
+        return ("", "", "")
+    if sec_type == "FUT":
+        return (contract_month, "", "")
+    if sec_type == "BAG":
+        # Combo legs are not exposed on the BAG itself; key on month only.
+        return (contract_month, "", "")
+    # OPT (or anything that carries strike/right) keeps all three.
+    return (contract_month, strike, right)
+
+
+def _open_trade_lane_key(trade: Any) -> Optional[Tuple[Any, ...]]:
+    """Build the broker-side dedupe key for a single live ib.openTrades() trade.
+
+    Returns None when the trade does not currently occupy a working-order slot,
+    or the contract/order/status payload is malformed.
+    """
+    contract = getattr(trade, "contract", None)
+    order = getattr(trade, "order", None)
+    status = getattr(trade, "orderStatus", None)
+    if contract is None or order is None or status is None:
+        return None
+
+    raw_status = _safe_str(getattr(status, "status", "")).lower()
+    remaining = _safe_float(getattr(status, "remaining", 0.0))
+
+    if raw_status in _WORKING_OPEN_STATUSES:
+        pass
+    elif raw_status == _INACTIVE_OPEN_STATUS and remaining > 0.0:
+        # Inactive orders can still occupy a slot until IBKR finalises them.
+        pass
+    else:
+        return None
+
+    sec_type = _safe_upper(getattr(contract, "secType", ""))
+    symbol = _safe_upper(getattr(contract, "symbol", ""))
+    side = _safe_upper(getattr(order, "action", ""))
+    exchange = _safe_upper(getattr(contract, "exchange", ""))
+    currency = _safe_upper(getattr(contract, "currency", ""))
+    contract_month = _safe_str(getattr(contract, "lastTradeDateOrContractMonth", ""))
+    strike = _normalize_strike(getattr(contract, "strike", ""))
+    right = _safe_upper(getattr(contract, "right", ""))
+    contract_month, strike, right = _project_lane_for_sec_type(
+        sec_type,
+        contract_month=contract_month,
+        strike=strike,
+        right=right,
+    )
+    limit_price = _normalize_lmt_price(getattr(order, "lmtPrice", None))
+
+    return (sec_type, symbol, side, exchange, currency, contract_month, strike, right, limit_price)
+
+
+def _intent_lane_key(intent: NormalizedIntent, resolved_contract: _ResolvedContract, prepared: _PreparedOrder) -> Tuple[Any, ...]:
+    """Build the broker-side dedupe key for the intent we are about to submit.
+
+    Pulls identity from the resolved IBKR contract whenever available so the
+    key matches the broker's own view (e.g. front-month FUT expiry filled in
+    by qualifyContracts / contract details).
+    """
+    contract = getattr(resolved_contract, "contract", None)
+    order = getattr(prepared, "order", None)
+
+    sec_type = _safe_upper(getattr(contract, "secType", "") or intent.sec_type)
+    symbol = _safe_upper(getattr(contract, "symbol", "") or intent.symbol)
+    side = _safe_upper(getattr(order, "action", "") or intent.side)
+    exchange = _safe_upper(getattr(contract, "exchange", "") or intent.exchange)
+    currency = _safe_upper(getattr(contract, "currency", "") or intent.currency)
+
+    contract_month = _safe_str(getattr(contract, "lastTradeDateOrContractMonth", ""))
+    strike = _normalize_strike(getattr(contract, "strike", ""))
+    right = _safe_upper(getattr(contract, "right", ""))
+    contract_month, strike, right = _project_lane_for_sec_type(
+        sec_type,
+        contract_month=contract_month,
+        strike=strike,
+        right=right,
+    )
+
+    limit_price = _normalize_lmt_price(getattr(order, "lmtPrice", None) if order is not None else None)
+    if limit_price is None:
+        limit_price = _normalize_lmt_price(intent.limit_price)
+
+    return (sec_type, symbol, side, exchange, currency, contract_month, strike, right, limit_price)
+
+
+# ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
 
@@ -1708,6 +1864,17 @@ class IbkrAdapter:
                         raw=raw,
                     )
 
+                guard_result = self._enforce_open_order_guard(
+                    ib=ib,
+                    intent=intent,
+                    resolved_contract=resolved_contract,
+                    prepared=prepared,
+                    submitted_at=submitted_at,
+                    idempotency_key=idempotency_key,
+                )
+                if guard_result is not None:
+                    return guard_result
+
                 LOGGER.info(
                     "ibkr.place_order",
                     extra={
@@ -1806,6 +1973,155 @@ class IbkrAdapter:
             },
         )
         raise SubmissionError(f"Failed to submit order for {intent.symbol}: {last_exc}") from last_exc
+
+    # ------------------------------------------------------------------
+    # Broker-side open-order guard
+    # ------------------------------------------------------------------
+
+    def _snapshot_open_trades(self, ib: IBLike) -> List[Any]:
+        """Read-only snapshot of ib.openTrades(). Never cancels or modifies.
+
+        Falls back to an empty list when the underlying IB client does not
+        expose openTrades() or the call fails — the guard fails open in that
+        case and the submission proceeds as before.
+        """
+        fn = getattr(ib, "openTrades", None)
+        if not callable(fn):
+            return []
+        try:
+            result = _call_with_timeout(fn, label="openTrades")
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "ibkr.open_trades_snapshot_failed",
+                extra={"error": str(exc)},
+            )
+            return []
+        return list(result or [])
+
+    def _enforce_open_order_guard(
+        self,
+        *,
+        ib: IBLike,
+        intent: NormalizedIntent,
+        resolved_contract: _ResolvedContract,
+        prepared: _PreparedOrder,
+        submitted_at: datetime,
+        idempotency_key: str,
+    ) -> Optional[SubmittedOrder]:
+        """Block submission when broker already has a working order on the
+        same lane, or when the per-lane working-order count would breach
+        IBKR's working-order cap.
+
+        Returns a SubmittedOrder with status `duplicate_open_order` or
+        `suppressed_open_orders_cap` to short-circuit submission, or None to
+        let the caller proceed to placeOrder.
+        """
+        if not self._config.enable_open_order_guard:
+            return None
+
+        snapshot = self._snapshot_open_trades(ib)
+        if not snapshot:
+            return None
+
+        intent_key = _intent_lane_key(intent, resolved_contract, prepared)
+        # Lane bucket for the cap check is the broker-truth (sec_type, symbol, side).
+        intent_bucket = (intent_key[0], intent_key[1], intent_key[2])
+
+        existing_keys: List[Tuple[Any, ...]] = []
+        existing_order_ids: List[int] = []
+        bucket_count = 0
+        bucket_order_ids: List[int] = []
+
+        for trade in snapshot:
+            key = _open_trade_lane_key(trade)
+            if key is None:
+                continue
+            existing_keys.append(key)
+
+            order_obj = getattr(trade, "order", None)
+            try:
+                order_id = int(getattr(order_obj, "orderId", 0) or 0)
+            except (TypeError, ValueError):
+                order_id = 0
+            if order_id:
+                existing_order_ids.append(order_id)
+
+            if (key[0], key[1], key[2]) == intent_bucket:
+                bucket_count += 1
+                if order_id:
+                    bucket_order_ids.append(order_id)
+
+        if intent_key in existing_keys:
+            LOGGER.warning(
+                "IBKR_OPEN_ORDER_DUPLICATE_BLOCKED symbol=%s sec_type=%s side=%s "
+                "exchange=%s currency=%s contract_month=%s strike=%s right=%s "
+                "limit_price=%s existing_order_ids=%s",
+                intent_key[1], intent_key[0], intent_key[2],
+                intent_key[3], intent_key[4], intent_key[5],
+                intent_key[6], intent_key[7], intent_key[8],
+                bucket_order_ids,
+            )
+            return SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=prepared.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=False,
+                submitted_at=submitted_at,
+                ib_order_id=None,
+                status="duplicate_open_order",
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                limit_price=intent.limit_price,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                contract_summary=resolved_contract.summary,
+                raw={
+                    "guard": "duplicate_open_order",
+                    "lane": list(intent_key),
+                    "existing_order_ids": list(bucket_order_ids),
+                },
+            )
+
+        cap = max(0, int(self._config.open_order_cap_per_lane))
+        if cap > 0 and bucket_count >= cap:
+            LOGGER.warning(
+                "IBKR_OPEN_ORDER_CAP_BLOCKED symbol=%s sec_type=%s side=%s "
+                "count=%d cap=%d existing_order_ids=%s",
+                intent_bucket[1], intent_bucket[0], intent_bucket[2],
+                bucket_count, cap, bucket_order_ids,
+            )
+            return SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=prepared.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=False,
+                submitted_at=submitted_at,
+                ib_order_id=None,
+                status="suppressed_open_orders_cap",
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                limit_price=intent.limit_price,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                contract_summary=resolved_contract.summary,
+                raw={
+                    "guard": "suppressed_open_orders_cap",
+                    "lane": list(intent_bucket),
+                    "count": bucket_count,
+                    "cap": cap,
+                    "existing_order_ids": list(bucket_order_ids),
+                },
+            )
+
+        return None
 
     def _qualify_if_possible(self, ib: IBLike, contract: Any) -> Any:
         # IBKR does not support reqContractDetails / qualifyContracts on BAG

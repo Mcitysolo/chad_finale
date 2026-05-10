@@ -710,6 +710,7 @@ _UNCONFIRMED_BROKER_STATUSES = frozenset({
     "pendingsubmit", "presubmitted", "submitted", "apipending",
     "inactive", "unknown", "", "error", "failed", "rejected",
     "cancelled", "duplicate_blocked",
+    "duplicate_open_order", "suppressed_open_orders_cap",
 })
 
 
