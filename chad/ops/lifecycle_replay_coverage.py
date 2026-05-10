@@ -43,14 +43,45 @@ def _snapshot_map(snapshot: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def _ledger_meta_map(ledger: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def _normalize_ledger_open_records(ledger_state: Any) -> Dict[str, Dict[str, Any]]:
+    """Return ledger open records keyed by their original id, regardless of schema.
+
+    Accepts both:
+      - Wrapped schema: {"open": {<id>: {"symbol": ..., "qty": ..., ...}, ...}}
+      - Flat schema (current writer in chad/portfolio/ibkr_paper_ledger_watcher.py):
+          {<id>: {"symbol": ..., "qty": ..., ...}, ...}
+
+    Includes only dict records with symbol present, qty present, and float(qty) != 0.0.
+    """
+    if not isinstance(ledger_state, dict):
+        return {}
+
+    candidate: Any = ledger_state.get("open")
+    if not isinstance(candidate, dict):
+        candidate = ledger_state
+
     out: Dict[str, Dict[str, Any]] = {}
-    open_map = ledger.get("open") or {}
-    if not isinstance(open_map, dict):
-        return out
-    for row in open_map.values():
+    for key, row in candidate.items():
         if not isinstance(row, dict):
             continue
+        sym = row.get("symbol")
+        if not isinstance(sym, str) or not sym.strip():
+            continue
+        if "qty" not in row:
+            continue
+        try:
+            qty = float(row.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty == 0.0:
+            continue
+        out[str(key)] = row
+    return out
+
+
+def _ledger_meta_map(ledger: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in _normalize_ledger_open_records(ledger).values():
         sym = str(row.get("symbol") or "").strip().upper()
         if not sym:
             continue

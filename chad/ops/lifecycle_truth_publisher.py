@@ -108,6 +108,42 @@ def _sha256_prefixed(payload: Dict[str, Any]) -> str:
     return f"sha256:{hashlib.sha256(b).hexdigest()}"
 
 
+def _normalize_ledger_open_records(ledger_state: Any) -> Dict[str, Dict[str, Any]]:
+    """Return ledger open records keyed by their original id, regardless of schema.
+
+    Accepts both:
+      - Wrapped schema: {"open": {<id>: {"symbol": ..., "qty": ..., ...}, ...}}
+      - Flat schema (current writer in chad/portfolio/ibkr_paper_ledger_watcher.py):
+          {<id>: {"symbol": ..., "qty": ..., ...}, ...}
+
+    Includes only dict records with symbol present, qty present, and float(qty) != 0.0.
+    """
+    if not isinstance(ledger_state, dict):
+        return {}
+
+    candidate: Any = ledger_state.get("open")
+    if not isinstance(candidate, dict):
+        candidate = ledger_state
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, row in candidate.items():
+        if not isinstance(row, dict):
+            continue
+        sym = row.get("symbol")
+        if not isinstance(sym, str) or not sym.strip():
+            continue
+        if "qty" not in row:
+            continue
+        try:
+            qty = float(row.get("qty") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if qty == 0.0:
+            continue
+        out[str(key)] = row
+    return out
+
+
 # ----------------------------
 # Broker events evidence (bootstrap only)
 # ----------------------------
@@ -317,9 +353,7 @@ def build_positions_truth(
     reconciliation_status_upstream = str(reconciliation.get("status") or "").strip().upper()
     upstream_green = reconciliation_status_upstream == "GREEN"
 
-    ledger_open = ledger_state.get("open")
-    if not isinstance(ledger_open, dict):
-        ledger_open = {}
+    ledger_open = _normalize_ledger_open_records(ledger_state)
     ledger_state_positions_count = int(len(ledger_open))
 
     replay_positions = replay_state.get("positions")
