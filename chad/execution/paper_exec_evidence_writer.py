@@ -108,6 +108,17 @@ _PAPER_PENDING_STATUSES = frozenset({
     "inactive", "unknown", "", "error",
 })
 
+# Broker-rejected statuses — orders the broker did NOT accept (e.g. Error 201
+# open-order cap, Error 200 no security definition, contract validation
+# failures). These MUST NOT be auto-translated to paper_fill in paper mode:
+# the order never traded, so any fill record would be fictional and would
+# feed bogus realized PnL into trade_closer / SCR. normalize_paper_fill_
+# evidence demotes these to status="rejected" with pnl_untrusted=True; the
+# audit trail is preserved but no FIFO match / SCR contribution can occur.
+_PAPER_REJECTED_STATUSES = frozenset({
+    "error", "failed", "rejected", "cancelled",
+})
+
 # Strategies that exclusively trade options instruments. A fill attributed to
 # any of these MUST carry asset_class="options"; if the writer would otherwise
 # persist the fill with asset_class="etf"/"equity" (e.g. because the BAG combo
@@ -1556,8 +1567,37 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
             except Exception:
                 pass
 
-    # 3) status — translate pending/error → paper_fill if we have a price.
+    # 3) status — translate pending → paper_fill if we have a price.
+    #
+    # Defense-in-depth: broker-rejected statuses (error/failed/rejected/
+    # cancelled) MUST NEVER auto-translate to paper_fill. The primary gate
+    # lives in chad/core/live_loop.py (SKIP_EVIDENCE_UNCONFIRMED_ORDER_STATUS),
+    # but direct callers of normalize_paper_fill_evidence / write_paper_exec_
+    # evidence are protected here too: demote to status="rejected" with
+    # pnl_untrusted=True so the audit trail is preserved while trade_closer /
+    # SCR / profit_lock skip the record. BAG simulator is unaffected — it ran
+    # earlier (line ~1428) and either returned with status="paper_fill" or
+    # left status untouched.
     status_norm = _safe_str(ev.status, "").strip().lower()
+    if status_norm in _PAPER_REJECTED_STATUSES:
+        if not isinstance(ev.extra, dict):
+            ev.extra = dict(ev.extra) if ev.extra else {}
+        ev.extra["pnl_untrusted"] = True
+        # Preserve any earlier reason set by the deviation/placeholder guard;
+        # only stamp the broker-rejected reason when no prior reason exists.
+        if not ev.extra.get("pnl_untrusted_reason"):
+            ev.extra["pnl_untrusted_reason"] = (
+                f"broker_rejected_status:{status_norm}"
+            )
+        tags_list = list(ev.tags) if ev.tags else []
+        for t in ("pnl_untrusted", "broker_rejected"):
+            if t not in tags_list:
+                tags_list.append(t)
+        ev.tags = tuple(tags_list)
+        ev.reject = True
+        ev.status = "rejected"
+        return ev
+
     if status_norm in _PAPER_PENDING_STATUSES:
         if _safe_float(ev.fill_price, 0.0) > 0.0:
             ev.status = "paper_fill"

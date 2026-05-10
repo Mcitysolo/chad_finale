@@ -66,7 +66,7 @@ def test_month_coded_futures_symbol_resolves_via_root(fake_price_cache):
         side="BUY",
         quantity=1.0,
         fill_price=0.0,
-        status="error",
+        status="PendingSubmit",
         is_live=False,
         asset_class="unknown",
     )
@@ -77,13 +77,13 @@ def test_month_coded_futures_symbol_resolves_via_root(fake_price_cache):
 
 
 def test_etf_unknown_asset_class_resolves(fake_price_cache):
-    """status=error + asset_class=unknown + symbol=SPY → paper_fill, etf."""
+    """status=PendingSubmit + asset_class=unknown + symbol=SPY → paper_fill, etf."""
     ev = PaperExecEvidence(
         symbol="SPY",
         side="BUY",
         quantity=10.0,
         fill_price=0.0,
-        status="error",
+        status="PendingSubmit",
         is_live=False,
         asset_class="unknown",
     )
@@ -167,7 +167,7 @@ def test_expected_price_fallback_when_cache_miss(fake_price_cache):
         quantity=1.0,
         fill_price=0.0,
         expected_price=42.0,
-        status="error",
+        status="PendingSubmit",
         is_live=False,
         asset_class="equity",
     )

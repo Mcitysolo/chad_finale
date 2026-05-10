@@ -699,6 +699,65 @@ def _apply_intelligence_bias(intents: list, logger: logging.Logger) -> list:
     return surviving
 
 
+# ---------------------------------------------------------------------------
+# Paper-fill safety gate — guards FILLS_*.ndjson against unconfirmed IBKR
+# submissions that may be rejected asynchronously (e.g. Error 201 open-order
+# cap). Without this gate, an IBKR STK/FUT order returning status=PendingSubmit
+# is normalized to status=paper_fill in paper_exec_evidence_writer and the
+# fake fill persists even after IBKR cancels the order.
+# ---------------------------------------------------------------------------
+_UNCONFIRMED_BROKER_STATUSES = frozenset({
+    "pendingsubmit", "presubmitted", "submitted", "apipending",
+    "inactive", "unknown", "", "error", "failed", "rejected",
+    "cancelled", "duplicate_blocked",
+})
+
+
+def _is_explicit_paper_simulator(bag_extra: Any) -> bool:
+    """True when the intent carries explicit BAG/options-spread metadata that
+    licenses paper-fill evidence regardless of IBKR order acceptance.
+
+    The alpha_options BAG simulator in paper_exec_evidence_writer rewrites the
+    fill from the strategy-supplied net_debit_estimate and never depends on a
+    confirmed IBKR fill, so its evidence is trustworthy even when the wrapping
+    STK proxy submission returns PendingSubmit.
+    """
+    if not isinstance(bag_extra, dict) or not bag_extra:
+        return False
+    sec = str(bag_extra.get("sec_type", "") or "").strip().upper()
+    if sec in ("BAG", "COMBO"):
+        return True
+    req_ac = str(bag_extra.get("required_asset_class", "") or "").strip().lower()
+    if req_ac == "options" and any(
+        k in bag_extra for k in ("long_strike", "short_strike", "net_debit_estimate")
+    ):
+        return True
+    return False
+
+
+def _should_persist_paper_evidence(order: Any, bag_extra: Any) -> Tuple[bool, Optional[str]]:
+    """Decide whether a SubmittedOrder result warrants a paper_fill record.
+
+    Returns ``(persist, skip_reason)``. ``skip_reason`` is None when persist=True.
+
+    Rule: IBKR submissions whose synchronous adapter status is unconfirmed
+    (PendingSubmit/PreSubmitted/Submitted/Inactive/Unknown/Error/...) MUST NOT
+    produce paper_fill evidence — IBKR may asynchronously reject or cancel
+    the order (e.g. Error 201 open-order cap) and the fake fill would persist
+    in FILLS_*.ndjson and feed bogus realized PnL into SCR / trade_closer.
+
+    Exception: explicit paper-only simulators (alpha_options BAG/COMBO with
+    leg metadata) own their own fill semantics and are licensed to write
+    paper_fill regardless of the synchronous adapter status.
+    """
+    raw_status = str(getattr(order, "status", "") or "").strip().lower()
+    if raw_status in _UNCONFIRMED_BROKER_STATUSES:
+        if _is_explicit_paper_simulator(bag_extra):
+            return True, None
+        return False, f"unconfirmed_order_status:{raw_status or 'empty'}"
+    return True, None
+
+
 def run_once(logger: logging.Logger) -> None:
     """
     Execute one CHAD live cycle.
@@ -1946,6 +2005,28 @@ def run_once(logger: logging.Logger) -> None:
                                         _bag_extra[_k] = _sm[_k]
                         except Exception:
                             _bag_extra = {}
+
+                        # Paper-fill safety gate (see _should_persist_paper_evidence):
+                        # IBKR returns PendingSubmit/PreSubmitted synchronously and
+                        # may reject async (e.g. Error 201 open-order cap). Skip the
+                        # fill record unless the adapter status is confirmed OR the
+                        # path is an explicit paper simulator (alpha_options BAG).
+                        _persist_ev, _skip_reason = _should_persist_paper_evidence(order, _bag_extra)
+                        if not _persist_ev:
+                            logger.warning(
+                                "SKIP_EVIDENCE_UNCONFIRMED_ORDER_STATUS "
+                                "symbol=%s strategy=%s sec_type=%s side=%s "
+                                "qty=%s status=%s reason=%s — IBKR submission "
+                                "not yet confirmed; no paper fill written",
+                                getattr(order, "symbol", "?"),
+                                getattr(intent, "strategy", "?"),
+                                getattr(order, "sec_type", "?"),
+                                getattr(order, "side", "?"),
+                                getattr(order, "quantity", "?"),
+                                getattr(order, "status", "?"),
+                                _skip_reason,
+                            )
+                            continue
 
                         ev = PaperExecEvidence(
                             symbol=order.symbol,
