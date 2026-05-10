@@ -1,9 +1,14 @@
 {
-  "model_path": "/home/ubuntu/chad_finale/shared/models/xgb_veto_model.json",
-  "trained_at_utc": "2026-05-03T11:51:06.519205+00:00",
-  "training_samples": 7672,
-  "validation_accuracy": 0.5498371335504886,
-  "validation_logloss": 0.6935948332086059,
+  "dataset_hash": "sha256:68b35d6f442b2f18ef507a14d0298e0d45ecfc713b2d47028382db55fa37a715",
+  "excluded": {
+    "legacy_schema": 0,
+    "malformed": 0,
+    "missing_pnl": 0,
+    "nonfinite_pnl": 0,
+    "quarantined": 24,
+    "untrusted": 8243,
+    "untrusted_fill_id": 5
+  },
   "feature_names": [
     "strategy_encoded",
     "regime_encoded",
@@ -16,6 +21,38 @@
     "recent_win_rate",
     "regime_confidence"
   ],
-  "prior_model_backup": "/home/ubuntu/chad_finale/shared/models/xgb_veto_model_20260503_115106.json",
-  "schema_version": "xgb_manifest.v1"
+  "label_definition": "1=loss(net_pnl<=0), 0=win(net_pnl>0)",
+  "metrics": {
+    "accuracy": 0.7534246575342466,
+    "base_loss_rate": 0.6608615948670944,
+    "logloss": 0.5364161300978977,
+    "n_train": 872.0,
+    "n_val": 219.0,
+    "val_veto_rate_at_0.65": 0.7123287671232876
+  },
+  "min_training_samples": 100,
+  "model_path": "/home/ubuntu/chad_finale/shared/models/xgb_veto_model.json",
+  "model_sha256": "sha256:74afb9e1c8f3e0fe4a9c2012dd09b1fa78fab984f1c2308cc6cd839ebc6aa3fb",
+  "model_version": "xgb_veto_20260510_020007",
+  "pnl_source_priority": [
+    "payload.pnl_breakdown.net_pnl",
+    "payload.net_pnl",
+    "payload.pnl"
+  ],
+  "prior_model_backup": "/home/ubuntu/chad_finale/shared/models/xgb_veto_model_20260510_020007.json",
+  "schema_version": "xgb_manifest.v2",
+  "trained_at_utc": "2026-05-10T02:00:07.712729+00:00",
+  "training_filters": {
+    "exclude_nonfinite_pnl": true,
+    "exclude_pnl_untrusted": true,
+    "exclude_quarantined": true,
+    "exclude_untrusted_fill_ids": true,
+    "usable_schemas": [
+      "closed_trade.v1",
+      "closed_trade.v2"
+    ]
+  },
+  "training_samples": 1091,
+  "validation_accuracy": 0.7534246575342466,
+  "validation_logloss": 0.5364161300978977
 }
