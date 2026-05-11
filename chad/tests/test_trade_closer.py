@@ -660,3 +660,234 @@ def test_preserve_existing_fill_id_when_present(tmp_path):
 
     key = ("alpha_test", "MES")
     assert closer.queues[key][0]["fill_id"] == "existing_123"
+
+
+# ---------------------------------------------------------------------------
+# GAP-A003 — options_multiplier respected by trade_closer
+# ---------------------------------------------------------------------------
+
+def _options_fill(
+    fid: str,
+    side: str,
+    qty: float,
+    px: float,
+    *,
+    strategy: str = "alpha_options",
+    symbol: str = "SPY",
+    seq: int = 1,
+    options_multiplier: float = 100.0,
+    asset_class: str = "options",
+    ts: str = "2026-05-09T16:00:00Z",
+    extra_overrides: dict = None,
+    drop_pnl_untrusted: bool = True,
+) -> dict:
+    """Build a paper_exec_fill record with alpha_options BAG-style metadata.
+
+    By default the record is born NOT marked pnl_untrusted so the FIFO
+    matcher actually consumes it — Phase B (writer-side) now stamps real
+    BAG closes as untrusted, but this helper exists to exercise the
+    multiplier path independently of that policy.
+    """
+    extra = {
+        "sec_type": "BAG",
+        "options_multiplier": options_multiplier,
+        "asset_class": asset_class,
+        "net_debit": px,
+        "contracts": qty,
+    }
+    if extra_overrides:
+        extra.update(extra_overrides)
+    if drop_pnl_untrusted:
+        extra.pop("pnl_untrusted", None)
+    return {
+        "payload": {
+            "schema_version": "paper_exec_fill.v4",
+            "fill_id": fid,
+            "strategy": strategy,
+            "symbol": symbol,
+            "side": side,
+            "quantity": qty,
+            "fill_price": px,
+            "fill_time_utc": ts,
+            "entry_time_utc": ts,
+            "is_live": False,
+            "reject": False,
+            "status": "paper_fill",
+            "asset_class": asset_class,
+            "extra": extra,
+        },
+        "sequence_id": seq,
+        "timestamp_utc": ts,
+        "prev_hash": "GENESIS",
+        "record_hash": fid,
+    }
+
+
+def test_options_multiplier_used_in_closed_trade(tmp_path):
+    """An open/close BAG pair carrying extra.options_multiplier=100 must
+    produce a closed_trade with contract_multiplier=100 and PnL scaled by
+    that factor (not the SPY symbol-table value of 1.0).
+    """
+    closer = _make_closer(tmp_path)
+    fills = [
+        _options_fill("bag_open", "BUY", 1, 1.50, seq=1),
+        _options_fill("bag_close", "SELL", 1, 2.20, seq=2),
+    ]
+    _write_fills(tmp_path / "fills" / "FILLS_20260509.ndjson", fills)
+    closer.load_state()
+    closed = closer.process_fills("20260509")
+    assert len(closed) == 1
+    ct = closed[0]
+    assert ct.contract_multiplier == 100.0, (
+        f"options BAG close must inherit options_multiplier=100 — "
+        f"got {ct.contract_multiplier} (regression to SPY=1.0?)"
+    )
+    # PnL = (2.20 - 1.50) * 1 contract * 100 multiplier = +70
+    assert ct.pnl == pytest.approx(70.0), (
+        f"PnL must scale by the 100x multiplier — got {ct.pnl}"
+    )
+    # Notional in the payload must also reflect the 100x multiplier.
+    payload = ct.to_payload()
+    assert payload["contract_multiplier"] == 100.0
+    assert payload["notional"] == pytest.approx(1.50 * 1 * 100.0)
+
+
+def test_options_multiplier_missing_falls_back_to_symbol_table(tmp_path):
+    """When neither extra.options_multiplier nor a top-level options_multiplier
+    is present, trade_closer must fall back to get_multiplier(symbol).
+    A bare SPY fill (no options metadata) → multiplier=1.0.
+    """
+    closer = _make_closer(tmp_path)
+    open_f = _fill("open", "BUY", 1, 720.0, symbol="SPY", seq=1)
+    open_f["payload"]["status"] = "paper_fill"
+    close_f = _fill("close", "SELL", 1, 725.0, symbol="SPY", seq=2)
+    close_f["payload"]["status"] = "paper_fill"
+    _write_fills(tmp_path / "fills" / "FILLS_20260509.ndjson", [open_f, close_f])
+    closer.load_state()
+    closed = closer.process_fills("20260509")
+    assert len(closed) == 1
+    assert closed[0].contract_multiplier == 1.0
+    assert closed[0].pnl == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        0,            # zero
+        -100.0,       # negative
+        float("nan"), # NaN
+        float("inf"), # +inf
+        float("-inf"),# -inf
+        "garbage",    # non-numeric string
+        None,         # explicit None
+        {"x": 1},     # nested dict
+    ],
+)
+def test_options_multiplier_invalid_value_falls_back_safely(tmp_path, bad_value):
+    """Garbage / nonfinite / non-positive options_multiplier values must
+    not poison the matcher — they fall back to get_multiplier(symbol).
+    """
+    closer = _make_closer(tmp_path)
+    fills = [
+        _options_fill(
+            "bad_open", "BUY", 1, 1.50, seq=1,
+            extra_overrides={"options_multiplier": bad_value},
+        ),
+        _options_fill(
+            "bad_close", "SELL", 1, 2.20, seq=2,
+            extra_overrides={"options_multiplier": bad_value},
+        ),
+    ]
+    _write_fills(tmp_path / "fills" / "FILLS_20260509.ndjson", fills)
+    closer.load_state()
+    closed = closer.process_fills("20260509")
+    assert len(closed) == 1
+    # SPY symbol-table multiplier == 1.0
+    assert closed[0].contract_multiplier == 1.0, (
+        f"invalid options_multiplier={bad_value!r} must fall back to "
+        f"get_multiplier(SPY)=1.0 — got {closed[0].contract_multiplier}"
+    )
+    assert closed[0].pnl == pytest.approx(2.20 - 1.50)
+
+
+def test_mes_futures_multiplier_unchanged_by_patch(tmp_path):
+    """Regression guard: an MES futures fill without any options metadata
+    must continue to use the MES=5.0 symbol-table multiplier.
+    """
+    closer = _make_closer(tmp_path)
+    fills = [
+        _fill("mes_open", "BUY", 1, 5000.0, symbol="MES", seq=1),
+        _fill("mes_close", "SELL", 1, 5010.0, symbol="MES", seq=2),
+    ]
+    _write_fills(tmp_path / "fills" / "FILLS_20260509.ndjson", fills)
+    closer.load_state()
+    closed = closer.process_fills("20260509")
+    assert len(closed) == 1
+    assert closed[0].contract_multiplier == 5.0
+    assert closed[0].pnl == pytest.approx((5010 - 5000) * 1 * 5.0)
+
+
+def test_options_close_with_pnl_untrusted_is_skipped(tmp_path):
+    """An options close marked pnl_untrusted=True (Phase B behavior for
+    synthetic BAG closes) must still be skipped by trade_closer — the
+    multiplier patch must not weaken the existing untrusted guard. The
+    untrusted close is dropped before FIFO matching; the prior open
+    remains in the queue.
+    """
+    closer = _make_closer(tmp_path)
+    open_fill = _options_fill("open_trusted", "BUY", 1, 1.50, seq=1)
+    close_fill = _options_fill(
+        "close_untrusted", "SELL", 1, 0.45, seq=2,
+        extra_overrides={
+            "pnl_untrusted": True,
+            "pnl_untrusted_reason": "bag_close_synthetic_credit_ratio_30pct",
+        },
+        drop_pnl_untrusted=False,
+    )
+    _write_fills(
+        tmp_path / "fills" / "FILLS_20260509.ndjson",
+        [open_fill, close_fill],
+    )
+    closer.load_state()
+    closed = closer.process_fills("20260509")
+    assert closed == [], (
+        "untrusted BAG close must be skipped — no closed_trade should be "
+        f"produced; got: {closed}"
+    )
+    # The opening lot is still queued and carries the 100x multiplier.
+    key = ("alpha_options", "SPY")
+    assert key in closer.queues
+    assert len(closer.queues[key]) == 1
+    lot = closer.queues[key][0]
+    assert lot["multiplier"] == 100.0
+
+
+def test_options_close_uses_open_side_multiplier_if_close_drops_it(tmp_path):
+    """If a close fill loses its options_multiplier metadata (e.g. a hand-
+    edited record), the matcher must still scale PnL by the open-side
+    lot's stored 100x multiplier — not the SPY symbol-table fallback.
+    This is what protects the close path from silent equity-priced
+    closes when only the open carries the metadata.
+    """
+    closer = _make_closer(tmp_path)
+    open_fill = _options_fill("open_with_mult", "BUY", 1, 1.50, seq=1)
+    # Close fill: strip extra.options_multiplier entirely so _fill_multiplier
+    # would otherwise fall back to get_multiplier(SPY)=1.0.
+    close_fill = _options_fill("close_no_mult", "SELL", 1, 2.20, seq=2)
+    close_fill["payload"]["extra"].pop("options_multiplier", None)
+    close_fill["payload"]["asset_class"] = ""
+    close_fill["payload"]["extra"].pop("asset_class", None)
+
+    _write_fills(
+        tmp_path / "fills" / "FILLS_20260509.ndjson",
+        [open_fill, close_fill],
+    )
+    closer.load_state()
+    closed = closer.process_fills("20260509")
+    assert len(closed) == 1
+    ct = closed[0]
+    assert ct.contract_multiplier == 100.0, (
+        "close must inherit the OPEN-side lot's options_multiplier=100 "
+        "even when the close fill itself drops the field"
+    )
+    assert ct.pnl == pytest.approx((2.20 - 1.50) * 1 * 100.0)

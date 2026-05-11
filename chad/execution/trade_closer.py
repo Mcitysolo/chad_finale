@@ -62,6 +62,67 @@ def get_multiplier(symbol: str) -> float:
     return CONTRACT_MULTIPLIERS.get(symbol.upper(), DEFAULT_MULTIPLIER)
 
 
+import math as _math  # local import keeps the module-level surface tidy
+
+
+def _coerce_finite_positive(v: Any) -> Optional[float]:
+    """Return float(v) iff it's a finite, strictly positive number.
+
+    Anything that fails float() (str garbage, None, dicts), or that parses to
+    NaN / +inf / -inf / 0 / negative, is rejected so the caller can fall back.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not _math.isfinite(f):
+        return None
+    if f <= 0.0:
+        return None
+    return f
+
+
+def _fill_multiplier(fill: Dict[str, Any]) -> float:
+    """Pick the multiplier to use when computing closed-trade PnL.
+
+    Selection rule (first match wins):
+      1. If the fill carries a finite-positive ``options_multiplier`` value
+         (either at the top level — which is what _extract_fill promotes —
+         or under ``extra.options_multiplier``), use it. This is the alpha
+         options BAG case where the writer stamped 100x on the record.
+      2. If asset_class == "options" AND extra.options_multiplier exists,
+         use it (covers fills where the top-level promotion was bypassed
+         but the structured ``extra`` is intact).
+      3. Otherwise fall back to the per-symbol table via get_multiplier().
+
+    Stocks / futures / crypto are untouched: they don't carry
+    options_multiplier, so they hit step 3 unchanged.
+    """
+    if not isinstance(fill, dict):
+        return DEFAULT_MULTIPLIER
+
+    # Step 1: flat top-level options_multiplier (promoted by _extract_fill).
+    direct = _coerce_finite_positive(fill.get("options_multiplier"))
+    if direct is not None:
+        return direct
+
+    # Step 2: structured extra path. Defensive against missing/garbage extra.
+    extra = fill.get("extra")
+    if isinstance(extra, dict):
+        nested = _coerce_finite_positive(extra.get("options_multiplier"))
+        if nested is not None:
+            asset_class = str(fill.get("asset_class") or "").strip().lower()
+            extra_ac = str(extra.get("asset_class") or "").strip().lower()
+            if asset_class == "options" or extra_ac == "options":
+                return nested
+            # No asset_class signal anywhere — still trust the explicit
+            # options_multiplier value the writer placed in extra.
+            return nested
+
+    # Step 3: fall back to the per-symbol table.
+    return get_multiplier(fill.get("symbol", ""))
+
+
 # ---------------------------------------------------------------------------
 # ClosedTrade dataclass
 # ---------------------------------------------------------------------------
@@ -329,7 +390,20 @@ def _extract_fill(
         or obj.get("timestamp_utc")
     )
 
-    return {
+    # Promote options_multiplier and asset_class onto the flat fill dict so
+    # _match_fill / _fill_multiplier can apply the per-contract multiplier
+    # without re-deriving it from the symbol table. Stocks / futures / crypto
+    # records do not carry options_multiplier, so this is a no-op for them.
+    options_multiplier: Optional[float] = None
+    if isinstance(extra, dict):
+        options_multiplier = _coerce_finite_positive(extra.get("options_multiplier"))
+    asset_class_top = str(payload.get("asset_class") or "").strip().lower()
+    asset_class_extra = ""
+    if isinstance(extra, dict):
+        asset_class_extra = str(extra.get("asset_class") or "").strip().lower()
+    asset_class = asset_class_top or asset_class_extra
+
+    flat: Dict[str, Any] = {
         "fill_id": str(fill_id),
         "strategy": strategy,
         "symbol": symbol,
@@ -338,6 +412,11 @@ def _extract_fill(
         "fill_price": float(px),
         "ts_utc": str(ts) if ts else None,
     }
+    if options_multiplier is not None:
+        flat["options_multiplier"] = options_multiplier
+    if asset_class:
+        flat["asset_class"] = asset_class
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +567,14 @@ class TradeCloser:
         """Apply a single fill to its FIFO queue and emit any closed trades."""
         key = (fill["strategy"], fill["symbol"])
         queue = self.queues[key]
-        multiplier = get_multiplier(fill["symbol"])
+        # The OPEN-side multiplier is what matters for PnL — a BAG opened at
+        # options_multiplier=100 must close at 100 regardless of whether the
+        # closing fill's metadata happens to drop the field. We therefore
+        # stamp the multiplier on the opening lot below, and prefer the
+        # lot's stored multiplier on close. The incoming fill's own
+        # multiplier acts as a fallback for legacy lots restored from a
+        # state file written before this field existed.
+        incoming_multiplier = _fill_multiplier(fill)
         closed: List[ClosedTrade] = []
 
         remaining = fill["quantity"]
@@ -503,6 +589,7 @@ class TradeCloser:
                     "quantity": remaining,
                     "fill_price": fill["fill_price"],
                     "ts_utc": fill["ts_utc"],
+                    "multiplier": incoming_multiplier,
                 }
             )
             return closed
@@ -515,6 +602,11 @@ class TradeCloser:
             opening_side = lot["side"]
             entry_price = lot["fill_price"]
             exit_price = fill["fill_price"]
+            # Prefer the multiplier stamped on the open-side lot; only fall
+            # back to the incoming fill's multiplier when the lot lacks one
+            # (legacy state files persisted before lots carried multiplier).
+            lot_multiplier = _coerce_finite_positive(lot.get("multiplier"))
+            multiplier = lot_multiplier if lot_multiplier is not None else incoming_multiplier
             direction = 1.0 if opening_side == "BUY" else -1.0
             pnl = (exit_price - entry_price) * close_qty * multiplier * direction
 
@@ -549,6 +641,7 @@ class TradeCloser:
                     "quantity": remaining,
                     "fill_price": fill["fill_price"],
                     "ts_utc": fill["ts_utc"],
+                    "multiplier": incoming_multiplier,
                 }
             )
 
