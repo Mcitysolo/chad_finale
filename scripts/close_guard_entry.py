@@ -12,9 +12,11 @@ clears the matching `trade_closer_state.queues[strategy|symbol]` entry
 in the same invocation so the next live-loop cycle cannot rebuild it.
 
 Fail-closed: refuses to run when SCR is unsafe, when exec_mode is not
-paper/dry_run, or when LiveGate operator intent is ALLOW_LIVE. Refuses
-on broker_sync|* keys (those are owned by `_rebuild_guard_from_broker`
-and reflect IBKR truth).
+paper/dry_run, or when LiveGate's `allow_ibkr_live` flag is true (the
+HTTP /live-gate endpoint is the single source of truth — operator_intent
+in paper mode is normally ALLOW_LIVE and must NOT block maintenance).
+Refuses on broker_sync|* keys (those are owned by
+`_rebuild_guard_from_broker` and reflect IBKR truth).
 
 Usage:
     python3 scripts/close_guard_entry.py \
@@ -44,10 +46,11 @@ LOG = logging.getLogger("scripts.close_guard_entry")
 RUNTIME_DIR = REPO_ROOT / "runtime"
 TRADE_CLOSER_STATE_PATH = RUNTIME_DIR / "trade_closer_state.json"
 SCR_STATE_PATH = RUNTIME_DIR / "scr_state.json"
-OPERATOR_INTENT_PATH = RUNTIME_DIR / "operator_intent.json"
 OPERATOR_ACTIONS_DIR = REPO_ROOT / "data" / "operator_actions"
 
 _SAFE_SCR_STATES = frozenset({"CONFIDENT", "CAUTIOUS"})
+LIVE_GATE_URL_DEFAULT = "http://127.0.0.1:9618/live-gate"
+LIVE_GATE_TIMEOUT_S = 2.0
 
 
 def _utc_now_iso() -> str:
@@ -84,25 +87,40 @@ def _check_scr_safe() -> Tuple[bool, str]:
     return True, state
 
 
-def _check_livegate_not_allow_live() -> Tuple[bool, str]:
-    """Refuse if LiveGate operator intent is ALLOW_LIVE.
+def _fetch_live_gate_snapshot() -> Optional[Dict[str, Any]]:
+    """Fetch the LiveGate snapshot from the backend HTTP endpoint.
 
-    Reads operator_intent.json directly to avoid pulling the full evaluate()
-    path which would also touch market state. Fail-closed: missing/unreadable
-    file is treated as 'not ALLOW_LIVE' (the conservative direction here is
-    to ALLOW the close because we want maintenance available in non-live
-    postures), so we only refuse when we positively read ALLOW_LIVE.
+    Returns the parsed JSON dict, or None when the endpoint is
+    unreachable / unparseable. Never raises.
     """
-    if not OPERATOR_INTENT_PATH.is_file():
-        return True, "operator_intent.json missing (not ALLOW_LIVE)"
     try:
-        oi = json.loads(OPERATOR_INTENT_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        return True, f"operator_intent.json unreadable ({exc}); treated as not ALLOW_LIVE"
-    mode = str(oi.get("operator_mode") or oi.get("mode") or "").upper().strip()
-    if mode == "ALLOW_LIVE" or mode == "ALLOW":
-        return False, f"operator_intent.operator_mode={mode}"
-    return True, mode or "UNSET"
+        from urllib.request import Request, urlopen  # local import: stdlib only
+        url = os.environ.get("CHAD_LIVE_GATE_URL", LIVE_GATE_URL_DEFAULT)
+        req = Request(url, headers={"User-Agent": "chad-close-guard-cli/1.0"})
+        with urlopen(req, timeout=LIVE_GATE_TIMEOUT_S) as resp:
+            raw = resp.read()
+        obj = json.loads(raw.decode("utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _check_live_ibkr_not_allowed() -> Tuple[bool, str]:
+    """Refuse when actual live IBKR execution is enabled (allow_ibkr_live=true).
+
+    The dangerous state is `allow_ibkr_live=true` (the gate that lets real
+    IBKR orders flow). `operator_intent.operator_mode=ALLOW_LIVE` is the
+    normal paper-mode posture set by the auto-refresher and must NOT block
+    maintenance. Fail-closed: if the /live-gate endpoint is unreachable,
+    refuse with reason=livegate_unreachable.
+    """
+    snapshot = _fetch_live_gate_snapshot()
+    if snapshot is None:
+        return False, "livegate_unreachable"
+    allow_live = bool(snapshot.get("allow_ibkr_live", False))
+    if allow_live:
+        return False, "allow_ibkr_live=true"
+    return True, "allow_ibkr_live=false"
 
 
 def _gate_check() -> Tuple[bool, Dict[str, str]]:
@@ -112,7 +130,7 @@ def _gate_check() -> Tuple[bool, Dict[str, str]]:
     reasons["exec_mode"] = exec_msg
     ok_scr, scr_msg = _check_scr_safe()
     reasons["scr"] = scr_msg
-    ok_livegate, lg_msg = _check_livegate_not_allow_live()
+    ok_livegate, lg_msg = _check_live_ibkr_not_allowed()
     reasons["livegate"] = lg_msg
     return (ok_exec and ok_scr and ok_livegate), reasons
 

@@ -47,7 +47,6 @@ def cli_env(tmp_path, monkeypatch):
     guard_path = tmp_path / "runtime" / "position_guard.json"
     tc_path = tmp_path / "runtime" / "trade_closer_state.json"
     scr_path = tmp_path / "runtime" / "scr_state.json"
-    intent_path = tmp_path / "runtime" / "operator_intent.json"
     actions_dir = tmp_path / "data" / "operator_actions"
 
     guard_path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,10 +55,11 @@ def cli_env(tmp_path, monkeypatch):
     monkeypatch.setattr(position_guard, "STATE_PATH", guard_path)
     monkeypatch.setattr(cli, "TRADE_CLOSER_STATE_PATH", tc_path)
     monkeypatch.setattr(cli, "SCR_STATE_PATH", scr_path)
-    monkeypatch.setattr(cli, "OPERATOR_INTENT_PATH", intent_path)
     monkeypatch.setattr(cli, "OPERATOR_ACTIONS_DIR", actions_dir)
 
-    # Default: paper mode, CONFIDENT SCR, no operator intent file.
+    # Default: paper mode, CONFIDENT SCR, LiveGate reports allow_ibkr_live=false.
+    # The CLI fetches the live-gate snapshot over HTTP; monkeypatch the fetcher
+    # to a deterministic safe value so tests don't depend on the backend running.
     monkeypatch.setenv("CHAD_EXECUTION_MODE", "paper")
     _seed_json(scr_path, {
         "schema_version": "scr_state.v1",
@@ -67,14 +67,18 @@ def cli_env(tmp_path, monkeypatch):
         "sizing_factor": 1.0,
         "paper_only": False,
     })
+    monkeypatch.setattr(
+        cli, "_fetch_live_gate_snapshot",
+        lambda: {"allow_ibkr_live": False, "allow_ibkr_paper": True},
+    )
 
     return {
         "cli": cli,
         "guard_path": guard_path,
         "tc_path": tc_path,
         "scr_path": scr_path,
-        "intent_path": intent_path,
         "actions_dir": actions_dir,
+        "monkeypatch": monkeypatch,
     }
 
 
@@ -225,10 +229,14 @@ def test_close_guard_entry_refuses_when_exec_mode_not_paper(cli_env, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — CLI refuses when LiveGate operator intent is ALLOW_LIVE
+# Test 5 — CLI refuses when LiveGate reports allow_ibkr_live=true
 # ---------------------------------------------------------------------------
 
-def test_close_guard_entry_refuses_when_livegate_allow_live(cli_env, caplog):
+def test_close_guard_entry_refuses_when_livegate_allow_ibkr_live(cli_env, caplog):
+    """Predicate is `allow_ibkr_live` (real IBKR orders enabled), NOT
+    `operator_intent.operator_mode == ALLOW_LIVE` (which is the normal
+    paper-mode posture set by the auto-refresher and must NOT block
+    maintenance)."""
     cli = cli_env["cli"]
     _seed_json(cli_env["guard_path"], {
         "delta|AAPL": {
@@ -237,18 +245,52 @@ def test_close_guard_entry_refuses_when_livegate_allow_live(cli_env, caplog):
         },
     })
     _seed_json(cli_env["tc_path"], {"queues": [], "processed_fill_ids": []})
-    _seed_json(cli_env["intent_path"], {"operator_mode": "ALLOW_LIVE"})
+    cli_env["monkeypatch"].setattr(
+        cli, "_fetch_live_gate_snapshot",
+        lambda: {"allow_ibkr_live": True, "allow_ibkr_paper": True},
+    )
 
     with caplog.at_level("ERROR"):
         rc = cli.run([
             "--strategy", "delta", "--symbol", "AAPL",
             "--reason", "test", "--by", "test", "--confirm",
         ])
-    assert rc == 4, "must exit with code 4 for LiveGate ALLOW_LIVE refusal"
-    assert any("livegate" in m.lower() or "ALLOW_LIVE" in m for m in caplog.messages)
+    assert rc == 4, "must exit with code 4 when allow_ibkr_live=true"
+    assert any("livegate" in m.lower() or "allow_ibkr_live" in m.lower() for m in caplog.messages)
 
     guard = _load_json(cli_env["guard_path"])
-    assert guard["delta|AAPL"]["open"] is True, "must NOT close guard when LiveGate is ALLOW_LIVE"
+    assert guard["delta|AAPL"]["open"] is True, (
+        "must NOT close guard when allow_ibkr_live=true"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 5b — CLI fails closed when LiveGate endpoint is unreachable
+# ---------------------------------------------------------------------------
+
+def test_close_guard_entry_refuses_when_livegate_unreachable(cli_env, caplog):
+    cli = cli_env["cli"]
+    _seed_json(cli_env["guard_path"], {
+        "delta|AAPL": {
+            "open": True, "strategy": "delta", "symbol": "AAPL",
+            "side": "BUY", "quantity": 31.0, "last_state": "OPEN",
+        },
+    })
+    _seed_json(cli_env["tc_path"], {"queues": [], "processed_fill_ids": []})
+    cli_env["monkeypatch"].setattr(cli, "_fetch_live_gate_snapshot", lambda: None)
+
+    with caplog.at_level("ERROR"):
+        rc = cli.run([
+            "--strategy", "delta", "--symbol", "AAPL",
+            "--reason", "test", "--by", "test", "--confirm",
+        ])
+    assert rc == 4, "must fail-closed when /live-gate is unreachable"
+    assert any("livegate_unreachable" in m.lower() for m in caplog.messages)
+
+    guard = _load_json(cli_env["guard_path"])
+    assert guard["delta|AAPL"]["open"] is True, (
+        "must NOT close guard when LiveGate snapshot cannot be read"
+    )
 
 
 # ---------------------------------------------------------------------------
