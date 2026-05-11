@@ -249,11 +249,13 @@ def _bag_sell_close_evidence(**overrides) -> PaperExecEvidence:
     return PaperExecEvidence(**kwargs)
 
 
-def test_bag_paper_fill_sell_closes_position(monkeypatch, tmp_path):
-    """End-to-end: a SELL max_hold_exit intent must produce a trusted BAG
-    SELL fill (reversed legs, pnl_breakdown, asset_class=options) AND that
-    fill must satisfy is_fill_confirmed so mark_position_closed mutates
-    the guard from open=True → open=False.
+def test_bag_paper_fill_sell_close_with_debit_context_still_untrusted(monkeypatch, tmp_path):
+    """GAP-A002: a SELL max_hold_exit intent with opening debit context
+    must produce a BAG SELL fill (reversed legs, pnl_breakdown,
+    asset_class=options) that is ALWAYS flagged pnl_untrusted, because
+    the close_credit is a synthetic simulator haircut
+    (original_debit * 0.30), not a market quote. The fill must therefore
+    NOT satisfy is_fill_confirmed and the guard must remain open.
     """
     from chad.core import position_guard
 
@@ -296,9 +298,17 @@ def test_bag_paper_fill_sell_closes_position(monkeypatch, tmp_path):
     assert short_leg["action"] == "BUY", (
         "original short-strike leg must be BUY on the close"
     )
-    # 3. pnl_untrusted is False because original_debit context exists.
-    assert ev.extra.get("pnl_untrusted") is False, (
-        "BAG SELL close with opening debit context must NOT be flagged untrusted"
+    # 3. pnl_untrusted is True even with opening debit context — the
+    #    close_credit is a synthetic 0.30 haircut, not a market quote.
+    assert ev.extra.get("pnl_untrusted") is True, (
+        "BAG SELL close must ALWAYS be flagged pnl_untrusted — the "
+        "close_credit is a synthetic simulator haircut, not a quote."
+    )
+    assert ev.extra.get("pnl_untrusted_reason") == (
+        "bag_close_synthetic_credit_ratio_30pct"
+    ), (
+        "with-debit-context closes must carry the synthetic-credit-ratio "
+        "reason so the audit trail explains why PnL is untrusted."
     )
     # 4. pnl_breakdown structured for trade_closer / SCR.
     pnl = ev.extra.get("pnl_breakdown")
@@ -309,15 +319,17 @@ def test_bag_paper_fill_sell_closes_position(monkeypatch, tmp_path):
     assert pnl["multiplier"] == 100
     # gross_pnl = (0.45 - 1.50) * 1 * 100 = -105.0
     assert abs(pnl["gross_pnl"] - (-105.0)) < 1e-9
-    # 5. Tags include bag/spread/paper_fill (existing) + bag_close (new).
+    # 5. Tags include bag/spread/paper_fill + bag_close + pnl_untrusted.
     assert "bag" in ev.tags
     assert "spread" in ev.tags
     assert "paper_fill" in ev.tags
     assert "bag_close" in ev.tags
+    assert "pnl_untrusted" in ev.tags
 
-    # 6. Position-guard close confirmation: build the fill_evidence dict
-    # the way live_loop will after write_paper_exec_evidence returns, and
-    # verify mark_position_closed flips the guard entry to closed.
+    # 6. Guard stays open: with pnl_untrusted=True, is_fill_confirmed
+    #    must reject the close so the guard is not auto-mutated. Real
+    #    guard closure now requires either a trusted broker fill or an
+    #    operator-driven close_guard_entry intervention.
     fill_evidence = {
         "fill_id": "bag-close-test-fill-id-1",
         "status": ev.status,
@@ -326,26 +338,17 @@ def test_bag_paper_fill_sell_closes_position(monkeypatch, tmp_path):
         "tags": list(ev.tags),
         "extra": dict(ev.extra),
     }
-    assert position_guard.is_fill_confirmed(fill_evidence) is True, (
-        "BAG SELL close fill must satisfy is_fill_confirmed so the guard "
-        "can be safely closed"
+    assert position_guard.is_fill_confirmed(fill_evidence) is False, (
+        "BAG SELL close with synthetic credit must NOT satisfy "
+        "is_fill_confirmed — the guard stays open until a real broker "
+        "fill or operator close_guard_entry intervenes."
     )
 
-    class _Intent:
-        strategy = "alpha_options"
-        symbol = "SPY"
-        side = "SELL"
-        quantity = 1.0
-
-    closed = position_guard.mark_position_closed(_Intent(), fill_evidence=fill_evidence)
-    assert closed is True, "mark_position_closed must mutate guard on confirmed fill"
-
+    # Sanity: the on-disk guard state is unchanged.
     state = json.loads(state_path.read_text(encoding="utf-8"))
     entry = state["alpha_options|SPY"]
-    assert entry["open"] is False
-    assert entry["last_state"] == "CLOSED"
-    assert entry["closed_by"] == "fill_confirmed"
-    assert entry["closed_fill_id"] == "bag-close-test-fill-id-1"
+    assert entry["open"] is True
+    assert entry["last_state"] == "OPEN"
 
 
 def test_bag_paper_fill_sell_close_without_debit_context_marks_untrusted(monkeypatch, tmp_path):
@@ -390,6 +393,15 @@ def test_bag_paper_fill_sell_close_without_debit_context_marks_untrusted(monkeyp
     assert pnl["close_credit"] == 0.0
     assert pnl["gross_pnl"] == 0.0
     assert ev.extra.get("pnl_untrusted") is True
+    # GAP-A002: when recovery fails the reason must point at the missing
+    # debit context (NOT the synthetic-credit-ratio reason), so the
+    # audit trail still distinguishes the two failure modes.
+    reason = ev.extra.get("pnl_untrusted_reason") or ""
+    assert reason.startswith("bag_sell_close_no_opening_debit_context"), (
+        f"missing-debit-context closes must keep the original reason — "
+        f"got {reason!r}"
+    )
+    assert "pnl_untrusted" in ev.tags
 
     # is_fill_confirmed must reject the untrusted close so the guard
     # remains open until a trusted fill is produced.
@@ -471,10 +483,19 @@ def test_bag_paper_fill_sell_close_recovers_legs_from_disk(monkeypatch, tmp_path
     )
     fired = simulate_bag_paper_fill(ev)
     assert fired is True
-    assert ev.extra.get("pnl_untrusted") is False, (
-        "writer must recover original_debit from the disk-backed opening "
-        "fill so the close is trusted"
+    # GAP-A002: even when the writer successfully recovers original_debit
+    # from disk, the close_credit is still a synthetic 0.30 haircut, so
+    # the close must remain pnl_untrusted with the synthetic-credit-ratio
+    # reason. (The "no debit context" reason is reserved for the path
+    # where recovery itself fails.)
+    assert ev.extra.get("pnl_untrusted") is True, (
+        "BAG SELL close must be pnl_untrusted even when original_debit is "
+        "recovered — the 0.30 close_credit is synthetic, not a quote."
     )
+    assert ev.extra.get("pnl_untrusted_reason") == (
+        "bag_close_synthetic_credit_ratio_30pct"
+    )
+    assert "pnl_untrusted" in ev.tags
     assert abs(ev.fill_price - 0.45) < 1e-9
     legs = ev.extra.get("bag_legs")
     assert isinstance(legs, list) and len(legs) == 2
@@ -483,3 +504,53 @@ def test_bag_paper_fill_sell_close_recovers_legs_from_disk(monkeypatch, tmp_path
     short_leg = next(l for l in legs if l["strike"] == 725.0)
     assert long_leg["action"] == "SELL"
     assert short_leg["action"] == "BUY"
+
+
+def test_bag_open_buy_path_is_not_marked_untrusted_by_close_patch():
+    """GAP-A002 regression guard: the BAG OPEN (BUY) path uses the
+    strategy's net_debit_estimate as a trusted reference price. The
+    SELL-close trust-predicate patch must NOT bleed into the open path —
+    opening BAG fills remain pnl_untrusted=False with no
+    bag_close_synthetic_credit_ratio_30pct reason and no pnl_untrusted
+    tag.
+    """
+    ev = _bag_evidence()  # side="BUY" — opening fill
+    fired = simulate_bag_paper_fill(ev)
+    assert fired is True
+    assert ev.extra.get("pnl_untrusted") is False, (
+        "OPEN BAG fills must NOT inherit the close-path's untrusted flag"
+    )
+    assert "pnl_untrusted_reason" not in ev.extra, (
+        "OPEN BAG fills must NOT carry a close-path reason field"
+    )
+    assert "pnl_untrusted" not in ev.tags
+    # And tag/fill invariants for the open path are still in place.
+    assert "bag" in ev.tags
+    assert "spread" in ev.tags
+    assert "paper_fill" in ev.tags
+    assert ev.fill_price == 1.50
+
+
+def test_non_bag_paper_evidence_unaffected_by_close_patch():
+    """GAP-A002 regression guard: a non-options strategy paper fill
+    (e.g. alpha_futures) must pass through the BAG simulator untouched —
+    no pnl_untrusted flag, no reason, no pnl_untrusted tag added by the
+    close-path patch.
+    """
+    ev = PaperExecEvidence(
+        symbol="ES", side="SELL", quantity=1.0, fill_price=5500.0,
+        expected_price=5500.0, strategy="alpha_futures",
+        source_strategies=["alpha_futures"], broker="ibkr_paper",
+        status="paper_fill", asset_class="futures", is_live=False,
+        fill_time_utc="2026-05-08T16:00:00Z",
+        extra={"plan_path": "/tmp/plan.json"},
+    )
+    fired = simulate_bag_paper_fill(ev)
+    assert fired is False, "BAG simulator must not fire for non-options strategies"
+    assert "pnl_untrusted" not in ev.extra
+    assert "pnl_untrusted_reason" not in ev.extra
+    assert "pnl_untrusted" not in ev.tags
+    # Status / asset_class / fill_price untouched.
+    assert ev.status == "paper_fill"
+    assert ev.asset_class == "futures"
+    assert ev.fill_price == 5500.0

@@ -1073,9 +1073,15 @@ def _simulate_bag_sell_close(ev: "PaperExecEvidence") -> bool:
         can reconcile realized PnL: ``original_debit``, ``close_credit``,
         ``quantity``, ``multiplier``, ``gross_pnl =
         (close_credit - original_debit) * quantity * multiplier``.
-      * ``extra.pnl_untrusted = False`` when an opening debit was
-        recovered; ``True`` otherwise (no debit context — the close is
-        recorded for guard mutation but realized PnL is unknown).
+      * ``extra.pnl_untrusted = True`` for every BAG SELL close produced
+        by this path. The ``close_credit`` is a synthetic simulator
+        haircut (``original_debit * _BAG_CLOSE_CREDIT_RATIO``), not a
+        market quote, so SCR / profit_lock / trade_closer must never
+        treat it as real performance. The reason field disambiguates
+        the cause: ``bag_close_synthetic_credit_ratio_30pct`` when an
+        opening debit was recovered, or
+        ``bag_sell_close_no_opening_debit_context: ...`` when it was
+        not. The ``pnl_untrusted`` tag is always added to ``ev.tags``.
 
     Returns True when the SELL-close branch fired, False otherwise.
     """
@@ -1246,12 +1252,21 @@ def _simulate_bag_sell_close(ev: "PaperExecEvidence") -> bool:
         "multiplier": _OPTIONS_MULTIPLIER,
         "gross_pnl": gross_pnl,
     }
-    extra["pnl_untrusted"] = not has_debit_context
+    # GAP-A002 — the close_credit above is a synthetic simulator haircut
+    # (original_debit * _BAG_CLOSE_CREDIT_RATIO), NOT a market quote. Every
+    # BAG SELL close produced by this path must therefore be flagged
+    # pnl_untrusted regardless of whether opening debit context was
+    # recovered, so SCR / profit_lock / trade_closer never treat the
+    # synthetic credit as real performance. The opening-context branch
+    # still keeps its more specific reason for forensic clarity.
+    extra["pnl_untrusted"] = True
     if not has_debit_context:
         extra["pnl_untrusted_reason"] = (
             "bag_sell_close_no_opening_debit_context: original_debit=0.0 — "
             "opening fill not recoverable from extra meta or fills log"
         )
+    else:
+        extra["pnl_untrusted_reason"] = "bag_close_synthetic_credit_ratio_30pct"
     extra.setdefault("simulator", "alpha_options.bag_paper_fill.v1")
     extra["bag_close_path"] = True
     ev.extra = extra
@@ -1261,7 +1276,7 @@ def _simulate_bag_sell_close(ev: "PaperExecEvidence") -> bool:
     for t in ("bag", "spread", "paper_fill", "bag_close"):
         if t not in tags_list:
             tags_list.append(t)
-    if not has_debit_context and "pnl_untrusted" not in tags_list:
+    if "pnl_untrusted" not in tags_list:
         tags_list.append("pnl_untrusted")
     ev.tags = tuple(tags_list)
     return True
