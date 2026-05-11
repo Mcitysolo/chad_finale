@@ -54,7 +54,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 LOG = logging.getLogger(__name__)
 
@@ -114,8 +114,41 @@ def _write_atomic(path: Path, payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _iter_trade_payloads(glob_pattern: str = TRADES_GLOB) -> Iterable[dict]:
-    """Yield trade payloads in chronological file order, oldest first."""
+def _load_quarantine_exclusion_sets() -> Tuple[Set[str], Set[str]]:
+    """Return ``(invalid_fill_ids, invalid_trade_hashes)`` for quarantine
+    filtering. Mirrors the trade_stats_engine._load_all_trades pattern so
+    the same exclusion union (operator manifests + live untrusted-fill
+    scan + sidecars) is honoured here. Fail-safe: any error returns
+    empty sets so the monitor degrades to its pre-quarantine behaviour
+    rather than crashing.
+    """
+    try:
+        from chad.utils.quarantine import get_exclusion_sets
+
+        return get_exclusion_sets()
+    except Exception as exc:  # noqa: BLE001 — must never break the monitor
+        LOG.warning("edge_decay_quarantine_load_failed err=%s — using empty sets", exc)
+        return set(), set()
+
+
+def _iter_trade_payloads(
+    glob_pattern: str = TRADES_GLOB,
+    invalid_fill_ids: Optional[Set[str]] = None,
+    invalid_trade_hashes: Optional[Set[str]] = None,
+) -> Iterable[dict]:
+    """Yield trade payloads in chronological file order, oldest first.
+
+    When ``invalid_fill_ids`` / ``invalid_trade_hashes`` are provided,
+    records matching any of:
+      * top-level ``record_hash`` ∈ invalid_trade_hashes
+      * ``payload.fill_id`` ∈ invalid_fill_ids
+      * any element of ``payload.fill_ids`` ∈ invalid_fill_ids
+    are skipped before the existing pnl_untrusted / historical_pre_rebuild
+    filters run. This keeps the streak counter from re-halting strategies
+    whose quarantined evidence has already been excluded by SCR.
+    """
+    bad_fills = invalid_fill_ids or set()
+    bad_hashes = invalid_trade_hashes or set()
     for path in sorted(glob.glob(glob_pattern)):
         if ".scr_reset_bak" in path or path.endswith(".bak"):
             continue
@@ -129,8 +162,21 @@ def _iter_trade_payloads(glob_pattern: str = TRADES_GLOB) -> Iterable[dict]:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    payload = rec.get("payload", rec) if isinstance(rec, dict) else None
+                    if not isinstance(rec, dict):
+                        continue
+                    rh = rec.get("record_hash")
+                    if isinstance(rh, str) and rh in bad_hashes:
+                        continue
+                    payload = rec.get("payload", rec)
                     if not isinstance(payload, dict):
+                        continue
+                    fid = payload.get("fill_id")
+                    if isinstance(fid, str) and fid in bad_fills:
+                        continue
+                    fids = payload.get("fill_ids")
+                    if isinstance(fids, list) and any(
+                        isinstance(f, str) and f in bad_fills for f in fids
+                    ):
                         continue
                     if payload.get("pnl_untrusted") is True:
                         continue
@@ -158,12 +204,26 @@ def _pnl_of(payload: Mapping[str, Any]) -> Optional[float]:
 
 def collect_recent_trades_by_strategy(
     glob_pattern: str = TRADES_GLOB,
+    invalid_fill_ids: Optional[Set[str]] = None,
+    invalid_trade_hashes: Optional[Set[str]] = None,
 ) -> Dict[str, List[float]]:
     """Return {strategy: [pnl_oldest, ..., pnl_newest]} trimmed to a
     manageable tail per strategy (1000 trades is plenty for streak logic).
+
+    When the quarantine sets are not supplied, they are loaded once from
+    ``chad.utils.quarantine.get_exclusion_sets`` so the monitor cannot
+    re-halt a strategy whose losing tail has already been quarantined
+    by an operator manifest (e.g. alpha_options 2026-05-11 phantom BAG
+    closes).
     """
+    if invalid_fill_ids is None and invalid_trade_hashes is None:
+        invalid_fill_ids, invalid_trade_hashes = _load_quarantine_exclusion_sets()
     per_strat: Dict[str, List[float]] = {}
-    for payload in _iter_trade_payloads(glob_pattern):
+    for payload in _iter_trade_payloads(
+        glob_pattern,
+        invalid_fill_ids=invalid_fill_ids,
+        invalid_trade_hashes=invalid_trade_hashes,
+    ):
         strat = str(payload.get("strategy") or "unknown")
         pnl = _pnl_of(payload)
         if pnl is None:
