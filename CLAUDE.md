@@ -49,6 +49,19 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 3. Monitor first 3 execution cycles with manual oversight
 4. Confirm broker truth reconciliation on first fill
 
+## Position-Guard Rebuilder Policy (GAP-028 Option B — PERMISSIVE)
+- `_rebuild_guard_from_paper_ledger` (chad/core/live_loop.py:383) intentionally does NOT consult
+  `reconciliation_state.exclusion_policy`. Strategies may continue to attribute against excluded
+  symbols; the rebuilder mirrors `trade_closer_state.queues` faithfully.
+- Maintenance surface: the drift detector
+  (`chad.core.position_guard.detect_guard_vs_broker_truth_drift`) is wired into
+  `chad-reconciliation-publisher` and emits `runtime/position_guard_drift.json`
+  (schema_version=position_guard_drift.v1) every cycle. Operators close stale entries with
+  `scripts/close_guard_entry.py` (atomic guard-close + trade_closer FIFO clear; honours the
+  §4 invariant that closing the guard alone lets the next live-loop cycle rebuild it).
+- Fail-closed gates on the CLI: refuses when SCR ∉ {CONFIDENT, CAUTIOUS}, when exec_mode is
+  not paper/dry_run, when LiveGate operator intent is ALLOW_LIVE, or on `broker_sync|*` keys.
+
 ## Key Files Reference
 - Hot path entry: chad/core/orchestrator.py
 - Execution: chad/execution/ibkr_adapter.py
@@ -57,6 +70,8 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 - Profit Lock: chad/risk/profit_lock.py
 - Attribution: chad/execution/paper_exec_evidence_writer.py
 - Full preview: chad/core/full_cycle_preview.py
+- Guard drift detector: chad/core/position_guard.py (detect_guard_vs_broker_truth_drift)
+- Guard close CLI: scripts/close_guard_entry.py
 
 ## Active Git Tags
 - STABILITY_FREEZE_20260307_GREEN — original stable baseline

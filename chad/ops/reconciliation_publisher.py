@@ -28,6 +28,7 @@ LOG = logging.getLogger("chad.ops.reconciliation_publisher")
 RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 GUARD_PATH = RUNTIME_DIR / "position_guard.json"
 OUT_PATH = RUNTIME_DIR / "reconciliation_state.json"
+DRIFT_OUT_PATH = RUNTIME_DIR / "position_guard_drift.json"
 
 IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4002
@@ -240,8 +241,58 @@ def _write(payload: Dict[str, Any]) -> None:
     tmp.replace(OUT_PATH)
 
 
+def _emit_position_guard_drift() -> int:
+    """GAP-028 §5.1: emit per-strategy ↔ broker_sync drift findings.
+
+    Pure read-only: invokes detect_guard_vs_broker_truth_drift() against the
+    current on-disk position_guard.json and writes the v1 advisory file at
+    DRIFT_OUT_PATH. No mutation of position_guard.json or trade_closer_state.json.
+    Returns the number of drift records emitted.
+    """
+    try:
+        from chad.core.position_guard import detect_guard_vs_broker_truth_drift
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("position_guard import failed for drift emit: %s", exc)
+        return 0
+
+    if GUARD_PATH.is_file():
+        try:
+            guard_state = json.loads(GUARD_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("position_guard.json unreadable for drift emit: %s", exc)
+            guard_state = {}
+    else:
+        guard_state = {}
+
+    drifts = detect_guard_vs_broker_truth_drift(guard_state) if isinstance(guard_state, dict) else []
+    payload = {
+        "schema_version": "position_guard_drift.v1",
+        "ts_utc": _utc_now_iso(),
+        "ttl_seconds": TTL_SECONDS,
+        "drift_count": len(drifts),
+        "drifts": drifts,
+    }
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DRIFT_OUT_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(DRIFT_OUT_PATH)
+    LOG.info(
+        "position_guard_drift emitted drift_count=%d path=%s",
+        len(drifts), DRIFT_OUT_PATH,
+    )
+    return len(drifts)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    # GAP-028 §5.1: emit per-strategy ↔ broker_sync drift advisory file
+    # (read-only; aligned with this publisher's TTL). Failure here must not
+    # block the rest of reconciliation, so wrap defensively.
+    try:
+        _emit_position_guard_drift()
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("position_guard_drift emit failed: %s", exc)
 
     chad_side = _load_guard_positions()
 
