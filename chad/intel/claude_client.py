@@ -727,7 +727,7 @@ Provide a clear, practical advisory response. Be direct and risk-aware."""
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "phi3:mini")
-OLLAMA_TIMEOUT_SEC = 30.0
+OLLAMA_TIMEOUT_SEC = float(os.environ.get("CHAD_OLLAMA_TIMEOUT_SEC", "30.0"))
 
 _ollama_logger = logging.getLogger("chad.ollama")
 
