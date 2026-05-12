@@ -1,0 +1,12 @@
+[Unit]
+Description=CHAD Lifecycle Replay Engine timer (every 30 min)
+Requires=chad-lifecycle-replay-engine.service
+
+[Timer]
+Unit=chad-lifecycle-replay-engine.service
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

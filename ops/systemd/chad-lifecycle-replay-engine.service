@@ -1,0 +1,19 @@
+[Unit]
+Description=CHAD Lifecycle Replay Engine + Coverage (oneshot, atomic write to runtime/)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=CHAD_ROOT=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/chad.env
+ExecStart=/bin/bash -c 'cd /home/ubuntu/chad_finale && /home/ubuntu/chad_finale/venv/bin/python3 -m chad.ops.lifecycle_replay_engine > runtime/lifecycle_replay_state.json.tmp && mv runtime/lifecycle_replay_state.json.tmp runtime/lifecycle_replay_state.json'
+ExecStartPost=/bin/bash -c 'cd /home/ubuntu/chad_finale && /home/ubuntu/chad_finale/venv/bin/python3 -m chad.ops.lifecycle_replay_coverage > runtime/lifecycle_replay_coverage.json.tmp && mv runtime/lifecycle_replay_coverage.json.tmp runtime/lifecycle_replay_coverage.json'
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
