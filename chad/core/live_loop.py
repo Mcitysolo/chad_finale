@@ -94,7 +94,7 @@ _PAPER_PENDING_STATUSES = frozenset({
     "pendingsubmit", "presubmitted", "submitted", "apipending",
     "inactive", "unknown", "", "error",
 })
-from ib_insync import IB, util
+from ib_async import IB, util
 
 # ib_insync requires asyncio. patchAsyncio() applies nest_asyncio so the
 # main-thread loop is reentrant. Worker threads (e.g. Redis state-bus
@@ -108,7 +108,7 @@ ib = IB()
 # Monkey-patch: skip reqExecutionsAsync on connect to avoid
 # cold-start hang when gateway has large execution backlog.
 # The fill harvester (clientId=79) handles execution history separately.
-import ib_insync.ib as _ib_module
+import ib_async.ib as _ib_module
 async def _noop_executions(self, *a, **kw): return []
 _ib_module.IB.reqExecutionsAsync = _noop_executions
 # ISSUE-29 / test-import safety: tests that import this module must NOT

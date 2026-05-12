@@ -773,20 +773,20 @@ def _lazy_import_ib_factory() -> IBFactory:
 
 def _lazy_import_contract_classes() -> Tuple[Any, Any, Any, Any, Any]:
     try:
-        from ib_insync import Contract, Future, Forex, Order, Stock  # type: ignore[import]
+        from ib_async import Contract, Future, Forex, Order, Stock  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover
         raise ConnectionError(
-            "ib_insync is not installed. Install it inside the CHAD venv."
+            "ib_async is not installed. Install it inside the CHAD venv."
         ) from exc
     return Contract, Future, Forex, Order, Stock
 
 
 def _lazy_import_option_class() -> Any:
     try:
-        from ib_insync import Option  # type: ignore[import]
+        from ib_async import Option  # type: ignore[import]
     except ImportError as exc:  # pragma: no cover
         raise ConnectionError(
-            "ib_insync is not installed. Install it inside the CHAD venv."
+            "ib_async is not installed. Install it inside the CHAD venv."
         ) from exc
     return Option
 
@@ -1155,9 +1155,9 @@ class _ContractResolver:
 
         # Build BAG contract
         try:
-            from ib_insync import ComboLeg  # type: ignore[import]
+            from ib_async import ComboLeg  # type: ignore[import]
         except ImportError as exc:  # pragma: no cover
-            raise ConnectionError("ib_insync is not installed") from exc
+            raise ConnectionError("ib_async is not installed") from exc
 
         bag = _Contract()
         bag.symbol = intent.symbol

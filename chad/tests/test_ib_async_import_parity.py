@@ -100,6 +100,14 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
     # USDCAD FX rate via reqMktData for advisory context. No
     # order-affecting calls.
     "chad/intel/advisory_engine.py",
+    # Phase 2: execution-path migration. Hot-path live loop and IBKR
+    # adapter / trade router. ib_async preserves the full ib_insync
+    # public API surface (IB, util.patchAsyncio, Contract, Order,
+    # Future, Forex, Stock, Option, ComboLeg, ib_async.ib submodule),
+    # so the migration is import-only — no call-site changes.
+    "chad/core/live_loop.py",
+    "chad/execution/ibkr_adapter.py",
+    "chad/execution/ibkr_trade_router.py",
 )
 
 # Production source files still importing ib_insync that are explicitly
@@ -107,11 +115,8 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
 # disallow-listed category. Phase 2 will migrate these with dedicated
 # IBKR safety tests.
 PHASE2_DEFERRED_FILES: tuple[str, ...] = (
-    "chad/core/live_loop.py",
     "chad/core/paper_position_closer.py",
     "chad/core/paper_shadow_runner.py",
-    "chad/execution/ibkr_adapter.py",
-    "chad/execution/ibkr_trade_router.py",
 )
 
 

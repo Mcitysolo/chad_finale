@@ -129,7 +129,7 @@ class IBKRTradeRouter:
         """
         Execute a trade via IBKR. Uses what-if mode by default (no real execution).
         """
-        from ib_insync import Contract, Order  # type: ignore[import]
+        from ib_async import Contract, Order  # type: ignore[import]
 
         side = req.side.upper()
         if side not in ("BUY", "SELL"):
