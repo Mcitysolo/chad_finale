@@ -23,3 +23,13 @@ def test_env_var_overrides_timeout(monkeypatch):
     finally:
         monkeypatch.delenv("CHAD_OLLAMA_TIMEOUT_SEC", raising=False)
         importlib.reload(claude_client)
+
+
+def test_env_var_overrides_max_requests_per_min(monkeypatch):
+    monkeypatch.setenv("CHAD_MAX_REQUESTS_PER_MIN", "25")
+    reloaded = importlib.reload(claude_client)
+    try:
+        assert reloaded.DEFAULT_MAX_REQUESTS_PER_MIN == 25
+    finally:
+        monkeypatch.delenv("CHAD_MAX_REQUESTS_PER_MIN", raising=False)
+        importlib.reload(claude_client)

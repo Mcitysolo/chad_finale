@@ -84,7 +84,7 @@ class TestTierRouting:
 
 class TestRateLimiting:
     def _make_client(self):
-        config = ClaudeConfig(api_key="sk-ant-test")
+        config = ClaudeConfig(api_key="sk-ant-test", max_requests_per_min=10)
         with patch("chad.intel.claude_client.ClaudeClient._build_anthropic_client", return_value=None):
             return ClaudeClient(config=config)
 
