@@ -1,23 +1,24 @@
 """
 GAP-012 / GAP-013 closure tests: Polygon residue guards.
 
-Polygon-specific modules may remain only as explicitly gated legacy/optional
-tools. These tests assert:
+The Polygon subscription was cancelled; IBKR is the sole authoritative
+market data source. `chad/market_data/polygon_daily_bars_backfill.py` has
+been removed entirely. The legacy `backend/polygon_stocks_stream.py`
+remains as a gated/optional tool. These tests assert:
 
-1. Importing the legacy Polygon modules is safe (no network, no SystemExit,
-   no RuntimeError) regardless of CHAD_BAR_PROVIDER.
-2. Executing those modules' main()/CLI entrypoint without
-   CHAD_BAR_PROVIDER=polygon raises SystemExit with a clear message.
+1. Importing `backend/polygon_stocks_stream.py` is safe (no network, no
+   SystemExit, no RuntimeError) regardless of CHAD_BAR_PROVIDER.
+2. Executing its main() without CHAD_BAR_PROVIDER=polygon raises
+   SystemExit with a clear message.
 3. The IBKR bar provider docstring no longer claims Polygon is the default
    for equities.
-4. The active provider used by the running CHAD daemon does not require the
-   polygon-api-client package to be importable.
+4. The active provider used by the running CHAD daemon does not require
+   the polygon-api-client package to be importable.
 """
 
 from __future__ import annotations
 
 import importlib
-import os
 import sys
 from pathlib import Path
 
@@ -35,48 +36,6 @@ def _without_polygon_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 def _purge_module(name: str) -> None:
     """Drop a previously-imported module so importlib re-runs top-level code."""
     sys.modules.pop(name, None)
-
-
-# ----------------------------------------------------------------------
-# polygon_daily_bars_backfill
-# ----------------------------------------------------------------------
-
-
-def test_polygon_daily_backfill_import_safe_without_polygon_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Importing the module must succeed even with no provider override."""
-    _without_polygon_provider(monkeypatch)
-    _purge_module("chad.market_data.polygon_daily_bars_backfill")
-
-    mod = importlib.import_module("chad.market_data.polygon_daily_bars_backfill")
-
-    # Sanity: the guard exists and is callable, but was not invoked at import.
-    assert callable(getattr(mod, "_require_polygon_provider"))
-    assert callable(getattr(mod, "main"))
-
-
-def test_polygon_daily_backfill_execution_requires_polygon_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Calling main() without CHAD_BAR_PROVIDER=polygon must SystemExit."""
-    _without_polygon_provider(monkeypatch)
-    _purge_module("chad.market_data.polygon_daily_bars_backfill")
-    mod = importlib.import_module("chad.market_data.polygon_daily_bars_backfill")
-
-    with pytest.raises(SystemExit) as excinfo:
-        mod.main([])
-
-    msg = str(excinfo.value)
-    assert "CHAD_BAR_PROVIDER=polygon" in msg, (
-        f"guard SystemExit message did not name the override: {msg!r}"
-    )
-
-    # And calling _require_polygon_provider directly with provider=ibkr
-    # must also refuse.
-    monkeypatch.setenv("CHAD_BAR_PROVIDER", "ibkr")
-    with pytest.raises(SystemExit):
-        mod._require_polygon_provider()
 
 
 # ----------------------------------------------------------------------
@@ -122,6 +81,22 @@ def test_polygon_stocks_stream_execution_requires_polygon_provider(
     assert "CHAD_BAR_PROVIDER=polygon" in msg, (
         f"guard SystemExit message did not name the override: {msg!r}"
     )
+
+
+# ----------------------------------------------------------------------
+# polygon_daily_bars_backfill removal
+# ----------------------------------------------------------------------
+
+
+def test_polygon_daily_bars_backfill_removed() -> None:
+    """The legacy backfill module must no longer be present in the tree."""
+    legacy = REPO_ROOT / "chad" / "market_data" / "polygon_daily_bars_backfill.py"
+    assert not legacy.exists(), (
+        f"polygon_daily_bars_backfill.py should be deleted but still exists at {legacy}"
+    )
+
+    with pytest.raises(ImportError):
+        importlib.import_module("chad.market_data.polygon_daily_bars_backfill")
 
 
 # ----------------------------------------------------------------------
@@ -179,15 +154,10 @@ def test_active_provider_does_not_require_polygon_import(
             "chad.market_data.nightly_bars_refresh",
             "chad.market_data.price_cache_refresh",
             "chad.market_data.build_bars_cache",
+            "chad.market_data.service",
         ):
             _purge_module(active_mod)
             importlib.import_module(active_mod)
-
-        # And the legacy backfill module must remain *import-safe* even when
-        # the polygon-api-client package is unavailable, because its import
-        # is now lazy and only happens when actually constructing the client.
-        _purge_module("chad.market_data.polygon_daily_bars_backfill")
-        importlib.import_module("chad.market_data.polygon_daily_bars_backfill")
     finally:
         sys.meta_path.remove(blocker)
 

@@ -13,7 +13,6 @@ What it does
 - Builds a deterministic list of tickers ("universe") from *existing* on-disk artifacts:
   1) config/universe.json                     (preferred, operator-controlled)
   2) runtime/full_execution_cycle_last.json   (fallback: summary.tick_symbols)
-  3) control/polygon_universe.txt             (fallback: one ticker per line)
 
 - Writes runtime/universe.json (atomic replace, stable shape).
 
@@ -191,25 +190,6 @@ def _load_symbols_from_plan(path: Path) -> Tuple[List[str], Optional[str]]:
     return [], "plan_no_symbols_found"
 
 
-def _load_symbols_from_text_file(path: Path) -> Tuple[List[str], Optional[str]]:
-    """
-    control/polygon_universe.txt format: one ticker per line, allows comments '#'
-    """
-    if not path.is_file():
-        return [], f"missing:{path}"
-    try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        items: List[str] = []
-        for raw in lines:
-            s = raw.strip()
-            if not s or s.startswith("#"):
-                continue
-            items.append(s)
-        return _dedupe_preserve_order(items), None
-    except Exception as exc:
-        return [], f"text_read_error:{path.name}:{type(exc).__name__}:{exc}"
-
-
 @dataclass(frozen=True)
 class Paths:
     repo_dir: Path
@@ -232,7 +212,6 @@ def build_universe(*, paths: Paths, max_symbols: int) -> Dict[str, Any]:
 
     cfg_universe_path = paths.config_dir / "universe.json"
     plan_path = paths.runtime_dir / "full_execution_cycle_last.json"
-    polygon_universe_path = paths.control_dir / "polygon_universe.txt"
     out_path = paths.runtime_dir / "universe.json"
 
     warnings: List[str] = []
@@ -250,19 +229,13 @@ def build_universe(*, paths: Paths, max_symbols: int) -> Dict[str, Any]:
     if plan_err:
         warnings.append(f"plan_tick_symbols:{plan_err}")
 
-    # 3) polygon universe txt (fallback)
-    pol_syms, pol_err = _load_symbols_from_text_file(polygon_universe_path)
-    sources["polygon_universe_txt"] = {"path": str(polygon_universe_path), "count": len(pol_syms), "error": pol_err}
-    if pol_err:
-        warnings.append(f"polygon_universe_txt:{pol_err}")
-
     # Merge in deterministic order:
-    # - primary: config universe if present, else plan if present, else polygon txt.
-    primary: List[str] = cfg_syms or plan_syms or pol_syms
+    # - primary: config universe if present, else plan.
+    primary: List[str] = cfg_syms or plan_syms
     merged: List[str] = list(primary)
 
     # Append extras without disturbing primary order
-    for extra in (cfg_syms, plan_syms, pol_syms):
+    for extra in (cfg_syms, plan_syms):
         for sym in extra:
             if sym not in merged:
                 merged.append(sym)

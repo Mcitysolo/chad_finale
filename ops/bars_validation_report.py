@@ -138,7 +138,7 @@ def expected_last_session_date(exchange: str, now_utc: datetime) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="CHAD Bars Validation Report (1d) — schema + market-aware freshness.")
     ap.add_argument("--bars-dir", required=True, help="e.g. /home/ubuntu/chad_finale/data/bars/1d")
-    ap.add_argument("--universe-file", required=True, help="e.g. /home/ubuntu/chad_finale/control/polygon_universe.txt")
+    ap.add_argument("--universe-file", required=True, help="newline-delimited ticker file (one symbol per line, '#' comments allowed)")
     ap.add_argument("--out", required=True, help="output report JSON path")
     ap.add_argument("--exchange", default="XNYS", help="exchange calendar id (default: XNYS / NYSE)")
     args = ap.parse_args()
