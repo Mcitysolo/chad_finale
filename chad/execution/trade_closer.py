@@ -17,9 +17,12 @@ import dataclasses
 import datetime as _dt
 import hashlib
 import json
+import logging
 import pathlib
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
+
+_LOG = logging.getLogger("chad.execution.trade_closer")
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +130,46 @@ def _fill_multiplier(fill: Dict[str, Any]) -> float:
 # ClosedTrade dataclass
 # ---------------------------------------------------------------------------
 
+def _sanitize_meta(value: Any) -> Dict[str, Any]:
+    """Gap-4 (v9.1 audit): return a JSON-safe shallow copy of *value*.
+
+    Used everywhere meta crosses a serialization boundary (fill record →
+    FIFO lot → closed_trade.v1 payload → trade_closer_state.json). Returns
+    {} when *value* is None or not a dict. For dict input, every key/value
+    is checked with `json.dumps` (no `default=` fallback so the check is
+    real); a value that fails serialization is converted to ``str(v)``.
+    A value that also fails ``str()`` is dropped with a WARNING log. Keys
+    are coerced to ``str`` to keep the resulting dict round-trip safe.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in value.items():
+        try:
+            key_str = str(k)
+        except Exception:  # noqa: BLE001 — defensive; str() basically never raises
+            _LOG.warning("trade_closer_meta_drop reason=key_not_stringable")
+            continue
+        try:
+            json.dumps(v)
+            out[key_str] = v
+            continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            out[key_str] = str(v)
+            _LOG.warning(
+                "trade_closer_meta_sanitize key=%s converted_to_str source_type=%s",
+                key_str, type(v).__name__,
+            )
+        except Exception:  # noqa: BLE001
+            _LOG.warning(
+                "trade_closer_meta_drop key=%s reason=value_unsanitizable source_type=%s",
+                key_str, type(v).__name__,
+            )
+    return out
+
+
 @dataclasses.dataclass
 class ClosedTrade:
     strategy: str
@@ -141,6 +184,10 @@ class ClosedTrade:
     contract_multiplier: float
     fill_ids: List[str]
     schema: str = "closed_trade.v1"
+    # Gap-4 (v9.1 audit): forwarded strategy meta block (setup_family,
+    # stop_width_usd, session_window, r_target_1, r_target_2, ...). Empty
+    # default keeps existing callers and legacy state files compatible.
+    meta: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_payload(self) -> Dict[str, Any]:
         # Local import: keeps trade_closer's import surface narrow and avoids
@@ -200,6 +247,13 @@ class ClosedTrade:
             "is_live": False,
             "tags": ["paper", "closed", self.strategy],
             "pnl_breakdown": breakdown,
+            # Gap-4 (v9.1 audit): forwarded TradeSignal/position meta block.
+            # setup_family_expectancy_updater reads payload["meta"]["setup_family"]
+            # and payload["meta"]["stop_width_usd"] to bucket alpha_intraday_micro
+            # trades by ORB / VWAP_RECLAIM / etc. Empty default for strategies
+            # that emit no meta — schema_version is unchanged (no formal
+            # closed_trade.v1 migration framework exists).
+            "meta": _sanitize_meta(self.meta),
         }
 
 
@@ -403,6 +457,24 @@ def _extract_fill(
         asset_class_extra = str(extra.get("asset_class") or "").strip().lower()
     asset_class = asset_class_top or asset_class_extra
 
+    # Gap-4 (v9.1 audit): pull meta from the fill payload so opening lots
+    # can stamp setup_family/stop_width_usd before the closing fill arrives.
+    # Source precedence (first JSON-safe dict wins):
+    #   1. payload["meta"]
+    #   2. extra["meta"]
+    # Falls back to {} (and trade_closer then consults position_guard at
+    # lot-creation time inside _match_fill so writer-side meta forwarding
+    # is optional, not required, for the closed_trade.v1 meta block to
+    # populate in production).
+    fill_meta: Dict[str, Any] = {}
+    raw_meta = payload.get("meta")
+    if isinstance(raw_meta, dict) and raw_meta:
+        fill_meta = _sanitize_meta(raw_meta)
+    elif isinstance(extra, dict):
+        raw_extra_meta = extra.get("meta")
+        if isinstance(raw_extra_meta, dict) and raw_extra_meta:
+            fill_meta = _sanitize_meta(raw_extra_meta)
+
     flat: Dict[str, Any] = {
         "fill_id": str(fill_id),
         "strategy": strategy,
@@ -411,6 +483,7 @@ def _extract_fill(
         "quantity": float(qty),
         "fill_price": float(px),
         "ts_utc": str(ts) if ts else None,
+        "meta": fill_meta,
     }
     if options_multiplier is not None:
         flat["options_multiplier"] = options_multiplier
@@ -433,15 +506,53 @@ class TradeCloser:
         trades_dir: pathlib.Path,
         state_path: pathlib.Path,
         routing_path: Optional[pathlib.Path] = None,
+        position_guard_path: Optional[pathlib.Path] = None,
     ) -> None:
         self.fills_dir = pathlib.Path(fills_dir)
         self.trades_dir = pathlib.Path(trades_dir)
         self.state_path = pathlib.Path(state_path)
         self._routing_path = pathlib.Path(routing_path) if routing_path is not None else None
+        # Gap-4 (v9.1 audit): optional override of the position_guard.json
+        # path used as a fallback source of TradeSignal.meta when the fill
+        # record does not carry meta itself. Production default is None →
+        # use the canonical runtime path. Tests inject a tmp_path file.
+        self._position_guard_path: Optional[pathlib.Path] = (
+            pathlib.Path(position_guard_path) if position_guard_path is not None else None
+        )
         # queues[(strategy, symbol)] = deque of open lots
-        # each lot: {fill_id, side, quantity, fill_price, ts_utc}
+        # each lot: {fill_id, side, quantity, fill_price, ts_utc, multiplier, meta}
         self.queues: Dict[Tuple[str, str], Deque[Dict[str, Any]]] = defaultdict(deque)
         self.processed_fill_ids: set = set()
+
+    def _resolve_lot_meta(
+        self,
+        fill: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Gap-4 (v9.1 audit): pick the meta dict to stamp on a newly
+        created opening lot.
+
+        Precedence:
+          1. Meta carried on the fill record (set by _extract_fill from
+             payload["meta"] or extra["meta"]).
+          2. position_guard.json entry for (strategy, symbol) — looked up
+             at lot creation time. Production source for alpha_intraday_micro
+             until/unless paper_exec_evidence_writer learns to copy meta
+             onto the fill record directly.
+        Returns {} when both sources are absent / unparseable. Never raises.
+        """
+        fill_meta = fill.get("meta") if isinstance(fill, dict) else None
+        if isinstance(fill_meta, dict) and fill_meta:
+            return _sanitize_meta(fill_meta)
+        try:
+            from chad.core.position_guard import get_open_position_meta
+            guard_meta = get_open_position_meta(
+                str(fill.get("strategy", "")),
+                str(fill.get("symbol", "")),
+                path=self._position_guard_path,
+            )
+        except Exception:  # noqa: BLE001 — position_guard lookup must never break FIFO
+            guard_meta = {}
+        return _sanitize_meta(guard_meta) if isinstance(guard_meta, dict) else {}
 
     # ---- state ----------------------------------------------------------
 
@@ -575,6 +686,10 @@ class TradeCloser:
         # multiplier acts as a fallback for legacy lots restored from a
         # state file written before this field existed.
         incoming_multiplier = _fill_multiplier(fill)
+        # Gap-4: resolve meta once per incoming fill so a single position
+        # guard read backs both the same-side append and the flip-residual
+        # opening lot paths below. Closing legs do not consume this dict.
+        incoming_meta = self._resolve_lot_meta(fill)
         closed: List[ClosedTrade] = []
 
         remaining = fill["quantity"]
@@ -590,6 +705,7 @@ class TradeCloser:
                     "fill_price": fill["fill_price"],
                     "ts_utc": fill["ts_utc"],
                     "multiplier": incoming_multiplier,
+                    "meta": incoming_meta,
                 }
             )
             return closed
@@ -610,6 +726,13 @@ class TradeCloser:
             direction = 1.0 if opening_side == "BUY" else -1.0
             pnl = (exit_price - entry_price) * close_qty * multiplier * direction
 
+            # Gap-4: forward the opening lot's meta onto the ClosedTrade so
+            # the closed_trade.v1 payload preserves setup_family / stop_width
+            # back to the analytics layer. Legacy lots persisted by older
+            # state files lack `meta` — they fall through to {}.
+            lot_meta = lot.get("meta")
+            ct_meta = _sanitize_meta(lot_meta) if isinstance(lot_meta, dict) else {}
+
             closed.append(
                 ClosedTrade(
                     strategy=fill["strategy"],
@@ -623,6 +746,7 @@ class TradeCloser:
                     pnl=pnl,
                     contract_multiplier=multiplier,
                     fill_ids=[lot["fill_id"], fill["fill_id"]],
+                    meta=ct_meta,
                 )
             )
 
@@ -632,7 +756,9 @@ class TradeCloser:
                 queue.popleft()
 
         # Any leftover incoming qty becomes a new opening lot in the
-        # opposite direction (flip).
+        # opposite direction (flip). Carry incoming_meta so the flip-side
+        # lot is also tagged with whatever meta the closing fill provided
+        # (or the current position_guard entry for the new side).
         if remaining > 0:
             queue.append(
                 {
@@ -642,6 +768,7 @@ class TradeCloser:
                     "fill_price": fill["fill_price"],
                     "ts_utc": fill["ts_utc"],
                     "multiplier": incoming_multiplier,
+                    "meta": incoming_meta,
                 }
             )
 

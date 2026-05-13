@@ -500,26 +500,28 @@ add("CONTRACT-6.2", "6 / Business Framework",
     "Investigate chad-equity-history.timer; verify last fire timestamp (systemctl list-timers).",
 )
 
-# 6.3 — tier_manager hysteresis: synthetic — currently in PRO ($183k); equity drops to 4% below $160k threshold
+# 6.3 — tier_manager hysteresis: synthetic — currently in SCALE ($183k); equity drops near the
+# demotion gate of $144,000 (renamed PRO -> SCALE in v9.1).  The v9.1 ladder uses an explicit
+# `demotion_equity_usd` field per tier; `_select_tier` falls back to a hysteresis_pct band only
+# when that field is absent.  This test exercises both sides of the gate.
 try:
     from chad.risk.tier_manager import _select_tier
     tiers_cfg = json.load(open(ROOT/"config/tiers.json"))
-    tiers_list = tiers_cfg.get("tiers", [])
+    tiers_obj = tiers_cfg.get("tiers", {})  # v9.1: dict; pre-v9.1: list — _select_tier accepts either
     hpct = float(tiers_cfg.get("hysteresis_pct", 5.0))
-    # Equity 4% below PRO floor (160000 * 0.96 = 153600) — within hysteresis (5%)
-    # Should HOLD at PRO
-    held = _select_tier(153600, tiers_list, "PRO", hpct)  # 153600 = PRO_MIN(160000) * (1 - hysteresis 0.04); 150000 = below demotion floor
-    # Equity 6% below (152000) — should DEMOTE to MID
-    demoted = _select_tier(150000, tiers_list, "PRO", hpct)
-    ok = held["name"] == "PRO" and demoted["name"] != "PRO"
-    SYNTH_OUT.append(("CONTRACT-6.3", f"hysteresis @153600 from PRO → {held['name']} | @150000 → {demoted['name']}"))
+    # Equity above the SCALE demotion gate (144,000) — should HOLD at SCALE.
+    held = _select_tier(150000, tiers_obj, "SCALE", hpct)
+    # Equity below the SCALE demotion gate — should DEMOTE off SCALE.
+    demoted = _select_tier(140000, tiers_obj, "SCALE", hpct)
+    ok = held["name"] == "SCALE" and demoted["name"] != "SCALE"
+    SYNTH_OUT.append(("CONTRACT-6.3", f"hysteresis @150000 from SCALE → {held['name']} | @140000 → {demoted['name']}"))
     add("CONTRACT-6.3", "6 / Business Framework",
-        "tier_manager applies 5% hysteresis on demotion (4% below: hold PRO; 6% below: demote)",
+        "tier_manager applies demotion gate (above gate: hold SCALE; below gate: demote)",
         "synthetic",
-        "_select_tier(153600,…,'PRO',5)=='PRO' and _select_tier(150000,…,'PRO',5)!='PRO'",
-        f"held@153600={held['name']}, demoted@150000={demoted['name']}",
+        "_select_tier(150000,…,'SCALE')=='SCALE' and _select_tier(140000,…,'SCALE')!='SCALE'",
+        f"held@150000={held['name']}, demoted@140000={demoted['name']}",
         "PASS" if ok else "FAIL",
-        "Hysteresis must hold within 5% band; demote outside it.",
+        "Demotion gate must hold above demotion_equity_usd; demote below it.",
     )
 except Exception as e:
     add("CONTRACT-6.3", "6 / Business Framework", "tier hysteresis", "synthetic", "_select_tier",

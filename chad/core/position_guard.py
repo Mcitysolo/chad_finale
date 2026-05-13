@@ -171,6 +171,16 @@ def _intent_side(intent) -> str:
     return str(getattr(intent, "side", "") or "")
 
 
+def _intent_meta(intent) -> Dict[str, Any]:
+    """Gap-4: pull intent.meta as a defensive dict copy for forwarding into
+    the position_guard entry. Returns {} when intent has no meta or it is
+    not a dict, so the additive "meta" entry key is always JSON-safe."""
+    raw = getattr(intent, "meta", None)
+    if not isinstance(raw, dict):
+        return {}
+    return dict(raw)
+
+
 def _position_key(strategy: str, symbol: str) -> str:
     return f"{strategy}|{symbol}"
 
@@ -275,6 +285,12 @@ def mark_position_open(intent) -> None:
         "quantity": quantity,
         "last_state": PositionState.OPEN.value,
         "_entry_version": int(_time.time() * 1000),
+        # Gap-4 (v9.1 audit): forward TradeSignal.meta (setup_family,
+        # stop_width_usd, session_window, ...) into guard storage so the
+        # downstream FIFO matcher (trade_closer) can stamp it onto the
+        # closed_trade.v1 record. Empty dict default keeps schema additive
+        # and non-meta strategies emit "meta": {} downstream.
+        "meta": _intent_meta(intent),
     }
     save_state(state)
 
@@ -387,8 +403,47 @@ def replace_position(intent) -> None:
         "quantity": quantity,
         "last_state": PositionState.FLIPPED.value,
         "_entry_version": int(_time.time() * 1000),
+        # Gap-4 (v9.1 audit): mirror mark_position_open so flipped entries
+        # also carry forward TradeSignal.meta into the new opening side.
+        "meta": _intent_meta(intent),
     }
     save_state(state)
+
+
+def get_open_position_meta(
+    strategy: str,
+    symbol: str,
+    *,
+    path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Gap-4 (v9.1 audit): return the meta dict stored on the open
+    position_guard entry for (strategy, symbol).
+
+    Used by trade_closer.TradeCloser to stamp setup_family / stop_width_usd
+    onto a newly created opening FIFO lot so the meta survives onto the
+    closed_trade.v1 payload at exit. Returns {} when there is no matching
+    entry, the entry has no `meta` key, or the stored value is not a dict.
+
+    Pure read — never mutates state, never raises. Accepts an optional
+    explicit `path` for test isolation (mirrors close_stale_position_*
+    pattern used by scripts/close_guard_entry.py).
+    """
+    target = Path(path) if path is not None else STATE_PATH
+    if not target.is_file():
+        return {}
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    entry = raw.get(_position_key(str(strategy), str(symbol)))
+    if not isinstance(entry, dict):
+        return {}
+    meta = entry.get("meta")
+    if not isinstance(meta, dict):
+        return {}
+    return dict(meta)
 
 
 def reset_from_broker(strategy: str, symbol: str) -> None:

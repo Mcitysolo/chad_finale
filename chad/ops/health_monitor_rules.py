@@ -599,6 +599,117 @@ def rule_halted_with_unclamped_boost(findings: List[Finding]) -> None:
         # eff <= 1.0 → halt clamp working as designed; no finding emitted.
 
 
+def rule_tier_daily_loss_approaching(findings: List[Finding]) -> None:
+    """R15 — Daily-loss budget approaching tier limit (MICRO / STARTER).
+
+    Fires when the tier-enforced daily loss budget has burned more than 70%
+    of the tier ceiling (i.e. budget_remaining_today_usd is below 30% of
+    max_daily_loss_usd). NOTIFY only — no kill-switch and no position
+    action; the tier_risk_enforcer remains the sole authority for hard
+    stops.
+    """
+    state = _read_json(RUNTIME / "tier_enforcement_state.json")
+    if not state:
+        return
+    if bool(state.get("daily_loss_limit_hit", False)):
+        return
+    tier = str(state.get("tier", "") or "").upper()
+    if tier not in ("MICRO", "STARTER"):
+        return
+    max_daily_loss = state.get("max_daily_loss_usd")
+    if max_daily_loss is None:
+        return
+    try:
+        max_daily_loss_f = float(max_daily_loss)
+    except (TypeError, ValueError):
+        return
+    if max_daily_loss_f <= 0:
+        return
+    try:
+        budget_remaining = float(state.get("budget_remaining_today_usd", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return
+    threshold = max_daily_loss_f * 0.30
+    if budget_remaining >= threshold:
+        return
+    findings.append(Finding(
+        rule_id="R15",
+        severity="WARNING",
+        title=f"Daily loss budget approaching limit — tier {tier}",
+        description=(
+            f"Daily loss budget {budget_remaining:.2f} remaining "
+            f"(30% threshold hit) — tier {tier}"
+        ),
+        remedy_type="NOTIFY_ONLY",
+        remedy_action="notify",
+        evidence=(
+            f"tier_enforcement_state.json tier={tier} "
+            f"budget_remaining={budget_remaining:.2f} "
+            f"max_daily_loss={max_daily_loss_f:.2f}"
+        ),
+    ))
+
+
+def rule_setup_family_skip_rate(findings: List[Finding]) -> None:
+    """R16 — Setup family skipping too many entries via stop-too-wide gate.
+
+    Looks at runtime/setup_family_expectancy.json and flags any family
+    where skip_count_stop_too_wide is more than 2× the realised trade
+    count (with a sample-size floor of 5 trades to avoid noise). Indicates
+    the active tier's stop budget may be too tight for the family.
+    NOTIFY only.
+    """
+    expectancy = _read_json(RUNTIME / "setup_family_expectancy.json")
+    if not isinstance(expectancy, dict):
+        return
+    families = expectancy.get("families")
+    if isinstance(families, dict):
+        family_iter = families.items()
+    elif isinstance(expectancy.get("setup_families"), dict):
+        family_iter = expectancy["setup_families"].items()
+    else:
+        # Fall back to scanning top-level dict entries that look like
+        # per-family records.
+        family_iter = (
+            (k, v) for k, v in expectancy.items()
+            if isinstance(v, dict) and (
+                "trades" in v
+                or "skip_count_stop_too_wide" in v
+            )
+        )
+    for family, info in family_iter:
+        if not isinstance(info, dict):
+            continue
+        try:
+            trades = int(info.get("trades", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            skip_count = int(info.get("skip_count_stop_too_wide", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if trades < 5:
+            continue
+        if skip_count <= trades * 2:
+            continue
+        findings.append(Finding(
+            rule_id="R16",
+            severity="WARNING",
+            title=f"Setup family skip rate high: {family}",
+            description=(
+                f"Setup family {family} skip rate high: {skip_count} "
+                f"skips vs {trades} trades — stop budget may be too "
+                "tight for active tier"
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=(
+                f"setup_family_expectancy.{family} "
+                f"skip_count_stop_too_wide={skip_count} trades={trades}"
+            ),
+        ))
+
+
 def run_all_rules() -> List[Finding]:
     """Run all rules and return list of findings."""
     findings: List[Finding] = []
@@ -617,6 +728,8 @@ def run_all_rules() -> List[Finding]:
         rule_alpha_cluster_degradation,
         rule_scr_effective_trades_gap,
         rule_halted_with_unclamped_boost,
+        rule_tier_daily_loss_approaching,
+        rule_setup_family_skip_rate,
     ]:
         try:
             fn(findings)

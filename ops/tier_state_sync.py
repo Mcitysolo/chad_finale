@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# DEPRECATED v9.1 — tier classification is now owned exclusively by
+# chad/risk/tier_manager.py. This file is retained for reference only.
+# Do not execute. Do not import.
 from __future__ import annotations
 
 import json

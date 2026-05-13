@@ -1,0 +1,18 @@
+[Unit]
+Description=CHAD micro/starter EOD flatten — closes alpha_intraday_micro positions before intraday margin cutoff
+After=network.target
+ConditionPathExists=/home/ubuntu/chad_finale/runtime/tier_state.json
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/chad.env
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 /home/ubuntu/chad_finale/ops/micro_eod_flatten.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-micro-eod-flatten
+
+[Install]
+WantedBy=multi-user.target

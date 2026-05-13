@@ -1,74 +1,98 @@
 {
-  "schema_version": "tiers.v2",
-  "_comment": "Equity tier ladder. As account grows, more strategies unlock. TierManager reads runtime/portfolio_snapshot.json and writes runtime/tier_state.json. The live_loop reads tier_state.json to gate strategies.",
-  "_hysteresis_pct": "5% buffer prevents flapping between tiers when equity hovers near a threshold",
-  "tiers": [
-    {
-      "name": "MICRO",
+  "schema_version": "tiers.v9_1",
+  "hysteresis_pct": 5.0,
+  "tiers": {
+    "MICRO": {
+      "description": "Proving account — single instrument, minimum frequency",
       "min_equity_usd": 0,
-      "max_equity_usd": 10000,
-      "description": "Crypto + equities only — no futures, no options",
-      "enabled_strategies": [
-        "alpha", "alpha_intraday", "alpha_crypto",
-        "delta", "gamma", "gamma_reversion",
-        "beta", "beta_trend"
-      ]
+      "max_equity_usd": 2500,
+      "demotion_equity_usd": null,
+      "enabled_strategies": ["alpha_intraday_micro"],
+      "allowed_instruments": ["MES"],
+      "risk_profile": {
+        "max_contracts_per_trade": 1,
+        "max_risk_per_trade_usd": 10,
+        "max_daily_loss_usd": 20,
+        "max_weekly_loss_usd": 30,
+        "max_trades_per_day": 2,
+        "primary_session_only": true,
+        "flatten_before_eod": true,
+        "flatten_eod_minutes_before_close": 30,
+        "stop_width_gate_enabled": true
+      }
     },
-    {
-      "name": "SMALL",
-      "min_equity_usd": 10000,
-      "max_equity_usd": 50000,
-      "description": "Adds defined-risk options spreads + ETF mean reversion + pairs",
+    "STARTER": {
+      "description": "Controlled scaling — two instruments, primary session only",
+      "min_equity_usd": 2500,
+      "max_equity_usd": 25000,
+      "demotion_equity_usd": 2250,
       "enabled_strategies": [
-        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
-        "delta", "delta_pairs",
-        "gamma", "gamma_reversion",
-        "beta", "beta_trend",
-        "omega_vol", "omega_momentum_options"
-      ]
+        "alpha_intraday_micro",
+        "alpha_intraday",
+        "beta_trend",
+        "alpha_crypto"
+      ],
+      "allowed_instruments": ["MES", "MNQ", "SPY", "QQQ", "IWM", "BTC-USD"],
+      "risk_profile": {
+        "max_contracts_per_trade": 2,
+        "max_risk_per_trade_usd": 40,
+        "max_daily_loss_usd": 150,
+        "max_weekly_loss_usd": 300,
+        "max_trades_per_day": 4,
+        "primary_session_only": true,
+        "flatten_before_eod": true,
+        "flatten_eod_minutes_before_close": 30,
+        "stop_width_gate_enabled": true
+      }
     },
-    {
-      "name": "MID",
-      "min_equity_usd": 50000,
+    "PRO_GROWTH": {
+      "description": "Full futures + equities — primary and secondary session",
+      "min_equity_usd": 25000,
       "max_equity_usd": 160000,
-      "description": "Unlocks micro futures (MES, MNQ, MGC) and gamma futures",
+      "demotion_equity_usd": 22500,
       "enabled_strategies": [
-        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
+        "alpha",
+        "alpha_intraday",
+        "alpha_intraday_micro",
         "alpha_futures",
-        "delta", "delta_pairs",
-        "gamma", "gamma_futures", "gamma_reversion",
-        "beta", "beta_trend",
-        "omega", "omega_vol", "omega_momentum_options"
-      ]
+        "alpha_crypto",
+        "beta",
+        "beta_trend",
+        "gamma_futures",
+        "delta",
+        "omega_macro"
+      ],
+      "allowed_instruments": ["*"],
+      "risk_profile": {
+        "max_contracts_per_trade": 5,
+        "max_risk_per_trade_usd": 200,
+        "max_daily_loss_usd": 500,
+        "max_weekly_loss_usd": 1500,
+        "max_trades_per_day": 10,
+        "primary_session_only": false,
+        "flatten_before_eod": false,
+        "flatten_eod_minutes_before_close": null,
+        "stop_width_gate_enabled": true
+      }
     },
-    {
-      "name": "PRO",
+    "SCALE": {
+      "description": "Full stack — all 16 strategies, existing sizing pipeline unchanged",
       "min_equity_usd": 160000,
-      "max_equity_usd": 1000000,
-      "description": "All 16 strategies firing at meaningful size",
-      "enabled_strategies": [
-        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
-        "alpha_futures",
-        "delta", "delta_pairs",
-        "gamma", "gamma_futures", "gamma_reversion",
-        "beta", "beta_trend",
-        "omega", "omega_vol", "omega_macro", "omega_momentum_options"
-      ]
-    },
-    {
-      "name": "INSTITUTIONAL",
-      "min_equity_usd": 1000000,
-      "max_equity_usd": null,
-      "description": "Full institutional sizing — macro futures (ZN, ZB) deploy meaningfully",
-      "enabled_strategies": [
-        "alpha", "alpha_intraday", "alpha_crypto", "alpha_options",
-        "alpha_futures",
-        "delta", "delta_pairs",
-        "gamma", "gamma_futures", "gamma_reversion",
-        "beta", "beta_trend",
-        "omega", "omega_vol", "omega_macro", "omega_momentum_options"
-      ]
+      "max_equity_usd": 10000000,
+      "demotion_equity_usd": 144000,
+      "enabled_strategies": ["*"],
+      "allowed_instruments": ["*"],
+      "risk_profile": {
+        "max_contracts_per_trade": null,
+        "max_risk_per_trade_usd": null,
+        "max_daily_loss_usd": null,
+        "max_weekly_loss_usd": null,
+        "max_trades_per_day": null,
+        "primary_session_only": false,
+        "flatten_before_eod": false,
+        "flatten_eod_minutes_before_close": null,
+        "stop_width_gate_enabled": false
+      }
     }
-  ],
-  "hysteresis_pct": 5.0
+  }
 }

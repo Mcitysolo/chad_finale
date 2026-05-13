@@ -142,6 +142,16 @@ _paper_adapter = IbkrAdapter(
 LOOP_INTERVAL_SECONDS = 60
 _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
 
+# Gap-1 (v9.1 audit): tier-level allowlist enforcement on raw TradeSignals
+# emitted by strategies. Strategies (e.g. alpha_crypto) carry internal
+# universes and do not consult the active tier; this gate is the canonical
+# pipeline-level enforcement point. Instance is created once at module
+# load and reused each cycle; the gate re-reads tier_state.json per call.
+from chad.execution.tier_instrument_gate import TierInstrumentGate as _TierInstrumentGate
+_TIER_INSTRUMENT_GATE = _TierInstrumentGate(
+    runtime_dir=Path("/home/ubuntu/chad_finale/runtime"),
+)
+
 # Redis stop signal flag — set by state bus subscriber
 _redis_stop_flag = False
 _redis_stop_reason = ""
@@ -1122,6 +1132,44 @@ def run_once(logger: logging.Logger) -> None:
             _stage4_exc,
         )
         return []
+
+    # ------------------------------------------------------------------
+    # Gap-1 (v9.1 audit): tier instrument allowlist enforcement. Runs as
+    # the first gate after raw TradeSignal aggregation and BEFORE all
+    # downstream gates and intent building. Strategies whose internal
+    # universe ignores the active tier (alpha_crypto BTC/ETH/SOL) can no
+    # longer reach the router on a tier that excludes their symbols.
+    # Fail-soft: any exception leaves routed_signals unchanged. The gate
+    # itself fails open on tier_state.json read/parse errors.
+    # ------------------------------------------------------------------
+    try:
+        _pre_tier_count = len(routed_signals or [])
+        _allowed_sigs, _blocked_sigs = _TIER_INSTRUMENT_GATE.filter_signals(
+            list(routed_signals or [])
+        )
+        routed_signals = _allowed_sigs
+        if _blocked_sigs:
+            logger.warning(
+                "TIER_INSTRUMENT_GATE blocked=%d remaining=%d symbols=%s",
+                len(_blocked_sigs),
+                len(routed_signals),
+                sorted({
+                    str(getattr(s, "symbol", "") or "")
+                    for s in _blocked_sigs
+                }),
+            )
+        if _routing_diag is not None:
+            try:
+                _routing_diag.observe_signals(
+                    "signals_after_tier_instrument_gate", routed_signals
+                )
+            except Exception:
+                pass
+    except Exception as _tier_gate_err:  # noqa: BLE001
+        logger.warning(
+            "tier_instrument_gate_failed err=%s — proceeding without filter",
+            _tier_gate_err,
+        )
 
     # Weekend gate — drop equity signals on Saturday/Sunday UTC; crypto
     # strategies pass through unchanged. Pipeline B (equity intent builder

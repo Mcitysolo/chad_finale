@@ -638,6 +638,18 @@ def build_default_strategy_limits() -> Dict[StrategyName, StrategyRiskLimits]:
         allow_short=False,
     )
 
+    # Alpha Intraday Micro: tier-aware MES/MNQ intraday sleeve. Sized at one
+    # micro contract per signal; gated by TierRiskEnforcer (per-trade stop
+    # budget, daily/weekly loss caps, max trades/day). Caps mirror
+    # alpha_futures since this is a futures sleeve.
+    limits[StrategyName.ALPHA_INTRADAY_MICRO] = StrategyRiskLimits(
+        enabled=True,
+        max_symbol_notional=50_000.0,
+        max_total_notional=150_000.0,
+        max_trade_notional=50_000.0,
+        allow_short=True,
+    )
+
     return limits
 
 

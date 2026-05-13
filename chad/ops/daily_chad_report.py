@@ -1649,7 +1649,8 @@ class MorningBrief:
                     f"from where we started)"
                 )
 
-                if tier_name.upper() == "PRO":
+                # renamed PRO -> SCALE in v9.1
+                if tier_name.upper() == "SCALE":
                     lines.append(
                         f"Top tier — using all {n_strategies} of our 16 approaches"
                     )

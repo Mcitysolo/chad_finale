@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD setup family expectancy updater — runs daily after market close
+Requires=chad-setup-expectancy.service
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 21:00 America/New_York
+AccuracySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

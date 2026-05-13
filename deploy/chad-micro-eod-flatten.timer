@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD micro/starter EOD flatten timer — fires at 15:30 ET Mon–Fri
+Requires=chad-micro-eod-flatten.service
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:30 America/New_York
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

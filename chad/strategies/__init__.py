@@ -90,6 +90,10 @@ from .omega_vol import omega_vol_handler
 from .omega_vol_config import build_omega_vol_config
 from .delta_pairs import delta_pairs_handler
 from .delta_pairs_config import build_delta_pairs_config
+from .alpha_intraday_micro import (
+    alpha_intraday_micro_handler,
+    build_alpha_intraday_micro_config,
+)
 # ---------------------------------------------------------------------------
 # Protocols & Dataclasses
 # ---------------------------------------------------------------------------
@@ -232,6 +236,11 @@ def _build_registry() -> Dict[StrategyName, StrategyRegistration]:
             name=StrategyName.DELTA_PAIRS,
             build_config=build_delta_pairs_config,
             handler=delta_pairs_handler,
+        ),
+        StrategyName.ALPHA_INTRADAY_MICRO: StrategyRegistration(
+            name=StrategyName.ALPHA_INTRADAY_MICRO,
+            build_config=build_alpha_intraday_micro_config,
+            handler=alpha_intraday_micro_handler,
         ),
     }
     return registrations
