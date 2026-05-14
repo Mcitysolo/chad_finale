@@ -87,6 +87,15 @@ except Exception:  # pragma: no cover - defensive fallback
     class LegendLoaderError(Exception):  # type: ignore[no-redef]
         pass
 
+# TierRiskProfile attach — tier-aware strategies (alpha_intraday_micro)
+# refuse to size without an explicit TierRiskProfile on the context.
+# Import is fail-soft so a missing tier_manager module does not break
+# context construction; population is fail-closed (tier_profile stays None).
+try:
+    from chad.risk.tier_manager import TierRiskProfile  # type: ignore
+except Exception:  # pragma: no cover - defensive fallback
+    TierRiskProfile = None  # type: ignore[assignment, misc]
+
 __all__ = [
     "MarketContext",
     "ContextResult",
@@ -163,6 +172,10 @@ class MarketContext:
     vix_history: Optional[List[float]] = None
     vol_index: Optional[float] = None
     market_data: Dict[str, Any] = field(default_factory=dict)
+    # Tier-aware strategies (alpha_intraday_micro) require an explicit
+    # TierRiskProfile to size; populated from runtime/tier_state.json.
+    tier_profile: Optional[Any] = None
+    tier_name: str = ""
 
 
 @dataclass
@@ -489,6 +502,9 @@ class ContextBuilder:
                 legend_load_error = f"unexpected:{exc}"
                 self.logger.warning("legend_load_unexpected_error: %s", exc)
 
+        # Load tier risk profile from runtime/tier_state.json (fail-closed).
+        tier_profile_obj, tier_name_str = self._load_tier_profile()
+
         # Build context
         context = MarketContext(
             ticks=wrapped_ticks,
@@ -502,6 +518,8 @@ class ContextBuilder:
             vix_history=vix_history,
             vol_index=vix_spot,
             market_data=market_data,
+            tier_profile=tier_profile_obj,
+            tier_name=tier_name_str,
         )
 
         # Evidence for auditability
@@ -738,6 +756,48 @@ class ContextBuilder:
             )  # type: ignore
 
     _DYNAMIC_CAPS_PATH = Path("/home/ubuntu/chad_finale/runtime/dynamic_caps.json")
+    _TIER_STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/tier_state.json")
+
+    def _load_tier_profile(self) -> Tuple[Optional[Any], str]:
+        """Reconstruct TierRiskProfile from runtime/tier_state.json.
+
+        Returns (tier_profile, tier_name).  On any failure (missing file,
+        malformed JSON, TierRiskProfile import unavailable) returns
+        (None, ""); strategies that require a tier profile then fail
+        closed and emit no signals.
+        """
+        if TierRiskProfile is None:
+            return None, ""
+        try:
+            if not self._TIER_STATE_PATH.is_file():
+                return None, ""
+            data = json.loads(self._TIER_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self.logger.warning("tier_state.json read failed: %s", exc)
+            return None, ""
+        if not isinstance(data, dict):
+            return None, ""
+        rp = data.get("risk_profile")
+        if not isinstance(rp, dict):
+            return None, ""
+        try:
+            profile = TierRiskProfile(
+                max_contracts_per_trade=rp.get("max_contracts_per_trade"),
+                max_risk_per_trade_usd=rp.get("max_risk_per_trade_usd"),
+                max_daily_loss_usd=rp.get("max_daily_loss_usd"),
+                max_weekly_loss_usd=rp.get("max_weekly_loss_usd"),
+                max_trades_per_day=rp.get("max_trades_per_day"),
+                primary_session_only=bool(rp.get("primary_session_only", False)),
+                flatten_before_eod=bool(rp.get("flatten_before_eod", False)),
+                flatten_eod_minutes_before_close=rp.get(
+                    "flatten_eod_minutes_before_close"
+                ),
+                stop_width_gate_enabled=bool(rp.get("stop_width_gate_enabled", False)),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("tier_state.json profile construct failed: %s", exc)
+            return None, ""
+        return profile, str(data.get("tier_name") or "")
 
     def _load_equity_from_dynamic_caps(self) -> float:
         """

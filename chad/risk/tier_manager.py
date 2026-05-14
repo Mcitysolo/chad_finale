@@ -92,6 +92,7 @@ _CANONICAL_STRATEGY_NAMES: List[str] = [
     "alpha_crypto",
     "alpha_futures",
     "alpha_intraday",
+    "alpha_intraday_micro",
     "alpha_options",
     "beta",
     "beta_trend",
