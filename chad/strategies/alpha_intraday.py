@@ -248,6 +248,7 @@ def _build_signal(
         "stop_loss_pct": _stop_pts_pct,
         "take_profit_pct": _target_pts_pct,
         "trigger": trigger,
+        "setup_family": trigger,
         "max_hold_bars": 30,
         "timeframe": timeframe,
         "stop_distance_pts": round(_stop_pts, 6),

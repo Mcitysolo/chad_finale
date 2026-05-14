@@ -134,6 +134,24 @@ def _asset_class_for_symbol(sym: str) -> AssetClass:
     return AssetClass.EQUITY
 
 
+def _setup_family_for_alpha(reason: str, side: SignalSide, regime: Optional[str]) -> str:
+    if "recovery" in (reason or ""):
+        return "recovery_long"
+    if regime == "uptrend" and side == SignalSide.BUY:
+        return "ema_crossover_long"
+    if regime == "downtrend" and side == SignalSide.SELL:
+        return "ema_crossover_short"
+    if regime == "chop" and side == SignalSide.BUY:
+        return "chop_reversion_long"
+    if regime == "chop" and side == SignalSide.SELL:
+        return "chop_reversion_short"
+    if side == SignalSide.BUY:
+        return "alpha_long"
+    if side == SignalSide.SELL:
+        return "alpha_short"
+    return f"alpha_{reason}" if reason else "alpha_unknown"
+
+
 # ---------------------------------------------------------------------------
 # Indicator helpers
 # ---------------------------------------------------------------------------
@@ -381,6 +399,7 @@ def build_alpha_signals(
         _entry_meta: Dict[str, Any] = {
             "reason": reason,
             "regime": regime,
+            "setup_family": _setup_family_for_alpha(reason, side, regime),
             "stop_distance_pts": round(_stop_per_share, 6),
             "stop_distance_usd": round(_stop_per_share, 6),
             "tier_max_risk_usd": _tier_max,

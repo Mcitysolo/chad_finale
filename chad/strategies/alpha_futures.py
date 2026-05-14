@@ -238,6 +238,14 @@ def _lowest_low(bars: Sequence[Mapping[str, float]], lookback: int) -> float:
     values = [v for v in values if v > 0]
     return min(values) if values else 0.0
 
+
+def _setup_family_for_alpha_futures(side: SignalSide, *, breakout: bool = True) -> str:
+    if side == SignalSide.BUY:
+        return "momentum_breakout_long"
+    if side == SignalSide.SELL:
+        return "momentum_breakout_short"
+    return f"alpha_futures_{side.value.lower()}"
+
 # ---------------------------------------------------------------------------
 # Capital allocator interface
 def _allocation_weight() -> float:
@@ -587,9 +595,16 @@ def _build_signal_for_symbol(
         return None
     estimated_notional = price * spec.point_value * contracts
     atr_pct = _safe_div(atr_val, price, 0.0)
+    _breakout_entry = (
+        (highest_high > 0 and price >= highest_high)
+        or (lowest_low > 0 and price <= lowest_low)
+    )
     _entry_meta: Dict[str, Any] = {
             "engine": "alpha_futures.v4",
             "family": spec.family,
+            "setup_family": _setup_family_for_alpha_futures(
+                side, breakout=_breakout_entry,
+            ),
             "contract_symbol": symbol,
             "exchange": spec.exchange,
             "point_value": spec.point_value,

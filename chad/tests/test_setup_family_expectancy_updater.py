@@ -185,9 +185,13 @@ def test_5_zero_stop_width_does_not_crash(tmp_path: Path) -> None:
 
 
 def test_6_other_strategies_ignored(tmp_path: Path) -> None:
+    # Phase A Item 4 expanded the updater scope to include alpha,
+    # alpha_futures, and alpha_intraday alongside alpha_intraday_micro.
+    # Strategies outside that whitelist (e.g. broker_sync, manual,
+    # delta_pairs) must still be ignored.
     records = [
-        _record(pnl=+100.0, setup_family="ORB", strategy="alpha_intraday"),
-        _record(pnl=-100.0, setup_family="ORB", strategy="alpha_intraday"),
+        _record(pnl=+100.0, setup_family="ORB", strategy="broker_sync"),
+        _record(pnl=-100.0, setup_family="ORB", strategy="manual"),
         _record(pnl=+100.0, setup_family="ORB", strategy="alpha_intraday_micro"),
     ]
     _write_ledger(tmp_path / "trades", records)

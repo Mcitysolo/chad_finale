@@ -60,6 +60,14 @@ DEFAULT_TRADES_DIR = REPO_ROOT / "data" / "trades"
 DEFAULT_OUTPUT_PATH = REPO_ROOT / "runtime" / "setup_family_expectancy.json"
 
 TARGET_STRATEGY = "alpha_intraday_micro"
+SETUP_EXPECTANCY_STRATEGIES = frozenset(
+    {
+        "alpha_intraday_micro",
+        "alpha",
+        "alpha_futures",
+        "alpha_intraday",
+    }
+)
 
 CANONICAL_FAMILIES: Tuple[str, ...] = (
     "ORB",
@@ -209,6 +217,7 @@ class SetupFamilyExpectancyUpdater:
         self._trades_skipped_corrupt: int = 0
         self._last_trade_ts: Optional[datetime] = None
         self._families: Dict[str, _FamilyAccumulator] = {}
+        self._strategies_seen: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -226,6 +235,7 @@ class SetupFamilyExpectancyUpdater:
         self._trades_skipped_corrupt = 0
         self._last_trade_ts = None
         self._families = {fam: _FamilyAccumulator() for fam in CANONICAL_FAMILIES}
+        self._strategies_seen = set()
 
         for record in self._iter_records():
             self._consume(record)
@@ -324,8 +334,9 @@ class SetupFamilyExpectancyUpdater:
         outer, payload = record
         try:
             strategy = str(payload.get("strategy") or outer.get("strategy") or "").strip()
-            if strategy != TARGET_STRATEGY:
+            if strategy not in SETUP_EXPECTANCY_STRATEGIES:
                 return
+            self._strategies_seen.add(strategy)
 
             self._total_trades_found += 1
 
@@ -421,6 +432,7 @@ class SetupFamilyExpectancyUpdater:
                 "trades_processed": self._trades_processed,
                 "trades_skipped_corrupt": self._trades_skipped_corrupt,
                 "last_trade_ts_utc": last_trade_iso,
+                "strategies_processed": sorted(self._strategies_seen),
             },
         }
 
@@ -473,6 +485,7 @@ __all__ = [
     "CANONICAL_FAMILIES",
     "UNKNOWN_FAMILY",
     "SKIP_REASON_STOP_TOO_WIDE",
+    "SETUP_EXPECTANCY_STRATEGIES",
     "DEFAULT_LOOKBACK_DAYS",
     "DEFAULT_TRADES_DIR",
     "DEFAULT_OUTPUT_PATH",
