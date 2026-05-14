@@ -251,6 +251,7 @@ def _compute_contract_size(
     equity: float,
     tuning: StrategyTuning,
     confidence: float,
+    tier_max_risk_usd: Optional[float] = None,
 ) -> Tuple[int, float, float, float]:
     """
     Return (contracts, allocation_weight, risk_budget_usd, risk_per_contract_usd).
@@ -260,11 +261,26 @@ def _compute_contract_size(
     effective_risk_pct = tuning.risk_budget_pct * alloc_weight
     risk_budget = max(equity * effective_risk_pct * _clamp(confidence, 0.5, 1.25),
                       tuning.min_risk_budget_usd)
-    risk_per_contract = atr_val * spec.point_value * spec.risk_multiple
+    # Option A:
+    # Preserve legacy sizing when no tier budget is active.
+    # Activate stop-aligned sizing only when tier_max_risk_usd is present.
+    if tier_max_risk_usd is not None:
+        stop_atr_mult_for_sizing = getattr(
+            tuning,
+            "stop_loss_atr_multiple",
+            spec.risk_multiple,
+        )
+    else:
+        stop_atr_mult_for_sizing = spec.risk_multiple
+    sizing_distance_pts = atr_val * stop_atr_mult_for_sizing
+    risk_per_contract = sizing_distance_pts * spec.point_value
     # If budget cannot support one contract, return 0
     if risk_per_contract <= 0 or risk_budget < risk_per_contract:
         return 0, alloc_weight, risk_budget, risk_per_contract
     raw_contracts = int(risk_budget // risk_per_contract)
+    if tier_max_risk_usd is not None and risk_per_contract > 0:
+        tier_contracts = int(float(tier_max_risk_usd) // risk_per_contract)
+        raw_contracts = min(raw_contracts, tier_contracts)
     contracts = min(raw_contracts, spec.max_contracts)
     if contracts <= 0:
         return 0, alloc_weight, risk_budget, risk_per_contract
@@ -450,6 +466,7 @@ def _build_signal_for_symbol(
     tuning: StrategyTuning,
     equity: float,
     open_position: Optional[Mapping[str, Any]] = None,
+    tier_max_risk_usd: Optional[float] = None,
 ) -> Optional[TradeSignal]:
     """Generate a TradeSignal for the given symbol, or None if conditions fail."""
     if len(bars) < tuning.min_bars or price <= 0:
@@ -526,7 +543,8 @@ def _build_signal_for_symbol(
         return None
     contracts, alloc_wt, risk_budget_usd, risk_per_contract_usd = _compute_contract_size(
         symbol=symbol, spec=spec, price=price, atr_val=atr_val,
-        equity=equity, tuning=tuning, confidence=confidence)
+        equity=equity, tuning=tuning, confidence=confidence,
+        tier_max_risk_usd=tier_max_risk_usd)
     if contracts <= 0:
         return None
     estimated_notional = price * spec.point_value * contracts
@@ -558,6 +576,23 @@ def _build_signal_for_symbol(
             "liquidity_usd": round(liquidity_usd, 6),
             "spread_bps": 0.0,
             "required_asset_class": "futures",
+            "stop_distance_pts": round(
+                atr_val * getattr(tuning, "stop_loss_atr_multiple", spec.risk_multiple),
+                6,
+            ),
+            "stop_distance_usd": round(
+                atr_val * getattr(tuning, "stop_loss_atr_multiple", spec.risk_multiple) * spec.point_value,
+                6,
+            ),
+            "sizing_distance_pts": round(
+                risk_per_contract_usd / spec.point_value,
+                6,
+            ) if spec.point_value else 0.0,
+            "sizing_risk_multiple": round(
+                (risk_per_contract_usd / spec.point_value / atr_val),
+                6,
+            ) if spec.point_value and atr_val else 0.0,
+            "tier_max_risk_usd": tier_max_risk_usd,
         },
     )
 
@@ -587,6 +622,11 @@ def build_alpha_futures_signals(
         }
     else:
         open_positions = _load_alpha_futures_open_positions()
+    tier_max_risk_usd = getattr(
+        getattr(ctx, "tier_profile", None),
+        "max_risk_per_trade_usd",
+        None,
+    )
     signals: List[TradeSignal] = []
     for symbol in ALPHA_FUTURES_UNIVERSE:
         spec = DEFAULT_SPECS.get(symbol)
@@ -600,6 +640,7 @@ def build_alpha_futures_signals(
             tuning=tuning,
             equity=equity,
             open_position=open_positions.get(symbol),
+            tier_max_risk_usd=tier_max_risk_usd,
         )
         if signal is not None:
             signals.append(signal)

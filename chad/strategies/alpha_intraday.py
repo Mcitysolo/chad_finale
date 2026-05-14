@@ -180,7 +180,24 @@ def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
         return None
 
 
-def _size_for(sym: str, confidence: float) -> float:
+def _size_for(
+    sym: str,
+    confidence: float,
+    *,
+    atr: float = 0.0,
+    tier_max_risk_usd: Optional[float] = None,
+) -> float:
+    if sym in ("MES", "MNQ") and atr > 0.0 and tier_max_risk_usd is not None:
+        from chad.risk.futures_position_sizer import FUTURES_SPECS
+        _spec = FUTURES_SPECS.get(sym)
+        if _spec is not None:
+            _stop_pts = atr * 2.0
+            _risk_per = _stop_pts * _spec.point_value
+            if _risk_per > 0:
+                _contracts = int(float(tier_max_risk_usd) // _risk_per)
+                if _contracts <= 0:
+                    return 0.0
+                return float(min(_contracts, 10))
     base = 5.0
     if sym == "MES":
         return min(2.0, max(1.0, round(base * confidence * 0.4)))
@@ -204,13 +221,21 @@ def _build_signal(
     confidence: float,
     trigger: str,
     timeframe: str,
-) -> TradeSignal:
+    *,
+    atr: float = 0.0,
+    tier_max_risk_usd: Optional[float] = None,
+) -> Optional[TradeSignal]:
     confidence = max(0.50, min(0.95, float(confidence)))
+    size = _size_for(sym, confidence, atr=atr, tier_max_risk_usd=tier_max_risk_usd)
+    if size <= 0.0:
+        return None
+    _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
+    _stop_pts = atr * 2.0 if atr > 0 else 0.0
     return TradeSignal(
         strategy=StrategyName.ALPHA_INTRADAY,
         symbol=sym,
         side=side,
-        size=_size_for(sym, confidence),
+        size=size,
         confidence=confidence,
         asset_class=_asset_class(sym),
         meta={
@@ -220,6 +245,9 @@ def _build_signal(
             "trigger": trigger,
             "max_hold_bars": 30,
             "timeframe": timeframe,
+            "stop_distance_pts": round(_stop_pts, 6),
+            "stop_distance_usd": round(_stop_pts * _point_value, 6),
+            "tier_max_risk_usd": tier_max_risk_usd,
         },
     )
 
@@ -228,10 +256,15 @@ def _evaluate_symbol(
     sym: str,
     bars: Sequence[Any],
     timeframe: str,
+    *,
+    tier_max_risk_usd: Optional[float] = None,
 ) -> Optional[TradeSignal]:
     highs, lows, closes = _highs_lows_closes(bars)
     if len(closes) < 45:
         return None
+
+    # ATR for stop-distance sizing — also reused by the vol_explosion trigger.
+    atr_for_sizing = _atr_window(highs, lows, closes, start_from_end=0, length=14) or 0.0
 
     # Scale parameters by timeframe
     if timeframe == "daily_fallback":
@@ -258,7 +291,10 @@ def _evaluate_symbol(
                     side = None
                 if side is not None:
                     conf = min(0.95, 0.60 + (ratio - vol_mult) * 0.10)
-                    return _build_signal(sym, side, conf, "vol_explosion", timeframe)
+                    return _build_signal(
+                        sym, side, conf, "vol_explosion", timeframe,
+                        atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                    )
     except Exception:
         pass
 
@@ -274,7 +310,10 @@ def _evaluate_symbol(
             ):
                 side = SignalSide.BUY if m_short > 0 else SignalSide.SELL
                 conf = min(0.90, 0.55 + abs(m_short) * 20.0)
-                return _build_signal(sym, side, conf, "momentum_surge", timeframe)
+                return _build_signal(
+                    sym, side, conf, "momentum_surge", timeframe,
+                    atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                )
     except Exception:
         pass
 
@@ -291,11 +330,17 @@ def _evaluate_symbol(
                 if px < lower * (1.0 - bb_pen) and rsi < 25:
                     dist = abs(px - lower) / std20
                     conf = min(0.85, 0.58 + dist * 0.05)
-                    return _build_signal(sym, SignalSide.BUY, conf, "mean_reversion_snap", timeframe)
+                    return _build_signal(
+                        sym, SignalSide.BUY, conf, "mean_reversion_snap", timeframe,
+                        atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                    )
                 if px > upper * (1.0 + bb_pen) and rsi > 75:
                     dist = abs(px - upper) / std20
                     conf = min(0.85, 0.58 + dist * 0.05)
-                    return _build_signal(sym, SignalSide.SELL, conf, "mean_reversion_snap", timeframe)
+                    return _build_signal(
+                        sym, SignalSide.SELL, conf, "mean_reversion_snap", timeframe,
+                        atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                    )
     except Exception:
         pass
 
@@ -309,6 +354,11 @@ def alpha_intraday_handler(ctx: MarketContext, *_args, **_kwargs) -> List[TradeS
         bars_1m = getattr(ctx, "bars_1m", {}) or {}
         bars_daily = getattr(ctx, "bars", {}) or {}
         prices = getattr(ctx, "prices", {}) or {}
+        tier_max_risk_usd = getattr(
+            getattr(ctx, "tier_profile", None),
+            "max_risk_per_trade_usd",
+            None,
+        )
 
         for sym in UNIVERSE:
             try:
@@ -332,7 +382,7 @@ def alpha_intraday_handler(ctx: MarketContext, *_args, **_kwargs) -> List[TradeS
                 if not bars:
                     continue
 
-                sig = _evaluate_symbol(sym, bars, timeframe)
+                sig = _evaluate_symbol(sym, bars, timeframe, tier_max_risk_usd=tier_max_risk_usd)
                 if sig is not None:
                     signals.append(sig)
                     _LAST_SIGNAL[sym] = now

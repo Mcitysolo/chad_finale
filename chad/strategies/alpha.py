@@ -311,7 +311,17 @@ def build_alpha_signals(
         if blocked:
             continue
 
-        size = min(p.max_size, p.base_size * (1.0 + abs(momentum)))
+        _tier_profile = getattr(ctx, "tier_profile", None)
+        _tier_max = getattr(_tier_profile, "max_risk_per_trade_usd", None)
+        _stop_per_share = p.atr_trail_mult * a if a > 0 else 0.0
+
+        if _stop_per_share > 0 and _tier_max is not None:
+            _risk_sized_shares = int(float(_tier_max) // _stop_per_share)
+            if _risk_sized_shares <= 0:
+                continue
+            size = max(1, min(p.max_size, _risk_sized_shares))
+        else:
+            size = min(p.max_size, p.base_size * (1.0 + abs(momentum)))
         if abs(size - pos) < p.min_delta_size:
             continue
 
@@ -341,7 +351,13 @@ def build_alpha_signals(
                 confidence=_clamp(0.5 + abs(momentum), 0.0, 0.95),
                 asset_class=_asset_class_for_symbol(sym),
                 created_at=now,
-                meta={"reason": reason, "regime": regime},
+                meta={
+                    "reason": reason,
+                    "regime": regime,
+                    "stop_distance_pts": round(_stop_per_share, 6),
+                    "stop_distance_usd": round(_stop_per_share, 6),
+                    "tier_max_risk_usd": _tier_max,
+                },
             )
         )
 
