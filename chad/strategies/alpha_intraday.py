@@ -28,6 +28,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
 
 LOG = logging.getLogger(__name__)
@@ -232,18 +233,28 @@ def _build_signal(
     size = _size_for(sym, confidence, atr=atr, tier_max_risk_usd=tier_max_risk_usd)
     if size <= 0.0:
         return None
+    # Pre-entry R:R gate (entry-only, fail-open). Uses the strategy's fixed
+    # stop_loss_pct / take_profit_pct as point-equivalents. With the current
+    # 4.5 / 1.5 defaults this gate never blocks in normal operation — it is a
+    # misconfiguration guard and future extension point.
+    _stop_pts_pct = 1.5
+    _target_pts_pct = 4.5
+    if not passes_rr_gate(_target_pts_pct, _stop_pts_pct):
+        return None
     _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
     _stop_pts = atr * 2.0 if atr > 0 else 0.0
     meta: Dict[str, Any] = {
         "high_convexity": True,
-        "stop_loss_pct": 1.5,
-        "take_profit_pct": 4.5,
+        "stop_loss_pct": _stop_pts_pct,
+        "take_profit_pct": _target_pts_pct,
         "trigger": trigger,
         "max_hold_bars": 30,
         "timeframe": timeframe,
         "stop_distance_pts": round(_stop_pts, 6),
         "stop_distance_usd": round(_stop_pts * _point_value, 6),
         "tier_max_risk_usd": tier_max_risk_usd,
+        "rr_ratio": round(_target_pts_pct / _stop_pts_pct, 4),
+        "rr_gate": "PASSED",
     }
     if primary_session_only is not None:
         meta["session_window"] = session_window

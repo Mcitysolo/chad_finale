@@ -48,6 +48,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,7 @@ class AlphaParams:
     time_stop_bars: int = 30
     min_favor_move_atr: float = 0.5
     atr_trail_mult: float = 2.0
+    target_atr_multiple: float = 3.0
     vol_spike_atr_pct: float = 0.060
 
     # Churn control
@@ -336,6 +338,15 @@ def build_alpha_signals(
         if blocked:
             continue
 
+        # Pre-entry R:R gate (entry-only, fail-open). Exits above are
+        # unaffected. Degenerate ATR (a <= 0) yields a zero target/stop and
+        # passes_rr_gate fails open.
+        if a > 0:
+            _stop_pts_alpha = p.atr_trail_mult * a
+            _target_pts_alpha = p.target_atr_multiple * a
+            if not passes_rr_gate(_target_pts_alpha, _stop_pts_alpha):
+                continue
+
         _tier_profile = getattr(ctx, "tier_profile", None)
         _tier_max = getattr(_tier_profile, "max_risk_per_trade_usd", None)
         _stop_per_share = p.atr_trail_mult * a if a > 0 else 0.0
@@ -373,6 +384,9 @@ def build_alpha_signals(
             "stop_distance_pts": round(_stop_per_share, 6),
             "stop_distance_usd": round(_stop_per_share, 6),
             "tier_max_risk_usd": _tier_max,
+            "rr_ratio": round(p.target_atr_multiple / p.atr_trail_mult, 4)
+                if p.atr_trail_mult > 0 else None,
+            "rr_gate": "PASSED",
         }
         if _primary_only is not None:
             _entry_meta["session_window"] = _session_window

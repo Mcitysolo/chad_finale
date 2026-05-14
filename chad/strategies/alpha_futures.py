@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
+from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
 
 # Equity-index futures eligible for tier-aware session gating. MCL/MGC keep
@@ -80,6 +81,7 @@ class StrategyTuning:
     allow_short: bool = True
     # Exit rules — checked before entry logic when a position is open
     stop_loss_atr_multiple: float = 2.0
+    target_atr_multiple: float = 3.0
     trend_exit_on_ema_slow: bool = True
     time_stop_bars: int = 20
 
@@ -538,6 +540,17 @@ def _build_signal_for_symbol(
         )
         return None
 
+    # ---- Pre-entry R:R gate (entry-only, fail-open) ----
+    # Block new entries whose reward/risk ratio falls below the floor. Exits
+    # above are unaffected. Degenerate inputs (atr_val <= 0 or zero multiples)
+    # fail open via passes_rr_gate.
+    _stop_mult = getattr(tuning, "stop_loss_atr_multiple", spec.risk_multiple)
+    _target_mult = getattr(tuning, "target_atr_multiple", 3.0)
+    _stop_pts = atr_val * float(_stop_mult)
+    _target_pts = atr_val * float(_target_mult)
+    if not passes_rr_gate(_target_pts, _stop_pts):
+        return None
+
     highest_high = _highest_high(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     lowest_low = _lowest_low(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     latest_bar = bars[-1]
@@ -611,6 +624,9 @@ def _build_signal_for_symbol(
                 6,
             ) if spec.point_value and atr_val else 0.0,
             "tier_max_risk_usd": tier_max_risk_usd,
+            "rr_ratio": round(float(_target_mult) / float(_stop_mult), 4)
+                if float(_stop_mult) > 0 else None,
+            "rr_gate": "PASSED",
     }
     if primary_session_only is not None and symbol in _EQUITY_INDEX_FUTURES:
         _entry_meta["session_window"] = session_window
