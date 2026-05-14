@@ -48,6 +48,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.session import session_decision
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -220,6 +221,24 @@ def build_alpha_signals(
     signals: List[TradeSignal] = []
     now = ctx.now if isinstance(ctx.now, datetime) else _utc_now()
 
+    # Tier-aware session gate (entry-only, fail-open). Resolved once per
+    # cycle so exits in the per-symbol loop are never short-circuited.
+    _tier_profile = getattr(ctx, "tier_profile", None)
+    _primary_only = getattr(_tier_profile, "primary_session_only", None)
+    _entries_allowed = True
+    _session_window: Optional[str] = None
+    if _primary_only is not None:
+        try:
+            _decision = session_decision(
+                now, primary_session_only=bool(_primary_only),
+            )
+            _entries_allowed = _decision.entry_allowed
+            _session_window = _decision.session_window
+        except Exception:
+            # Fail-open: preserve current behavior on parse / tz failure.
+            _entries_allowed = True
+            _session_window = None
+
     for symbol in universe:
         sym = _norm_sym(symbol)
         px = _safe_float(raw_prices.get(sym))
@@ -308,6 +327,12 @@ def build_alpha_signals(
             _STATE.set(sym, {"size": 0.0})
             continue
 
+        # Entry-only session gate. Exits above have already been emitted;
+        # this guard never affects exit, stop-loss, or position-reduction
+        # paths.
+        if not _entries_allowed:
+            continue
+
         if blocked:
             continue
 
@@ -342,6 +367,17 @@ def build_alpha_signals(
             side = SignalSide.SELL if px > (ef + es) / 2 else SignalSide.BUY
             reason = "chop_reversion"
 
+        _entry_meta: Dict[str, Any] = {
+            "reason": reason,
+            "regime": regime,
+            "stop_distance_pts": round(_stop_per_share, 6),
+            "stop_distance_usd": round(_stop_per_share, 6),
+            "tier_max_risk_usd": _tier_max,
+        }
+        if _primary_only is not None:
+            _entry_meta["session_window"] = _session_window
+            _entry_meta["session_gate"] = "PASSED"
+            _entry_meta["primary_session_only"] = bool(_primary_only)
         signals.append(
             TradeSignal(
                 strategy=StrategyName.ALPHA,
@@ -351,13 +387,7 @@ def build_alpha_signals(
                 confidence=_clamp(0.5 + abs(momentum), 0.0, 0.95),
                 asset_class=_asset_class_for_symbol(sym),
                 created_at=now,
-                meta={
-                    "reason": reason,
-                    "regime": regime,
-                    "stop_distance_pts": round(_stop_per_share, 6),
-                    "stop_distance_usd": round(_stop_per_share, 6),
-                    "tier_max_risk_usd": _tier_max,
-                },
+                meta=_entry_meta,
             )
         )
 

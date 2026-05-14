@@ -25,6 +25,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
+from chad.utils.session import session_decision
+
+# Equity-index futures eligible for tier-aware session gating. MCL/MGC keep
+# their pre-existing UTC overnight gate; ZN/ZB and other instruments stay
+# unaffected by Phase A Item 2.
+_EQUITY_INDEX_FUTURES = frozenset({"MES", "MNQ", "MYM", "M2K"})
 
 _TRADE_CLOSER_STATE_PATH = "/home/ubuntu/chad_finale/runtime/trade_closer_state.json"
 
@@ -467,6 +473,9 @@ def _build_signal_for_symbol(
     equity: float,
     open_position: Optional[Mapping[str, Any]] = None,
     tier_max_risk_usd: Optional[float] = None,
+    session_entry_allowed: bool = True,
+    session_window: Optional[str] = None,
+    primary_session_only: Optional[bool] = None,
 ) -> Optional[TradeSignal]:
     """Generate a TradeSignal for the given symbol, or None if conditions fail."""
     if len(bars) < tuning.min_bars or price <= 0:
@@ -513,6 +522,22 @@ def _build_signal_for_symbol(
             )
             return None
 
+    # ---- Tier-aware session gate (entry-only, equity-index futures only) ----
+    # Applies only when a TierRiskProfile is present on the context. The
+    # caller resolves the SessionDecision once per cycle and passes it in;
+    # exits have already been emitted above. MCL/MGC keep their existing
+    # UTC overnight gate; bonds and other instruments are not affected.
+    if (
+        primary_session_only is not None
+        and symbol in _EQUITY_INDEX_FUTURES
+        and not session_entry_allowed
+    ):
+        logger.info(
+            "SESSION_GATE_SKIP symbol=%s primary_session_only=%s window=%s",
+            symbol, bool(primary_session_only), session_window,
+        )
+        return None
+
     highest_high = _highest_high(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     lowest_low = _lowest_low(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     latest_bar = bars[-1]
@@ -549,14 +574,7 @@ def _build_signal_for_symbol(
         return None
     estimated_notional = price * spec.point_value * contracts
     atr_pct = _safe_div(atr_val, price, 0.0)
-    return TradeSignal(
-        strategy=StrategyName.ALPHA_FUTURES,
-        symbol=symbol,
-        side=side,
-        size=float(contracts),
-        confidence=float(confidence),
-        asset_class=AssetClass.FUTURES,
-        meta={
+    _entry_meta: Dict[str, Any] = {
             "engine": "alpha_futures.v4",
             "family": spec.family,
             "contract_symbol": symbol,
@@ -593,7 +611,19 @@ def _build_signal_for_symbol(
                 6,
             ) if spec.point_value and atr_val else 0.0,
             "tier_max_risk_usd": tier_max_risk_usd,
-        },
+    }
+    if primary_session_only is not None and symbol in _EQUITY_INDEX_FUTURES:
+        _entry_meta["session_window"] = session_window
+        _entry_meta["session_gate"] = "PASSED"
+        _entry_meta["primary_session_only"] = bool(primary_session_only)
+    return TradeSignal(
+        strategy=StrategyName.ALPHA_FUTURES,
+        symbol=symbol,
+        side=side,
+        size=float(contracts),
+        confidence=float(confidence),
+        asset_class=AssetClass.FUTURES,
+        meta=_entry_meta,
     )
 
 def build_alpha_futures_signals(
@@ -622,11 +652,30 @@ def build_alpha_futures_signals(
         }
     else:
         open_positions = _load_alpha_futures_open_positions()
+    _tier_profile = getattr(ctx, "tier_profile", None)
     tier_max_risk_usd = getattr(
-        getattr(ctx, "tier_profile", None),
+        _tier_profile,
         "max_risk_per_trade_usd",
         None,
     )
+    # Resolve the tier-aware session decision once per cycle. Fail-open:
+    # if tier_profile is absent, or session_decision raises, the strategy
+    # preserves its pre-existing behavior (no equity-index session gate).
+    _primary_only = getattr(_tier_profile, "primary_session_only", None)
+    _session_entry_allowed: bool = True
+    _session_window: Optional[str] = None
+    if _primary_only is not None:
+        try:
+            _decision = session_decision(
+                getattr(ctx, "now", None),
+                primary_session_only=bool(_primary_only),
+            )
+            _session_entry_allowed = _decision.entry_allowed
+            _session_window = _decision.session_window
+        except Exception as _exc:
+            logger.warning(
+                "alpha_futures: session_decision failed=%s — fail-open", _exc,
+            )
     signals: List[TradeSignal] = []
     for symbol in ALPHA_FUTURES_UNIVERSE:
         spec = DEFAULT_SPECS.get(symbol)
@@ -641,6 +690,11 @@ def build_alpha_futures_signals(
             equity=equity,
             open_position=open_positions.get(symbol),
             tier_max_risk_usd=tier_max_risk_usd,
+            session_entry_allowed=_session_entry_allowed,
+            session_window=_session_window,
+            primary_session_only=(
+                bool(_primary_only) if _primary_only is not None else None
+            ),
         )
         if signal is not None:
             signals.append(signal)

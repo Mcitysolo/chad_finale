@@ -28,6 +28,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.session import session_decision
 
 LOG = logging.getLogger(__name__)
 
@@ -224,6 +225,8 @@ def _build_signal(
     *,
     atr: float = 0.0,
     tier_max_risk_usd: Optional[float] = None,
+    session_window: Optional[str] = None,
+    primary_session_only: Optional[bool] = None,
 ) -> Optional[TradeSignal]:
     confidence = max(0.50, min(0.95, float(confidence)))
     size = _size_for(sym, confidence, atr=atr, tier_max_risk_usd=tier_max_risk_usd)
@@ -231,6 +234,21 @@ def _build_signal(
         return None
     _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
     _stop_pts = atr * 2.0 if atr > 0 else 0.0
+    meta: Dict[str, Any] = {
+        "high_convexity": True,
+        "stop_loss_pct": 1.5,
+        "take_profit_pct": 4.5,
+        "trigger": trigger,
+        "max_hold_bars": 30,
+        "timeframe": timeframe,
+        "stop_distance_pts": round(_stop_pts, 6),
+        "stop_distance_usd": round(_stop_pts * _point_value, 6),
+        "tier_max_risk_usd": tier_max_risk_usd,
+    }
+    if primary_session_only is not None:
+        meta["session_window"] = session_window
+        meta["session_gate"] = "PASSED"
+        meta["primary_session_only"] = bool(primary_session_only)
     return TradeSignal(
         strategy=StrategyName.ALPHA_INTRADAY,
         symbol=sym,
@@ -238,17 +256,7 @@ def _build_signal(
         size=size,
         confidence=confidence,
         asset_class=_asset_class(sym),
-        meta={
-            "high_convexity": True,
-            "stop_loss_pct": 1.5,
-            "take_profit_pct": 4.5,
-            "trigger": trigger,
-            "max_hold_bars": 30,
-            "timeframe": timeframe,
-            "stop_distance_pts": round(_stop_pts, 6),
-            "stop_distance_usd": round(_stop_pts * _point_value, 6),
-            "tier_max_risk_usd": tier_max_risk_usd,
-        },
+        meta=meta,
     )
 
 
@@ -258,6 +266,8 @@ def _evaluate_symbol(
     timeframe: str,
     *,
     tier_max_risk_usd: Optional[float] = None,
+    session_window: Optional[str] = None,
+    primary_session_only: Optional[bool] = None,
 ) -> Optional[TradeSignal]:
     highs, lows, closes = _highs_lows_closes(bars)
     if len(closes) < 45:
@@ -294,6 +304,8 @@ def _evaluate_symbol(
                     return _build_signal(
                         sym, side, conf, "vol_explosion", timeframe,
                         atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                        session_window=session_window,
+                        primary_session_only=primary_session_only,
                     )
     except Exception:
         pass
@@ -313,6 +325,8 @@ def _evaluate_symbol(
                 return _build_signal(
                     sym, side, conf, "momentum_surge", timeframe,
                     atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                    session_window=session_window,
+                    primary_session_only=primary_session_only,
                 )
     except Exception:
         pass
@@ -333,6 +347,8 @@ def _evaluate_symbol(
                     return _build_signal(
                         sym, SignalSide.BUY, conf, "mean_reversion_snap", timeframe,
                         atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                        session_window=session_window,
+                        primary_session_only=primary_session_only,
                     )
                 if px > upper * (1.0 + bb_pen) and rsi > 75:
                     dist = abs(px - upper) / std20
@@ -340,6 +356,8 @@ def _evaluate_symbol(
                     return _build_signal(
                         sym, SignalSide.SELL, conf, "mean_reversion_snap", timeframe,
                         atr=atr_for_sizing, tier_max_risk_usd=tier_max_risk_usd,
+                        session_window=session_window,
+                        primary_session_only=primary_session_only,
                     )
     except Exception:
         pass
@@ -354,11 +372,35 @@ def alpha_intraday_handler(ctx: MarketContext, *_args, **_kwargs) -> List[TradeS
         bars_1m = getattr(ctx, "bars_1m", {}) or {}
         bars_daily = getattr(ctx, "bars", {}) or {}
         prices = getattr(ctx, "prices", {}) or {}
+        _tier_profile = getattr(ctx, "tier_profile", None)
         tier_max_risk_usd = getattr(
-            getattr(ctx, "tier_profile", None),
+            _tier_profile,
             "max_risk_per_trade_usd",
             None,
         )
+
+        # Tier-aware session gate (entry-only, fail-open). When tier_profile
+        # is absent the strategy preserves its pre-existing behavior.
+        _primary_only = getattr(_tier_profile, "primary_session_only", None)
+        _session_window: Optional[str] = None
+        if _primary_only is not None:
+            try:
+                _decision = session_decision(
+                    getattr(ctx, "now", None),
+                    primary_session_only=bool(_primary_only),
+                )
+            except Exception as _exc:
+                LOG.warning("alpha_intraday: session_decision failed=%s — fail-open", _exc)
+                _decision = None
+            if _decision is not None:
+                _session_window = _decision.session_window
+                if not _decision.entry_allowed:
+                    LOG.info(
+                        "alpha_intraday: session_gate_blocked reason=%s "
+                        "primary_session_only=%s window=%s",
+                        _decision.skip_reason, bool(_primary_only), _session_window,
+                    )
+                    return []
 
         for sym in UNIVERSE:
             try:
@@ -382,7 +424,14 @@ def alpha_intraday_handler(ctx: MarketContext, *_args, **_kwargs) -> List[TradeS
                 if not bars:
                     continue
 
-                sig = _evaluate_symbol(sym, bars, timeframe, tier_max_risk_usd=tier_max_risk_usd)
+                sig = _evaluate_symbol(
+                    sym, bars, timeframe,
+                    tier_max_risk_usd=tier_max_risk_usd,
+                    session_window=_session_window,
+                    primary_session_only=(
+                        bool(_primary_only) if _primary_only is not None else None
+                    ),
+                )
                 if sig is not None:
                     signals.append(sig)
                     _LAST_SIGNAL[sym] = now
