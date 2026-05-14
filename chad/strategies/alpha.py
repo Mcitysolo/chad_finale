@@ -48,6 +48,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
 
@@ -365,6 +366,22 @@ def build_alpha_signals(
             if not passes_rr_gate(_target_pts_alpha, _stop_pts_alpha):
                 continue
 
+        # Pre-entry liquidity gate (entry-only, EQUITY/ETF, fail-open).
+        # Exits above are unaffected; this guard never blocks position-
+        # reducing or stop-loss paths. UNKNOWN classifications pass.
+        confidence = _clamp(0.5 + abs(momentum), 0.0, 0.95)
+        _asset_cls = _asset_class_for_symbol(sym)
+        if _asset_cls in (AssetClass.EQUITY, AssetClass.ETF):
+            _liq_blocked, _liq_class, _liq_required_conf = blocks_thin_entry(
+                sym,
+                float(confidence),
+            )
+            if _liq_blocked:
+                continue
+        else:
+            _liq_class = LiquidityClass.UNKNOWN
+            _liq_required_conf = float(confidence)
+
         _tier_profile = getattr(ctx, "tier_profile", None)
         _tier_max = getattr(_tier_profile, "max_risk_per_trade_usd", None)
         _stop_per_share = p.atr_trail_mult * a if a > 0 else 0.0
@@ -406,6 +423,8 @@ def build_alpha_signals(
             "rr_ratio": round(p.target_atr_multiple / p.atr_trail_mult, 4)
                 if p.atr_trail_mult > 0 else None,
             "rr_gate": "PASSED",
+            "liquidity_class": _liq_class.value,
+            "liquidity_required_confidence": round(float(_liq_required_conf), 6),
         }
         if _primary_only is not None:
             _entry_meta["session_window"] = _session_window
@@ -417,8 +436,8 @@ def build_alpha_signals(
                 symbol=sym,
                 side=side,
                 size=float(size),
-                confidence=_clamp(0.5 + abs(momentum), 0.0, 0.95),
-                asset_class=_asset_class_for_symbol(sym),
+                confidence=confidence,
+                asset_class=_asset_cls,
                 created_at=now,
                 meta=_entry_meta,
             )

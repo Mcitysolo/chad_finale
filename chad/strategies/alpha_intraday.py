@@ -28,6 +28,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
 
@@ -241,6 +242,20 @@ def _build_signal(
     _target_pts_pct = 4.5
     if not passes_rr_gate(_target_pts_pct, _stop_pts_pct):
         return None
+    # Pre-entry liquidity gate (entry-only, EQUITY/ETF, fail-open). Futures
+    # (MES/MNQ) and crypto (*-USD) are excluded by AssetClass and pass with
+    # liquidity_class=UNKNOWN. UNKNOWN classifications never block.
+    _asset_cls_liq = _asset_class(sym)
+    if _asset_cls_liq in (AssetClass.EQUITY, AssetClass.ETF):
+        _liq_blocked, _liq_class, _liq_required_conf = blocks_thin_entry(
+            sym,
+            float(confidence),
+        )
+        if _liq_blocked:
+            return None
+    else:
+        _liq_class = LiquidityClass.UNKNOWN
+        _liq_required_conf = float(confidence)
     _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
     _stop_pts = atr * 2.0 if atr > 0 else 0.0
     meta: Dict[str, Any] = {
@@ -256,6 +271,8 @@ def _build_signal(
         "tier_max_risk_usd": tier_max_risk_usd,
         "rr_ratio": round(_target_pts_pct / _stop_pts_pct, 4),
         "rr_gate": "PASSED",
+        "liquidity_class": _liq_class.value,
+        "liquidity_required_confidence": round(float(_liq_required_conf), 6),
     }
     if primary_session_only is not None:
         meta["session_window"] = session_window
