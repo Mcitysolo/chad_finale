@@ -1,0 +1,17 @@
+[Unit]
+Description=CHAD options Greeks publisher
+After=chad-options-chain-refresh.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.options_greeks_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-options-greeks-refresh
+
+[Install]
+WantedBy=multi-user.target

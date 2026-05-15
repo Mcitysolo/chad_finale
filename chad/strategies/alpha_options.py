@@ -58,6 +58,19 @@ from chad.types import (
 from chad.options.chain_provider import OptionsChain
 from chad.options.strike_selector import SpreadSpec, select_vertical_spread
 
+# Phase B Item 6 — synthetic Greeks lookup is metadata-only. Importing the
+# gate must never break alpha_options if the helper is unavailable.
+try:
+    from chad.utils.options_greeks_gate import (
+        GreeksResult,
+        get_option_greeks,
+    )
+except Exception:  # pragma: no cover - failure-soft import
+    GreeksResult = None  # type: ignore[assignment]
+
+    def get_option_greeks(*_args: Any, **_kwargs: Any):  # type: ignore[no-redef]
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -364,6 +377,37 @@ def _extract_directional_from_bars(
 
 
 # ---------------------------------------------------------------------------
+# Greeks metadata helper (Phase B Item 6 — additive, fail-open)
+# ---------------------------------------------------------------------------
+
+class _DefaultGreeks:
+    """Minimal stand-in matching GreeksResult shape when the gate is absent."""
+    __slots__ = ("delta", "gamma", "theta", "theo_price", "source", "near_atm")
+
+    def __init__(self, right: str) -> None:
+        self.delta = 0.5 if str(right).upper() == "C" else -0.5
+        self.gamma = None
+        self.theta = None
+        self.theo_price = None
+        self.source = "default"
+        self.near_atm = False
+
+
+def _safe_get_greeks(symbol: str, expiry: str, strike: float, right: str):
+    """Look up synthetic Greeks; return a neutral default on any failure."""
+    try:
+        result = get_option_greeks(symbol, expiry, float(strike), right)
+        if result is None:
+            return _DefaultGreeks(right)
+        # Tolerate either GreeksResult dataclass or a duck-typed object.
+        if not hasattr(result, "delta") or not hasattr(result, "source"):
+            return _DefaultGreeks(right)
+        return result
+    except Exception:
+        return _DefaultGreeks(right)
+
+
+# ---------------------------------------------------------------------------
 # Signal generation
 # ---------------------------------------------------------------------------
 
@@ -404,6 +448,21 @@ def _build_spread_signals(
         long_right = spread.right
         short_right = spread.right
 
+    # Phase B Item 6 — annotate (metadata only) with synthetic Greeks for
+    # both legs. This NEVER touches `size`, `contracts`, max_loss_per_contract,
+    # or net_debit_estimate. Failure-soft: a None gate response or any
+    # exception yields neutral defaults via _safe_get_greeks.
+    _long_greeks = _safe_get_greeks(
+        spread.symbol, spread.expiry, spread.long_strike, long_right
+    )
+    _short_greeks = _safe_get_greeks(
+        spread.symbol, spread.expiry, spread.short_strike, short_right
+    )
+    try:
+        net_delta_estimate = float(_long_greeks.delta) - float(_short_greeks.delta)
+    except Exception:
+        net_delta_estimate = 0.0
+
     signal = TradeSignal(
         strategy=StrategyName.ALPHA_OPTIONS,
         symbol=spread.symbol,
@@ -427,6 +486,13 @@ def _build_spread_signals(
             "contracts": contracts,
             "required_asset_class": "options",
             "sec_type": "BAG",
+            "long_delta": float(_long_greeks.delta),
+            "short_delta": float(_short_greeks.delta),
+            "net_delta_estimate": round(float(net_delta_estimate), 6),
+            "long_theo_price": _long_greeks.theo_price,
+            "short_theo_price": _short_greeks.theo_price,
+            "long_delta_source": _long_greeks.source,
+            "short_delta_source": _short_greeks.source,
             **source_info,
         },
     )

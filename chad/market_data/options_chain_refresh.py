@@ -41,6 +41,11 @@ CONNECT_TIMEOUT_SEC = 20
 DEFAULT_CONTRACT_DETAILS_TIMEOUT_SEC = 30
 OPTIONS_CHAIN_TIMEOUT_ENV = "CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS"
 PRICE_PCT_WINDOW = 0.10
+# Phase B Item 6: cache schema version. v1 (implicit) = expirations + strikes
+# only. v2 adds per-symbol spot_price so the synthetic Greeks publisher can
+# avoid re-fetching the underlying. The shape of existing fields is preserved
+# verbatim — v1 readers ignore unknown keys and continue working.
+OPTIONS_CHAIN_CACHE_SCHEMA = "options_chain_cache.v2"
 # alpha_options.AlphaOptionsTuning targets DTE 21-45. With MAX_EXPIRIES=2 the
 # refresher only ever kept the two nearest (weekly/daily) expirations, which
 # never intersect the 21-45 window, so alpha_options could never build a spread.
@@ -315,11 +320,15 @@ def _refresh_symbol(ib: Any, symbol: str) -> Dict[str, Any]:
             f"strikes={len(strikes)}"
         )
 
+    # Phase B Item 6 (v2): persist the spot used for strike-window filtering
+    # so the downstream Greeks publisher can compute synthetic deltas/theos
+    # without re-fetching the underlying. Additive; older readers ignore it.
     return {
         "symbol": symbol,
         "exchange": exchange,
         "expirations": expirations,
         "strikes": strikes,
+        "spot_price": float(spot) if spot and spot > 0 else None,
         "ts_utc": _utc_now_iso(),
         "ttl_seconds": CACHE_TTL_SECONDS,
     }
@@ -420,6 +429,7 @@ def run(symbols: Sequence[str]) -> int:
                 )
             )
             cache_doc = {
+                "schema_version": OPTIONS_CHAIN_CACHE_SCHEMA,
                 "ts_utc": _utc_now_iso(),
                 "chains": {},
                 "error": error_msg,
@@ -439,6 +449,7 @@ def run(symbols: Sequence[str]) -> int:
             return 1
 
         cache_doc = {
+            "schema_version": OPTIONS_CHAIN_CACHE_SCHEMA,
             "ts_utc": _utc_now_iso(),
             "chains": chains,
         }
