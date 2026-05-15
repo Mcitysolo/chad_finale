@@ -32,6 +32,7 @@ from chad.utils.catalyst_gate import check_catalyst_gate
 from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.rs_gate import RSGateResult, get_rs_adjustment
+from chad.utils.rvol_gate import get_rvol_adjustment
 from chad.utils.session import session_decision
 
 LOG = logging.getLogger(__name__)
@@ -279,6 +280,16 @@ def _build_signal(
         )
     else:
         _rs_adj = RSGateResult(0.0, "unknown", None, None, "unknown")
+    # Pre-entry RVOL confidence modifier (entry-only, all asset classes,
+    # fail-open). The publisher marks futures/crypto rvol_class="unavailable"
+    # so they yield a zero adjustment. Missing/stale volume_scan.json also
+    # yields 0.0. Never hard-blocks.
+    _rvol_adj = get_rvol_adjustment(sym)
+    if _rvol_adj.confidence_adjustment != 0.0:
+        confidence = max(
+            0.50,
+            min(0.95, float(confidence) + _rvol_adj.confidence_adjustment),
+        )
     _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
     _stop_pts = atr * 2.0 if atr > 0 else 0.0
     meta: Dict[str, Any] = {
@@ -310,6 +321,9 @@ def _build_signal(
         "rs_excess_vs_spy_5d": _rs_adj.excess_vs_spy_5d,
         "rs_market_direction": _rs_adj.market_direction,
         "rs_confidence_adjustment": round(float(_rs_adj.confidence_adjustment), 6),
+        "rvol": _rvol_adj.rvol,
+        "rvol_class": _rvol_adj.rvol_class,
+        "rvol_confidence_adjustment": round(float(_rvol_adj.confidence_adjustment), 6),
     }
     if primary_session_only is not None:
         meta["session_window"] = session_window

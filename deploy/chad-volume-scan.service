@@ -1,0 +1,18 @@
+[Unit]
+Description=CHAD intraday volume scan publisher
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/polygon.env
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.volume_scan_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-volume-scan
+
+[Install]
+WantedBy=multi-user.target
