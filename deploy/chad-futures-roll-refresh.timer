@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD futures roll calendar — daily refresh
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=86400
+AccuracySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

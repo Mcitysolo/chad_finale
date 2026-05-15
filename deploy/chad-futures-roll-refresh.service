@@ -1,0 +1,17 @@
+[Unit]
+Description=CHAD futures roll calendar publisher
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.futures_roll_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-futures-roll-refresh
+
+[Install]
+WantedBy=multi-user.target

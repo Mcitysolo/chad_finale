@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
 from chad.utils.risk_reward import passes_rr_gate
+from chad.utils.roll_gate import RollGateResult, check_roll_gate
 from chad.utils.session import session_decision
 
 # Equity-index futures eligible for tier-aware session gating. MCL/MGC keep
@@ -559,6 +560,18 @@ def _build_signal_for_symbol(
     if not passes_rr_gate(_target_pts, _stop_pts):
         return None
 
+    # ---- Pre-entry futures roll gate (entry-only, fail-open) ----
+    # Reads runtime/futures_roll_state.json. Only audited quarterly equity-
+    # index micros (MES/MNQ/MYM/M2K) can block entries; all other symbols
+    # and missing/stale files fail open. Exits above are unaffected.
+    _roll: RollGateResult = check_roll_gate(symbol)
+    if _roll.blocked:
+        logger.info(
+            "ROLL_GATE_SKIP symbol=%s reason=%s days_to_expiry=%s pattern=%s",
+            symbol, _roll.block_reason, _roll.days_to_expiry, _roll.roll_pattern,
+        )
+        return None
+
     highest_high = _highest_high(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     lowest_low = _lowest_low(bars[:-1], tuning.breakout_lookback) if len(bars) > 1 else 0.0
     latest_bar = bars[-1]
@@ -642,6 +655,9 @@ def _build_signal_for_symbol(
             "rr_ratio": round(float(_target_mult) / float(_stop_mult), 4)
                 if float(_stop_mult) > 0 else None,
             "rr_gate": "PASSED",
+            "days_to_expiry": _roll.days_to_expiry,
+            "roll_pattern": _roll.roll_pattern,
+            "roll_supported": _roll.roll_supported,
     }
     if primary_session_only is not None and symbol in _EQUITY_INDEX_FUTURES:
         _entry_meta["session_window"] = session_window
