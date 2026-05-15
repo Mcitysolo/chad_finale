@@ -117,6 +117,18 @@ def check_catalyst_gate(
     has_catalyst = bool(rec.get("has_catalyst"))
     strength = str(rec.get("catalyst_strength") or "none").strip().lower()
     direction = str(rec.get("catalyst_direction") or "none").strip().lower()
+    confirmed_gate_relevant = bool(rec.get("confirmed_gate_relevant", False))
+
+    # Without explicit headline confirmation (provider ticker tags alone are
+    # not enough), never block trades — old payloads missing the field fail
+    # open by default.
+    if not confirmed_gate_relevant:
+        return CatalystGateResult(
+            allowed=True,
+            catalyst_strength=strength,
+            catalyst_direction=direction,
+            block_reason=None,
+        )
 
     if not has_catalyst:
         return CatalystGateResult(

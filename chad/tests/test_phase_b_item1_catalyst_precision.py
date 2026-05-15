@@ -245,7 +245,7 @@ def test_yahoo_dict_normalization_preserves_symbols() -> None:
     def fake_yahoo(symbol: str, limit: int) -> List[Dict[str, Any]]:
         return [
             {
-                "headline": "Generic-looking story — beats estimates and guidance raised",
+                "headline": "Eli Lilly beats earnings estimates and guidance raised",
                 "published_utc": _utc_now_z(),
                 "symbols": ["LLY"],
                 "source": "yahoo_finance",
@@ -271,7 +271,7 @@ def test_yahoo_dict_normalization_preserves_symbols() -> None:
 # ---------------------------------------------------------------------------
 def test_polygon_normalization_preserves_tickers() -> None:
     art = NewsArticle(
-        headline="Generic mixed-market headline beats estimates",
+        headline="LLY beats estimates as Eli Lilly raises guidance",
         published_utc=_utc_now_z(),
         symbols=["LLY"],
     )

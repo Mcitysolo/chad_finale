@@ -87,6 +87,10 @@ class CatalystIntel:
     source_provider: str = "unknown"
     symbol_relevance: str = "unknown"
     relevant_news_count: int = 0
+    # True only when headline ticker token/alias confirms the symbol — safe
+    # for the catalyst gate to use as a blocking input. Provider ticker tags
+    # alone (e.g., Polygon's article.tickers) never set this to True.
+    confirmed_gate_relevant: bool = False
 
 
 _SYMBOL_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -219,6 +223,28 @@ def classify_symbol_relevance(symbol: str, article: NewsArticle) -> str:
         return "broad_market"
 
     return "unknown"
+
+
+def _headline_confirms_symbol(symbol: str, article: NewsArticle) -> bool:
+    """Return True only when the headline itself confirms the symbol.
+
+    Provider ticker tags (Polygon's article.tickers, Yahoo's query echo) are
+    not sufficient. The catalyst gate uses this signal to decide whether a
+    news catalyst is precise enough to block a trade.
+    """
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        return False
+    headline = article.headline or ""
+    if not headline.strip():
+        return False
+    if _is_analyst_source_headline_for_bank(headline, sym):
+        return False
+    if _headline_has_symbol(headline, sym):
+        return True
+    if _headline_has_alias(headline, sym):
+        return True
+    return False
 
 
 _RELEVANCE_RANK = {"direct": 3, "weak": 2, "broad_market": 1, "unknown": 0}
@@ -464,9 +490,11 @@ def build_catalyst_intel(
             source_provider=source_provider if source_provider else "none",
             symbol_relevance="unknown",
             relevant_news_count=0,
+            confirmed_gate_relevant=False,
         )
 
     direct_articles: List[NewsArticle] = []
+    confirmed_articles: List[NewsArticle] = []
     best_observed_relevance = "unknown"
     for art in articles:
         rel = classify_symbol_relevance(sym, art)
@@ -474,9 +502,16 @@ def build_catalyst_intel(
             best_observed_relevance = rel
         if rel == "direct":
             direct_articles.append(art)
+            if _headline_confirms_symbol(sym, art):
+                confirmed_articles.append(art)
 
-    if not direct_articles:
-        latest = articles[0]
+    symbol_relevance = "direct" if direct_articles else best_observed_relevance
+
+    if not confirmed_articles:
+        # No headline-confirmed relevance — provider ticker tags alone are
+        # not enough to block trades. Keep news_count / symbol_relevance /
+        # relevant_news_count informational; suppress catalyst eligibility.
+        latest = direct_articles[0] if direct_articles else articles[0]
         return CatalystIntel(
             symbol=sym,
             has_catalyst=False,
@@ -488,8 +523,9 @@ def build_catalyst_intel(
             latest_ts_utc=latest.published_utc,
             catalyst_categories=[],
             source_provider=source_provider if source_provider else "unknown",
-            symbol_relevance=best_observed_relevance,
-            relevant_news_count=0,
+            symbol_relevance=symbol_relevance,
+            relevant_news_count=len(direct_articles),
+            confirmed_gate_relevant=False,
         )
 
     best_strength = "none"
@@ -498,7 +534,7 @@ def build_catalyst_intel(
     categories: List[str] = []
     seen_cats: set[str] = set()
 
-    for art in direct_articles:
+    for art in confirmed_articles:
         strength, direction = _classify_article(art)
         if strength in ("high", "medium"):
             catalyst_count += 1
@@ -517,7 +553,7 @@ def build_catalyst_intel(
     if not has_catalyst:
         best_direction = "none"
 
-    latest = direct_articles[0]
+    latest = confirmed_articles[0]
     return CatalystIntel(
         symbol=sym,
         has_catalyst=has_catalyst,
@@ -531,6 +567,7 @@ def build_catalyst_intel(
         source_provider=source_provider if source_provider else "unknown",
         symbol_relevance="direct",
         relevant_news_count=len(direct_articles),
+        confirmed_gate_relevant=True,
     )
 
 
@@ -596,6 +633,7 @@ __all__ = [
     "get_catalyst_intel",
     "classify_symbol_relevance",
     "_classify_article",
+    "_headline_confirms_symbol",
     "_polygon_news",
     "_yahoo_news",
     "_read_polygon_key",

@@ -93,6 +93,7 @@ def _intel_to_payload(intel: CatalystIntel) -> Dict[str, Any]:
         "source_provider": intel.source_provider,
         "symbol_relevance": getattr(intel, "symbol_relevance", "unknown"),
         "relevant_news_count": int(getattr(intel, "relevant_news_count", 0)),
+        "confirmed_gate_relevant": bool(getattr(intel, "confirmed_gate_relevant", False)),
     }
 
 

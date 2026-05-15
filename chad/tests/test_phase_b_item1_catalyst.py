@@ -64,6 +64,7 @@ def _high_bullish(headline: str = "LLY earnings beat estimates by 35%") -> Dict[
         "latest_ts_utc": _utc_now_z(),
         "catalyst_categories": ["earnings"],
         "source_provider": "test",
+        "confirmed_gate_relevant": True,
     }
 
 
@@ -78,6 +79,7 @@ def _high_bearish(headline: str = "FDA rejects application — shares halted") -
         "latest_ts_utc": _utc_now_z(),
         "catalyst_categories": ["regulatory"],
         "source_provider": "test",
+        "confirmed_gate_relevant": True,
     }
 
 
@@ -92,6 +94,7 @@ def _medium_bearish() -> Dict[str, Any]:
         "latest_ts_utc": _utc_now_z(),
         "catalyst_categories": ["ratings"],
         "source_provider": "test",
+        "confirmed_gate_relevant": True,
     }
 
 
@@ -106,6 +109,7 @@ def _medium_bullish() -> Dict[str, Any]:
         "latest_ts_utc": _utc_now_z(),
         "catalyst_categories": ["ratings"],
         "source_provider": "test",
+        "confirmed_gate_relevant": True,
     }
 
 
@@ -120,6 +124,7 @@ def _low() -> Dict[str, Any]:
         "latest_ts_utc": _utc_now_z(),
         "catalyst_categories": [],
         "source_provider": "test",
+        "confirmed_gate_relevant": False,
     }
 
 
