@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -69,6 +70,7 @@ class NewsArticle:
     published_utc: str
     source: str = ""
     url: str = ""
+    symbols: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,143 @@ class CatalystIntel:
     latest_ts_utc: str
     catalyst_categories: List[str] = field(default_factory=list)
     source_provider: str = "unknown"
+    symbol_relevance: str = "unknown"
+    relevant_news_count: int = 0
+
+
+_SYMBOL_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "AAPL": ("Apple",),
+    "AMZN": ("Amazon",),
+    "AVGO": ("Broadcom",),
+    "BAC": ("Bank of America",),
+    "GOOGL": ("Alphabet", "Google"),
+    "GOOG": ("Alphabet", "Google"),
+    "LLY": ("Eli Lilly", "Lilly"),
+    "MSFT": ("Microsoft",),
+    "NVDA": ("Nvidia", "NVIDIA"),
+    "SPY": ("S&P 500", "SPDR S&P 500"),
+    "QQQ": ("Nasdaq 100", "Invesco QQQ"),
+    "GLD": ("SPDR Gold", "Gold ETF"),
+}
+
+_ANALYST_BANKS = frozenset(
+    {"BAC", "JPM", "MS", "GS", "C", "WFC", "BCS", "DB", "UBS", "HSBC", "RBC"}
+)
+
+_ANALYST_VERBS = (
+    "raises", "raise", "lifts", "lifted",
+    "cuts", "cut", "lowers", "lowered",
+    "resets", "reset",
+    "downgrade", "downgrades", "downgrading",
+    "upgrade", "upgrades", "upgrading",
+    "initiates", "initiated", "initiating",
+    "reiterates", "reiterated",
+    "boosts", "boosted",
+    "trims", "trimmed",
+)
+
+_ANALYST_TARGET_KEYWORDS = (
+    "price target",
+    "target price",
+    "stock price target",
+    "rating",
+    "outlook",
+    "to buy",
+    "to sell",
+    "to hold",
+)
+
+_BROAD_MARKET_KEYWORDS = (
+    "dow jones",
+    "russell 2000",
+    "broad market",
+    "stocks rise", "stocks fall", "stocks gain", "stocks drop", "stocks soar", "stocks tumble",
+    "stocks mixed", "stocks slip", "stocks edge",
+    "market rally", "market sell", "market drops", "market plunges",
+    "best stocks", "stocks to buy", "stocks to watch", "top stocks",
+    "unstoppable stock", "unstoppable stocks",
+    "ipo",
+    "futures rise", "futures fall", "futures rally", "futures drop", "futures gain",
+    "futures slip", "futures soar", "futures tumble", "futures mixed",
+    "dow futures", "nasdaq futures", "s&p futures",
+)
+
+
+def _normalize_symbol(symbol: str) -> str:
+    return (symbol or "").strip().upper()
+
+
+def _article_symbols(article: NewsArticle) -> set[str]:
+    raw = getattr(article, "symbols", None) or []
+    return {_normalize_symbol(str(s)) for s in raw if str(s).strip()}
+
+
+def _headline_has_symbol(headline: str, symbol: str) -> bool:
+    sym = _normalize_symbol(symbol)
+    if not sym or not headline:
+        return False
+    if not re.fullmatch(r"[A-Z0-9.\-]+", sym):
+        return False
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(sym) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, headline) is not None
+
+
+def _headline_has_alias(headline: str, symbol: str) -> bool:
+    sym = _normalize_symbol(symbol)
+    aliases = _SYMBOL_ALIASES.get(sym, ())
+    if not aliases or not headline:
+        return False
+    text = headline.lower()
+    return any(alias.lower() in text for alias in aliases)
+
+
+def _is_broad_market_headline(headline: str) -> bool:
+    text = (headline or "").lower()
+    if not text:
+        return False
+    return any(k in text for k in _BROAD_MARKET_KEYWORDS)
+
+
+def _is_analyst_source_headline_for_bank(headline: str, symbol: str) -> bool:
+    sym = _normalize_symbol(symbol)
+    if sym not in _ANALYST_BANKS:
+        return False
+    text = (headline or "").lower()
+    if not text:
+        return False
+    has_verb = any(re.search(r"\b" + re.escape(v) + r"\b", text) for v in _ANALYST_VERBS)
+    has_target = any(k in text for k in _ANALYST_TARGET_KEYWORDS)
+    return has_verb and has_target
+
+
+def classify_symbol_relevance(symbol: str, article: NewsArticle) -> str:
+    """Return one of {"direct", "weak", "broad_market", "unknown"}."""
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        return "unknown"
+
+    if sym in _article_symbols(article):
+        return "direct"
+
+    headline = article.headline or ""
+    if not headline.strip():
+        return "unknown"
+
+    analyst_source = _is_analyst_source_headline_for_bank(headline, sym)
+
+    if _headline_has_symbol(headline, sym):
+        return "weak" if analyst_source else "direct"
+
+    if _headline_has_alias(headline, sym):
+        return "weak" if analyst_source else "direct"
+
+    if _is_broad_market_headline(headline):
+        return "broad_market"
+
+    return "unknown"
+
+
+_RELEVANCE_RANK = {"direct": 3, "weak": 2, "broad_market": 1, "unknown": 0}
 
 
 def _read_polygon_key() -> Optional[str]:
@@ -143,6 +282,10 @@ def _polygon_news(
         headline = str(entry.get("title") or "").strip()
         if not headline:
             continue
+        tickers_raw = entry.get("tickers")
+        syms: List[str] = []
+        if isinstance(tickers_raw, list):
+            syms = [_normalize_symbol(str(t)) for t in tickers_raw if str(t).strip()]
         out.append(
             NewsArticle(
                 headline=headline,
@@ -151,6 +294,7 @@ def _polygon_news(
                 if isinstance(entry.get("publisher"), dict)
                 else "polygon",
                 url=str(entry.get("article_url") or "").strip(),
+                symbols=syms,
             )
         )
     return out
@@ -172,17 +316,41 @@ def _yahoo_news(symbol: str, limit: int = POLYGON_DEFAULT_LIMIT) -> List[NewsArt
             headline = str(getattr(item, "headline", "") or "").strip()
             if not headline:
                 continue
+            # NewsItem.symbols is the query echo, not per-article attribution —
+            # do not propagate it; downstream relevance must use headline matching.
             out.append(
                 NewsArticle(
                     headline=headline,
                     published_utc=str(getattr(item, "published_utc", "") or "").strip(),
                     source=str(getattr(item, "source", "") or "yahoo").strip(),
                     url=str(getattr(item, "url", "") or "").strip(),
+                    symbols=[],
                 )
             )
         except Exception:
             continue
     return out
+
+
+def _extract_symbols_from_record(rec: Any) -> List[str]:
+    candidates: List[Any] = []
+    if isinstance(rec, dict):
+        for key in ("symbols", "tickers", "ticker"):
+            if key in rec:
+                candidates.append(rec.get(key))
+    else:
+        for attr in ("symbols", "tickers", "ticker"):
+            val = getattr(rec, attr, None)
+            if val:
+                candidates.append(val)
+    for val in candidates:
+        if isinstance(val, list):
+            return [_normalize_symbol(str(s)) for s in val if str(s).strip()]
+        if isinstance(val, tuple):
+            return [_normalize_symbol(str(s)) for s in val if str(s).strip()]
+        if isinstance(val, str) and val.strip():
+            return [_normalize_symbol(val)]
+    return []
 
 
 def _normalize_yahoo_record(rec: Any) -> Optional[NewsArticle]:
@@ -211,6 +379,7 @@ def _normalize_yahoo_record(rec: Any) -> Optional[NewsArticle]:
             ).strip(),
             source=str(rec.get("source") or rec.get("provider") or "").strip(),
             url=str(rec.get("url") or rec.get("link") or "").strip(),
+            symbols=_extract_symbols_from_record(rec),
         )
     headline = str(getattr(rec, "headline", "") or getattr(rec, "title", "") or "").strip()
     if not headline:
@@ -225,6 +394,7 @@ def _normalize_yahoo_record(rec: Any) -> Optional[NewsArticle]:
         ).strip(),
         source=str(getattr(rec, "source", "") or getattr(rec, "provider", "") or "").strip(),
         url=str(getattr(rec, "url", "") or getattr(rec, "link", "") or "").strip(),
+        symbols=_extract_symbols_from_record(rec),
     )
 
 
@@ -279,7 +449,7 @@ def build_catalyst_intel(
     articles: List[NewsArticle],
     source_provider: str = "unknown",
 ) -> CatalystIntel:
-    sym = (symbol or "").strip().upper()
+    sym = _normalize_symbol(symbol)
     if not articles:
         return CatalystIntel(
             symbol=sym,
@@ -292,6 +462,34 @@ def build_catalyst_intel(
             latest_ts_utc="",
             catalyst_categories=[],
             source_provider=source_provider if source_provider else "none",
+            symbol_relevance="unknown",
+            relevant_news_count=0,
+        )
+
+    direct_articles: List[NewsArticle] = []
+    best_observed_relevance = "unknown"
+    for art in articles:
+        rel = classify_symbol_relevance(sym, art)
+        if _RELEVANCE_RANK.get(rel, 0) > _RELEVANCE_RANK.get(best_observed_relevance, 0):
+            best_observed_relevance = rel
+        if rel == "direct":
+            direct_articles.append(art)
+
+    if not direct_articles:
+        latest = articles[0]
+        return CatalystIntel(
+            symbol=sym,
+            has_catalyst=False,
+            catalyst_strength="none",
+            catalyst_direction="none",
+            news_count=len(articles),
+            catalyst_count=0,
+            latest_headline=latest.headline,
+            latest_ts_utc=latest.published_utc,
+            catalyst_categories=[],
+            source_provider=source_provider if source_provider else "unknown",
+            symbol_relevance=best_observed_relevance,
+            relevant_news_count=0,
         )
 
     best_strength = "none"
@@ -300,7 +498,7 @@ def build_catalyst_intel(
     categories: List[str] = []
     seen_cats: set[str] = set()
 
-    for art in articles:
+    for art in direct_articles:
         strength, direction = _classify_article(art)
         if strength in ("high", "medium"):
             catalyst_count += 1
@@ -319,7 +517,7 @@ def build_catalyst_intel(
     if not has_catalyst:
         best_direction = "none"
 
-    latest = articles[0]
+    latest = direct_articles[0]
     return CatalystIntel(
         symbol=sym,
         has_catalyst=has_catalyst,
@@ -331,6 +529,8 @@ def build_catalyst_intel(
         latest_ts_utc=latest.published_utc,
         catalyst_categories=categories,
         source_provider=source_provider if source_provider else "unknown",
+        symbol_relevance="direct",
+        relevant_news_count=len(direct_articles),
     )
 
 
@@ -394,6 +594,7 @@ __all__ = [
     "CatalystIntel",
     "build_catalyst_intel",
     "get_catalyst_intel",
+    "classify_symbol_relevance",
     "_classify_article",
     "_polygon_news",
     "_yahoo_news",

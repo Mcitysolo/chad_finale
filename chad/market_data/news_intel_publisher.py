@@ -91,6 +91,8 @@ def _intel_to_payload(intel: CatalystIntel) -> Dict[str, Any]:
         "latest_ts_utc": intel.latest_ts_utc,
         "catalyst_categories": list(intel.catalyst_categories),
         "source_provider": intel.source_provider,
+        "symbol_relevance": getattr(intel, "symbol_relevance", "unknown"),
+        "relevant_news_count": int(getattr(intel, "relevant_news_count", 0)),
     }
 
 

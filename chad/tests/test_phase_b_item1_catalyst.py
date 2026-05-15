@@ -338,7 +338,7 @@ def test_get_catalyst_intel_falls_back_to_yahoo_when_polygon_empty() -> None:
     def fake_yahoo(symbol: str, limit: int) -> List[NewsArticle]:
         return [
             NewsArticle(
-                headline="Analyst upgrade — partnership announced",
+                headline="Apple analyst upgrade — partnership announced",
                 published_utc=_utc_now_z(),
             )
         ]
