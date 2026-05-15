@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD crypto derivatives public-data refresh — every 5 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=300
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

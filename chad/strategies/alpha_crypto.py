@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from chad.types import AssetClass, SignalSide, StrategyConfig, StrategyName, TradeSignal
+from chad.utils.crypto_signal_filter import CryptoFilterResult, get_crypto_filter
 
 logger = logging.getLogger(__name__)
 
@@ -726,6 +727,17 @@ def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List[TradeSigna
         side = SignalSide.BUY
         confidence = _clamp(0.5 + 0.4 * strength, 0.0, 0.95)
 
+        # Phase B Item 4 — confidence-only crowding modifier. Reads the
+        # public Kraken Futures derivatives snapshot from runtime/. Missing
+        # or stale snapshot returns zero adjustment (fail-open). Never
+        # blocks the trade and never alters side/size.
+        _crypto_filter: CryptoFilterResult = get_crypto_filter(symbol, side.value)
+        if _crypto_filter.confidence_adjustment != 0.0:
+            confidence = max(
+                0.0,
+                min(0.95, float(confidence) + _crypto_filter.confidence_adjustment),
+            )
+
         logger.info(
             "alpha_crypto signal: %s %s strength=%.3f",
             symbol, side.value, strength,
@@ -753,6 +765,12 @@ def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List[TradeSigna
                     "strength": float(strength),
                     "target_notional_usd": float(target_notional_usd),
                     "required_asset_class": "crypto",
+                    "crypto_market_bias": _crypto_filter.market_bias,
+                    "crypto_funding_rate_8h": _crypto_filter.funding_rate_8h,
+                    "crypto_funding_extreme": _crypto_filter.funding_extreme,
+                    "crypto_confidence_adjustment": round(
+                        float(_crypto_filter.confidence_adjustment), 6
+                    ),
                 },
             )
         )
