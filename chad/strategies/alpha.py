@@ -48,6 +48,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.catalyst_gate import check_catalyst_gate
 from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
@@ -382,6 +383,21 @@ def build_alpha_signals(
             _liq_class = LiquidityClass.UNKNOWN
             _liq_required_conf = float(confidence)
 
+        # Pre-entry catalyst gate (entry-only, EQUITY/ETF, fail-open). Exits
+        # above are unaffected. Missing/stale runtime/news_intel.json yields
+        # an allowed=True unknown result so the strategy keeps trading.
+        if _asset_cls in (AssetClass.EQUITY, AssetClass.ETF):
+            _side_for_gate = (
+                "BUY" if regime in ("uptrend", "recovery") else
+                ("SELL" if regime == "downtrend" else
+                 ("SELL" if px > (ef + es) / 2 else "BUY"))
+            )
+            _cat_result = check_catalyst_gate(sym, _side_for_gate)
+            if not _cat_result.allowed:
+                continue
+        else:
+            _cat_result = None
+
         _tier_profile = getattr(ctx, "tier_profile", None)
         _tier_max = getattr(_tier_profile, "max_risk_per_trade_usd", None)
         _stop_per_share = p.atr_trail_mult * a if a > 0 else 0.0
@@ -425,6 +441,15 @@ def build_alpha_signals(
             "rr_gate": "PASSED",
             "liquidity_class": _liq_class.value,
             "liquidity_required_confidence": round(float(_liq_required_conf), 6),
+            "catalyst_strength": (
+                _cat_result.catalyst_strength if _cat_result is not None else "unknown"
+            ),
+            "catalyst_direction": (
+                _cat_result.catalyst_direction if _cat_result is not None else "unknown"
+            ),
+            "catalyst_gate": (
+                "PASSED" if _cat_result is None or _cat_result.allowed else "BLOCKED"
+            ),
         }
         if _primary_only is not None:
             _entry_meta["session_window"] = _session_window

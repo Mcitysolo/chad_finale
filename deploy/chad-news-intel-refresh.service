@@ -1,0 +1,18 @@
+[Unit]
+Description=CHAD news intelligence publisher
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/polygon.env
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.news_intel_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-news-intel-refresh
+
+[Install]
+WantedBy=multi-user.target

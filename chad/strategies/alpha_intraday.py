@@ -28,6 +28,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.utils.catalyst_gate import check_catalyst_gate
 from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
 from chad.utils.session import session_decision
@@ -256,6 +257,15 @@ def _build_signal(
     else:
         _liq_class = LiquidityClass.UNKNOWN
         _liq_required_conf = float(confidence)
+    # Pre-entry catalyst gate (entry-only, EQUITY/ETF, fail-open). Futures
+    # and crypto are excluded by AssetClass; missing/stale news_intel.json
+    # yields an allowed=True unknown result.
+    if _asset_cls_liq in (AssetClass.EQUITY, AssetClass.ETF):
+        _cat = check_catalyst_gate(sym, side.value)
+        if not _cat.allowed:
+            return None
+    else:
+        _cat = None
     _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
     _stop_pts = atr * 2.0 if atr > 0 else 0.0
     meta: Dict[str, Any] = {
@@ -273,6 +283,15 @@ def _build_signal(
         "rr_gate": "PASSED",
         "liquidity_class": _liq_class.value,
         "liquidity_required_confidence": round(float(_liq_required_conf), 6),
+        "catalyst_strength": (
+            _cat.catalyst_strength if _cat is not None else "unknown"
+        ),
+        "catalyst_direction": (
+            _cat.catalyst_direction if _cat is not None else "unknown"
+        ),
+        "catalyst_gate": (
+            "PASSED" if _cat is None or _cat.allowed else "BLOCKED"
+        ),
     }
     if primary_session_only is not None:
         meta["session_window"] = session_window
