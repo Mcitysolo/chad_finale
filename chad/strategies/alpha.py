@@ -51,6 +51,7 @@ from chad.types import (
 from chad.utils.catalyst_gate import check_catalyst_gate
 from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
+from chad.utils.rs_gate import RSGateResult, get_rs_adjustment
 from chad.utils.session import session_decision
 
 # ---------------------------------------------------------------------------
@@ -429,6 +430,19 @@ def build_alpha_signals(
             side = SignalSide.SELL if px > (ef + es) / 2 else SignalSide.BUY
             reason = "chop_reversion"
 
+        # Pre-entry relative-strength confidence modifier (entry-only,
+        # EQUITY/ETF, fail-open). Never hard-blocks; only nudges confidence.
+        # Missing/stale runtime/relative_strength.json yields adjustment=0.0.
+        if _asset_cls in (AssetClass.EQUITY, AssetClass.ETF):
+            _rs = get_rs_adjustment(sym, side.value)
+            if _rs.confidence_adjustment != 0.0:
+                confidence = max(
+                    0.0,
+                    min(0.95, float(confidence) + _rs.confidence_adjustment),
+                )
+        else:
+            _rs = RSGateResult(0.0, "unknown", None, None, "unknown")
+
         _entry_meta: Dict[str, Any] = {
             "reason": reason,
             "regime": regime,
@@ -450,6 +464,11 @@ def build_alpha_signals(
             "catalyst_gate": (
                 "PASSED" if _cat_result is None or _cat_result.allowed else "BLOCKED"
             ),
+            "rs_class": _rs.rs_class,
+            "rs_vs_spy": _rs.rs_vs_spy,
+            "rs_excess_vs_spy_5d": _rs.excess_vs_spy_5d,
+            "rs_market_direction": _rs.market_direction,
+            "rs_confidence_adjustment": round(float(_rs.confidence_adjustment), 6),
         }
         if _primary_only is not None:
             _entry_meta["session_window"] = _session_window

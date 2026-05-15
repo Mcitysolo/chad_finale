@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD relative strength refresh — nightly after bar update
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=86400
+AccuracySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

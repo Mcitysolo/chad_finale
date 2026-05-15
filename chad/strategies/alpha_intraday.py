@@ -31,6 +31,7 @@ from chad.types import (
 from chad.utils.catalyst_gate import check_catalyst_gate
 from chad.utils.liquidity import LiquidityClass, blocks_thin_entry
 from chad.utils.risk_reward import passes_rr_gate
+from chad.utils.rs_gate import RSGateResult, get_rs_adjustment
 from chad.utils.session import session_decision
 
 LOG = logging.getLogger(__name__)
@@ -266,6 +267,18 @@ def _build_signal(
             return None
     else:
         _cat = None
+    # Pre-entry relative-strength confidence modifier (entry-only,
+    # EQUITY/ETF, fail-open). Futures (MES/MNQ) and crypto (*-USD) are
+    # excluded by AssetClass. Missing/stale relative_strength.json yields
+    # adjustment=0.0. Never hard-blocks.
+    if _asset_cls_liq in (AssetClass.EQUITY, AssetClass.ETF):
+        _rs_adj = get_rs_adjustment(sym, side.value)
+        confidence = max(
+            0.50,
+            min(0.95, float(confidence) + _rs_adj.confidence_adjustment),
+        )
+    else:
+        _rs_adj = RSGateResult(0.0, "unknown", None, None, "unknown")
     _point_value = {"MES": 5.0, "MNQ": 2.0}.get(sym, 0.0)
     _stop_pts = atr * 2.0 if atr > 0 else 0.0
     meta: Dict[str, Any] = {
@@ -292,6 +305,11 @@ def _build_signal(
         "catalyst_gate": (
             "PASSED" if _cat is None or _cat.allowed else "BLOCKED"
         ),
+        "rs_class": _rs_adj.rs_class,
+        "rs_vs_spy": _rs_adj.rs_vs_spy,
+        "rs_excess_vs_spy_5d": _rs_adj.excess_vs_spy_5d,
+        "rs_market_direction": _rs_adj.market_direction,
+        "rs_confidence_adjustment": round(float(_rs_adj.confidence_adjustment), 6),
     }
     if primary_session_only is not None:
         meta["session_window"] = session_window
