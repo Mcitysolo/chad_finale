@@ -100,8 +100,19 @@ Net additions from this window:
 
 ### D. Live-trading unlock conditions (all must hold)
 
-C1 live trading remains **NOT unlocked**. The following are all
-required before any consideration of live Kraken Futures routing:
+**Kraken Futures live trading is blocked for the current Canadian
+deployment.** See
+`docs/PHASE_C_KRAKEN_FUTURES_CANADA_BLOCKED_2026-05-16.md` for the
+jurisdictional decision. Kraken spot remains allowed; C1A public intel
+remains allowed as read-only market data; C1B adapter scaffold remains
+dormant; C1C auth smoke scaffold must not be used against the
+operator's Canadian Kraken account.
+
+Future unlock is only possible with a legally eligible entity, account,
+and jurisdiction plus explicit operator approval. Possession of API
+keys alone is not sufficient. In addition to that eligibility gate, the
+following technical conditions must all hold before any consideration
+of live Kraken Futures routing:
 
 1. `KRAKEN_FUTURES_API_KEY` present in the operator environment.
 2. `KRAKEN_FUTURES_API_SECRET` present in the operator environment.
@@ -118,8 +129,9 @@ required before any consideration of live Kraken Futures routing:
    source, fill harvester, drift detector, and trade-closer behaviour
    for Kraken Futures fills.
 
-Until all eight conditions are satisfied, the adapter and client
-remain scaffold-only and isolated from live signal flow.
+Until the jurisdictional block is lifted and all eight technical
+conditions are satisfied, the adapter and client remain scaffold-only
+and isolated from live signal flow.
 
 ---
 
@@ -187,21 +199,25 @@ All seven artifacts are present in `runtime/`.
 
 ## 8. Next authorized action
 
-Do not build more Phase C live execution until Kraken Futures
-credentials exist. Next safe action is one of:
+Kraken Futures live trading is blocked for the current Canadian
+deployment (see
+`docs/PHASE_C_KRAKEN_FUTURES_CANADA_BLOCKED_2026-05-16.md`). The
+authenticated smoke test must not be used against the operator's
+Canadian Kraken account, and option **A** as previously framed
+(provisioning Kraken Futures credentials and running the auth smoke)
+is therefore not authorized under this deployment. Public Kraken
+Futures intel (C1A) continues to run as read-only market data.
 
-- **A. (Recommended.)** Operator provisions Kraken Futures private
-  API keys (`KRAKEN_FUTURES_API_KEY`, `KRAKEN_FUTURES_API_SECRET`),
-  then runs the authenticated smoke test
-  (`chad/tools/kraken_futures_auth_smoke.py`) against a certified
-  read-only private endpoint. No order placement. No strategy wiring.
+Next safe action:
+
 - **B.** Build the FMP earnings/analyst publisher from the already
   scaffolded FMP stable-endpoint client (commit `29e2699`) — strictly
   read-only, intelligence-only, no execution surface.
 
-Recommended choice: **A**, because C1 is the closest item to a real
-unlock gate and B can be undertaken in parallel only if the operator
-declines to provision Kraken Futures credentials right now.
+Recommended choice: **B**, because the Canadian jurisdiction block
+removes the Kraken Futures private-endpoint path from the menu for
+this deployment, and B is read-only intelligence work that does not
+touch live execution.
 
 ---
 
@@ -209,14 +225,18 @@ declines to provision Kraken Futures credentials right now.
 
 The following are not permitted in this checkpoint window:
 
-- no Kraken Futures live orders.
+- no Kraken Futures live orders (jurisdiction-blocked for the current
+  Canadian deployment — see
+  `docs/PHASE_C_KRAKEN_FUTURES_CANADA_BLOCKED_2026-05-16.md`).
 - no strategy routing to `KrakenFuturesAdapter` /
   `KrakenFuturesClient`.
+- no use of `chad/tools/kraken_futures_auth_smoke.py` against the
+  operator's Canadian Kraken account.
 - no IBKR DOM implementation (blocked on Level 2 entitlement).
 - no Coinglass implementation (blocked on paid API key and stable
   endpoint contract).
 - no private endpoint calls without credentials AND a certified
-  read-only smoke test.
+  read-only smoke test AND a legally eligible Kraken Futures entity.
 
 ---
 
