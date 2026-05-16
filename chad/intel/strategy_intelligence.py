@@ -34,6 +34,13 @@ CONFIDENCE_CACHE_TTL_SEC = 300       # 5 minutes
 REGIME_CACHE_TTL_SEC = 900           # 15 minutes
 MAX_CALL_TIMEOUT_SEC = 5.0
 
+# Read-only earnings intelligence consumer constants. Intel-only — strategy
+# code MUST NOT import _load_earnings_intel_context.
+EARNINGS_INTEL_FILENAME = "earnings_intel.json"
+EARNINGS_INTEL_DEFAULT_TTL_SEC = 21600  # 6h, mirrors publisher cadence
+EARNINGS_INTEL_UPCOMING_LIMIT = 10
+_EARNINGS_INTEL_DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
+
 
 @dataclass
 class ConfidenceBias:
@@ -93,6 +100,187 @@ def _neutral_universe_filter() -> UniverseFilter:
         reasons={},
         ts_utc=_utc_now_iso(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Earnings intelligence — READ-ONLY, fail-open
+# ---------------------------------------------------------------------------
+#
+# Surface for runtime/earnings_intel.json (FMP stable endpoints: earnings
+# calendar, price-target-consensus, analyst-estimates, sec-filings-search).
+#
+# Allowed consumers: chad.intel.strategy_intelligence (this module) and
+# chad.dashboard.api (read-only dashboard surface).
+#
+# Forbidden consumers: chad/strategies/*, chad/execution/*, chad/risk/*.
+# This helper is intelligence-only during the one-week observation period.
+# Wiring it into a strategy gate, confidence modifier, sizing path, or
+# routing gate without a separate audit is a governance violation.
+
+
+def _empty_earnings_intel_summary() -> Dict[str, Any]:
+    return {
+        "symbols_requested": None,
+        "symbols_processed": None,
+        "symbols_with_next_earnings": None,
+        "symbols_with_price_targets": None,
+        "symbols_with_analyst_estimates": None,
+        "symbols_with_sec_filings": None,
+    }
+
+
+def _empty_earnings_intel_context(
+    *,
+    freshness: str,
+    status: str = "unknown",
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a normalized empty context with the requested freshness label."""
+    payload = payload if isinstance(payload, dict) else {}
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    return {
+        "freshness": freshness,
+        "status": status,
+        "summary": _empty_earnings_intel_summary(),
+        "upcoming": [],
+        "ts_utc": payload.get("ts_utc") if payload else None,
+        "ttl_seconds": payload.get("ttl_seconds") if payload else None,
+        "source_provider": (source.get("provider") if isinstance(source, dict) else None) or None,
+    }
+
+
+def _earnings_intel_freshness(payload: Dict[str, Any]) -> str:
+    """Classify earnings_intel.json freshness using ts_utc + ttl_seconds.
+
+    Returns: 'fresh' | 'stale' | 'unknown'. 'missing' and 'malformed' are
+    set upstream by the loader and never produced here.
+    """
+    ts_str = str(payload.get("ts_utc") or "")
+    ttl = payload.get("ttl_seconds")
+    if not ts_str:
+        return "unknown"
+    try:
+        ttl_sec = float(ttl) if ttl is not None else float(EARNINGS_INTEL_DEFAULT_TTL_SEC)
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return "fresh" if age <= ttl_sec else "stale"
+    except Exception:
+        return "unknown"
+
+
+def _earnings_intel_status(payload: Dict[str, Any]) -> str:
+    """Normalize the publisher's status field.
+
+    Accepts: ok | partial | error. Anything else maps to 'unknown'. status=partial
+    is a valid by-design state for the publisher and must not be treated as error.
+    """
+    raw = str(payload.get("status") or "").strip().lower()
+    if raw in ("ok", "partial", "error"):
+        return raw
+    return "unknown"
+
+
+def _earnings_intel_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the publisher summary dict, normalized to ints or None."""
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return _empty_earnings_intel_summary()
+
+    def _opt_int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "symbols_requested": _opt_int(summary.get("symbols_requested")),
+        "symbols_processed": _opt_int(summary.get("symbols_processed")),
+        "symbols_with_next_earnings": _opt_int(summary.get("symbols_with_next_earnings")),
+        "symbols_with_price_targets": _opt_int(summary.get("symbols_with_price_targets")),
+        "symbols_with_analyst_estimates": _opt_int(summary.get("symbols_with_analyst_estimates")),
+        "symbols_with_sec_filings": _opt_int(summary.get("symbols_with_sec_filings")),
+    }
+
+
+def _earnings_intel_upcoming(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract upcoming earnings records, sorted by days ascending (None last).
+
+    Includes only symbols with a non-empty ``next_earnings_date``. Caps the list
+    at EARNINGS_INTEL_UPCOMING_LIMIT entries.
+    """
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, dict):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for sym, rec in symbols.items():
+        if not isinstance(rec, dict):
+            continue
+        next_date = rec.get("next_earnings_date")
+        if not next_date:
+            continue
+        days_raw = rec.get("days_to_next_earnings")
+        try:
+            days: Optional[int] = int(days_raw) if days_raw is not None else None
+        except (TypeError, ValueError):
+            days = None
+        rows.append({
+            "symbol": str(sym),
+            "next_earnings_date": str(next_date),
+            "days_to_next_earnings": days,
+        })
+
+    rows.sort(key=lambda r: (r["days_to_next_earnings"] is None, r["days_to_next_earnings"] if r["days_to_next_earnings"] is not None else 0, r["symbol"]))
+    return rows[:EARNINGS_INTEL_UPCOMING_LIMIT]
+
+
+def _load_earnings_intel_context(
+    runtime_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read-only, fail-open loader for ``runtime/earnings_intel.json``.
+
+    Never raises. Returns a normalized context dict for the intelligence and
+    dashboard surfaces only. See module-header comment for forbidden
+    consumers.
+    """
+    rd = Path(runtime_dir) if runtime_dir is not None else _EARNINGS_INTEL_DEFAULT_RUNTIME_DIR
+    path = rd / EARNINGS_INTEL_FILENAME
+
+    try:
+        if not path.is_file():
+            return _empty_earnings_intel_context(freshness="missing", status="unknown")
+    except Exception:
+        return _empty_earnings_intel_context(freshness="missing", status="unknown")
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return _empty_earnings_intel_context(freshness="missing", status="unknown")
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return _empty_earnings_intel_context(freshness="malformed", status="unknown")
+    if not isinstance(payload, dict):
+        return _empty_earnings_intel_context(freshness="malformed", status="unknown")
+
+    try:
+        freshness = _earnings_intel_freshness(payload)
+        status = _earnings_intel_status(payload)
+        summary = _earnings_intel_summary(payload)
+        upcoming = _earnings_intel_upcoming(payload)
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        return {
+            "freshness": freshness,
+            "status": status,
+            "summary": summary,
+            "upcoming": upcoming,
+            "ts_utc": payload.get("ts_utc"),
+            "ttl_seconds": payload.get("ttl_seconds"),
+            "source_provider": (source.get("provider") if isinstance(source, dict) else None) or None,
+        }
+    except Exception:
+        return _empty_earnings_intel_context(freshness="unknown", status="unknown", payload=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +495,10 @@ class StrategyIntelligence:
             "ts_utc": event_risk.get("ts_utc"),
             "ttl_seconds": event_risk.get("ttl_seconds"),
         }
+
+    def _load_earnings_intel_context(self) -> Dict[str, Any]:
+        """Read-only earnings intelligence context. See module-level helper."""
+        return _load_earnings_intel_context(self._runtime_dir)
 
     def _load_market_context(self) -> Dict[str, Any]:
         """

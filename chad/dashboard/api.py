@@ -29,6 +29,8 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
+from chad.intel.strategy_intelligence import _load_earnings_intel_context
+
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = REPO / "runtime"
 DATA = REPO / "data"
@@ -543,6 +545,25 @@ class StateBuilder:
                 top_reddit = sym
         event_risk = _load_json(RUNTIME / "event_risk.json")
         regime = event_risk.get("regime") or "NEUTRAL"
+        try:
+            earnings_intel = _load_earnings_intel_context(RUNTIME)
+        except Exception:
+            earnings_intel = {
+                "freshness": "unknown",
+                "status": "unknown",
+                "summary": {
+                    "symbols_requested": None,
+                    "symbols_processed": None,
+                    "symbols_with_next_earnings": None,
+                    "symbols_with_price_targets": None,
+                    "symbols_with_analyst_estimates": None,
+                    "symbols_with_sec_filings": None,
+                },
+                "upcoming": [],
+                "ts_utc": None,
+                "ttl_seconds": None,
+                "source_provider": None,
+            }
         return {
             "vix": vix,
             "vix_label": _vix_label_legacy(vix),
@@ -550,6 +571,7 @@ class StateBuilder:
             "spy_trend": spy_signal,
             "top_reddit_mention": top_reddit,
             "market_regime": regime,
+            "earnings_intel": earnings_intel,
         }
 
     def _business(self) -> dict:

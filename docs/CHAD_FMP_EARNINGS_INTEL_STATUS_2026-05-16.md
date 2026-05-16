@@ -49,13 +49,22 @@ by design.
   it.
 
 ## 7. Consumer Status
-- **No strategy consumer of `earnings_intel.json` exists yet.** The only
-  references in `chad/` are the publisher itself and its tests.
-- The old `earnings_state.json` likewise has no active strategy
-  consumers in `chad/` (the only mention is a docstring in the new
-  publisher noting it is not mutated).
-- This publisher is therefore **intelligence-only** at present: writes
-  runtime data, no live strategy wiring.
+- **`earnings_intel.json` is now surfaced read-only** in the
+  strategy-intelligence / dashboard context via
+  `chad.intel.strategy_intelligence._load_earnings_intel_context` and the
+  `earnings_intel` block on `chad.dashboard.api.StateBuilder._intelligence()`.
+- **No strategy gates are wired.** No file under `chad/strategies/`
+  references the helper or `earnings_intel.json` (enforced by
+  `chad/tests/test_earnings_intel_context.py`).
+- **No confidence modifiers are wired.** No adjustment is applied to
+  any `TradeSignal.confidence` or to any sizing path.
+- **No execution routing consumes it.** No file under `chad/execution/`
+  or `chad/risk/` references the helper or `earnings_intel.json`
+  (enforced by the same test module).
+- The old `earnings_state.json` remains untouched bootstrap legacy.
+- **Observation period remains one full collection week** before any
+  strategy wiring is considered. Re-audit before advancing to metadata
+  enrichment (Option B) or a soft confidence modifier (Option C).
 
 ## 8. Future Use Cases
 - Earnings proximity guard (e.g., block new entries within N days of
