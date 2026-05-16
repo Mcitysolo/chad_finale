@@ -13,7 +13,7 @@ requested entry, a default-shaped ``GreeksResult`` is returned:
   - call (right="C"): delta = +0.5, source="default"
   - put  (right="P"): delta = -0.5, source="default"
 
-The TTL is read from the file (``ttl_seconds``) with a 7200s fallback.
+The TTL is read from the file (``ttl_seconds``) with a 90000s fallback.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_DIR = REPO_ROOT / "runtime"
 GREEKS_FILE_NAME = "options_greeks.json"
 
-GREEKS_FILE_TTL = 7200
+GREEKS_FILE_TTL = 90000
 DEFAULT_CALL_DELTA = 0.5
 DEFAULT_PUT_DELTA = -0.5
 

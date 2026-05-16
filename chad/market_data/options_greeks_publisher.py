@@ -38,7 +38,7 @@ GREEKS_SCHEMA_VERSION = "options_greeks.v1"
 GREEKS_FILE_NAME = "options_greeks.json"
 CHAIN_CACHE_FILE_NAME = "options_chains_cache.json"
 PRICE_CACHE_FILE_NAME = "price_cache.json"
-DEFAULT_TTL_SECONDS = 3600
+DEFAULT_TTL_SECONDS = 90000
 
 MAX_EXPIRIES_PER_SYMBOL = 3
 NEAR_ATM_STRIKES_PER_SIDE = 3  # 3 below + ATM + 3 above = up to 7
