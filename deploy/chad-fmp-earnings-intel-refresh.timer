@@ -1,0 +1,11 @@
+[Unit]
+Description=CHAD FMP earnings and analyst intelligence refresh — every 6 hours
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=21600
+AccuracySec=60s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

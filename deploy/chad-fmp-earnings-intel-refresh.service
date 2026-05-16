@@ -1,0 +1,18 @@
+[Unit]
+Description=CHAD FMP earnings and analyst intelligence publisher
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/fmp.env
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.fmp_earnings_intel_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-fmp-earnings-intel-refresh
+
+[Install]
+WantedBy=multi-user.target
