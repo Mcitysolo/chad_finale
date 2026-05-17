@@ -1,0 +1,17 @@
+[Unit]
+Description=CHAD dynamic universe candidate scanner
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.market_data.dynamic_universe_scanner
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-dynamic-universe-scanner-refresh
+
+[Install]
+WantedBy=multi-user.target
