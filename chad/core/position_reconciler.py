@@ -24,6 +24,34 @@ LOG = logging.getLogger("chad.core.position_reconciler")
 # nor show up as reconciliation mismatches.
 KNOWN_NON_CHAD_SYMBOLS: frozenset = frozenset({"AAPL", "MSFT"})
 
+# GAP-001: unify reconciler exclusions onto the publisher's canonical SSOT
+# (config/reconciliation_exclusions.json, loaded once at publisher import).
+# Reuses the publisher's already-resolved module constants so there is no
+# parallel config reader and no runtime/reconciliation_state.json round-trip.
+try:
+    from chad.ops.reconciliation_publisher import (
+        KNOWN_NON_CHAD_SYMBOLS as _PUBLISHER_NON_CHAD,
+        EXCLUSION_POLICY as _PUBLISHER_EXCLUSION_POLICY,
+    )
+    _EFFECTIVE_NON_CHAD_SYMBOLS = frozenset(
+        str(s).upper()
+        for s in (
+            set(KNOWN_NON_CHAD_SYMBOLS)
+            | set(_PUBLISHER_NON_CHAD)
+            | set(_PUBLISHER_EXCLUSION_POLICY.keys())
+        )
+    )
+    _EXCLUSION_SOURCE = "unified_publisher_config"
+except Exception as _exc:  # pragma: no cover - defensive
+    LOG.warning(
+        "RECONCILER_EXCLUSION_IMPORT_FAILED source=local_floor err=%s",
+        _exc,
+    )
+    _EFFECTIVE_NON_CHAD_SYMBOLS = frozenset(
+        str(s).upper() for s in KNOWN_NON_CHAD_SYMBOLS
+    )
+    _EXCLUSION_SOURCE = "local_floor_fallback"
+
 _PRICE_CACHE_PATH = Path("/home/ubuntu/chad_finale/runtime/price_cache.json")
 
 
@@ -84,7 +112,7 @@ def reconcile_positions_with_signals(
             if not symbol or open_side not in ("BUY", "SELL"):
                 continue
 
-            if symbol in KNOWN_NON_CHAD_SYMBOLS:
+            if str(symbol).upper() in _EFFECTIVE_NON_CHAD_SYMBOLS:
                 continue
 
             # ISSUE-29 fix: skip partial_attribution_residual entries.
