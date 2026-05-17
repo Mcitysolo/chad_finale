@@ -31,6 +31,14 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 MODEL_PATH = REPO_ROOT / "shared" / "models" / "xgb_veto_model.json"
 MANIFEST_PATH = REPO_ROOT / "shared" / "models" / "xgb_veto_manifest.json"
 
+# Runtime-current paths populated by the promotion CLI
+# (scripts/promote_xgb_veto.py). When present, the predictor prefers
+# these over the shared/models baseline so weekly retrains land in
+# runtime/ without dirtying the tracked baseline.
+RUNTIME_MODEL_DIR = REPO_ROOT / "runtime" / "models" / "xgb_veto" / "current"
+RUNTIME_MODEL_PATH = RUNTIME_MODEL_DIR / "xgb_veto_model.json"
+RUNTIME_MANIFEST_PATH = RUNTIME_MODEL_DIR / "xgb_veto_manifest.json"
+
 # Default threshold above which a positive prediction (P(loss)) means
 # "would veto". Tuned during shadow soak.
 VETO_THRESHOLD = float(os.environ.get("CHAD_ML_VETO_THRESHOLD", "0.65"))
@@ -156,16 +164,23 @@ def _load_manifest() -> Optional[Dict[str, Any]]:
     if _manifest_load_attempted:
         return _manifest_cache
     _manifest_load_attempted = True
+    # Prefer runtime-current manifest when promoted; fall back to the
+    # tracked baseline. Both load paths share fail-open semantics.
+    if RUNTIME_MANIFEST_PATH.exists():
+        manifest_path = RUNTIME_MANIFEST_PATH
+    else:
+        manifest_path = MANIFEST_PATH
     try:
-        if not MANIFEST_PATH.exists():
-            logger.info("ml_veto: manifest missing at %s", MANIFEST_PATH)
+        if not manifest_path.exists():
+            logger.info("ml_veto: manifest missing at %s", manifest_path)
             _manifest_cache = None
             return None
-        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             logger.warning("ml_veto: manifest not a dict — invalid")
             _manifest_cache = None
             return None
+        logger.debug("ml_veto: manifest loaded from %s", manifest_path)
         _manifest_cache = data
         return _manifest_cache
     except Exception as exc:  # noqa: BLE001 — fail-open
@@ -255,13 +270,20 @@ def _load_model():
     _model_load_attempted = True
     try:
         import xgboost as xgb  # type: ignore[import]
-        if not MODEL_PATH.exists():
+        # Prefer runtime-current model when promoted; fall back to the
+        # tracked baseline.
+        if RUNTIME_MODEL_PATH.exists():
+            model_path = RUNTIME_MODEL_PATH
+        else:
+            model_path = MODEL_PATH
+        if not model_path.exists():
             logger.info("ml_veto: model not found at %s — veto disabled",
-                        MODEL_PATH)
+                        model_path)
             return None
         bst = xgb.Booster()
-        bst.load_model(str(MODEL_PATH))
-        logger.info("ml_veto: model loaded from %s", MODEL_PATH)
+        bst.load_model(str(model_path))
+        logger.debug("ml_veto: model loaded from %s", model_path)
+        logger.info("ml_veto: model loaded from %s", model_path)
         _model = bst
         return _model
     except Exception as e:  # noqa: BLE001 — fail-open

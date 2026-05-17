@@ -45,9 +45,22 @@ DATA_DIR = ROOT / "data" / "trades"
 MODELS_DIR = ROOT / "shared" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Tracked baseline paths — read by the predictor only as a fallback
+# when no promoted runtime-current model exists. The trainer must NOT
+# overwrite these under normal operation; they represent the reviewed
+# baseline and are restored from git when a regressed retrain lands.
 MODEL_PATH = MODELS_DIR / "xgb_veto_model.json"
 MANIFEST_PATH = MODELS_DIR / "xgb_veto_manifest.json"
 PERF_PATH = MODELS_DIR / "model_performance.json"
+
+# Candidate / promoted runtime locations (untracked under runtime/).
+# Weekly retrain lands a candidate in CANDIDATES_DIR/<UTC ts>/; the
+# operator promotes it via scripts/promote_xgb_veto.py into
+# RUNTIME_MODEL_DIR which the predictor then prefers over MODEL_PATH.
+CANDIDATES_DIR = ROOT / "runtime" / "models" / "xgb_veto" / "candidates"
+RUNTIME_MODEL_DIR = ROOT / "runtime" / "models" / "xgb_veto" / "current"
+RUNTIME_MODEL_PATH = RUNTIME_MODEL_DIR / "xgb_veto_model.json"
+RUNTIME_MANIFEST_PATH = RUNTIME_MODEL_DIR / "xgb_veto_manifest.json"
 
 # Manifest schema bumped when trainer started excluding quarantined,
 # pnl_untrusted, untrusted-fill_id, nonfinite, and unusable-legacy
@@ -493,26 +506,63 @@ def _train_model(
           f"base_loss_rate={base_loss_rate:.3f} "
           f"veto_rate@0.65={veto_rate_at_065:.3f}")
 
-    # SS08: snapshot the prior model with a UTC timestamp before overwriting
-    # so each retrain is recoverable. Filename collisions are avoided because
-    # the timestamp resolves to the second.
-    backup_path: Optional[Path] = None
-    if MODEL_PATH.exists():
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path = MODEL_PATH.with_name(f"xgb_veto_model_{ts}.json")
-        try:
-            shutil.copy2(MODEL_PATH, backup_path)
-            LOG.info("Backed up prior model to %s", backup_path)
-            print(f"Backed up prior model to {backup_path}")
-        except Exception:  # noqa: BLE001
-            LOG.exception("Failed to back up prior model — continuing")
-            backup_path = None
+    # Candidate paths. Production trainer writes to
+    # CANDIDATES_DIR/<UTC ts>/ so the tracked baseline at MODEL_PATH /
+    # MANIFEST_PATH is never overwritten by the weekly timer. When the
+    # module-level MODEL_PATH/MANIFEST_PATH have been monkey-patched
+    # (test fixtures), the trainer honors those paths instead — the
+    # adapter preserves the existing test surface that drives a real
+    # train_model run against a tmp directory.
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    default_model = MODELS_DIR / "xgb_veto_model.json"
+    default_manifest = MODELS_DIR / "xgb_veto_manifest.json"
+    if MODEL_PATH != default_model or MANIFEST_PATH != default_manifest:
+        candidate_dir = MODEL_PATH.parent
+        target_model_path = MODEL_PATH
+        target_manifest_path = MANIFEST_PATH
+    else:
+        candidate_dir = CANDIDATES_DIR / ts
+        target_model_path = candidate_dir / "xgb_veto_model.json"
+        target_manifest_path = candidate_dir / "xgb_veto_manifest.json"
 
-    LOG.info("Saving XGBoost model to %s", MODEL_PATH)
     try:
-        bst.save_model(str(MODEL_PATH))
+        candidate_dir.mkdir(parents=True, exist_ok=True)
     except Exception:  # noqa: BLE001
-        LOG.exception("Failed to save XGBoost model to %s", MODEL_PATH)
+        LOG.exception("Failed to create candidate dir %s", candidate_dir)
+        return TrainingResult(
+            ok=False,
+            reason="candidate_dir_create_failed",
+            n_samples=int(n_samples),
+            n_features=int(n_features),
+            metrics=metrics,
+            excluded=excluded,
+            dataset_hash=dataset_hash,
+        )
+
+    # prior_model_backup points at the model the candidate would
+    # supersede if promoted: runtime-current when present, else the
+    # tracked baseline. The trainer no longer copies live model bytes
+    # — promotion does that.
+    if RUNTIME_MODEL_PATH.exists():
+        backup_path: Optional[Path] = RUNTIME_MODEL_PATH
+    elif MODEL_PATH.exists():
+        backup_path = MODEL_PATH
+    else:
+        backup_path = None
+
+    LOG.info("Saving XGBoost candidate model to %s", target_model_path)
+    try:
+        # Stage with a ".json" extension so xgboost picks the JSON
+        # serializer (UBJSON is its silent default for unrecognized
+        # extensions). os.replace() makes the publish atomic.
+        tmp_model = target_model_path.with_name(
+            f".write.{target_model_path.name}"
+        )
+        bst.save_model(str(tmp_model))
+        import os as _os
+        _os.replace(str(tmp_model), str(target_model_path))
+    except Exception:  # noqa: BLE001
+        LOG.exception("Failed to save XGBoost model to %s", target_model_path)
         return TrainingResult(
             ok=False,
             reason="model_save_failed",
@@ -524,22 +574,26 @@ def _train_model(
             backup_path=backup_path,
         )
 
-    model_hash = _hash_file(MODEL_PATH) or ""
+    print(f"[train_xgb_model] candidate written to {candidate_dir}")
+    LOG.info("[train_xgb_model] candidate written to %s", candidate_dir)
+
+    model_hash = _hash_file(target_model_path) or ""
     trained_at = datetime.now(timezone.utc).isoformat()
-    # Stable model_version — uses the timestamped backup name for the
-    # *new* model. This makes "which model was scoring on day X" easy
-    # to answer even after subsequent retrains.
-    model_version = f"xgb_veto_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    # Stable model_version — encodes the candidate UTC timestamp so the
+    # promoted model retains the identity of the training run that
+    # produced it.
+    model_version = f"xgb_veto_{ts}"
 
     # SS08 + Batch 9: manifest is the source-of-truth for the predictor's
     # safety gates. It records the dataset fingerprint, the per-reason
     # exclusion counts, validation metrics, and the rollback target so
-    # operators can restore by copying the backup over MODEL_PATH.
+    # operators can restore by copying the backup over the runtime
+    # current model. The manifest lands next to the candidate model.
     manifest_written = False
     try:
         manifest = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
-            "model_path": str(MODEL_PATH),
+            "model_path": str(target_model_path),
             "model_sha256": model_hash,
             "model_version": model_version,
             "trained_at_utc": trained_at,
@@ -552,6 +606,8 @@ def _train_model(
             "excluded": {k: int(v) for k, v in excluded.items()},
             "min_training_samples": int(MIN_TRAINING_SAMPLES),
             "prior_model_backup": str(backup_path) if backup_path else None,
+            "candidate_id": ts,
+            "candidate_dir": str(candidate_dir),
             "label_definition": "1=loss(net_pnl<=0), 0=win(net_pnl>0)",
             "pnl_source_priority": [
                 "payload.pnl_breakdown.net_pnl",
@@ -567,12 +623,17 @@ def _train_model(
                 + sorted(_legacy_schemas_allowed()),
             },
         }
-        MANIFEST_PATH.write_text(
+        import os as _os
+        tmp_manifest = target_manifest_path.with_suffix(
+            target_manifest_path.suffix + ".tmp"
+        )
+        tmp_manifest.write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )
+        _os.replace(str(tmp_manifest), str(target_manifest_path))
         manifest_written = True
-        LOG.info("Manifest written to %s", MANIFEST_PATH)
-        print(f"Manifest written to {MANIFEST_PATH}")
+        LOG.info("Manifest written to %s", target_manifest_path)
+        print(f"Manifest written to {target_manifest_path}")
     except Exception:  # noqa: BLE001
         LOG.exception("Failed to write XGBoost manifest — continuing")
 
@@ -590,7 +651,7 @@ def _train_model(
             excluded=excluded,
             dataset_hash=dataset_hash,
             model_version=model_version,
-            manifest_path=MANIFEST_PATH if manifest_written else None,
+            manifest_path=target_manifest_path if manifest_written else None,
             backup_path=backup_path,
         )
 
@@ -603,7 +664,7 @@ def _train_model(
         excluded=excluded,
         dataset_hash=dataset_hash,
         model_version=model_version,
-        manifest_path=MANIFEST_PATH if manifest_written else None,
+        manifest_path=target_manifest_path if manifest_written else None,
         backup_path=backup_path,
     )
 
