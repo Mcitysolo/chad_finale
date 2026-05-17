@@ -9,14 +9,46 @@
 
 ## 1. Status
 
-**DESIGN ONLY — NOT IMPLEMENTED.**
+**Phase D Item 1A (scanner publisher) — IMPLEMENTED & COMMITTED.**
+**Phase D Item 1B (read-only intelligence/dashboard surface) — IMPLEMENTED (not yet committed).**
 
-This document defines the contract, scope, scoring inputs, safety rules,
-and implementation order for the Phase D `dynamic_universe_scanner`. It
-intentionally contains no implementation. No code, runtime, deploy, or
-config files were modified to produce it.
+Update history:
 
-Acceptance for this design pass:
+- 2026-05-16: design accepted (this document).
+- Phase D Item 1A: `chad/market_data/dynamic_universe_scanner.py`
+  publisher landed and installed. `runtime/dynamic_universe_candidates.json`
+  is being written every 5 minutes with `status=ok`, `provider_status=real`,
+  schema `dynamic_universe_candidates.v1`.
+- Phase D Item 1B: `dynamic_universe_candidates` is now surfaced
+  **read-only** in `chad.intel.strategy_intelligence` (module-level
+  `_load_dynamic_universe_candidates_context` plus a thin class wrapper
+  on `StrategyIntelligence`) and in the dashboard `_intelligence()`
+  payload (`chad/dashboard/api.py`). The helper is fail-open: missing /
+  malformed / stale / partial / empty payloads never raise. The dashboard
+  block contains `freshness`, `status`, `summary`, the top-10
+  `top_candidates`, `ts_utc`, `ttl_seconds`, and `source_provider` only.
+
+What is **explicitly NOT done** by Item 1B and remains out of scope until
+a separate authorisation:
+
+- No strategy gates are wired. No file under `chad/strategies/` imports
+  the helper or reads `runtime/dynamic_universe_candidates.json` (enforced
+  by a test in `chad/tests/test_dynamic_universe_candidates_context.py`).
+- No confidence modifiers are wired. The helper does not feed
+  `ConfidenceBias`, sizing, or routing decisions.
+- `runtime/universe.json` is **not** replaced. The canonical writer
+  remains `chad.analytics.universe_builder`; the helper only reads.
+- No `chad/execution/`, `chad/risk/`, or `chad/core/` file consumes the
+  helper (enforced by the same test).
+- No config mutation, no systemd changes, no deploy changes for 1B.
+
+The observation period defined in §9 (item C — at least 5 trading days
+of side-by-side comparison with the current static-then-runtime
+universe) remains required before any §9 item D (optional v2 promotion
+logic) is authorised. The dashboard surface introduced by Item 1B is the
+intended operator-facing observation tool during that window.
+
+Original acceptance for the 2026-05-16 design pass (kept for audit):
 
 - A single new file under `docs/` (this file).
 - No edits under `chad/`, `deploy/`, `ops/`, `config/`, or `runtime/`.

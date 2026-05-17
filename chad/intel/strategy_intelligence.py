@@ -41,6 +41,15 @@ EARNINGS_INTEL_DEFAULT_TTL_SEC = 21600  # 6h, mirrors publisher cadence
 EARNINGS_INTEL_UPCOMING_LIMIT = 10
 _EARNINGS_INTEL_DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 
+# Read-only dynamic universe candidates consumer constants. Intel-only —
+# strategy/execution/risk code MUST NOT import
+# _load_dynamic_universe_candidates_context. See module-header comment on
+# read-only consumption during the Phase D observation period.
+DYNAMIC_UNIVERSE_CANDIDATES_FILENAME = "dynamic_universe_candidates.json"
+DYNAMIC_UNIVERSE_CANDIDATES_DEFAULT_TTL_SEC = 300  # 5m, mirrors publisher cadence
+DYNAMIC_UNIVERSE_CANDIDATES_TOP_LIMIT = 10
+_DYNAMIC_UNIVERSE_CANDIDATES_DEFAULT_RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
+
 
 @dataclass
 class ConfidenceBias:
@@ -284,6 +293,210 @@ def _load_earnings_intel_context(
 
 
 # ---------------------------------------------------------------------------
+# Dynamic universe candidates — READ-ONLY, fail-open
+# ---------------------------------------------------------------------------
+#
+# Surface for runtime/dynamic_universe_candidates.json (Phase D Item 1A
+# scanner publisher: ranks the active equity/ETF universe using RS, RVOL,
+# news catalysts, and earnings metadata).
+#
+# Allowed consumers: chad.intel.strategy_intelligence (this module) and
+# chad.dashboard.api (read-only dashboard surface).
+#
+# Forbidden consumers: chad/strategies/*, chad/execution/*, chad/risk/*,
+# chad/core/*. This helper is intelligence-only during the Phase D
+# observation period. Wiring it into a strategy gate, confidence modifier,
+# sizing path, routing gate, or runtime/universe.json producer without a
+# separate audit is a governance violation.
+
+
+def _empty_dynamic_universe_candidates_summary() -> Dict[str, Any]:
+    return {
+        "symbols_considered": None,
+        "candidates_published": None,
+        "strong_rs_count": None,
+        "high_rvol_count": None,
+        "confirmed_catalyst_count": None,
+        "earnings_warning_count": None,
+    }
+
+
+def _empty_dynamic_universe_candidates_context(
+    *,
+    freshness: str,
+    status: str = "unknown",
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a normalized empty context with the requested freshness label."""
+    payload = payload if isinstance(payload, dict) else {}
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    return {
+        "freshness": freshness,
+        "status": status,
+        "summary": _empty_dynamic_universe_candidates_summary(),
+        "top_candidates": [],
+        "ts_utc": payload.get("ts_utc") if payload else None,
+        "ttl_seconds": payload.get("ttl_seconds") if payload else None,
+        "source_provider": (source.get("provider") if isinstance(source, dict) else None) or None,
+    }
+
+
+def _dynamic_universe_candidates_freshness(payload: Dict[str, Any]) -> str:
+    """Classify dynamic_universe_candidates.json freshness using ts_utc + ttl_seconds.
+
+    Returns: 'fresh' | 'stale' | 'unknown'. 'missing' and 'malformed' are
+    set upstream by the loader and never produced here.
+    """
+    ts_str = str(payload.get("ts_utc") or "")
+    ttl = payload.get("ttl_seconds")
+    if not ts_str:
+        return "unknown"
+    try:
+        ttl_sec = float(ttl) if ttl is not None else float(DYNAMIC_UNIVERSE_CANDIDATES_DEFAULT_TTL_SEC)
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return "fresh" if age <= ttl_sec else "stale"
+    except Exception:
+        return "unknown"
+
+
+def _dynamic_universe_candidates_status(payload: Dict[str, Any]) -> str:
+    """Normalize the publisher's status field.
+
+    Accepts: ok | partial | empty | error. Anything else maps to 'unknown'.
+    status=partial and status=empty are valid by-design publisher states
+    and must not be treated as error.
+    """
+    raw = str(payload.get("status") or "").strip().lower()
+    if raw in ("ok", "partial", "empty", "error"):
+        return raw
+    return "unknown"
+
+
+def _dynamic_universe_candidates_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the publisher summary dict, normalized to ints or None."""
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return _empty_dynamic_universe_candidates_summary()
+
+    def _opt_int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "symbols_considered": _opt_int(summary.get("symbols_considered")),
+        "candidates_published": _opt_int(summary.get("candidates_published")),
+        "strong_rs_count": _opt_int(summary.get("strong_rs_count")),
+        "high_rvol_count": _opt_int(summary.get("high_rvol_count")),
+        "confirmed_catalyst_count": _opt_int(summary.get("confirmed_catalyst_count")),
+        "earnings_warning_count": _opt_int(summary.get("earnings_warning_count")),
+    }
+
+
+def _dynamic_universe_candidates_top(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract the first ``DYNAMIC_UNIVERSE_CANDIDATES_TOP_LIMIT`` candidates.
+
+    Publisher already sorts by ``(-score, symbol)`` and writes ``rank``
+    starting at 1, so we preserve publisher order rather than re-sorting.
+    Records without a symbol are skipped.
+    """
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return []
+
+    def _opt_int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _opt_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _str_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(x) for x in value]
+
+    rows: List[Dict[str, Any]] = []
+    for rec in candidates:
+        if not isinstance(rec, dict):
+            continue
+        sym = rec.get("symbol")
+        if not sym:
+            continue
+        rank = _opt_int(rec.get("rank"))
+        rows.append({
+            "rank": rank if rank is not None else 0,
+            "symbol": str(sym),
+            "score": _opt_float(rec.get("score")),
+            "reasons": _str_list(rec.get("reasons")),
+            "warnings": _str_list(rec.get("warnings")),
+            "rs_class": str(rec["rs_class"]) if isinstance(rec.get("rs_class"), str) else None,
+            "rvol_class": str(rec["rvol_class"]) if isinstance(rec.get("rvol_class"), str) else None,
+            "catalyst_strength": str(rec["catalyst_strength"]) if isinstance(rec.get("catalyst_strength"), str) else None,
+            "earnings_days": _opt_int(rec.get("earnings_days")),
+        })
+        if len(rows) >= DYNAMIC_UNIVERSE_CANDIDATES_TOP_LIMIT:
+            break
+    return rows
+
+
+def _load_dynamic_universe_candidates_context(
+    runtime_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read-only, fail-open loader for ``runtime/dynamic_universe_candidates.json``.
+
+    Never raises. Never writes any file. Returns a normalized context dict
+    for the intelligence and dashboard surfaces only. See module-header
+    comment for forbidden consumers.
+    """
+    rd = Path(runtime_dir) if runtime_dir is not None else _DYNAMIC_UNIVERSE_CANDIDATES_DEFAULT_RUNTIME_DIR
+    path = rd / DYNAMIC_UNIVERSE_CANDIDATES_FILENAME
+
+    try:
+        if not path.is_file():
+            return _empty_dynamic_universe_candidates_context(freshness="missing", status="unknown")
+    except Exception:
+        return _empty_dynamic_universe_candidates_context(freshness="missing", status="unknown")
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return _empty_dynamic_universe_candidates_context(freshness="missing", status="unknown")
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return _empty_dynamic_universe_candidates_context(freshness="malformed", status="unknown")
+    if not isinstance(payload, dict):
+        return _empty_dynamic_universe_candidates_context(freshness="malformed", status="unknown")
+
+    try:
+        freshness = _dynamic_universe_candidates_freshness(payload)
+        status = _dynamic_universe_candidates_status(payload)
+        summary = _dynamic_universe_candidates_summary(payload)
+        top = _dynamic_universe_candidates_top(payload)
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        return {
+            "freshness": freshness,
+            "status": status,
+            "summary": summary,
+            "top_candidates": top,
+            "ts_utc": payload.get("ts_utc"),
+            "ttl_seconds": payload.get("ttl_seconds"),
+            "source_provider": (source.get("provider") if isinstance(source, dict) else None) or None,
+        }
+    except Exception:
+        return _empty_dynamic_universe_candidates_context(freshness="unknown", status="unknown", payload=payload)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Intelligence
 # ---------------------------------------------------------------------------
 
@@ -499,6 +712,10 @@ class StrategyIntelligence:
     def _load_earnings_intel_context(self) -> Dict[str, Any]:
         """Read-only earnings intelligence context. See module-level helper."""
         return _load_earnings_intel_context(self._runtime_dir)
+
+    def _load_dynamic_universe_candidates_context(self) -> Dict[str, Any]:
+        """Read-only dynamic universe candidates context. See module-level helper."""
+        return _load_dynamic_universe_candidates_context(self._runtime_dir)
 
     def _load_market_context(self) -> Dict[str, Any]:
         """

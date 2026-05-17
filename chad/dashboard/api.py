@@ -29,7 +29,10 @@ from urllib.parse import parse_qs
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
-from chad.intel.strategy_intelligence import _load_earnings_intel_context
+from chad.intel.strategy_intelligence import (
+    _load_dynamic_universe_candidates_context,
+    _load_earnings_intel_context,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = REPO / "runtime"
@@ -564,6 +567,25 @@ class StateBuilder:
                 "ttl_seconds": None,
                 "source_provider": None,
             }
+        try:
+            dynamic_universe_candidates = _load_dynamic_universe_candidates_context(RUNTIME)
+        except Exception:
+            dynamic_universe_candidates = {
+                "freshness": "unknown",
+                "status": "unknown",
+                "summary": {
+                    "symbols_considered": None,
+                    "candidates_published": None,
+                    "strong_rs_count": None,
+                    "high_rvol_count": None,
+                    "confirmed_catalyst_count": None,
+                    "earnings_warning_count": None,
+                },
+                "top_candidates": [],
+                "ts_utc": None,
+                "ttl_seconds": None,
+                "source_provider": None,
+            }
         return {
             "vix": vix,
             "vix_label": _vix_label_legacy(vix),
@@ -572,6 +594,7 @@ class StateBuilder:
             "top_reddit_mention": top_reddit,
             "market_regime": regime,
             "earnings_intel": earnings_intel,
+            "dynamic_universe_candidates": dynamic_universe_candidates,
         }
 
     def _business(self) -> dict:
