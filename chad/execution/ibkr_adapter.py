@@ -37,7 +37,7 @@ import os
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
@@ -1253,6 +1253,91 @@ class _ContractResolver:
 
 
 # ---------------------------------------------------------------------------
+# BAG (combo) LMT discipline
+# ---------------------------------------------------------------------------
+
+
+def _resolve_bag_lmt_discipline(intent: NormalizedIntent) -> Optional[NormalizedIntent]:
+    """Enforce LMT-only pricing for BAG (combo) intents before order build.
+
+    Rules:
+      A. If sec_type == "BAG" and order_type != "LMT", coerce to LMT and log
+         BAG_MKT_COERCED_TO_LMT (with symbol + original order_type).
+      B/C. If limit_price is missing or non-positive, hydrate from
+         meta["net_debit_estimate"], else meta["spread_spec"].net_debit_estimate
+         (typed OptionsSpreadSpec or Mapping). On success, log
+         BAG_LIMIT_PRICE_FROM_DEBIT_ESTIMATE.
+      D. If no valid positive limit price can be derived, log
+         BAG_INTENT_SKIPPED_NO_LIMIT_PRICE and return None to signal the
+         caller to skip submission (mirrors the existing
+         ``ibkr.skip_non_positive_size`` skip path).
+
+    Non-BAG intents are returned unchanged.
+    """
+    if _safe_upper(intent.sec_type) != "BAG":
+        return intent
+
+    original_order_type = intent.order_type
+    updates: Dict[str, Any] = {}
+
+    if _safe_upper(original_order_type) != "LMT":
+        updates["order_type"] = "LMT"
+        LOGGER.warning(
+            "BAG_MKT_COERCED_TO_LMT symbol=%s original_order_type=%s",
+            intent.symbol,
+            original_order_type,
+        )
+
+    def _positive_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(out) or out <= 0.0:
+            return None
+        return out
+
+    current_lp = _positive_float(intent.limit_price)
+    resolved_lp: Optional[float] = current_lp
+
+    if resolved_lp is None:
+        meta = intent.meta if isinstance(intent.meta, Mapping) else {}
+        candidates: List[Any] = [meta.get("net_debit_estimate")]
+        spec = meta.get("spread_spec")
+        if isinstance(spec, OptionsSpreadSpec):
+            candidates.append(getattr(spec, "net_debit_estimate", None))
+        elif isinstance(spec, Mapping):
+            candidates.append(spec.get("net_debit_estimate"))
+
+        for cand in candidates:
+            hydrated = _positive_float(cand)
+            if hydrated is not None:
+                resolved_lp = hydrated
+                updates["limit_price"] = hydrated
+                LOGGER.info(
+                    "BAG_LIMIT_PRICE_FROM_DEBIT_ESTIMATE symbol=%s limit_price=%s",
+                    intent.symbol,
+                    hydrated,
+                )
+                break
+
+    if resolved_lp is None:
+        LOGGER.warning(
+            "BAG_INTENT_SKIPPED_NO_LIMIT_PRICE symbol=%s strategy=%s original_order_type=%s",
+            intent.symbol,
+            intent.strategy,
+            original_order_type,
+        )
+        return None
+
+    if updates:
+        return replace(intent, **updates)
+    return intent
+
+
+# ---------------------------------------------------------------------------
 # Order factory
 # ---------------------------------------------------------------------------
 
@@ -1793,6 +1878,15 @@ class IbkrAdapter:
 
         resolved_contract = self._resolver.resolve(ib, intent)
         what_if = bool(self._config.dry_run and self._config.simulate_what_if_in_dry_run)
+
+        disciplined_intent = _resolve_bag_lmt_discipline(intent)
+        if disciplined_intent is None:
+            # BAG intent has no positive limit_price after hydration attempts;
+            # skip without building or previewing an order. The marker line
+            # is emitted inside the helper.
+            return None
+        intent = disciplined_intent
+
         prepared = self._order_factory.build(intent, what_if=what_if)
 
         if self._config.dry_run and not self._config.simulate_what_if_in_dry_run:
