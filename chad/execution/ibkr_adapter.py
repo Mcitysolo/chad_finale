@@ -43,6 +43,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple, TypeVar, TYPE_CHECKING
 
+from chad.options.spread_spec import OptionsSpreadSpec
 from chad.types import AssetClass, RoutedSignal, SignalSide
 
 LOGGER = logging.getLogger("chad.execution.ibkr")
@@ -1045,35 +1046,89 @@ class _ContractResolver:
         Option = _lazy_import_option_class()
 
         meta = dict(intent.meta)
-        expiry = _safe_str(meta.get("expiry"))
-        if not expiry:
-            raise ContractResolutionError(
-                f"BAG contract for {intent.symbol} requires 'expiry' in intent.meta"
-            )
 
-        long_strike = meta.get("long_strike")
-        short_strike = meta.get("short_strike")
-        if long_strike is None or short_strike is None:
-            raise ContractResolutionError(
-                f"BAG contract for {intent.symbol} requires 'long_strike' and 'short_strike' in intent.meta"
-            )
-        try:
-            long_strike = float(long_strike)
-            short_strike = float(short_strike)
-        except (TypeError, ValueError):
-            raise ContractResolutionError(
-                f"BAG contract for {intent.symbol}: invalid strike values"
-            )
+        # Phase D Item 2 Tier 1 — prefer the typed OptionsSpreadSpec when the
+        # strategy stamped one under meta["spread_spec"]. Falls back to the
+        # legacy string-keyed dict path when the spec is absent or arrives
+        # in serialized form. Either path raises the same
+        # ContractResolutionError on bad data so downstream behavior (live
+        # log markers, qualification skipping, cache invalidation) is
+        # preserved exactly.
+        spec_obj = meta.get("spread_spec")
+        if spec_obj is not None and not isinstance(spec_obj, OptionsSpreadSpec):
+            # Tolerate a dict (or any mapping) accidentally placed under
+            # the typed key: rebuild via from_legacy_meta so the typed
+            # validators still run.
+            if isinstance(spec_obj, Mapping):
+                try:
+                    spec_obj = OptionsSpreadSpec.from_legacy_meta(intent.symbol, spec_obj)
+                except Exception as exc:
+                    raise ContractResolutionError(
+                        f"BAG contract for {intent.symbol}: invalid spread_spec dict ({exc})"
+                    ) from exc
+            else:
+                spec_obj = None
 
-        long_right = _safe_upper(_safe_str(meta.get("long_right")))
-        short_right = _safe_upper(_safe_str(meta.get("short_right")))
-        if long_right not in ("C", "P") or short_right not in ("C", "P"):
-            raise ContractResolutionError(
-                f"BAG contract for {intent.symbol} requires 'long_right' and 'short_right' (C or P)"
-            )
+        if spec_obj is None:
+            # Pre-validate the legacy fields with the same error messages
+            # callers (and tests) already match against, then build the
+            # typed spec from the validated values. This preserves the
+            # historical error surface while still flowing through the
+            # typed dataclass.
+            expiry_raw = _safe_str(meta.get("expiry") or meta.get("lastTradeDateOrContractMonth"))
+            if not expiry_raw:
+                raise ContractResolutionError(
+                    f"BAG contract for {intent.symbol} requires 'expiry' in intent.meta"
+                )
+            ls_raw = meta.get("long_strike")
+            ss_raw = meta.get("short_strike")
+            if ls_raw is None or ss_raw is None:
+                raise ContractResolutionError(
+                    f"BAG contract for {intent.symbol} requires 'long_strike' and 'short_strike' in intent.meta"
+                )
+            try:
+                _ = float(ls_raw)
+                _ = float(ss_raw)
+            except (TypeError, ValueError):
+                raise ContractResolutionError(
+                    f"BAG contract for {intent.symbol}: invalid strike values"
+                )
+            lr_raw = _safe_upper(_safe_str(meta.get("long_right")))
+            sr_raw = _safe_upper(_safe_str(meta.get("short_right")))
+            if lr_raw not in ("C", "P") or sr_raw not in ("C", "P"):
+                raise ContractResolutionError(
+                    f"BAG contract for {intent.symbol} requires 'long_right' and 'short_right' (C or P)"
+                )
 
-        exchange = _safe_str(meta.get("exchange")) or intent.exchange or "SMART"
-        currency = intent.currency or "USD"
+            try:
+                spec_obj = OptionsSpreadSpec.from_legacy_meta(intent.symbol, meta)
+            except ValueError as exc:
+                # Any remaining typed-validator failure (e.g. same-strike,
+                # malformed expiry that bypassed the regex check above) is
+                # surfaced as an invalid-strike / generic resolution error.
+                msg = str(exc)
+                if "differ" in msg:
+                    raise ContractResolutionError(
+                        f"BAG contract for {intent.symbol}: invalid strike values"
+                    ) from exc
+                raise ContractResolutionError(
+                    f"BAG contract for {intent.symbol}: {msg}"
+                ) from exc
+
+        # Pull the canonical, validated fields off the typed spec.
+        expiry = spec_obj.expiry
+        long_strike = float(spec_obj.long_strike)
+        short_strike = float(spec_obj.short_strike)
+        long_right = spec_obj.long_right
+        short_right = spec_obj.short_right
+
+        exchange = (
+            _safe_str(meta.get("exchange"))
+            or spec_obj.exchange
+            or intent.exchange
+            or "SMART"
+        )
+        currency = intent.currency or spec_obj.currency or "USD"
 
         # Build individual leg contracts for qualification
         long_opt = Option(

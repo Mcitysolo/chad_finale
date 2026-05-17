@@ -105,6 +105,21 @@ def test_alpha_options_bag_metadata_preserved_through_plan():
     # Unrelated equity path unchanged.
     assert resolve_asset_class("SPY", "STK") == "etf"
 
+    # 6. Phase D Item 2 Tier 1 — the typed OptionsSpreadSpec must also be
+    # stamped on the signal alongside the legacy keys. Its presence is a
+    # structural guard against future drift between the strategy and the
+    # IBKR adapter / paper-fill writer.
+    from chad.options.spread_spec import OptionsSpreadSpec
+
+    spec = sig.meta.get("spread_spec")
+    assert isinstance(spec, OptionsSpreadSpec)
+    assert spec.symbol == "SPY"
+    assert spec.long_strike == 720.0
+    assert spec.short_strike == 727.0
+    assert spec.long_right == "C"
+    assert spec.short_right == "C"
+    assert spec.spread_type == "BULL_CALL"
+
 
 # ---------------------------------------------------------------------------
 # Test 2: paper executor rejects unsupported BAG without writing as ETF

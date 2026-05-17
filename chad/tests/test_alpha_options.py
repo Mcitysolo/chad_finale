@@ -342,6 +342,41 @@ class TestSignalGeneration:
             assert signals[0].meta["long_right"] == "P"
             assert signals[0].meta["short_right"] == "P"
 
+    def test_bag_signal_carries_typed_spread_spec_alongside_legacy_keys(self) -> None:
+        """Phase D Item 2 Tier 1 — alpha_options now stamps a typed
+        OptionsSpreadSpec under meta['spread_spec'] alongside the legacy
+        string-keyed fields. Both must be present and must agree."""
+        from chad.options.spread_spec import OptionsSpreadSpec
+
+        chain = _make_chain(price=650.0)
+        spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
+        signals = _build_spread_signals(
+            spread=spread, confidence=0.75, equity=500_000.0,
+            tuning=AlphaOptionsTuning(), now=NOW, source_info={},
+        )
+        assert signals, "expected at least one BAG signal"
+        meta = signals[0].meta
+
+        # Legacy keys MUST remain present (additive contract).
+        for f in (
+            "spread_id", "spread_type", "expiry", "long_strike", "short_strike",
+            "long_right", "short_right", "sec_type", "net_debit_estimate",
+            "max_loss_per_contract",
+        ):
+            assert f in meta, f"legacy meta key {f!r} must still be emitted"
+
+        # Typed spec must be present and match the legacy fields.
+        spec = meta["spread_spec"]
+        assert isinstance(spec, OptionsSpreadSpec)
+        assert spec.symbol == meta.get("symbol", spread.symbol).upper() or spec.symbol == spread.symbol
+        assert spec.expiry == meta["expiry"]
+        assert spec.long_strike == float(meta["long_strike"])
+        assert spec.short_strike == float(meta["short_strike"])
+        assert spec.long_right == meta["long_right"]
+        assert spec.short_right == meta["short_right"]
+        assert spec.spread_type == meta["spread_type"]
+        assert spec.spread_id == meta["spread_id"]
+
     def test_signals_have_options_metadata(self) -> None:
         chain = _make_chain(price=650.0)
         spread = select_vertical_spread(chain, 650.0, "bullish", spread_width_pct=0.01)
@@ -713,6 +748,94 @@ class TestResolveCombo:
 
         with pytest.raises(ContractResolutionError, match="expiry"):
             resolver.resolve(None, intent)
+
+    def test_resolve_combo_accepts_typed_spread_spec(self) -> None:
+        """Phase D Item 2 Tier 1 — _resolve_combo prefers meta['spread_spec']
+        when present and produces the same BAG contract as the legacy dict
+        path."""
+        from chad.execution.ibkr_adapter import IbkrConfig, _ContractResolver, NormalizedIntent
+        from chad.options.spread_spec import OptionsSpreadSpec
+        from datetime import datetime, timezone
+
+        config = IbkrConfig(dry_run=True)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+
+        spec = OptionsSpreadSpec(
+            symbol="SPY",
+            expiry="20260618",
+            long_strike=737.0,
+            short_strike=744.0,
+            long_right="C",
+            short_right="C",
+            spread_type="BULL_CALL",
+            max_loss_per_contract=700.0,
+            net_debit_estimate=350.0,
+            spread_id="typed-1",
+            dte=32,
+        )
+
+        intent = NormalizedIntent(
+            strategy="alpha_options",
+            symbol="SPY",
+            sec_type="BAG",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            order_type="LMT",
+            quantity=1.0,
+            notional_estimate=0.0,
+            asset_class="options",
+            source_strategies=("alpha_options",),
+            created_at=datetime.now(timezone.utc),
+            meta={"spread_spec": spec},
+        )
+
+        resolved = resolver.resolve(None, intent)  # ib=None for dry-run
+        assert resolved.summary["sec_type"] == "BAG"
+        assert resolved.contract.secType == "BAG"
+        assert len(resolved.contract.comboLegs) == 2
+        assert resolved.contract.comboLegs[0].action == "BUY"
+        assert resolved.contract.comboLegs[1].action == "SELL"
+        assert resolved.summary["long_strike"] == 737.0
+        assert resolved.summary["short_strike"] == 744.0
+
+    def test_resolve_combo_still_accepts_legacy_dict_meta_when_no_spec(self) -> None:
+        """Backwards-compatibility — strategies that have not been migrated to
+        emit spread_spec must continue to resolve via the legacy dict path."""
+        from chad.execution.ibkr_adapter import IbkrConfig, _ContractResolver, NormalizedIntent
+        from datetime import datetime, timezone
+
+        config = IbkrConfig(dry_run=True)
+        resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+
+        intent = NormalizedIntent(
+            strategy="alpha_options",
+            symbol="SPY",
+            sec_type="BAG",
+            exchange="SMART",
+            currency="USD",
+            side="BUY",
+            order_type="LMT",
+            quantity=1.0,
+            notional_estimate=0.0,
+            asset_class="options",
+            source_strategies=("alpha_options",),
+            created_at=datetime.now(timezone.utc),
+            meta={
+                "expiry": "20260618",
+                "long_strike": 737.0,
+                "short_strike": 744.0,
+                "long_right": "C",
+                "short_right": "C",
+                "spread_type": "BULL_CALL",
+                # explicitly no spread_spec
+            },
+        )
+
+        resolved = resolver.resolve(None, intent)
+        assert resolved.summary["sec_type"] == "BAG"
+        assert resolved.contract.secType == "BAG"
+        assert len(resolved.contract.comboLegs) == 2
 
     def test_bag_in_whole_unit_sec_types(self) -> None:
         """BAG must be in default_whole_unit_sec_types for integer quantity enforcement."""

@@ -554,3 +554,70 @@ def test_non_bag_paper_evidence_unaffected_by_close_patch():
     assert ev.status == "paper_fill"
     assert ev.asset_class == "futures"
     assert ev.fill_price == 5500.0
+
+
+# ---------------------------------------------------------------------------
+# Phase D Item 2 Tier 1 — typed OptionsSpreadSpec hydration
+# ---------------------------------------------------------------------------
+
+
+def test_bag_simulator_hydrates_legacy_keys_from_typed_spread_spec():
+    """When the strategy stamps a typed OptionsSpreadSpec under
+    extra['spread_spec'] but omits one or more legacy keys, the simulator
+    must backfill the missing legacy keys from the spec and proceed
+    normally."""
+    from chad.options.spread_spec import OptionsSpreadSpec
+
+    spec = OptionsSpreadSpec(
+        symbol="SPY",
+        expiry="20260516",
+        long_strike=720.0,
+        short_strike=725.0,
+        long_right="C",
+        short_right="C",
+        spread_type="BULL_CALL",
+        max_loss_per_contract=500.0,
+        net_debit_estimate=1.50,
+        spread_id="typed-spec-1",
+        dte=10,
+    )
+
+    # Build evidence with ONLY the typed spec + minimal hints — no legacy
+    # long_strike / short_strike / etc.
+    ev = PaperExecEvidence(
+        symbol="SPY", side="BUY", quantity=1.0, fill_price=0.0,
+        expected_price=1.50, strategy="alpha_options",
+        source_strategies=["alpha_options"], broker="ibkr_paper",
+        status="", asset_class="", is_live=False,
+        fill_time_utc="2026-05-06T16:32:00Z",
+        extra={
+            "spread_spec": spec,
+            "contracts": 1,
+            "engine": "alpha_options.v1",
+        },
+    )
+
+    fired = simulate_bag_paper_fill(ev)
+    assert fired is True, "simulator must fire when typed spec carries BAG meta"
+    assert ev.fill_price == 1.50
+    assert ev.asset_class == "options"
+    assert ev.extra["long_strike"] == 720.0
+    assert ev.extra["short_strike"] == 725.0
+    assert ev.extra["long_right"] == "C"
+    assert ev.extra["short_right"] == "C"
+    assert ev.extra["sec_type"] == "BAG"
+
+
+def test_bag_simulator_legacy_dict_meta_path_still_works():
+    """Backwards-compatibility — when no spread_spec is present, the
+    simulator must continue to work from legacy dict meta exactly as
+    before. This is a guard against the hydration helper accidentally
+    altering the no-spec path."""
+    ev = _bag_evidence()  # no spread_spec
+    assert "spread_spec" not in ev.extra
+    fired = simulate_bag_paper_fill(ev)
+    assert fired is True
+    assert ev.fill_price == 1.50
+    assert ev.asset_class == "options"
+    assert isinstance(ev.extra.get("bag_legs"), list)
+    assert len(ev.extra["bag_legs"]) == 2

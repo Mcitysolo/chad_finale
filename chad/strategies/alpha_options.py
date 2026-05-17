@@ -56,6 +56,7 @@ from chad.types import (
 )
 
 from chad.options.chain_provider import OptionsChain
+from chad.options.spread_spec import OptionsSpreadSpec
 from chad.options.strike_selector import SpreadSpec, select_vertical_spread
 
 # Phase B Item 6 — synthetic Greeks lookup is metadata-only. Importing the
@@ -463,6 +464,39 @@ def _build_spread_signals(
     except Exception:
         net_delta_estimate = 0.0
 
+    # Phase D Item 2 Tier 1 — additive typed spec stamped under meta. Legacy
+    # string-keyed fields below are NOT removed: adapter / paper-fill writer
+    # / live_loop / external consumers still read them. The typed spec is a
+    # belt-and-braces channel so the contract is enforceable at construction
+    # time rather than via string-key spelling agreements across files.
+    try:
+        spread_spec = OptionsSpreadSpec(
+            symbol=spread.symbol,
+            expiry=spread.expiry,
+            long_strike=float(spread.long_strike),
+            short_strike=float(spread.short_strike),
+            long_right=long_right,
+            short_right=short_right,
+            ratio_long=1,
+            ratio_short=1,
+            exchange="SMART",
+            currency="USD",
+            spread_type=spread.spread_type,
+            max_loss_per_contract=float(spread.max_loss_per_contract),
+            net_debit_estimate=float(spread.net_debit_estimate),
+            spread_id=spread_id,
+            dte=int(spread.dte) if spread.dte is not None else None,
+        )
+    except Exception as _spec_err:  # pragma: no cover - additive, fail-soft
+        # If the typed spec fails to validate (should be impossible given
+        # the legacy path already validated these fields), do not break the
+        # signal — the adapter will still consume the legacy dict meta.
+        LOG.warning(
+            "alpha_options: spread_spec_build_failed symbol=%s exc=%s",
+            spread.symbol, _spec_err,
+        )
+        spread_spec = None
+
     signal = TradeSignal(
         strategy=StrategyName.ALPHA_OPTIONS,
         symbol=spread.symbol,
@@ -493,6 +527,7 @@ def _build_spread_signals(
             "short_theo_price": _short_greeks.theo_price,
             "long_delta_source": _long_greeks.source,
             "short_delta_source": _short_greeks.source,
+            "spread_spec": spread_spec,
             **source_info,
         },
     )

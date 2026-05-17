@@ -982,6 +982,57 @@ _OPTIONS_MULTIPLIER = 100  # standard equity-option contract multiplier
 _BAG_CLOSE_CREDIT_RATIO = 0.30
 
 
+def _hydrate_legacy_bag_meta_from_spec(extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase D Item 2 Tier 1 — backfill missing legacy BAG fields from a
+    typed ``OptionsSpreadSpec`` carried under ``extra["spread_spec"]``.
+
+    Pure additive. Existing legacy keys win; only blank / missing fields are
+    populated from the spec. Returns the same ``extra`` dict for chaining.
+    Failure-soft: any import / projection error leaves ``extra`` unchanged.
+
+    The spec may be either an actual ``OptionsSpreadSpec`` instance (what
+    the strategy stamps today) or its ``to_legacy_meta()`` dict projection
+    (defensive — covers external producers that serialized the spec)."""
+    if not isinstance(extra, dict):
+        return extra
+    spec = extra.get("spread_spec")
+    if spec is None:
+        return extra
+    try:
+        from chad.options.spread_spec import OptionsSpreadSpec
+
+        if isinstance(spec, OptionsSpreadSpec):
+            projected = spec.to_legacy_meta()
+        elif isinstance(spec, Mapping):
+            projected = dict(spec)
+        else:
+            return extra
+    except Exception:
+        return extra
+
+    for key in (
+        "sec_type",
+        "required_asset_class",
+        "spread_type",
+        "expiry",
+        "long_strike",
+        "short_strike",
+        "long_right",
+        "short_right",
+        "exchange",
+        "currency",
+        "ratio_long",
+        "ratio_short",
+        "max_loss_per_contract",
+        "net_debit_estimate",
+        "spread_id",
+        "dte",
+    ):
+        if extra.get(key) in (None, "") and key in projected and projected[key] is not None:
+            extra[key] = projected[key]
+    return extra
+
+
 def _find_opening_bag_fill(strategy: str, symbol: str) -> Optional[Dict[str, Any]]:
     """Locate the most recent opening BAG paper fill for strategy+symbol.
 
@@ -1091,6 +1142,10 @@ def _simulate_bag_sell_close(ev: "PaperExecEvidence") -> bool:
         return False
 
     extra = ev.extra if isinstance(ev.extra, dict) else {}
+    # Phase D Item 2 Tier 1 — backfill legacy keys from any typed
+    # OptionsSpreadSpec carried on the SELL-close evidence so the same
+    # opening-context detection branches below continue to work.
+    extra = _hydrate_legacy_bag_meta_from_spec(extra)
     sec_type = _safe_str(extra.get("sec_type"), "").strip().upper()
     required_ac = _safe_str(extra.get("required_asset_class"), "").strip().lower()
     strategy_norm = _safe_str(ev.strategy, "").strip().lower()
@@ -1320,6 +1375,10 @@ def simulate_bag_paper_fill(ev: "PaperExecEvidence") -> bool:
         return _simulate_bag_sell_close(ev)
 
     extra = ev.extra if isinstance(ev.extra, dict) else {}
+    # Phase D Item 2 Tier 1 — hydrate any missing legacy BAG keys from a
+    # typed OptionsSpreadSpec carried under extra["spread_spec"]. Pure
+    # additive: existing keys are preserved.
+    extra = _hydrate_legacy_bag_meta_from_spec(extra)
     sec_type = _safe_str(extra.get("sec_type"), "").strip().upper()
     required_ac = _safe_str(extra.get("required_asset_class"), "").strip().lower()
     is_bag = sec_type in ("BAG", "COMBO") or (

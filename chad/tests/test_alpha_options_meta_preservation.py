@@ -178,6 +178,55 @@ def test_single_leg_opt_intent_preserves_expiry_strike_right():
     assert intent.meta.get("right") == "C"
 
 
+def test_alpha_options_bag_intent_typed_spread_spec_resolves_through_adapter():
+    """Phase D Item 2 Tier 1 — when a typed OptionsSpreadSpec is supplied
+    on the routed-signal meta (in addition to the legacy keys), the
+    adapter must consume it via the typed path and build the BAG
+    contract without needing legacy key fallback."""
+    from chad.execution.ibkr_adapter import (
+        IbkrConfig,
+        NormalizedIntent,
+        _ContractResolver,
+    )
+    from chad.options.spread_spec import OptionsSpreadSpec
+
+    spec = OptionsSpreadSpec(
+        symbol="SPY",
+        expiry="20260620",
+        long_strike=470.0,
+        short_strike=475.0,
+        long_right="C",
+        short_right="C",
+        spread_type="BULL_CALL",
+        max_loss_per_contract=250.0,
+        net_debit_estimate=2.50,
+        spread_id="typed-mp-1",
+        dte=43,
+    )
+
+    config = IbkrConfig(dry_run=True)
+    resolver = _ContractResolver(config, now_fn=lambda: datetime.now(timezone.utc))
+    normalized = NormalizedIntent(
+        strategy="alpha_options",
+        symbol="SPY",
+        sec_type="BAG",
+        exchange="SMART",
+        currency="USD",
+        side="BUY",
+        order_type="LMT",
+        quantity=1.0,
+        notional_estimate=0.0,
+        asset_class="options",
+        source_strategies=("alpha_options",),
+        created_at=datetime.now(timezone.utc),
+        meta={"spread_spec": spec},
+    )
+    resolved = resolver.resolve(None, normalized)
+    assert resolved.summary["sec_type"] == "BAG"
+    assert resolved.contract.secType == "BAG"
+    assert len(resolved.contract.comboLegs) == 2
+
+
 def test_options_intent_missing_expiry_is_skipped_pre_submit(caplog):
     """A routed OPTIONS signal with no expiry must be skipped before
     the adapter sees it, with a clear OPTIONS_INTENT_SKIPPED_MISSING_CONTRACT_META
