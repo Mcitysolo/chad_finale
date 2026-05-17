@@ -324,8 +324,9 @@ def test_run_live_is_monkeypatchable_without_real_ibkr() -> None:
             def reqMarketDataType(self, code):  # noqa: D401
                 self.last_mdt = code
 
-            def qualifyContracts(self, *contracts):
-                # Stamp synthetic conIds.
+            async def qualifyContractsAsync(self, *contracts):
+                # Stamp synthetic conIds. Async so it composes correctly with
+                # the asyncio.run() event loop driving run_live().
                 for i, c in enumerate(contracts, start=100):
                     c.conId = i
                 return list(contracts)
@@ -404,6 +405,56 @@ def test_run_live_is_monkeypatchable_without_real_ibkr() -> None:
                 sys.modules[name] = saved[name]
             else:
                 sys.modules.pop(name, None)
+
+
+# --------------------------------------------------------------------------- #
+# 13b. AST sweep: run_live must use qualifyContractsAsync, not sync           #
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_uses_qualify_contracts_async_not_sync() -> None:
+    """The sync ``ib.qualifyContracts(...)`` drives the loop with
+    ``run_until_complete``, which collides with the outer ``asyncio.run()``
+    in ``main()`` and raises "This event loop is already running". The async
+    variant ``qualifyContractsAsync`` must be used inside ``run_live``.
+    """
+    src = PROBE_SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    sync_calls: list[str] = []
+    saw_async_call = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if attr == "qualifyContracts":
+                sync_calls.append(attr)
+            elif attr == "qualifyContractsAsync":
+                saw_async_call = True
+    assert not sync_calls, (
+        "probe must not call sync qualifyContracts inside async run_live; "
+        "use qualifyContractsAsync to avoid nested-loop error"
+    )
+    assert saw_async_call, (
+        "probe must call qualifyContractsAsync somewhere in run_live"
+    )
+
+
+def test_probe_qualify_contracts_async_call_is_awaited() -> None:
+    """The async qualifier must be ``await``ed — a bare call returns a
+    coroutine and silently leaks instead of qualifying contracts."""
+    src = PROBE_SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    awaited_targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            if isinstance(func, ast.Attribute):
+                awaited_targets.add(func.attr)
+    assert "qualifyContractsAsync" in awaited_targets, (
+        "qualifyContractsAsync must be awaited, not called bare"
+    )
+    assert "connectAsync" in awaited_targets, (
+        "connectAsync must be awaited"
+    )
 
 
 # --------------------------------------------------------------------------- #

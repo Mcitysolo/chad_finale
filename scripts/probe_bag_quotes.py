@@ -417,7 +417,7 @@ async def run_live(args: argparse.Namespace) -> dict:
             currency=args.currency,
         )
 
-        qualified = ib.qualifyContracts(long_opt, short_opt) or []
+        qualified = await ib.qualifyContractsAsync(long_opt, short_opt) or []
         if len(qualified) < 2:
             errors.append("qualify_contracts_failed")
         else:
@@ -518,8 +518,9 @@ async def _await_ticker(ib: Any, ticker: Any, timeout_s: float) -> None:
     seconds, waiting for bid+ask to populate. Returns silently on timeout —
     the caller projects whatever is present onto a quote dataclass.
     """
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
         bid = _safe_optional_float(getattr(ticker, "bid", None))
         ask = _safe_optional_float(getattr(ticker, "ask", None))
         last = _safe_optional_float(getattr(ticker, "last", None))
