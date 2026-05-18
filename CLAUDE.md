@@ -41,7 +41,8 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 4. Verify all 1465 tests pass after reboot
 5. Run full_cycle_preview.py --dry-run clean
 6. Confirm live_readiness.json flips to ready_for_live: true
-7. Review open paper positions (MES short) before mode switch
+7. Run scripts/lint_systemd_wants_symlinks.sh — require exit 0 (GAP-032 preventive guard; chad-scoped regular-file count must be 0)
+8. Review open paper positions (MES short) before mode switch
 
 ### Live Activation Sequence (requires explicit GO)
 1. Set trading posture from DRY_RUN to LIVE in config (Pending Action)

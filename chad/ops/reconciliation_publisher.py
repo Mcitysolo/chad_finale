@@ -294,6 +294,16 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         LOG.warning("position_guard_drift emit failed: %s", exc)
 
+    # GAP-032 preventive: refresh runtime/systemd_wants_lint.json on the
+    # publisher's existing ~5-min cadence so a regression to the
+    # regular-file-in-wants/ corruption signature is detected without
+    # adding a new (itself-corruptible) systemd timer. Best-effort.
+    try:
+        from chad.ops.systemd_wants_lint import main as _systemd_wants_lint_main
+        _systemd_wants_lint_main(["--quiet"])
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("systemd_wants_lint refresh failed: %s", exc)
+
     chad_side = _load_guard_positions()
 
     # Count open strategy-attribution entries (non-broker_sync) for visibility

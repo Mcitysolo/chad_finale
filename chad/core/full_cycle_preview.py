@@ -690,6 +690,7 @@ class PreviewApp:
         dynamic_caps = json_ready(self.artifact_repo.load_dynamic_caps_summary())
 
         futures_smoke_test = self._run_futures_smoke_test()
+        systemd_wants_lint_result = self._run_systemd_wants_lint()
 
         payload: Dict[str, Any] = {
             "runtime": {
@@ -703,6 +704,7 @@ class PreviewApp:
             "full_cycle": full_cycle,
             "dynamic_caps": dynamic_caps,
             "futures_smoke_test": futures_smoke_test,
+            "systemd_wants_lint": systemd_wants_lint_result,
         }
 
         text = self.renderer.render(payload)
@@ -725,6 +727,19 @@ class PreviewApp:
                 "ok": False,
                 "signal_count": 0,
                 "signals": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _run_systemd_wants_lint(self) -> Dict[str, Any]:
+        # GAP-032 preventive pre-flight: surface regression of the
+        # regular-file-in-wants/ corruption signature in the preview output.
+        # Best-effort and non-fatal — lint failure must never block preview.
+        try:
+            from chad.ops.systemd_wants_lint import scan as _systemd_wants_scan
+            return json_ready(_systemd_wants_scan())
+        except Exception as exc:
+            return {
+                "ok": None,
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
