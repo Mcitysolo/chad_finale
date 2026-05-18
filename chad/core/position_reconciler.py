@@ -249,6 +249,22 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
 
     for close in close_intents:
         symbol = close.get("symbol")
+        # GAP-001 corrected-scope chokepoint guard (Phase-48):
+        # operator-excluded symbols never receive close intents from ANY
+        # caller of apply_close_intents. Idempotent for the reconciler
+        # path (already filtered upstream at line 115); corrective for
+        # the regime_reduction path which has no upstream filter.
+        if symbol and str(symbol).upper() in _EFFECTIVE_NON_CHAD_SYMBOLS:
+            LOG.warning(
+                "APPLY_CLOSE_INTENTS_SKIP_EXCLUDED symbol=%s strategy=%s "
+                "position_key=%s reason=%s source=%s",
+                symbol,
+                close.get("strategy"),
+                close.get("position_key"),
+                close.get("reason"),
+                _EXCLUSION_SOURCE,
+            )
+            continue
         close_side = close.get("close_side")
         reason = close.get("reason", "reconciler_flip")
         qty = float(close.get("quantity", 0.0) or 0.0)

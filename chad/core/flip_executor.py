@@ -21,6 +21,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from chad.core.position_guard import _load_state, save_state
+# GAP-001 corrected-scope (Phase-48): surgical import of the unified
+# operator-exclusion SSOT so flip-close-first also honours it. Preserves
+# leaf-dependency direction (position_reconciler does not import here).
+from chad.core.position_reconciler import (
+    _EFFECTIVE_NON_CHAD_SYMBOLS,
+    _EXCLUSION_SOURCE,
+)
 
 LOG = logging.getLogger("chad.core.flip_executor")
 
@@ -140,6 +147,34 @@ def enforce_flip_close_first(
 
     for decision in flip_decisions:
         symbol = decision.flip_close_symbol
+        # GAP-001 corrected-scope chokepoint guard (Phase-48): operator-
+        # excluded symbols are never closed by CHAD via the BG11 flip
+        # path either. Drops the matching flipped signal to preserve the
+        # operator-exclusion invariant (CHAD must not open or close
+        # positions in these symbols at all).
+        if symbol and str(symbol).upper() in _EFFECTIVE_NON_CHAD_SYMBOLS:
+            ts = datetime.now(timezone.utc).isoformat()
+            audit.append({
+                "ts_utc": ts,
+                "event": "BG11_FLIP_SKIP_EXCLUDED",
+                "symbol": symbol,
+                "existing_strategy": decision.flip_close_strategy,
+                "new_strategy": decision.strategy,
+                "source": _EXCLUSION_SOURCE,
+                "result": "flipped_signal_blocked",
+            })
+            LOG.warning(
+                "BG11_FLIP_SKIP_EXCLUDED symbol=%s existing=%s new=%s "
+                "source=%s — operator-excluded SSOT; close NOT submitted, "
+                "flipped signal dropped",
+                symbol, decision.flip_close_strategy, decision.strategy,
+                _EXCLUSION_SOURCE,
+            )
+            for sig in routed_signals or []:
+                if _matches_flipped_signal(sig, decision):
+                    blocked_ids.add(id(sig))
+            continue
+
         existing_strategy = decision.flip_close_strategy
         position_key = f"{existing_strategy}|{symbol}"
         position = open_state.get(position_key) or {}

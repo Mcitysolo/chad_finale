@@ -68,7 +68,7 @@ def _open_position(strategy: str, symbol: str, side: str, qty: float = 10.0):
 
 def _make_submitted(status: str) -> SimpleNamespace:
     return SimpleNamespace(
-        symbol="SPY",
+        symbol="IWM",
         side="SELL",
         quantity=10.0,
         status=status,
@@ -110,7 +110,7 @@ def patched_guard(monkeypatch):
     """Provides a writable in-memory position guard that flip_executor
     sees instead of the on-disk file."""
     state: Dict[str, Dict[str, Any]] = {
-        "delta|SPY": _open_position("delta", "SPY", "BUY"),
+        "delta|IWM": _open_position("delta", "IWM", "BUY"),
     }
     saved: List[Dict[str, Any]] = []
 
@@ -128,17 +128,23 @@ def patched_guard(monkeypatch):
 
 
 def test_flip_allowed_requires_close_before_open(patched_guard):
-    """Phase A submits the close intent for the existing delta|SPY BUY
-    BEFORE the flipped alpha SELL is allowed through."""
+    """Phase A submits the close intent for the existing delta|IWM BUY
+    BEFORE the flipped alpha SELL is allowed through.
+
+    Symbol switched from SPY → IWM in GAP-001 Phase-48 because SPY now
+    routes through the BG11_FLIP_SKIP_EXCLUDED operator-exclusion guard;
+    the BG11 close-first flow is still exercised here against a
+    non-excluded equity.
+    """
     decisions = [
         _flip_decision(
             new_strategy="alpha",
-            symbol="SPY",
+            symbol="IWM",
             existing_strategy="delta",
             existing_side="BUY",
         ),
     ]
-    flipped = _flipped_signal("alpha", "SPY", "SELL")
+    flipped = _flipped_signal("alpha", "IWM", "SELL")
     adapter = _RecordingAdapter(status="filled")
 
     out, audit = fx.enforce_flip_close_first([flipped], decisions, adapter)
@@ -146,7 +152,7 @@ def test_flip_allowed_requires_close_before_open(patched_guard):
     # Adapter was called exactly once — for the close.
     assert len(adapter.calls) == 1, "close intent must be submitted exactly once"
     close_intent = adapter.calls[0][0]
-    assert close_intent.symbol == "SPY"
+    assert close_intent.symbol == "IWM"
     # Close side must be the OPPOSITE of the existing (open) side.
     assert close_intent.side == "SELL"
     assert close_intent.strategy == "delta"
@@ -161,12 +167,12 @@ def test_flip_close_failure_blocks_new_entry(patched_guard):
     decisions = [
         _flip_decision(
             new_strategy="alpha",
-            symbol="SPY",
+            symbol="IWM",
             existing_strategy="delta",
             existing_side="BUY",
         ),
     ]
-    flipped = _flipped_signal("alpha", "SPY", "SELL")
+    flipped = _flipped_signal("alpha", "IWM", "SELL")
     adapter = _RecordingAdapter(status="rejected")
 
     out, audit = fx.enforce_flip_close_first([flipped], decisions, adapter)
@@ -178,7 +184,7 @@ def test_flip_close_failure_blocks_new_entry(patched_guard):
         for r in audit
     )
     # Existing position is still OPEN — no false flat.
-    assert patched_guard.state["delta|SPY"]["open"] is True
+    assert patched_guard.state["delta|IWM"]["open"] is True
     # No save_state was issued.
     assert not patched_guard.saved
 
@@ -189,19 +195,19 @@ def test_flip_close_success_allows_new_entry(patched_guard):
     decisions = [
         _flip_decision(
             new_strategy="alpha",
-            symbol="SPY",
+            symbol="IWM",
             existing_strategy="delta",
             existing_side="BUY",
         ),
     ]
-    flipped = _flipped_signal("alpha", "SPY", "SELL")
+    flipped = _flipped_signal("alpha", "IWM", "SELL")
     adapter = _RecordingAdapter(status="filled")
 
     out, audit = fx.enforce_flip_close_first([flipped], decisions, adapter)
 
     assert flipped in out
-    assert patched_guard.state["delta|SPY"]["open"] is False
-    assert patched_guard.state["delta|SPY"]["closed_by"] == "flip_executor"
+    assert patched_guard.state["delta|IWM"]["open"] is False
+    assert patched_guard.state["delta|IWM"]["closed_by"] == "flip_executor"
     assert any(r["event"] == "BG11_FLIP_CLOSE_CONFIRMED" for r in audit)
 
 
@@ -213,12 +219,12 @@ def test_flip_no_close_confirmation_does_not_mutate_position_guard(
     decisions = [
         _flip_decision(
             new_strategy="alpha",
-            symbol="SPY",
+            symbol="IWM",
             existing_strategy="delta",
             existing_side="BUY",
         ),
     ]
-    flipped = _flipped_signal("alpha", "SPY", "SELL")
+    flipped = _flipped_signal("alpha", "IWM", "SELL")
     adapter = _RecordingAdapter(raise_exc=True)
 
     out, audit = fx.enforce_flip_close_first([flipped], decisions, adapter)
@@ -230,7 +236,7 @@ def test_flip_no_close_confirmation_does_not_mutate_position_guard(
         for r in audit
     )
     # Existing position is still OPEN — no false flat.
-    assert patched_guard.state["delta|SPY"]["open"] is True
+    assert patched_guard.state["delta|IWM"]["open"] is True
     assert not patched_guard.saved
 
 
@@ -239,18 +245,18 @@ def test_pending_status_treated_as_unconfirmed(patched_guard):
     decisions = [
         _flip_decision(
             new_strategy="alpha",
-            symbol="SPY",
+            symbol="IWM",
             existing_strategy="delta",
             existing_side="BUY",
         ),
     ]
-    flipped = _flipped_signal("alpha", "SPY", "SELL")
+    flipped = _flipped_signal("alpha", "IWM", "SELL")
     adapter = _RecordingAdapter(status="PendingSubmit")
 
     out, _audit = fx.enforce_flip_close_first([flipped], decisions, adapter)
 
     assert flipped not in out
-    assert patched_guard.state["delta|SPY"]["open"] is True
+    assert patched_guard.state["delta|IWM"]["open"] is True
 
 
 def test_flip_with_no_open_position_passes_through(patched_guard):
@@ -262,12 +268,12 @@ def test_flip_with_no_open_position_passes_through(patched_guard):
     decisions = [
         _flip_decision(
             new_strategy="alpha",
-            symbol="SPY",
+            symbol="IWM",
             existing_strategy="delta",
             existing_side="BUY",
         ),
     ]
-    flipped = _flipped_signal("alpha", "SPY", "SELL")
+    flipped = _flipped_signal("alpha", "IWM", "SELL")
     adapter = _RecordingAdapter(status="filled")
 
     out, audit = fx.enforce_flip_close_first([flipped], decisions, adapter)
