@@ -785,11 +785,60 @@ def run_once(logger: logging.Logger) -> None:
     check so that stale local state does not suppress valid signals or
     allow phantom positions.
     """
+    # GAP-039 (Phase-58/59): evaluate halt triggers FIRST, then check the
+    # early-return. The previous order (early-return BEFORE evaluate)
+    # caused GAP-034's auto-recovery counter to be unreachable once the
+    # bus was latched — the cycle returned before evaluate_and_persist
+    # ever ran, so the clean-streak hysteresis never incremented and the
+    # bus stayed latched indefinitely.
+    #
+    # Under the new order:
+    #   - A freshly-firing trigger writes runtime/stop_bus.json here and
+    #     is then halted by the is_stop_bus_active() early-return below.
+    #   - A latched-but-clean bus is auto-cleared here by the GAP-034
+    #     hysteresis helper inside evaluate_and_persist, and the
+    #     subsequent is_stop_bus_active() check falls through so the
+    #     cycle resumes normally.
+    #   - A still-latched bus stays active and is halted by the same
+    #     early-return.
+    #
+    # Snapshot inputs (pnl_state.json, CHAD_DAILY_LOSS_LIMIT env,
+    # ibkr_status.json) are written by independent publishers and do
+    # NOT depend on the guard-rebuild that runs later in this cycle.
+    try:
+        from chad.risk.stop_bus_state import evaluate_and_persist
+        snapshot = _build_stop_bus_snapshot(logger)
+        sb_result = evaluate_and_persist(
+            snapshot=snapshot,
+            triggered_by="live_loop.run_once",
+        )
+        if sb_result.get("any_active"):
+            logger.warning(
+                "STOP_BUS_TRIGGERED cycle=halted triggers=%s reason=%s",
+                sb_result.get("active_triggers", []),
+                sb_result.get("reason", ""),
+            )
+            # Fire Telegram alert — dedupe key in telegram_notify suppresses
+            # repeat sends for the same STOP event within the TTL window.
+            try:
+                from chad.utils.telegram_notify import send_stop_bus_alert
+                _sb_reason = sb_result.get("reason") or ",".join(
+                    str(t) for t in (sb_result.get("active_triggers") or [])
+                )
+                send_stop_bus_alert(_sb_reason or "stop_bus_triggered")
+            except Exception:
+                pass
+            # Fall through to the single is_stop_bus_active early-return
+            # below — it observes the just-persisted bus state and halts.
+    except Exception as _sbt_err:  # noqa: BLE001
+        logger.warning("stop_bus evaluation failed (non-fatal): %s", _sbt_err)
+
     # Phase-8 Session 4 (R2): honour an operator- or trigger-set STOP bus.
     # A truthy runtime/stop_bus.json halts the cycle before any rebuild or
     # routing so that reconciliation side-effects are not applied while
     # trading is stopped. clear_stop_bus() (from chad.risk.stop_bus_state
-    # or the CLI script) is required to resume.
+    # or the CLI script) is required to resume. Single halt path — both
+    # freshly-fired and still-latched buses exit here.
     try:
         from chad.risk.stop_bus_state import is_stop_bus_active, read_stop_bus
         if is_stop_bus_active():
@@ -823,38 +872,6 @@ def run_once(logger: logging.Logger) -> None:
             _rebuild_guard_from_broker(logger)
     except Exception as exc:
         logger.warning("Guard rebuild failed (non-fatal): %s", exc)
-
-    # Phase-8 Session 4 (R2): evaluate halt triggers. The snapshot is
-    # best-effort from existing runtime state — any trigger whose inputs
-    # are missing is simply skipped (the aggregator ignores missing keys).
-    # If any trigger fires this persists runtime/stop_bus.json and halts
-    # the current cycle.
-    try:
-        from chad.risk.stop_bus_state import evaluate_and_persist
-        snapshot = _build_stop_bus_snapshot(logger)
-        sb_result = evaluate_and_persist(
-            snapshot=snapshot,
-            triggered_by="live_loop.run_once",
-        )
-        if sb_result.get("any_active"):
-            logger.warning(
-                "STOP_BUS_TRIGGERED cycle=halted triggers=%s reason=%s",
-                sb_result.get("active_triggers", []),
-                sb_result.get("reason", ""),
-            )
-            # Fire Telegram alert — dedupe key in telegram_notify suppresses
-            # repeat sends for the same STOP event within the TTL window.
-            try:
-                from chad.utils.telegram_notify import send_stop_bus_alert
-                _sb_reason = sb_result.get("reason") or ",".join(
-                    str(t) for t in (sb_result.get("active_triggers") or [])
-                )
-                send_stop_bus_alert(_sb_reason or "stop_bus_triggered")
-            except Exception:
-                pass
-            return
-    except Exception as _sbt_err:  # noqa: BLE001
-        logger.warning("stop_bus evaluation failed (non-fatal): %s", _sbt_err)
 
     strategy_detail: Dict[str, Any] = {
         "available_strategies": {},
