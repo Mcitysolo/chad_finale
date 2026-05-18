@@ -265,6 +265,16 @@ class IbkrConfig:
     max_submit_retries: int = 2
     retry_backoff_s: float = 1.25
 
+    # GAP-036 (Phase-53): submit→confirm lifecycle.
+    # terminal_wait_s — bounded wait inside _submit_via_ib for trade.orderStatus
+    #   to reach a terminal state (Filled / Cancelled / ...) before returning.
+    #   Short-circuits as soon as a terminal status is observed.
+    # stale_threshold_s — age beyond which a non-terminal idempotency row is
+    #   considered potentially abandoned and eligible for the ib_probe reclaim
+    #   path inside _SQLiteIdempotencyStore.claim_or_reclaim().
+    terminal_wait_s: float = 5.0
+    stale_threshold_s: float = 600.0
+
     default_stock_exchange: str = "SMART"
     default_stock_currency: str = "USD"
     default_forex_exchange: str = "IDEALPRO"
@@ -665,6 +675,58 @@ def _should_connect(config: IbkrConfig, *, force: bool = False) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# GAP-036 (Phase-53): canonical state-machine for idempotency rows. The row's
+# `status` column is the verbatim IBKR orderStatus string (or the adapter's
+# own pseudo-statuses like "claimed", "duplicate_blocked"); classification is
+# derived by lower-casing and bucket lookup.
+#
+# terminal-positive: a successful Fill — re-submitting the same logical intent
+#   after this would double-buy or double-sell. UNCONDITIONALLY blocks.
+# terminal-negative: a failed terminal outcome — a legitimate retry of the
+#   same logical intent is permitted (DELETE + fresh INSERT).
+# non-terminal: order is still working at IB (or the adapter hasn't yet seen
+#   a transition). Blocks re-submission until either a terminal event arrives
+#   or the row goes stale and the ib_probe reclaim path runs.
+_IDEMPOTENCY_TERMINAL_POSITIVE: frozenset = frozenset({"filled"})
+_IDEMPOTENCY_TERMINAL_NEGATIVE: frozenset = frozenset({
+    "cancelled",
+    "apicancelled",
+    "rejected",
+    "inactive",
+    "error",
+})
+
+# Probe result tags (string sentinels — see IbkrAdapter._ib_probe).
+_PROBE_STILL_ACTIVE = "STILL_ACTIVE"
+_PROBE_ABSENT = "ABSENT"
+_PROBE_TERMINAL_PREFIX = "TERMINAL_AT_BROKER:"  # suffix is the IB status string
+
+
+def _classify_idempotency_status(status: Optional[str]) -> str:
+    """Return one of: 'terminal_positive' | 'terminal_negative' | 'non_terminal'."""
+    raw = (status or "").strip().lower()
+    if raw in _IDEMPOTENCY_TERMINAL_POSITIVE:
+        return "terminal_positive"
+    if raw in _IDEMPOTENCY_TERMINAL_NEGATIVE:
+        return "terminal_negative"
+    return "non_terminal"
+
+
+def _parse_row_updated_at(value: Any) -> Optional[datetime]:
+    """Best-effort parse of the SQLite updated_at_utc string back to datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 class _SQLiteIdempotencyStore:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -753,6 +815,226 @@ class _SQLiteIdempotencyStore:
             "payload_json": row[5],
             "result_json": row[6],
         }
+
+    # ------------------------------------------------------------------
+    # GAP-036 (Phase-53): state-machine-aware claim with reclaim policy.
+    # ------------------------------------------------------------------
+    def claim_or_reclaim(
+        self,
+        key: str,
+        payload: Mapping[str, Any],
+        now: datetime,
+        *,
+        stale_threshold_s: float,
+        ib_probe: Optional[Callable[[Optional[int]], str]] = None,
+    ) -> bool:
+        """State-machine-aware idempotency claim.
+
+        Returns True when the caller MAY proceed to submit; False to block.
+        Schema is unchanged — semantics live entirely in this method:
+
+          S1 fresh row → INSERT 'claimed' → True
+          S2 existing row status ∈ terminal-positive ({filled}) → False
+             (UNCONDITIONAL; re-submitting after a Fill double-trades)
+          S3 existing row status ∈ terminal-negative
+             ({cancelled, apicancelled, rejected, inactive, error}) → DELETE
+             old row + INSERT fresh 'claimed' row → True (retry permitted)
+          S4 existing row status is non-terminal AND age < stale_threshold_s
+             → False (prior submission still working)
+          S5 existing row status is non-terminal AND age ≥ stale_threshold_s
+             → invoke ib_probe(broker_order_id):
+               STILL_ACTIVE → bump updated_at_utc, return False
+               TERMINAL_AT_BROKER:<status> → mark(row, status) then:
+                   if classified terminal-positive → False (Filled-block)
+                   if classified terminal-negative → DELETE + fresh INSERT
+                     → True (legitimate retry)
+                   otherwise (still non-terminal report) → bump updated_at,
+                     return False
+               ABSENT → DELETE old row + INSERT fresh 'claimed' → True
+             If no ib_probe is supplied, the stale row is treated
+             defensively as STILL_ACTIVE (return False) — the caller must
+             have wired the probe in production.
+        """
+        with self._lock, self._connect() as conn:
+            # Step 1 — fresh row.
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO ibkr_exec_state (
+                    idempotency_key, status, created_at_utc, updated_at_utc,
+                    broker_order_id, payload_json, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    "claimed",
+                    now.isoformat(),
+                    now.isoformat(),
+                    None,
+                    _stable_json(payload),
+                    None,
+                ),
+            )
+            if cur.rowcount == 1:
+                return True
+
+            # Existing row — examine.
+            row = conn.execute(
+                """
+                SELECT status, updated_at_utc, broker_order_id
+                  FROM ibkr_exec_state
+                 WHERE idempotency_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if row is None:
+                # Race: the row vanished between INSERT OR IGNORE and SELECT.
+                # Retry the fresh-row path conservatively.
+                conn.execute(
+                    """
+                    INSERT INTO ibkr_exec_state (
+                        idempotency_key, status, created_at_utc, updated_at_utc,
+                        broker_order_id, payload_json, result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        "claimed",
+                        now.isoformat(),
+                        now.isoformat(),
+                        None,
+                        _stable_json(payload),
+                        None,
+                    ),
+                )
+                return True
+
+            existing_status, existing_updated_at, existing_order_id = row
+            classification = _classify_idempotency_status(existing_status)
+
+            # S2 — terminal-positive (Filled). UNCONDITIONAL block.
+            if classification == "terminal_positive":
+                return False
+
+            # S3 — terminal-negative. DELETE + fresh INSERT.
+            if classification == "terminal_negative":
+                self._delete_and_reinsert(conn, key, payload, now)
+                return True
+
+            # Non-terminal. Check staleness.
+            age_dt = _parse_row_updated_at(existing_updated_at)
+            if age_dt is None:
+                # Unparseable timestamp — treat as stale to drive recovery.
+                age_seconds = float("inf")
+            else:
+                age_seconds = (now - age_dt).total_seconds()
+
+            # S4 — non-terminal AND not stale → block (still working).
+            if age_seconds < float(stale_threshold_s):
+                return False
+
+            # S5 — non-terminal AND stale → consult probe.
+            broker_order_id: Optional[int] = (
+                int(existing_order_id) if existing_order_id is not None else None
+            )
+            probe_result: Optional[str] = None
+            if ib_probe is not None:
+                try:
+                    probe_result = ib_probe(broker_order_id)
+                except BaseException as exc:  # noqa: BLE001
+                    LOGGER.warning(
+                        "ibkr.idempotency_probe_failed",
+                        extra={"key": key, "error": str(exc)},
+                    )
+                    probe_result = None
+
+            if probe_result is None:
+                # No probe wired (or probe raised) — fail closed by bumping
+                # updated_at_utc and blocking. The caller MUST install a
+                # probe in production to drive the stale-reclaim path.
+                conn.execute(
+                    "UPDATE ibkr_exec_state SET updated_at_utc = ? "
+                    "WHERE idempotency_key = ?",
+                    (now.isoformat(), key),
+                )
+                return False
+
+            if probe_result == _PROBE_STILL_ACTIVE:
+                conn.execute(
+                    "UPDATE ibkr_exec_state SET updated_at_utc = ? "
+                    "WHERE idempotency_key = ?",
+                    (now.isoformat(), key),
+                )
+                return False
+
+            if probe_result.startswith(_PROBE_TERMINAL_PREFIX):
+                broker_status = probe_result[len(_PROBE_TERMINAL_PREFIX):]
+                # Promote the row to the broker's reported terminal status.
+                conn.execute(
+                    "UPDATE ibkr_exec_state "
+                    "SET status = ?, updated_at_utc = ? "
+                    "WHERE idempotency_key = ?",
+                    (broker_status, now.isoformat(), key),
+                )
+                bclass = _classify_idempotency_status(broker_status)
+                if bclass == "terminal_positive":
+                    return False
+                if bclass == "terminal_negative":
+                    self._delete_and_reinsert(conn, key, payload, now)
+                    return True
+                # Probe returned a non-terminal IB status (rare) — block but
+                # leave the bumped timestamp so subsequent cycles re-probe.
+                return False
+
+            if probe_result == _PROBE_ABSENT:
+                # ABSENT means the order has no trace at IB *and* no
+                # execution evidence for it (the probe enforces the
+                # execution-check hardening before returning ABSENT — see
+                # IbkrAdapter._ib_probe).
+                self._delete_and_reinsert(conn, key, payload, now)
+                return True
+
+            # Unknown probe result — fail closed.
+            LOGGER.warning(
+                "ibkr.idempotency_probe_unknown_result",
+                extra={"key": key, "probe_result": probe_result},
+            )
+            conn.execute(
+                "UPDATE ibkr_exec_state SET updated_at_utc = ? "
+                "WHERE idempotency_key = ?",
+                (now.isoformat(), key),
+            )
+            return False
+
+    @staticmethod
+    def _delete_and_reinsert(
+        conn: "sqlite3.Connection",
+        key: str,
+        payload: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        """Atomic (single-connection) replace of a terminal/stale row with a
+        fresh 'claimed' row. Used by S3 / S5 reclaim branches."""
+        conn.execute(
+            "DELETE FROM ibkr_exec_state WHERE idempotency_key = ?",
+            (key,),
+        )
+        conn.execute(
+            """
+            INSERT INTO ibkr_exec_state (
+                idempotency_key, status, created_at_utc, updated_at_utc,
+                broker_order_id, payload_json, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                "claimed",
+                now.isoformat(),
+                now.isoformat(),
+                None,
+                _stable_json(payload),
+                None,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1843,7 +2125,22 @@ class IbkrAdapter:
         now = self._now_fn()
         idempotency_key = self._compute_idempotency_key(intent)
         if self._idempotency:
-            claimed = self._idempotency.claim(idempotency_key, self._intent_payload(intent), now)
+            # GAP-036 (Phase-53): state-machine-aware claim. The ib_probe
+            # callable is bound to the currently-connected IB instance (if
+            # any). When the probe is unavailable (pure DRY_RUN paths) the
+            # claim_or_reclaim() implementation fails closed on the stale
+            # branch, preserving today's block-on-conflict semantics for
+            # non-stale rows.
+            def _probe_for_key(broker_order_id: Optional[int]) -> str:
+                return self._ib_probe(self._ib, broker_order_id)
+
+            claimed = self._idempotency.claim_or_reclaim(
+                idempotency_key,
+                self._intent_payload(intent),
+                now,
+                stale_threshold_s=float(self._config.stale_threshold_s),
+                ib_probe=_probe_for_key,
+            )
             if not claimed:
                 existing = self._idempotency.get(idempotency_key) or {}
                 LOGGER.warning(
@@ -2035,9 +2332,24 @@ class IbkrAdapter:
                         "exchange": intent.exchange,
                     },
                 )
+                # GAP-036 (Phase-53): bounded wait for terminal orderStatus,
+                # with a per-Trade statusEvent handler that promotes the
+                # idempotency row on every transition. The handler ONLY
+                # writes the idempotency row — it never writes paper-fill
+                # evidence (ISSUE-29 single-shot persist path is preserved
+                # at chad/core/live_loop.py: _should_persist_paper_evidence).
                 def _place_and_wait() -> Any:
                     t = ib.placeOrder(qualified_contract, prepared.order)
-                    ib.sleep(float(self._config.initial_status_wait_s))
+                    # Initial pump so the first status event is visible.
+                    initial_wait = float(self._config.initial_status_wait_s)
+                    if initial_wait > 0.0:
+                        ib.sleep(initial_wait)
+                    self._install_trade_status_handler(t, idempotency_key)
+                    self._await_terminal_status(
+                        ib,
+                        t,
+                        timeout_s=float(self._config.terminal_wait_s),
+                    )
                     return t
                 trade = _call_with_timeout(_place_and_wait, label="placeOrder")
 
@@ -2122,6 +2434,213 @@ class IbkrAdapter:
             },
         )
         raise SubmissionError(f"Failed to submit order for {intent.symbol}: {last_exc}") from last_exc
+
+    # ------------------------------------------------------------------
+    # GAP-036 (Phase-53): submit→confirm lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def _install_trade_status_handler(self, trade: Any, idempotency_key: str) -> None:
+        """Register a statusEvent handler on the per-Trade object that calls
+        ``_idempotency.mark()`` on every orderStatus transition.
+
+        The handler ONLY writes the idempotency row. It does NOT write
+        paper-fill evidence — the ISSUE-29 single-shot persist path in
+        ``chad/core/live_loop.py:_should_persist_paper_evidence`` remains the
+        sole writer.
+        """
+        if self._idempotency is None:
+            return
+        event = getattr(trade, "statusEvent", None)
+        if event is None:
+            return
+
+        def _on_status(t: Any) -> None:
+            try:
+                if self._idempotency is None:
+                    return
+                order_status = getattr(t, "orderStatus", None)
+                status_str = _safe_str(getattr(order_status, "status", ""), "")
+                order_obj = getattr(t, "order", None)
+                bro_id: Optional[int] = None
+                try:
+                    bro_id = int(getattr(order_obj, "orderId", 0) or 0) or None
+                except (TypeError, ValueError):
+                    bro_id = None
+                result_payload: Dict[str, Any] = {
+                    "order_status": _jsonable(order_status),
+                    "order": _jsonable(order_obj),
+                    "fills": _jsonable(getattr(t, "fills", []) or []),
+                }
+                self._idempotency.mark(
+                    idempotency_key,
+                    status=status_str,
+                    broker_order_id=bro_id,
+                    result=result_payload,
+                    now=self._now_fn(),
+                )
+            except BaseException as exc:  # noqa: BLE001
+                # Handler must never raise into the IB event loop.
+                LOGGER.warning(
+                    "ibkr.trade_status_handler_error",
+                    extra={"key": idempotency_key, "error": str(exc)},
+                )
+
+        try:
+            # ib_async events expose ``+=`` for subscription.
+            event += _on_status
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "ibkr.trade_status_handler_register_failed",
+                extra={"key": idempotency_key, "error": str(exc)},
+            )
+
+    def _await_terminal_status(
+        self,
+        ib: IBLike,
+        trade: Any,
+        *,
+        timeout_s: float,
+    ) -> None:
+        """Bounded wait for ``trade.orderStatus.status`` to reach a terminal
+        bucket (positive or negative). Short-circuits as soon as a terminal
+        status is observed; falls through after ``timeout_s`` even if still
+        non-terminal — the in-flight statusEvent handler will continue to
+        promote the row when the real transition arrives.
+        """
+        if timeout_s <= 0.0:
+            return
+        deadline = time.monotonic() + float(timeout_s)
+        sleep_fn = getattr(ib, "sleep", None)
+        step = 0.1
+        while time.monotonic() < deadline:
+            status_str = ""
+            try:
+                order_status = getattr(trade, "orderStatus", None)
+                status_str = _safe_str(getattr(order_status, "status", ""), "")
+            except BaseException:  # noqa: BLE001
+                status_str = ""
+            klass = _classify_idempotency_status(status_str)
+            if klass in ("terminal_positive", "terminal_negative"):
+                return
+            try:
+                if callable(sleep_fn):
+                    sleep_fn(step)
+                else:
+                    time.sleep(step)
+            except BaseException:  # noqa: BLE001
+                time.sleep(step)
+
+    def _ib_probe(self, ib: Optional[IBLike], broker_order_id: Optional[int]) -> str:
+        """Determine the live status of an order at IBKR for the
+        ``claim_or_reclaim`` stale-reclaim branch.
+
+        Return one of:
+          - ``_PROBE_STILL_ACTIVE`` — order appears in openTrades/trades with
+            a non-terminal orderStatus.
+          - ``_PROBE_TERMINAL_PREFIX + <ib_status>`` — order found at IB and
+            its orderStatus is already terminal (e.g. ``Filled`` / ``Cancelled``).
+          - ``_PROBE_ABSENT`` — order has NO record in openTrades/trades AND
+            no execution evidence in ib.fills() for the same orderId/permId.
+
+        ABSENT-EXECUTION HARDENING (Phase-54 mandate):
+          ABSENT is only returned after we have additionally checked
+          ``ib.fills()`` (execDetails / Fill objects) for an execution whose
+          orderId or permId matches ``broker_order_id``. If one is found,
+          the order was actually filled — return TERMINAL_AT_BROKER:Filled
+          so claim_or_reclaim promotes the row to terminal-positive
+          (UNCONDITIONAL block) and refuses to reclaim. This closes the
+          restart-gap double-submit hole where openTrades alone would lie.
+        """
+        if ib is None or broker_order_id is None or broker_order_id <= 0:
+            # Without a live IB handle or a broker order id we cannot prove
+            # the order is gone. Refuse to claim ABSENT — fail closed.
+            return _PROBE_STILL_ACTIVE
+
+        # ----- Step 1: scan openTrades / trades for the order. -----
+        found_status: Optional[str] = None
+
+        def _orderids(t: Any) -> Tuple[Optional[int], Optional[int]]:
+            o = getattr(t, "order", None)
+            try:
+                oid = int(getattr(o, "orderId", 0) or 0) or None
+            except (TypeError, ValueError):
+                oid = None
+            try:
+                pid = int(getattr(o, "permId", 0) or 0) or None
+            except (TypeError, ValueError):
+                pid = None
+            return oid, pid
+
+        def _scan(trades_iterable: Iterable[Any]) -> Optional[str]:
+            for t in trades_iterable or []:
+                oid, pid = _orderids(t)
+                if oid == broker_order_id or (pid is not None and pid == broker_order_id):
+                    os_obj = getattr(t, "orderStatus", None)
+                    return _safe_str(getattr(os_obj, "status", ""), "")
+            return None
+
+        try:
+            open_fn = getattr(ib, "openTrades", None)
+            if callable(open_fn):
+                found_status = _scan(open_fn() or [])
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "ibkr.probe_open_trades_failed",
+                extra={"broker_order_id": broker_order_id, "error": str(exc)},
+            )
+
+        if found_status is None:
+            try:
+                trades_fn = getattr(ib, "trades", None)
+                if callable(trades_fn):
+                    found_status = _scan(trades_fn() or [])
+            except BaseException as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "ibkr.probe_trades_failed",
+                    extra={"broker_order_id": broker_order_id, "error": str(exc)},
+                )
+
+        if found_status is not None:
+            klass = _classify_idempotency_status(found_status)
+            if klass in ("terminal_positive", "terminal_negative"):
+                return _PROBE_TERMINAL_PREFIX + found_status
+            return _PROBE_STILL_ACTIVE
+
+        # ----- Step 2: ABSENT-execution hardening (Phase-54 mandate).
+        # Before returning ABSENT, scan ib.fills() / executions for an
+        # execution attached to this orderId/permId. If one exists, the
+        # order WAS filled — promote to terminal-positive to block reclaim.
+        try:
+            fills_fn = getattr(ib, "fills", None)
+            fills_iter: Iterable[Any] = []
+            if callable(fills_fn):
+                fills_iter = fills_fn() or []
+            for f in fills_iter:
+                execution = getattr(f, "execution", None)
+                if execution is None:
+                    continue
+                try:
+                    e_oid = int(getattr(execution, "orderId", 0) or 0) or None
+                except (TypeError, ValueError):
+                    e_oid = None
+                try:
+                    e_pid = int(getattr(execution, "permId", 0) or 0) or None
+                except (TypeError, ValueError):
+                    e_pid = None
+                if e_oid == broker_order_id or (
+                    e_pid is not None and e_pid == broker_order_id
+                ):
+                    # Execution exists for this order → it filled.
+                    return _PROBE_TERMINAL_PREFIX + "Filled"
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "ibkr.probe_fills_failed",
+                extra={"broker_order_id": broker_order_id, "error": str(exc)},
+            )
+            # Fail closed: if we could not scan fills, do NOT claim ABSENT.
+            return _PROBE_STILL_ACTIVE
+
+        return _PROBE_ABSENT
 
     # ------------------------------------------------------------------
     # Broker-side open-order guard
