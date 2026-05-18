@@ -46,12 +46,26 @@ LOG = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
 STOP_BUS_PATH = ROOT / "runtime" / "stop_bus.json"
+STOP_BUS_RECOVERY_STATE_PATH = ROOT / "runtime" / "stop_bus_recovery_state.json"
 
 STOP_BUS_SCHEMA_VERSION = "stop_bus.v1"
+STOP_BUS_RECOVERY_SCHEMA_VERSION = "stop_bus_recovery_state.v1"
+
+# GAP-034 / Phase-42 auto-recovery defaults.
+DEFAULT_AUTO_CLEAR_ENABLED: bool = True
+DEFAULT_AUTO_CLEAR_CONSECUTIVE_CLEAN_REQUIRED: int = 5
+DEFAULT_AUTO_CLEAR_MIN_CLEAN_SECONDS: int = 240
+DEFAULT_AUTO_CLEAR_TTL_SECONDS: int = 600
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utc_now_dt() -> datetime:
+    # Separate from _utc_now_iso so tests can monkeypatch only the auto-
+    # recovery clock without touching set_stop_bus / clear_stop_bus.
+    return datetime.now(timezone.utc)
 
 
 def _write_atomic(path: Path, payload: Dict[str, Any]) -> None:
@@ -166,11 +180,159 @@ def clear_stop_bus(
     return payload
 
 
+# ---------------------------------------------------------------------------
+# GAP-034 / Phase-42: durable stop-bus auto-clear (clean-streak hysteresis)
+# ---------------------------------------------------------------------------
+
+
+def _read_recovery_state(
+    path: Path = STOP_BUS_RECOVERY_STATE_PATH,
+) -> Dict[str, Any]:
+    """Return the persisted auto-recovery counter state, tolerant of missing/malformed files."""
+    default = {
+        "schema_version": STOP_BUS_RECOVERY_SCHEMA_VERSION,
+        "consecutive_clean_evaluations": 0,
+        "last_eval_ts": "",
+        "last_clean_metric_ts": "",
+        "ttl_seconds": DEFAULT_AUTO_CLEAR_TTL_SECONDS,
+    }
+    if not path.is_file():
+        return dict(default)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return dict(default)
+    except (OSError, json.JSONDecodeError):
+        return dict(default)
+    for k, v in default.items():
+        data.setdefault(k, v)
+    return data
+
+
+def _write_recovery_state(
+    counter: int,
+    last_eval_ts: str,
+    last_clean_metric_ts: str,
+    path: Path = STOP_BUS_RECOVERY_STATE_PATH,
+    ttl_seconds: int = DEFAULT_AUTO_CLEAR_TTL_SECONDS,
+) -> Dict[str, Any]:
+    payload = {
+        "schema_version": STOP_BUS_RECOVERY_SCHEMA_VERSION,
+        "consecutive_clean_evaluations": int(counter),
+        "last_eval_ts": str(last_eval_ts or ""),
+        "last_clean_metric_ts": str(last_clean_metric_ts or ""),
+        "ttl_seconds": int(ttl_seconds),
+    }
+    _write_atomic(path, payload)
+    return payload
+
+
+def _reset_recovery_counter_if_nonzero(
+    path: Path = STOP_BUS_RECOVERY_STATE_PATH,
+) -> None:
+    """Idempotent: write counter=0 only if a prior non-zero counter exists."""
+    if not path.is_file():
+        return
+    rec = _read_recovery_state(path)
+    if int(rec.get("consecutive_clean_evaluations", 0) or 0) == 0:
+        return
+    _write_recovery_state(
+        counter=0,
+        last_eval_ts=_utc_now_iso(),
+        last_clean_metric_ts="",
+        path=path,
+    )
+
+
+def _maybe_auto_clear_on_clean_streak(
+    current_state: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    config: Optional[Mapping[str, Any]] = None,
+    path: Path = STOP_BUS_PATH,
+    recovery_state_path: Path = STOP_BUS_RECOVERY_STATE_PATH,
+) -> Optional[Dict[str, Any]]:
+    """Increment the clean-streak counter and, when both the count and the
+    elapsed-time threshold are met, atomically clear the stop bus with a
+    ``cleared_by`` label that begins with ``auto_recovery:``.
+
+    Returns the cleared payload when auto-clear fires; otherwise None.
+
+    Invoked ONLY from ``evaluate_and_persist`` when ``any_active`` is False
+    AND the bus is currently latched active. The set_stop_bus path and the
+    operator-manual clear path are independent of this helper.
+    """
+    cfg = dict(config or {})
+    enabled = bool(cfg.get("auto_clear_enabled", DEFAULT_AUTO_CLEAR_ENABLED))
+    if not enabled:
+        return None
+    if not bool(current_state.get("active", False)):
+        return None
+
+    required = int(cfg.get(
+        "auto_clear_consecutive_clean_required",
+        DEFAULT_AUTO_CLEAR_CONSECUTIVE_CLEAN_REQUIRED,
+    ))
+    min_seconds = float(cfg.get(
+        "auto_clear_min_clean_seconds",
+        DEFAULT_AUTO_CLEAR_MIN_CLEAN_SECONDS,
+    ))
+
+    now_dt = _utc_now_dt()
+    now_iso = now_dt.isoformat()
+
+    rec = _read_recovery_state(recovery_state_path)
+    prior_counter = int(rec.get("consecutive_clean_evaluations", 0) or 0)
+    prior_streak_start = rec.get("last_clean_metric_ts") or ""
+
+    if prior_counter <= 0 or not prior_streak_start:
+        new_counter = 1
+        streak_start_iso = now_iso
+    else:
+        new_counter = prior_counter + 1
+        streak_start_iso = prior_streak_start
+
+    _write_recovery_state(
+        counter=new_counter,
+        last_eval_ts=now_iso,
+        last_clean_metric_ts=streak_start_iso,
+        path=recovery_state_path,
+    )
+
+    if new_counter < required:
+        return None
+
+    try:
+        streak_start_dt = datetime.fromisoformat(streak_start_iso)
+        elapsed = (now_dt - streak_start_dt).total_seconds()
+    except (TypeError, ValueError):
+        elapsed = float("inf")
+
+    if elapsed < min_seconds:
+        return None
+
+    cleared = clear_stop_bus(
+        cleared_by=f"auto_recovery:broker_latency_clean_streak={required}",
+        path=path,
+    )
+    _write_recovery_state(
+        counter=0,
+        last_eval_ts=now_iso,
+        last_clean_metric_ts="",
+        path=recovery_state_path,
+    )
+    LOG.warning(
+        "STOP_BUS_AUTO_CLEARED counter=%d elapsed=%.1fs required=%d min_seconds=%.1f",
+        new_counter, elapsed, required, min_seconds,
+    )
+    return cleared
+
+
 def evaluate_and_persist(
     snapshot: Mapping[str, Any],
     config: Optional[Mapping[str, Any]] = None,
     triggered_by: str = "live_loop",
     path: Path = STOP_BUS_PATH,
+    recovery_state_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Evaluate Session-3 triggers against snapshot; persist if any active.
 
@@ -183,9 +345,18 @@ def evaluate_and_persist(
         }
 
     When any_active becomes True the bus file is written. When no trigger
-    is active the file is left untouched — callers that want to clear the
-    bus on recovery should call clear_stop_bus() explicitly.
+    is active, the GAP-034 / Phase-42 hysteresis helper may auto-clear a
+    latched bus once enough consecutive clean cycles AND the
+    ``auto_clear_min_clean_seconds`` elapsed-time threshold have both been
+    satisfied. Operator-manual clear via ``clear_stop_bus()`` is immediate
+    and independent of the counter.
     """
+    if recovery_state_path is None:
+        if path == STOP_BUS_PATH:
+            recovery_state_path = STOP_BUS_RECOVERY_STATE_PATH
+        else:
+            recovery_state_path = path.parent / "stop_bus_recovery_state.json"
+
     result = evaluate_all_stop_triggers(snapshot=snapshot, config=config)
     active = result.get("active_triggers", [])
     any_active = bool(result.get("any_active", False))
@@ -193,8 +364,21 @@ def evaluate_and_persist(
     if any_active:
         reason = "; ".join(result.get("reasons", [])) or "triggered"
         bus_state = set_stop_bus(reason=reason, triggered_by=triggered_by, path=path)
+        _reset_recovery_counter_if_nonzero(recovery_state_path)
     else:
         bus_state = read_stop_bus(path)
+        if bool(bus_state.get("active", False)):
+            cleared = _maybe_auto_clear_on_clean_streak(
+                current_state=bus_state,
+                snapshot=snapshot,
+                config=config,
+                path=path,
+                recovery_state_path=recovery_state_path,
+            )
+            if cleared is not None:
+                bus_state = cleared
+        else:
+            _reset_recovery_counter_if_nonzero(recovery_state_path)
 
     return {
         "any_active": any_active,
@@ -206,7 +390,13 @@ def evaluate_and_persist(
 
 __all__ = [
     "STOP_BUS_PATH",
+    "STOP_BUS_RECOVERY_STATE_PATH",
     "STOP_BUS_SCHEMA_VERSION",
+    "STOP_BUS_RECOVERY_SCHEMA_VERSION",
+    "DEFAULT_AUTO_CLEAR_ENABLED",
+    "DEFAULT_AUTO_CLEAR_CONSECUTIVE_CLEAN_REQUIRED",
+    "DEFAULT_AUTO_CLEAR_MIN_CLEAN_SECONDS",
+    "DEFAULT_AUTO_CLEAR_TTL_SECONDS",
     "read_stop_bus",
     "is_stop_bus_active",
     "set_stop_bus",
