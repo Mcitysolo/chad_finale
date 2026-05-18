@@ -353,6 +353,13 @@ class StateBuilder:
         else:
             realized_label = "Flat"
 
+        epoch_state = _load_json(RUNTIME / "epoch_state.json")
+        try:
+            _epoch_label = epoch_state.get("active_epoch") if isinstance(epoch_state, dict) else None
+            total_paper_pnl_epoch = str(_epoch_label) if _epoch_label else None
+        except Exception:
+            total_paper_pnl_epoch = None
+
         out = {
             "account_value": equity,
             "account_value_label": _fmt_money(equity),
@@ -362,6 +369,14 @@ class StateBuilder:
             "today_realized_pnl_label": _fmt_money_signed(today_realized),
             "total_paper_pnl": (round(total_paper, 2) if total_paper is not None else None),
             "total_paper_pnl_label": _fmt_money_signed(total_paper),
+            "total_paper_pnl_definition": (
+                "SCR-effective paper PnL: post-Epoch-2 (2026-05-04 cutoff), "
+                "quarantine-manifest-filtered, deduped, 60-day window. "
+                "Canonical PnL truth — NOT the raw paper-account sum."
+            ),
+            "total_paper_pnl_source": "runtime/scr_state.json::stats.total_pnl",
+            "total_paper_pnl_window_days": 60,
+            "total_paper_pnl_epoch": total_paper_pnl_epoch,
             "effective_trades": effective_trades,
             "win_rate": (round(win_rate, 4) if win_rate is not None else None),
             "win_rate_pct_label": (f"{win_rate * 100:.1f}%" if win_rate is not None else "—"),

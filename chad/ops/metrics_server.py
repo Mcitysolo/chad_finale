@@ -11,12 +11,17 @@ Serves:
 Computes paper performance rollups from append-only ledgers:
   - data/trades/trade_history_YYYYMMDD.ndjson
 
-LEAN set (SCR-aligned):
+RAW paper rollup (NOT SCR-aligned — diverges intentionally):
+  - source: data/trades/trade_history_*.ndjson, days_back=7
   - excludes paper_sim artifacts
   - excludes live trades (is_live=True)
   - excludes non-finite pnl
   - excludes untrusted pnl rows ("pnl_untrusted" tags/flags)
   - excludes legacy alpha_crypto rows with pnl==0.0 (treated as unknown realized outcome)
+  - does NOT consult runtime/quarantine_manifest_*.json
+  - does NOT apply the Epoch-2 cutoff
+  - DIVERGES from SCR canonical. For canonical SCR PnL truth use the
+    chad_scr_* metrics (chad_scr_total_pnl, chad_scr_win_rate, etc.).
 
 Why exclude alpha_crypto pnl==0.0?
   Historically, Kraken/crypto logging produced many rows with pnl=0.0 without
@@ -149,7 +154,9 @@ def _is_live_trade(payload: Dict[str, Any]) -> bool:
 
 def _is_untrusted_pnl(payload: Dict[str, Any]) -> bool:
     """
-    True if payload should be excluded from LEAN performance stats.
+    True if payload should be excluded from the RAW paper-rollup stats
+    (NOT SCR-aligned — does NOT consult runtime/quarantine_manifest_*.json;
+    DIVERGES from SCR canonical. For SCR truth use chad_scr_* metrics).
     """
     try:
         # Tag/flag-based untrusted
@@ -300,7 +307,9 @@ def _paper_rollup_metrics(
     """
     Return MetricLine list for paper rollups (tests rely on this).
 
-    LEAN set == finite pnl AND trusted pnl.
+    RAW paper-rollup set == finite pnl AND trusted pnl (NOT SCR-aligned;
+    does NOT consult runtime/quarantine_manifest_*.json — DIVERGES from
+    SCR canonical. For SCR truth use chad_scr_* metrics).
     """
     trades_raw = load_recent_paper_trades(days_back=days_back, max_trades=max_trades, trades_dir=trades_dir)
 
@@ -386,6 +395,13 @@ def _scr_lines() -> List[MetricLine]:
     excluded_untrusted = float(_coerce_float(stats.get("excluded_untrusted", 0), 0.0))
     excluded_nonfinite = float(_coerce_float(stats.get("excluded_nonfinite", 0), 0.0))
 
+    # Canonical SCR PnL truth (mirrored from runtime/scr_state.json::stats).
+    # Post-Epoch-2 cutoff, quarantine-manifest filtered, 60-day window.
+    total_pnl = float(_coerce_float(stats.get("total_pnl", 0.0), 0.0))
+    win_rate = float(_coerce_float(stats.get("win_rate", 0.0), 0.0))
+    sharpe_like = float(_coerce_float(stats.get("sharpe_like", 0.0), 0.0))
+    max_dd = float(_coerce_float(stats.get("max_drawdown", 0.0), 0.0))
+
     state = str(scr.get("state", "UNKNOWN")).upper()
     paper_only = bool(scr.get("paper_only", True))
     sizing_factor = float(_coerce_float(scr.get("sizing_factor", 0.0), 0.0))
@@ -397,6 +413,10 @@ def _scr_lines() -> List[MetricLine]:
     out.append(MetricLine("chad_scr_excluded_nonfinite", {}, _finite_or_zero(excluded_nonfinite)))
     out.append(MetricLine("chad_scr_sizing_factor", {}, _finite_or_zero(sizing_factor)))
     out.append(MetricLine("chad_scr_paper_only", {}, 1.0 if paper_only else 0.0))
+    out.append(MetricLine("chad_scr_total_pnl", {}, _finite_or_zero(total_pnl)))
+    out.append(MetricLine("chad_scr_win_rate", {}, _finite_or_zero(win_rate)))
+    out.append(MetricLine("chad_scr_sharpe_like", {}, _finite_or_zero(sharpe_like)))
+    out.append(MetricLine("chad_scr_max_drawdown", {}, _finite_or_zero(max_dd)))
 
     for st in ("WARMUP", "CAUTIOUS", "CONFIDENT", "PAUSED", "UNKNOWN"):
         out.append(MetricLine("chad_scr_state", {"state": st}, 1.0 if state == st else 0.0))
@@ -418,13 +438,17 @@ def _render_prometheus(metrics: Iterable[MetricLine]) -> str:
     ht("# HELP chad_metrics_server_up Metrics server is running (1).", "# TYPE chad_metrics_server_up gauge")
     ht("# HELP chad_metrics_generated_at_unix Generation timestamp (unix).", "# TYPE chad_metrics_generated_at_unix gauge")
 
-    ht("# HELP chad_paper_trades_total Paper trades in LEAN set (finite + trusted).", "# TYPE chad_paper_trades_total gauge")
-    ht("# HELP chad_paper_win_rate Win rate in LEAN set.", "# TYPE chad_paper_win_rate gauge")
-    ht("# HELP chad_paper_sharpe_like Mean/Std on LEAN pnl series.", "# TYPE chad_paper_sharpe_like gauge")
-    ht("# HELP chad_paper_pnl_untrusted_count Trades flagged pnl_untrusted (excluded from LEAN).", "# TYPE chad_paper_pnl_untrusted_count gauge")
+    ht("# HELP chad_paper_trades_total Paper trades in raw-paper-rollup set (finite + trusted; NOT SCR-aligned — does NOT consult runtime/quarantine_manifest_*.json; DIVERGES from SCR canonical; for SCR truth use chad_scr_* metrics).", "# TYPE chad_paper_trades_total gauge")
+    ht("# HELP chad_paper_win_rate Win rate in raw-paper-rollup set (NOT SCR-aligned; does NOT consult runtime/quarantine_manifest_*.json; DIVERGES from SCR canonical; for SCR truth use chad_scr_win_rate).", "# TYPE chad_paper_win_rate gauge")
+    ht("# HELP chad_paper_sharpe_like Mean/Std on raw-paper-rollup pnl series (NOT SCR-aligned; does NOT consult runtime/quarantine_manifest_*.json; DIVERGES from SCR canonical; for SCR truth use chad_scr_sharpe_like).", "# TYPE chad_paper_sharpe_like gauge")
+    ht("# HELP chad_paper_pnl_untrusted_count Trades flagged pnl_untrusted (excluded from raw-paper-rollup; this is NOT the same set as SCR excluded_untrusted — SCR additionally drops runtime/quarantine_manifest_*.json entries).", "# TYPE chad_paper_pnl_untrusted_count gauge")
 
     ht("# HELP chad_scr_effective_trades Trades included for SCR performance metrics.", "# TYPE chad_scr_effective_trades gauge")
     ht("# HELP chad_scr_state One-hot SCR state label.", "# TYPE chad_scr_state gauge")
+    ht("# HELP chad_scr_total_pnl Canonical SCR effective total PnL (runtime/scr_state.json::stats.total_pnl; Epoch-2 cutoff; quarantine-manifest filtered; 60d window). Authoritative PnL truth.", "# TYPE chad_scr_total_pnl gauge")
+    ht("# HELP chad_scr_win_rate Canonical SCR win rate (runtime/scr_state.json::stats.win_rate; Epoch-2 cutoff; quarantine-manifest filtered; 60d window).", "# TYPE chad_scr_win_rate gauge")
+    ht("# HELP chad_scr_sharpe_like Canonical SCR sharpe-like ratio (runtime/scr_state.json::stats.sharpe_like; Epoch-2 cutoff; quarantine-manifest filtered; 60d window).", "# TYPE chad_scr_sharpe_like gauge")
+    ht("# HELP chad_scr_max_drawdown Canonical SCR max drawdown (runtime/scr_state.json::stats.max_drawdown; Epoch-2 cutoff; quarantine-manifest filtered; 60d window).", "# TYPE chad_scr_max_drawdown gauge")
 
     now_dt = _utc_now()
     base = [
