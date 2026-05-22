@@ -36,6 +36,11 @@ def main() -> int:
     parser.add_argument("--strategy", required=True, help="Strategy identifier to un-halt.")
     parser.add_argument("--by", default="operator", help="Who is clearing the halt (cleared_by).")
     parser.add_argument(
+        "--reason",
+        default="manual_operator_clear",
+        help="Reason for the clear (stored as clear_reason in the audit entry).",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Skip the confirmation prompt (non-interactive mode).",
@@ -68,7 +73,11 @@ def main() -> int:
             print("Aborted.")
             return 0
 
-    after = clear_strategy_halt(strategy=args.strategy, cleared_by=args.by)
+    after = clear_strategy_halt(
+        strategy=args.strategy,
+        cleared_by=args.by,
+        clear_reason=args.reason,
+    )
     updated = after.get("allocations", {}).get(args.strategy)
     print("\ncleared_entry:")
     print(json.dumps(updated or {}, indent=2, sort_keys=True))

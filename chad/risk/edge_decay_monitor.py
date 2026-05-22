@@ -319,17 +319,33 @@ def clear_strategy_halt(
     strategy: str,
     cleared_by: str = "operator",
     path: Path = ALLOCATIONS_PATH,
+    clear_reason: str = "manual_operator_clear",
 ) -> Dict[str, Any]:
-    """Remove the halt flag (or strategy entry) and record who cleared it."""
+    """Remove the halt flag (or strategy entry) and record who cleared it.
+
+    GAP-018 / NEW-GAP-051 halt-clear semantics: when an operator clears
+    a halt, the persisted ``consecutive_negative`` counter is reset to 0
+    so downstream readers of ``strategy_allocations.json`` cannot be
+    misled by a stale pre-clear streak value. The pre-clear value is
+    preserved as ``previous_consecutive_negative`` for the audit trail.
+    Raw trade history in ``data/trades/`` is not touched; the next
+    ``EdgeDecayMonitor.check_strategy`` pass recomputes the streak from
+    the ledger, so any real (unquarantined) losing run will re-halt the
+    strategy with a fresh count rather than silently being hidden.
+    """
     state = read_allocations(path)
     allocations = state.get("allocations", {})
     existing = allocations.get(str(strategy))
     if isinstance(existing, dict):
+        prior_streak = int(existing.get("consecutive_negative", 0) or 0)
         existing.update({
             "halted": False,
             "halt_reason": "",
             "cleared_at": _utc_now_iso(),
             "cleared_by": str(cleared_by or ""),
+            "clear_reason": str(clear_reason or ""),
+            "previous_consecutive_negative": prior_streak,
+            "consecutive_negative": 0,
         })
         allocations[str(strategy)] = existing
     payload = {
@@ -339,8 +355,12 @@ def clear_strategy_halt(
     }
     _write_atomic(path, payload)
     LOG.warning(
-        "EDGE_DECAY_CLEARED strategy=%s cleared_by=%s",
-        strategy, cleared_by,
+        "EDGE_DECAY_CLEARED strategy=%s cleared_by=%s reason=%s prior_streak=%d",
+        strategy,
+        cleared_by,
+        clear_reason,
+        int((existing or {}).get("previous_consecutive_negative", 0) or 0)
+        if isinstance(existing, dict) else 0,
     )
     return payload
 
