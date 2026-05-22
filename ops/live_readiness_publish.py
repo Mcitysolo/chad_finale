@@ -54,6 +54,7 @@ HTTP_TIMEOUT_S = float(os.environ.get("CHAD_HTTP_TIMEOUT_S", "4.0"))
 STOP_PATH = RUNTIME_DIR / "stop_state.json"
 FEED_PATH = RUNTIME_DIR / "feed_state.json"
 RECON_PATH = RUNTIME_DIR / "reconciliation_state.json"
+GUARD_DRIFT_PATH = RUNTIME_DIR / "position_guard_drift.json"
 TRUTH_PATH = RUNTIME_DIR / "positions_truth.json"
 LIFECYCLE_PATH = RUNTIME_DIR / "trade_lifecycle_state.json"
 EXECQ_PATH = RUNTIME_DIR / "execution_quality.json"
@@ -138,15 +139,82 @@ def stop_ok() -> Tuple[bool, str]:
         return False, f"STOP_unreadable:{type(exc).__name__}"
 
 
-def reconciliation_ok() -> Tuple[bool, str]:
+def _resolved_reconciliation_status(
+    recon_path: Path = RECON_PATH,
+    guard_drift_path: Path = GUARD_DRIFT_PATH,
+) -> Tuple[str, str]:
+    """NEW-GAP-041: derive RESOLVED reconciliation status — not just the
+    publisher's `status` field (which excludes broker_sync-only drifts and
+    strategy-attribution side mismatches).
+
+    Resolved truth combines two runtime sources, both written by
+    chad-reconciliation-publisher:
+      * runtime/reconciliation_state.json — overall publisher status
+        ("GREEN" / "YELLOW" / "RED") plus its `drifts` advisory list.
+      * runtime/position_guard_drift.json — per-strategy guard-vs-broker
+        divergence (drift_count, side_mismatch / quantity / etc).
+
+    Policy (fail-closed):
+      * If the publisher status is anything other than "GREEN" → RED.
+      * If publisher reports any `drifts` entry → RED (broker reality gap
+        not initiated by CHAD).
+      * If position_guard_drift.drift_count > 0 → RED.
+      * If either source is missing/unreadable/has wrong schema → UNKNOWN.
+      * Only when both sources are present AND publisher status=GREEN AND
+        both drift surfaces are empty → GREEN.
+
+    Returns (resolved_status, reason). resolved_status ∈ {GREEN, RED, UNKNOWN}.
+    """
     try:
-        r = read_json_dict(RECON_PATH)
-        status = str(r.get("status") or "").upper()
-        if status != "GREEN":
-            return False, f"reconciliation_status={status}"
-        return True, "reconciliation=GREEN"
+        r = read_json_dict(recon_path)
     except Exception as exc:
-        return False, f"reconciliation_unreadable:{type(exc).__name__}"
+        return "UNKNOWN", f"reconciliation_unreadable:{type(exc).__name__}"
+
+    upstream_status = str(r.get("status") or "").upper()
+    if upstream_status == "RED":
+        return "RED", "reconciliation_status=RED"
+    if upstream_status != "GREEN":
+        # YELLOW or any unexpected value — fail-closed.
+        return "RED", f"reconciliation_status={upstream_status or 'EMPTY'}"
+
+    recon_drifts = r.get("drifts")
+    if isinstance(recon_drifts, list) and len(recon_drifts) > 0:
+        return "RED", f"reconciliation_drifts={len(recon_drifts)}"
+
+    try:
+        g = read_json_dict(guard_drift_path)
+    except Exception as exc:
+        return "UNKNOWN", f"position_guard_drift_unreadable:{type(exc).__name__}"
+
+    if str(g.get("schema_version") or "") != "position_guard_drift.v1":
+        return "UNKNOWN", "position_guard_drift_schema_invalid"
+
+    try:
+        drift_count = int(g.get("drift_count", 0) or 0)
+    except (TypeError, ValueError):
+        return "UNKNOWN", "position_guard_drift_count_invalid"
+
+    if drift_count > 0:
+        return "RED", f"position_guard_drift_count={drift_count}"
+
+    return "GREEN", "reconciliation_resolved=GREEN"
+
+
+def reconciliation_ok() -> Tuple[bool, str]:
+    """NEW-GAP-041: read RESOLVED reconciliation, not just publisher status.
+
+    Pre-fix this checked `reconciliation_state.json::status == "GREEN"` and
+    nothing else. Publisher status is GREEN even when broker-only drifts or
+    strategy-side guard divergences exist (see _resolved_reconciliation_status).
+    For LIVE activation we must fail closed on any of those.
+
+    Resolves module-level RECON_PATH / GUARD_DRIFT_PATH at call time (not
+    function-definition time) so tests can redirect both via monkeypatch.
+    """
+    resolved, reason = _resolved_reconciliation_status(RECON_PATH, GUARD_DRIFT_PATH)
+    if resolved == "GREEN":
+        return True, reason
+    return False, reason
 
 
 def feed_ok() -> Tuple[bool, str]:
