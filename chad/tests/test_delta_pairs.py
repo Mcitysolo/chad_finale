@@ -43,6 +43,19 @@ from chad.strategies.delta_pairs_config import (
 from chad.types import AssetClass, SignalSide, StrategyName
 
 
+# GAP-035: these legacy tests exercise SPY/QQQ/IWM pair internals (zscore,
+# pair_id linking, sizing) — the new upstream operator-exclusion filter in
+# build_delta_pairs_signals would otherwise short-circuit them. Bypass the
+# exclusion just for this module; the GAP-035 contract itself is covered
+# by tests in ``test_strategy_upstream_exclusion.py``.
+@pytest.fixture(autouse=True)
+def _bypass_operator_exclusion_for_legacy_tests(monkeypatch):
+    monkeypatch.setattr(
+        "chad.strategies.delta_pairs.is_operator_excluded",
+        lambda _sym: False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

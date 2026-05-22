@@ -50,6 +50,7 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.strategies._upstream_exclusion import is_operator_excluded
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +379,14 @@ def build_delta_pairs_signals(
     signals: List[TradeSignal] = []
 
     for pair in tuning.pairs:
+        # GAP-035: skip the entire pair if EITHER leg is in the operator-
+        # exclusion SSOT. Pairs are atomic (we trade long+short together),
+        # so we cannot emit just one leg if the other is excluded.
+        if (
+            is_operator_excluded(pair.sym_long)
+            or is_operator_excluded(pair.sym_short)
+        ):
+            continue
         closes_a = _extract_closes(ctx, pair.sym_long)
         closes_b = _extract_closes(ctx, pair.sym_short)
 

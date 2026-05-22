@@ -58,6 +58,7 @@ from chad.types import (
 from chad.options.chain_provider import OptionsChain
 from chad.options.spread_spec import OptionsSpreadSpec
 from chad.options.strike_selector import SpreadSpec, select_vertical_spread
+from chad.strategies._upstream_exclusion import is_operator_excluded
 
 # Phase B Item 6 — synthetic Greeks lookup is metadata-only. Importing the
 # gate must never break alpha_options if the helper is unavailable.
@@ -606,6 +607,15 @@ def build_alpha_options_signals(
             if _age_s <= tuning.max_hold_seconds:
                 continue
             _symbol = str(_entry.get("symbol", str(_key).split("|")[-1]))
+            # GAP-035: refuse to emit a max-hold exit SELL on an operator-
+            # excluded underlying. The operator-exclusion invariant is
+            # "CHAD must not open OR close excluded symbols"; pre-existing
+            # positions in excluded symbols are operator-only cleanup via
+            # scripts/close_guard_entry.py. Skipping emission here also
+            # prevents a never-confirmable exit signal from re-firing every
+            # cycle (downstream chokepoints would block it anyway).
+            if is_operator_excluded(_symbol):
+                continue
             _qty = _safe_float(_entry.get("quantity", 1.0), 1.0) or 1.0
 
             # GAP-A001: include opening BAG context so the writer's
@@ -686,6 +696,13 @@ def build_alpha_options_signals(
 
     for symbol in tuning.options_universe:
         sym = symbol.strip().upper()
+        # GAP-035: refuse to open a BAG on an operator-excluded underlying.
+        # The close-path chokepoints (position_reconciler / flip_executor)
+        # already block close intents on these symbols; this filter
+        # prevents the *open* leg upstream so the alpha_options BAG entry
+        # signal is never produced for SPY / QQQ / etc.
+        if is_operator_excluded(sym):
+            continue
         if sym in forced_exit_symbols:
             # Skip new BUY this cycle — exit signal already emitted.
             continue

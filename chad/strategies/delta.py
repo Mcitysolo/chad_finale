@@ -59,6 +59,10 @@ from chad.types import (
     StrategyName,
     TradeSignal,
 )
+from chad.strategies._upstream_exclusion import (
+    OPERATOR_EXCLUDED_SYMBOLS,
+    is_operator_excluded,
+)
 
 Number = float
 
@@ -599,6 +603,13 @@ def delta_handler(
     for sym in universe:
         s = _norm_sym(sym)
         if not s:
+            continue
+        # GAP-035: refuse to emit on operator-excluded symbols upstream
+        # of the close-path chokepoints (position_reconciler /
+        # flip_executor). The chokepoints already block close intents;
+        # this filter additionally prevents *opening* a new position on
+        # an excluded symbol from a stale signal/universe entry.
+        if is_operator_excluded(s):
             continue
         out.extend(_propose_for_symbol(s, ctx, p, px))
     return out
