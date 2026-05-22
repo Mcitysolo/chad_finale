@@ -241,6 +241,85 @@ def _is_recent(mtime_unix: Optional[float], *, max_age_s: int) -> bool:
     return (_now_unix() - float(mtime_unix)) <= float(max_age_s)
 
 
+def _parse_iso8601_to_unix(ts: Any) -> Optional[float]:
+    """Best-effort ISO-8601 -> POSIX seconds. Accepts trailing 'Z' and naive
+    datetimes (treated as UTC). Returns None on failure — caller decides how
+    to fail closed."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _count_recent_non_heartbeats(
+    newest_file: Optional[str],
+    *,
+    max_age_s: int,
+    scan_lines: int = 400,
+) -> int:
+    """GAP-053 helper: count broker_events that are (a) NOT heartbeats and
+    (b) within max_age_s seconds of now. Used by build_trade_lifecycle_state
+    to distinguish "pipeline working but no fills happened" (legitimate quiet
+    window, backlog_flag can be False) from "fills happened but ledger
+    writer broke" (backlog_flag must stay True).
+
+    Reads up to the last `scan_lines` lines of the newest broker_events
+    ndjson; that bound keeps cost O(1) on long files. Heartbeats dominate
+    by ~25:1, so 400 lines covers ~6 minutes of heartbeats plus any fills
+    in the trailing window — comfortably more than the default 900s window
+    needs.
+
+    Returns 0 on any failure (path missing, parse error, etc.); callers
+    treat 0-count as "no recent fills" which keeps the quiet-window branch
+    safe (it only relaxes backlog_flag when this is 0 AND broker_events
+    mtime is fresh).
+    """
+    if not newest_file:
+        return 0
+    try:
+        p = Path(newest_file)
+        if not p.is_file():
+            return 0
+        with p.open("r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()[-int(scan_lines):]
+    except Exception:
+        return 0
+
+    now = _now_unix()
+    cutoff_unix = now - float(max_age_s)
+    count = 0
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            import json
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj
+        event_type = str(payload.get("event_type") or "").strip().lower()
+        if event_type == "heartbeat":
+            continue
+        ts_unix = _parse_iso8601_to_unix(payload.get("ts_utc"))
+        if ts_unix is None:
+            continue
+        if ts_unix >= cutoff_unix and ts_unix <= now + 1.0:
+            count += 1
+    return count
+
+
 # ----------------------------
 # Build payloads
 # ----------------------------
@@ -276,7 +355,44 @@ def build_trade_lifecycle_state(
     fees_fresh = have_fees and _is_recent(fees_evidence.newest_mtime_unix, max_age_s=max_age_s)
 
     gap_flag = not (have_events and have_fills and have_fees)
-    backlog_flag = not (events_fresh and fills_fresh and fees_fresh)
+
+    # GAP-053 quiet-window policy: distinguish "pipeline broken" from
+    # "no fills happened recently". The pre-fix logic treated fills/fees
+    # mtime aging as backlog, which produced false positives during long
+    # cooldown / no-signal periods. Policy is documented in
+    # ops/pending_actions/GAP-053_lifecycle_replay_coverage_policy.md.
+    #
+    # Fail-closed invariants preserved:
+    #   * Missing files (gap_flag) ALWAYS forces backlog_flag=true.
+    #   * Stale broker_events (no heartbeats) ALWAYS forces backlog_flag=true
+    #     (this is the canonical "lifecycle pipeline alive" signal).
+    #   * If a non-heartbeat broker event arrived within max_age_s but the
+    #     fills/fees writers fell behind, backlog_flag=true (writer outage).
+    #   * Only when broker_events are fresh AND no recent fill-class events
+    #     occurred do we accept stale fills/fees as a legitimate quiet
+    #     window (backlog_flag=false). The accepted-policy field below
+    #     surfaces the decision to operators for audit.
+    recent_non_heartbeats = _count_recent_non_heartbeats(
+        evidence.newest_file, max_age_s=max_age_s
+    )
+    had_recent_broker_fill_activity = recent_non_heartbeats > 0
+    quiet_window_accepted = bool(
+        not gap_flag
+        and events_fresh
+        and not had_recent_broker_fill_activity
+        and (not fills_fresh or not fees_fresh)
+    )
+
+    if gap_flag:
+        backlog_flag = True
+    elif not events_fresh:
+        # Pipeline outage — heartbeats stopped.
+        backlog_flag = True
+    elif had_recent_broker_fill_activity and (not fills_fresh or not fees_fresh):
+        # Writer fell behind real fill activity.
+        backlog_flag = True
+    else:
+        backlog_flag = False
 
     payload: Dict[str, Any] = {
         "schema_version": "trade_lifecycle_state.v1",
@@ -285,6 +401,8 @@ def build_trade_lifecycle_state(
         "event_count_rolling": int(evidence.event_count_hint),
         "backlog_flag": bool(backlog_flag),
         "gap_flag": bool(gap_flag),
+        "quiet_window_accepted": bool(quiet_window_accepted),
+        "replay_coverage_policy": "GAP-053",
         "evidence": {
             "broker_events": {
                 "dir": str((data_dir / "broker_events").resolve()),
@@ -292,6 +410,8 @@ def build_trade_lifecycle_state(
                 "newest_file": evidence.newest_file,
                 "newest_mtime_unix": evidence.newest_mtime_unix,
                 "line_count_hint": int(evidence.event_count_hint),
+                "events_fresh": bool(events_fresh),
+                "recent_non_heartbeat_count": int(recent_non_heartbeats),
             },
             "fills": {
                 "dir": str((data_dir / "fills").resolve()),
@@ -299,6 +419,7 @@ def build_trade_lifecycle_state(
                 "newest_file": fills_evidence.newest_file,
                 "newest_mtime_unix": fills_evidence.newest_mtime_unix,
                 "line_count_hint": int(fills_evidence.line_count_hint),
+                "fresh": bool(fills_fresh),
             },
             "fees": {
                 "dir": str((data_dir / "fees").resolve()),
@@ -306,13 +427,21 @@ def build_trade_lifecycle_state(
                 "newest_file": fees_evidence.newest_file,
                 "newest_mtime_unix": fees_evidence.newest_mtime_unix,
                 "line_count_hint": int(fees_evidence.line_count_hint),
+                "fresh": bool(fees_fresh),
             },
             "max_age_seconds": int(max_age_s),
+            "had_recent_broker_fill_activity": bool(had_recent_broker_fill_activity),
         },
         "notes": (
-            "EVIDENCE-GATED BOOTSTRAP: Full lifecycle replay is not implemented yet. "
-            "LIVE must remain blocked unless broker_events, fills, and fees all exist and are fresh. "
-            "This artifact now consumes split ledgers to tighten fail-closed SSOT v5.0 behavior."
+            "EVIDENCE-GATED BOOTSTRAP with GAP-053 quiet-window policy: "
+            "broker_events heartbeat freshness is the canonical lifecycle "
+            "liveness signal. fills/fees mtime staleness is only treated as "
+            "backlog when broker_events report non-heartbeat activity within "
+            "max_age_seconds (writer-outage signal). When the broker emitted "
+            "no fill-class events in that window, stale ledger mtimes reflect "
+            "a quiet market window, not a backlog. gap_flag still trips on "
+            "missing files; downstream live-readiness still ANDs lifecycle_truth, "
+            "reconciliation, mode, scr, operator_intent, etc."
         ),
     }
     return payload
