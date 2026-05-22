@@ -207,24 +207,74 @@ def _close_intent_to_ibkr(close: dict):
     """
     Wrap a close-intent dict in a minimal object that matches the
     ExecutionIntent interface expected by IbkrAdapter.submit_strategy_trade_intents.
+
+    GAP-037: futures symbols (MES/MNQ/MCL/MGC/M6E/...) MUST be wrapped with
+    sec_type="FUT" and intent.meta.contract_month so the adapter resolves to a
+    Future(symbol, lastTradeDateOrContractMonth=..., exchange=spec.exchange).
+    Without this branch the adapter falls through to STK/SMART and IBKR returns
+    Error 200 ("No security definition has been found for the request") for
+    every futures-close attempt.
     """
     from chad.types import AssetClass
+    # Lazy imports: keep module load light; avoid pulling the full IBKR adapter
+    # at import time for callers that only build close-intent dicts.
+    from chad.execution.ibkr_adapter import resolve_asset_class
+    from chad.market_data.futures_contract_resolver import (
+        SOURCE_NAME as _FUTURES_RESOLVER_SOURCE,
+        resolve_contract_month,
+    )
+
+    symbol = str(close.get("symbol", "") or "").strip().upper()
+    asset_class_str = resolve_asset_class(symbol) if symbol else "equity"
+
+    meta: Dict[str, Any] = {}
+    if asset_class_str == "futures":
+        sec_type = "FUT"
+        asset_class_enum = AssetClass.FUTURES
+        contract_month = resolve_contract_month(symbol)
+        if contract_month:
+            meta["contract_month"] = contract_month
+            meta["contract_month_source"] = _FUTURES_RESOLVER_SOURCE
+            meta["contract_month_resolved_at_utc"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+        else:
+            LOG.warning(
+                "RECONCILER_CLOSE_FUTURES_UNRESOLVED symbol=%s — "
+                "adapter will reject; check futures_contract_resolver schedule",
+                symbol,
+            )
+    elif asset_class_str == "etf":
+        sec_type = "STK"
+        asset_class_enum = AssetClass.ETF
+    else:
+        # equity / forex / crypto / options fall back to equity-shaped STK
+        # since the reconciler historically only sees STK and FUT positions.
+        sec_type = "STK"
+        asset_class_enum = AssetClass.EQUITY
 
     class _ReconcilerIntent:
         __slots__ = (
             "symbol", "side", "quantity", "sec_type", "asset_class",
-            "strategy", "order_type", "confidence",
+            "strategy", "order_type", "confidence", "meta",
+            "exchange", "currency",
         )
 
         def __init__(self, c: dict):
             self.symbol = c["symbol"]
             self.side = c["close_side"]
             self.quantity = float(c.get("quantity", 0.0) or 0.0)
-            self.sec_type = "STK"
-            self.asset_class = AssetClass.EQUITY
+            self.sec_type = sec_type
+            self.asset_class = asset_class_enum
             self.strategy = c.get("strategy", "reconciler")
             self.order_type = "MKT"
             self.confidence = 1.0
+            self.meta = dict(meta)
+            # Adapter resolves FUT exchange/currency from its FuturesContractSpec
+            # registry; STK falls through to SMART/USD defaults in
+            # _intent_from_trade_intent. Both branches tolerate empty fields.
+            self.exchange = ""
+            self.currency = ""
 
     return _ReconcilerIntent(close)
 

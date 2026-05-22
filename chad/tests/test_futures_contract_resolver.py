@@ -69,6 +69,30 @@ def test_resolver_lowercase_symbol_normalises() -> None:
     assert resolve_contract_month("mes", now=now) is not None
 
 
+def test_resolver_does_not_return_expired_mcl_on_2026_05_19() -> None:
+    """MCLM6 (delivery June 2026) last traded 2026-05-18 per IBKR. On
+    2026-05-19 the resolver must not return '202606' or the live loop
+    will submit to an expired contract and IBKR rejects with Error 201."""
+    now = datetime(2026, 5, 19, 2, 30, tzinfo=timezone.utc)
+    month = resolve_contract_month("MCL", now=now)
+    assert month is not None
+    assert month != "202606", (
+        f"MCL must not return expired MCLM6 contract on 2026-05-19; got {month}"
+    )
+    assert month >= "202607"
+
+
+def test_resolver_non_mcl_symbols_unchanged_on_2026_05_19() -> None:
+    """Equity-index and metal micro-futures keep their standard
+    'expires in delivery month' calendar; their 202606 entry is still
+    valid on 2026-05-19."""
+    now = datetime(2026, 5, 19, 2, 30, tzinfo=timezone.utc)
+    for sym in ("MES", "MNQ", "MGC", "M2K", "MYM", "ZN", "ZB", "M6E"):
+        assert resolve_contract_month(sym, now=now) == "202606", (
+            f"{sym} schedule must still resolve to 202606 on 2026-05-19"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 2) Intent builder attaches meta for futures
 # ---------------------------------------------------------------------------
@@ -97,6 +121,21 @@ def _disable_routing_gates(monkeypatch: pytest.MonkeyPatch) -> None:
     import chad.execution.execution_pipeline as ep
 
     monkeypatch.setattr(ep, "run_all_gates", lambda **kwargs: (True, ""))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stop_bus(monkeypatch: pytest.MonkeyPatch) -> None:
+    # NEW-GAP-033b / Box 030: force the stop-bus check to False so that the
+    # production short-circuit in build_ibkr_intents_from_plan does not consult
+    # live runtime/stop_bus.json. Production behavior is correct and unchanged;
+    # this fixture only isolates the unit under test from a real-world latency
+    # excursion that would otherwise legitimately return [] and mask the
+    # contract_month / registry assertions we care about.
+    import chad.risk.stop_bus_state as sbs
+    import chad.execution.execution_pipeline as ep
+
+    monkeypatch.setattr(sbs, "is_stop_bus_active", lambda *_a, **_kw: False)
+    monkeypatch.setattr(ep, "_stop_bus_active", lambda: False)
 
 
 @pytest.mark.parametrize("symbol", ["MES", "MGC"])

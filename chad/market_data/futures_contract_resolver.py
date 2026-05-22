@@ -31,7 +31,12 @@ from typing import Dict, List, Optional
 EXPIRY_SCHEDULE: Dict[str, List[str]] = {
     "MES":  ["202606", "202609", "202612", "202703", "202706"],
     "MNQ":  ["202606", "202609", "202612", "202703", "202706"],
-    "MCL":  ["202606", "202607", "202608", "202609", "202610", "202611", "202612"],
+    # NYMEX crude-oil contracts expire in the calendar month BEFORE their
+    # delivery month: MCLM6 (June delivery) last traded 2026-05-18 per IBKR
+    # truth. Drop "202606" from the schedule so the resolver advances to
+    # "202607" once "202606" has expired. (Equity-index / metal micro-futures
+    # listed below keep the standard "expires in delivery month" calendar.)
+    "MCL":  ["202607", "202608", "202609", "202610", "202611", "202612", "202701"],
     "MGC":  ["202604", "202606", "202608", "202610", "202612", "202702", "202704"],
     "ZN":   ["202606", "202609", "202612", "202703"],
     "ZB":   ["202606", "202609", "202612", "202703"],
