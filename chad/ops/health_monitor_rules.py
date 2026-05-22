@@ -710,6 +710,212 @@ def rule_setup_family_skip_rate(findings: List[Finding]) -> None:
         ))
 
 
+def rule_options_chain_refresh_health(findings: List[Finding]) -> None:
+    """R17 (NEW-GAP-044) — chad-options-chain-refresh.service must succeed
+    OR fail loudly. The refresh service persists its failure to
+    runtime/options_chains_cache.json via an ``error`` field — but that
+    file change alone does NOT page operators. This rule promotes any
+    non-empty error field, an empty chains map, or a stale ts_utc into a
+    CRITICAL Finding so the health monitor's existing Telegram pipeline
+    surfaces it.
+
+    Three branches:
+      * file missing                            → INFO (bootstrap window)
+      * cache file present + non-empty ``error``→ CRITICAL (loud alert)
+      * cache file present + empty chains + no error → CRITICAL (degenerate)
+      * cache file present + ts_utc older than 26h on a weekday → WARNING
+        (the daily timer is Mon-Fri 12:30 UTC; 26h covers the gap with slack)
+    """
+    chain_path = RUNTIME / "options_chains_cache.json"
+    if not chain_path.is_file():
+        findings.append(Finding(
+            rule_id="R17",
+            severity="INFO",
+            title="Options chain cache missing",
+            description=(
+                "runtime/options_chains_cache.json is absent. Expected to be "
+                "written daily by chad-options-chain-refresh.service "
+                "(Mon-Fri 12:30 UTC)."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"path={chain_path} exists=False",
+        ))
+        return
+
+    doc = _read_json(chain_path)
+    err = doc.get("error")
+    chains = doc.get("chains") if isinstance(doc.get("chains"), dict) else {}
+    ts_utc_raw = str(doc.get("ts_utc") or "").strip()
+
+    if isinstance(err, str) and err.strip():
+        findings.append(Finding(
+            rule_id="R17",
+            severity="CRITICAL",
+            title="Options chain refresh failed",
+            description=(
+                f"chad-options-chain-refresh.service wrote an error: {err}. "
+                "Strategies that depend on the options chain (alpha_options, "
+                "omega_momentum_options) cannot generate fresh signals; the "
+                "Greeks gate will fall back to defaults."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"options_chains_cache.json error={err!r} ts_utc={ts_utc_raw}",
+        ))
+        return
+
+    if not chains:
+        findings.append(Finding(
+            rule_id="R17",
+            severity="CRITICAL",
+            title="Options chain cache empty",
+            description=(
+                "options_chains_cache.json has no chains and no error field. "
+                "Either the refresh service exited 0 with no work, or the "
+                "writer corrupted the cache. Either way, options strategies "
+                "will not produce signals."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"options_chains_cache.json chains_count=0 ts_utc={ts_utc_raw}",
+        ))
+        return
+
+    if ts_utc_raw:
+        try:
+            ts = datetime.fromisoformat(ts_utc_raw.replace("Z", "+00:00"))
+            age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age_s > 26 * 3600 and is_weekday():
+                findings.append(Finding(
+                    rule_id="R17",
+                    severity="WARNING",
+                    title="Options chain cache stale",
+                    description=(
+                        f"options_chains_cache.json ts_utc={ts_utc_raw} is "
+                        f"{age_s/3600:.1f}h old (>26h); the daily refresh "
+                        "timer did not run successfully today."
+                    ),
+                    remedy_type="NOTIFY_ONLY",
+                    remedy_action="notify",
+                    evidence=f"options_chains_cache.json ts_utc={ts_utc_raw} age_s={int(age_s)}",
+                ))
+        except Exception:
+            pass
+
+
+def rule_options_greeks_freshness(findings: List[Finding]) -> None:
+    """R18 (NEW-GAP-044) — companion rule that flags silently-stale Greeks.
+
+    runtime/options_greeks.json carries its own ``ttl_seconds`` (default
+    90000 ≈ 25h) and a ``source.chain_cache_ts_utc`` lineage. The
+    options_greeks_gate fall-back-to-default behaviour is failure-soft on
+    purpose; this rule re-surfaces the failure so it isn't invisible:
+
+      * file missing                            → CRITICAL
+      * doc ts_utc older than ttl_seconds        → CRITICAL (stale Greeks)
+      * status field == "partial" or "failed"    → WARNING
+      * symbols map empty                        → WARNING (no usable greeks)
+    """
+    greeks_path = RUNTIME / "options_greeks.json"
+    if not greeks_path.is_file():
+        findings.append(Finding(
+            rule_id="R18",
+            severity="CRITICAL",
+            title="Options Greeks file missing",
+            description=(
+                "runtime/options_greeks.json is absent. options_greeks_gate "
+                "will fall back to default delta=±0.5 for every options "
+                "lookup."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"path={greeks_path} exists=False",
+        ))
+        return
+
+    doc = _read_json(greeks_path)
+    ts_utc_raw = str(doc.get("ts_utc") or "").strip()
+    ttl_raw = doc.get("ttl_seconds")
+    try:
+        ttl_s = int(ttl_raw) if ttl_raw is not None else 90000
+        if ttl_s <= 0:
+            ttl_s = 90000
+    except (TypeError, ValueError):
+        ttl_s = 90000
+
+    if ts_utc_raw:
+        try:
+            ts = datetime.fromisoformat(ts_utc_raw.replace("Z", "+00:00"))
+            age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age_s > ttl_s:
+                findings.append(Finding(
+                    rule_id="R18",
+                    severity="CRITICAL",
+                    title="Options Greeks stale beyond TTL",
+                    description=(
+                        f"options_greeks.json ts_utc={ts_utc_raw} is "
+                        f"{age_s/3600:.1f}h old, exceeding declared "
+                        f"ttl_seconds={ttl_s}. options_greeks_gate is now "
+                        "silently returning default deltas for every "
+                        "lookup."
+                    ),
+                    remedy_type="NOTIFY_ONLY",
+                    remedy_action="notify",
+                    evidence=f"options_greeks.json age_s={int(age_s)} ttl_s={ttl_s}",
+                ))
+                return  # don't double-fire status/symbol warnings on stale.
+        except Exception:
+            pass
+
+    status = str(doc.get("status") or "").strip().lower()
+    if status in ("failed", "error"):
+        findings.append(Finding(
+            rule_id="R18",
+            severity="CRITICAL",
+            title=f"Options Greeks publisher reported status={status}",
+            description=(
+                "options_greeks.json::status reflects a failed publisher run. "
+                "Strategies that consult the Greeks gate will receive "
+                "default deltas with source='default' instead of computed "
+                "values."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"options_greeks.json status={status}",
+        ))
+        return
+
+    if status == "partial":
+        findings.append(Finding(
+            rule_id="R18",
+            severity="WARNING",
+            title="Options Greeks publisher partial",
+            description=(
+                "options_greeks.json::status=partial — at least one expiry or "
+                "strike could not be priced. Inspect source.provider_status."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"options_greeks.json status=partial",
+        ))
+
+    symbols = doc.get("symbols")
+    if isinstance(symbols, dict) and not symbols:
+        findings.append(Finding(
+            rule_id="R18",
+            severity="WARNING",
+            title="Options Greeks symbols map empty",
+            description=(
+                "options_greeks.json::symbols is {}. No per-symbol greeks "
+                "are available; gate will return defaults for every lookup."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=f"options_greeks.json symbols_count=0",
+        ))
+
+
 def run_all_rules() -> List[Finding]:
     """Run all rules and return list of findings."""
     findings: List[Finding] = []
@@ -730,6 +936,8 @@ def run_all_rules() -> List[Finding]:
         rule_halted_with_unclamped_boost,
         rule_tier_daily_loss_approaching,
         rule_setup_family_skip_rate,
+        rule_options_chain_refresh_health,
+        rule_options_greeks_freshness,
     ]:
         try:
             fn(findings)
