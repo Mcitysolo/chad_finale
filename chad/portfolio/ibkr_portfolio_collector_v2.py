@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,83 @@ from typing import Any, Dict, List, Optional
 # Runtime file freshness for portfolio snapshot (short on purpose)
 PORTFOLIO_SNAPSHOT_TTL_SECONDS = 300  # 5 minutes
 POSITIONS_SNAPSHOT_TTL_SECONDS = 300  # 5 minutes
+
+# NEW-GAP-043 wall-clock guard: the collector is a oneshot triggered every
+# 120s by chad-ibkr-collector.timer. The IBKR gateway can stall the
+# accountSummary()/positions() reply, and the systemd unit historically had
+# TimeoutStartSec=infinity, so the service could (and did) sit in
+# `activating/start` for hours, blocking subsequent timer fires. This
+# code-level alarm is a defense-in-depth bound that ensures the process
+# self-terminates even when systemd guardrails are misconfigured. The
+# matching unit-level guard is in
+# ops/systemd/chad-ibkr-collector.service.d/10-timeout-guards.conf.
+DEFAULT_WALL_CLOCK_SECONDS = 60
+WALL_CLOCK_ENV = "CHAD_COLLECTOR_WALL_CLOCK_SECONDS"
+
+
+class CollectorWallClockTimeout(SystemExit):
+    """Raised by the SIGALRM handler when the wall-clock guard fires.
+
+    Inherits SystemExit so an uncaught instance produces a non-zero exit
+    without a traceback (systemd records exit code 124 — the canonical
+    timeout exit code chosen by `timeout(1)` — making the failure visible
+    in `systemctl status` / `Result=exit-code` / `ExecMainStatus=124`).
+    """
+
+    def __init__(self, seconds: int) -> None:
+        super().__init__(124)
+        self.seconds = int(seconds)
+
+
+def _resolve_wall_clock_seconds() -> int:
+    raw = os.environ.get(WALL_CLOCK_ENV)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_WALL_CLOCK_SECONDS
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_WALL_CLOCK_SECONDS
+    if v <= 0:
+        return DEFAULT_WALL_CLOCK_SECONDS
+    return v
+
+
+def install_wall_clock_guard(seconds: Optional[int] = None) -> int:
+    """Install a SIGALRM-based wall-clock guard for the collector process.
+
+    Returns the number of seconds the alarm is set for. Re-arming with a
+    new call REPLACES any previous alarm (POSIX semantics). On a non-Linux
+    platform (no SIGALRM), this is a no-op that returns 0 — production
+    runs only on Linux so this is purely a test-portability guard.
+
+    The handler raises CollectorWallClockTimeout which propagates up and
+    forces a non-zero (124) exit. The 124 exit code makes the failure
+    visible as `Result=exit-code` in `systemctl status`, distinguishable
+    from a normal clean exit (0) or other failures (1).
+    """
+    s = int(seconds) if seconds is not None else _resolve_wall_clock_seconds()
+    if not hasattr(signal, "SIGALRM"):
+        return 0
+
+    def _handler(_signum: int, _frame: Any) -> None:  # pragma: no cover (signal-driven)
+        print(
+            f"[IBKR PORTFOLIO] WALL_CLOCK_TIMEOUT after {s}s — "
+            "collector self-terminated to prevent stuck-activating systemd state",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise CollectorWallClockTimeout(s)
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(s)
+    return s
+
+
+def disarm_wall_clock_guard() -> None:
+    """Disable any installed SIGALRM. Used in tests; production main() does
+    not need this — the kernel clears the alarm at process exit."""
+    if hasattr(signal, "SIGALRM"):
+        signal.alarm(0)
 
 
 def _utc_now_iso() -> str:
@@ -211,6 +290,15 @@ class IBKRPortfolioCollector:
 # ---------------------------------------------------------------------------
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # NEW-GAP-043: install the wall-clock guard BEFORE arg parsing / network.
+    # If anything below (arg parse, IB connect, accountSummary, positions)
+    # hangs, the SIGALRM handler exits 124 so the systemd unit transitions
+    # cleanly from activating → failed instead of sitting in activating
+    # indefinitely. Tests can opt out via CHAD_COLLECTOR_WALL_CLOCK_SECONDS=
+    # but the production default (60s) covers all observed healthy runs
+    # (typical wall-clock: ~2-5s for connect+accountSummary+positions+write).
+    install_wall_clock_guard()
+
     parser = argparse.ArgumentParser(
         description=(
             "IBKR Portfolio Collector v2\n"
