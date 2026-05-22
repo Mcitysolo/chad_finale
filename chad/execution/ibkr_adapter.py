@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple, TypeVar, TYPE_CHECKING
 
@@ -478,6 +478,81 @@ def _quantize_down(value: Decimal, step: Decimal) -> Decimal:
     return units * step
 
 
+# IBKR contract-side minTick values for FUT symbols currently routed by CHAD.
+# Values match the CME / NYMEX / COMEX / CBOT published "minimum price
+# fluctuation" for each contract and are cross-checked against the strategy
+# specs in chad/strategies/alpha_futures.py (MES/MNQ/MCL/MGC/ZN/ZB).
+# Used only by _snap_lmt_price_to_tick; STK / OPT / BAG / unknown FUT symbols
+# fall through unchanged so we do not silently substitute a guessed tick.
+_FUT_MIN_TICK_BY_SYMBOL: Dict[str, Decimal] = {
+    "MES": Decimal("0.25"),
+    "MNQ": Decimal("0.25"),
+    "MCL": Decimal("0.01"),
+    "MGC": Decimal("0.10"),
+    "ZN":  Decimal("0.015625"),
+    "ZB":  Decimal("0.03125"),
+    "M6E": Decimal("0.0001"),
+    "SIL": Decimal("0.005"),
+    "MYM": Decimal("1.0"),
+    "M2K": Decimal("0.10"),
+}
+
+
+def _snap_lmt_price_to_tick(
+    price: float,
+    *,
+    side: str,
+    sec_type: str,
+    symbol: str,
+) -> Tuple[float, Optional[Decimal]]:
+    """Snap a LMT price to the instrument minTick boundary.
+
+    Policy is side-safe / conservative so a rounding correction never makes
+    the order MORE aggressive than the strategy intended:
+      - BUY  -> floor-to-tick (will not accidentally pay more than the
+                originally-computed bid).
+      - SELL -> ceil-to-tick  (will not accidentally accept less than the
+                originally-computed ask).
+
+    Only FUT symbols listed in _FUT_MIN_TICK_BY_SYMBOL are snapped. STK / OPT
+    / BAG and unknown FUT symbols pass through unchanged — callers can detect
+    "unknown tick" via the returned tick being None and log accordingly
+    instead of silently rounding to an assumed value.
+
+    Returns (snapped_price, tick) where `tick` is the Decimal tick that was
+    applied, or None if no snap was performed. The function is pure (no
+    logging / no I/O) so it is trivial to unit-test.
+    """
+    if _safe_upper(sec_type) != "FUT":
+        return float(price), None
+    sym = _safe_upper(symbol)
+    tick = _FUT_MIN_TICK_BY_SYMBOL.get(sym)
+    if tick is None:
+        return float(price), None
+    try:
+        price_d = Decimal(str(price))
+    except (InvalidOperation, ValueError):
+        return float(price), None
+    if not price_d.is_finite() or price_d <= 0:
+        return float(price), None
+    side_u = _safe_upper(side)
+    if side_u == "BUY":
+        rounding = ROUND_DOWN
+    elif side_u == "SELL":
+        rounding = ROUND_UP
+    else:
+        # Defensive: intent.side is validated upstream, but fall back to
+        # nearest-tick if a caller ever passes something unexpected.
+        rounding = ROUND_HALF_EVEN
+    steps = (price_d / tick).to_integral_value(rounding=rounding)
+    snapped = steps * tick
+    if snapped <= 0:
+        # Guard against a positive price snapping down to zero on absurdly
+        # small inputs; preserve the original price instead of submitting 0.
+        return float(price), tick
+    return float(snapped), tick
+
+
 def _enum_value(value: Any) -> str:
     if hasattr(value, "value"):
         return str(getattr(value, "value")).strip().lower()
@@ -520,6 +595,12 @@ _FUTURES_SYMBOLS = frozenset({
     "MES", "MNQ", "ES", "NQ", "MGC", "MCL", "MCLK6",
     "ZN", "ZB", "M6E", "SI", "SIL",
     "GC", "CL", "RTY", "YM", "MYM",
+    # M2K (Micro E-mini Russell 2000) has a FuturesContractSpec entry below
+    # and an EXPIRY_SCHEDULE entry in futures_contract_resolver, but was
+    # missing here — resolve_asset_class("M2K") silently fell through to
+    # "equity", which made reconciler close intents for the open M2K SELL
+    # paper position emit as STK→SMART (GAP-037).
+    "M2K",
 })
 _ETF_SYMBOLS = frozenset({
     "GLD", "TLT", "VWO", "UVXY", "SVXY", "SIL", "PSQ", "SH",
@@ -1658,7 +1739,24 @@ class _OrderFactory:
         if self._config.account:
             order.account = self._config.account
         if order_type == "LMT":
-            order.lmtPrice = float(limit_price)
+            snapped_price, applied_tick = _snap_lmt_price_to_tick(
+                limit_price,
+                side=side,
+                sec_type=intent.sec_type,
+                symbol=intent.symbol,
+            )
+            if applied_tick is not None and snapped_price != float(limit_price):
+                LOGGER.info(
+                    "LMT_PRICE_SNAPPED symbol=%s side=%s sec_type=%s "
+                    "raw=%r snapped=%r tick=%s",
+                    _safe_upper(intent.symbol),
+                    side,
+                    _safe_upper(intent.sec_type),
+                    float(limit_price),
+                    snapped_price,
+                    str(applied_tick),
+                )
+            order.lmtPrice = float(snapped_price)
 
         return _PreparedOrder(order=order, quantity=quantity, what_if=what_if)
 
