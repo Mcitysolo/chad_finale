@@ -47,6 +47,18 @@ def _bypass_routing_gates(monkeypatch):
     monkeypatch.setattr(ep, "run_all_gates", lambda **_kwargs: (True, ""))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stop_bus(monkeypatch):
+    # NEW-GAP-033b / Box 029: force the stop-bus check to False so that the
+    # production short-circuit in build_ibkr_intents_from_plan does not consult
+    # live runtime/stop_bus.json. Production behavior is correct and unchanged;
+    # this fixture only isolates the unit under test from a real-world latency
+    # excursion that would otherwise legitimately return [].
+    import chad.risk.stop_bus_state as sbs
+    monkeypatch.setattr(sbs, "is_stop_bus_active", lambda *_a, **_kw: False)
+    monkeypatch.setattr(ep, "_stop_bus_active", lambda: False)
+
+
 def _routed_alpha_options_bag(symbol: str = "SPY", side: SignalSide = SignalSide.BUY,
                               meta_override: dict | None = None) -> RoutedSignal:
     meta = {
