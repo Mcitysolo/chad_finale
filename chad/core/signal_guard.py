@@ -173,5 +173,32 @@ def clear_signal(signal) -> None:
         _save_state(state)
 
 
+def revert_emission_for_unconfirmed(signal) -> bool:
+    """Undo the cooldown-arming write performed by ``should_emit_signal`` when
+    the downstream submission was never accepted by the broker.
+
+    Background — OPS-OMEGA-01 (Pattern C):
+      ``should_emit_signal`` writes ``updated_at_utc=now`` BEFORE the IBKR
+      adapter is consulted. When the adapter returns an unconfirmed/duplicate
+      status (e.g. ``duplicate_blocked``, ``duplicate_open_order``,
+      ``suppressed_open_orders_cap``, ``rejected``, ``error``), the 10-minute
+      cooldown was armed for a submission that never reached the broker,
+      producing a self-perpetuating "duplicate_blocked → cooldown_active for
+      10 min → duplicate_blocked" loop.
+
+    This function deletes the entry just written so the cooldown is not
+    consumed by an unconfirmed result. Returns True when an entry was removed
+    (used for log-line distinction).
+    """
+    fp = fingerprint_signal(signal)
+    state = _load_state()
+    key = fp.key()
+    if key in state:
+        del state[key]
+        _save_state(state)
+        return True
+    return False
+
+
 def reset_all_signals() -> None:
     _save_state({})

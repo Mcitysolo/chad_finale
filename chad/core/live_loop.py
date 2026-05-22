@@ -2092,6 +2092,28 @@ def run_once(logger: logging.Logger) -> None:
                                 getattr(order, "status", "?"),
                                 _skip_reason,
                             )
+                            # OPS-OMEGA-01 Pattern C: revert the cooldown-arming
+                            # write that should_emit_signal performed pre-submit,
+                            # so an unconfirmed/duplicate result does not consume
+                            # the 10-minute cooldown.
+                            try:
+                                from chad.core.signal_guard import (
+                                    revert_emission_for_unconfirmed,
+                                )
+                                if revert_emission_for_unconfirmed(adapted):
+                                    logger.info(
+                                        "COOLDOWN_NOT_REARMED_UNCONFIRMED_STATUS "
+                                        "symbol=%s strategy=%s side=%s qty=%s status=%s",
+                                        getattr(order, "symbol", "?"),
+                                        getattr(intent, "strategy", "?"),
+                                        getattr(order, "side", "?"),
+                                        getattr(order, "quantity", "?"),
+                                        getattr(order, "status", "?"),
+                                    )
+                            except Exception as _cd_err:
+                                logger.warning(
+                                    "COOLDOWN_REVERT_FAILED (non-fatal): %s", _cd_err
+                                )
                             continue
 
                         ev = PaperExecEvidence(

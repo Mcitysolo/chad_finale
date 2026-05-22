@@ -274,6 +274,13 @@ class IbkrConfig:
     #   path inside _SQLiteIdempotencyStore.claim_or_reclaim().
     terminal_wait_s: float = 5.0
     stale_threshold_s: float = 600.0
+    # OPS-OMEGA-01 Pattern A: TTL beyond which a *terminal-positive* (Filled)
+    # idempotency row is treated as expired and reclaimable. Without this, a
+    # single fill permanently blocks any future submission carrying the same
+    # fingerprint (strategy|symbol|side|qty|...), so a strategy that
+    # legitimately re-fires hours later is stuck on duplicate_blocked.
+    # Read at runtime from CHAD_DUPLICATE_CACHE_TTL_SECONDS when set.
+    terminal_positive_ttl_s: float = 900.0
 
     default_stock_exchange: str = "SMART"
     default_stock_currency: str = "USD"
@@ -908,6 +915,7 @@ class _SQLiteIdempotencyStore:
         *,
         stale_threshold_s: float,
         ib_probe: Optional[Callable[[Optional[int]], str]] = None,
+        terminal_positive_ttl_s: Optional[float] = None,
     ) -> bool:
         """State-machine-aware idempotency claim.
 
@@ -992,22 +1000,41 @@ class _SQLiteIdempotencyStore:
             existing_status, existing_updated_at, existing_order_id = row
             classification = _classify_idempotency_status(existing_status)
 
-            # S2 — terminal-positive (Filled). UNCONDITIONAL block.
-            if classification == "terminal_positive":
-                return False
-
-            # S3 — terminal-negative. DELETE + fresh INSERT.
-            if classification == "terminal_negative":
-                self._delete_and_reinsert(conn, key, payload, now)
-                return True
-
-            # Non-terminal. Check staleness.
+            # Compute row age once; reused by S2-TTL and S4/S5 branches.
             age_dt = _parse_row_updated_at(existing_updated_at)
             if age_dt is None:
                 # Unparseable timestamp — treat as stale to drive recovery.
                 age_seconds = float("inf")
             else:
                 age_seconds = (now - age_dt).total_seconds()
+
+            # S2 — terminal-positive (Filled). UNCONDITIONAL block within the
+            # configured TTL window; reclaimable once the row is older than
+            # ``terminal_positive_ttl_s`` (OPS-OMEGA-01 Pattern A). The TTL
+            # exists because a strategy fingerprint can legitimately re-fire
+            # hours after a fill — the cache must not permanently lock it out.
+            # When ``terminal_positive_ttl_s`` is None or <= 0 the previous
+            # "block forever" semantics are preserved.
+            if classification == "terminal_positive":
+                ttl_val = terminal_positive_ttl_s
+                if ttl_val is None or float(ttl_val) <= 0.0 or age_seconds < float(ttl_val):
+                    return False
+                LOGGER.info(
+                    "ibkr.idempotency_terminal_positive_expired_reclaim",
+                    extra={
+                        "key": key,
+                        "age_seconds": age_seconds,
+                        "ttl_seconds": float(ttl_val),
+                        "prior_status": existing_status,
+                    },
+                )
+                self._delete_and_reinsert(conn, key, payload, now)
+                return True
+
+            # S3 — terminal-negative. DELETE + fresh INSERT.
+            if classification == "terminal_negative":
+                self._delete_and_reinsert(conn, key, payload, now)
+                return True
 
             # S4 — non-terminal AND not stale → block (still working).
             if age_seconds < float(stale_threshold_s):
@@ -2238,6 +2265,7 @@ class IbkrAdapter:
                 now,
                 stale_threshold_s=float(self._config.stale_threshold_s),
                 ib_probe=_probe_for_key,
+                terminal_positive_ttl_s=self._resolve_terminal_positive_ttl_s(),
             )
             if not claimed:
                 existing = self._idempotency.get(idempotency_key) or {}
@@ -2649,10 +2677,20 @@ class IbkrAdapter:
           (UNCONDITIONAL block) and refuses to reclaim. This closes the
           restart-gap double-submit hole where openTrades alone would lie.
         """
-        if ib is None or broker_order_id is None or broker_order_id <= 0:
-            # Without a live IB handle or a broker order id we cannot prove
-            # the order is gone. Refuse to claim ABSENT — fail closed.
+        if ib is None:
+            # Without a live IB handle we cannot prove the order is gone.
+            # Refuse to claim ABSENT — fail closed.
             return _PROBE_STILL_ACTIVE
+        if broker_order_id is None or broker_order_id <= 0:
+            # OPS-OMEGA-01 Pattern A: a stale non-terminal row with no
+            # broker_order_id means no broker order was ever placed (the
+            # row was written by a pre-submission short-circuit such as
+            # ``duplicate_open_order`` / ``suppressed_open_orders_cap``,
+            # or an orphaned ``claimed`` row from a crash). Treat as
+            # ABSENT so the row can be reclaimed; without this, the row
+            # is locked forever because the previous fail-closed default
+            # bumped updated_at_utc on every probe.
+            return _PROBE_ABSENT
 
         # ----- Step 1: scan openTrades / trades for the order. -----
         found_status: Optional[str] = None
@@ -2935,6 +2973,25 @@ class IbkrAdapter:
     def _compute_idempotency_key(self, intent: NormalizedIntent) -> str:
         payload = self._stable_idempotency_payload(intent)
         return _hash_payload(payload)
+
+    def _resolve_terminal_positive_ttl_s(self) -> Optional[float]:
+        """Return the effective terminal-positive idempotency TTL in seconds.
+
+        Honours the ``CHAD_DUPLICATE_CACHE_TTL_SECONDS`` env var as a runtime
+        override; otherwise falls back to the value baked into the
+        ``IbkrAdapterConfig``. A non-positive value disables the TTL and
+        preserves the original "Filled blocks forever" semantics.
+        """
+        raw = os.environ.get("CHAD_DUPLICATE_CACHE_TTL_SECONDS")
+        if raw is not None and raw.strip() != "":
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                LOGGER.warning(
+                    "ibkr.duplicate_cache_ttl_env_invalid",
+                    extra={"raw": raw},
+                )
+        return float(self._config.terminal_positive_ttl_s)
 
     @staticmethod
     def _stable_idempotency_payload(intent: NormalizedIntent) -> Mapping[str, Any]:
