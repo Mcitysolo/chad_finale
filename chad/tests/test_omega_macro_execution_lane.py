@@ -55,6 +55,20 @@ def _isolate_from_disk_bars(monkeypatch):
     monkeypatch.setattr(ep, "_load_latest_bar_ts_for_symbol", lambda _s: "")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stop_bus(monkeypatch):
+    # NEW-GAP-033b / Box 031: force the stop-bus check to False so that the
+    # production short-circuit in build_ibkr_intents_from_plan does not consult
+    # live runtime/stop_bus.json. Production behavior is correct and unchanged;
+    # this fixture only isolates the omega_macro execution-lane unit tests
+    # from a real-world latency excursion that would otherwise legitimately
+    # return [] and mask the registry / intent-building assertions.
+    import chad.risk.stop_bus_state as sbs
+
+    monkeypatch.setattr(sbs, "is_stop_bus_active", lambda *_a, **_kw: False)
+    monkeypatch.setattr(ep, "_stop_bus_active", lambda: False)
+
+
 _OMEGA_MACRO_EXPECTED_EXCHANGE = {
     "ZN": "CBOT",
     "ZB": "CBOT",

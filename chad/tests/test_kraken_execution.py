@@ -27,6 +27,22 @@ from chad.execution.execution_pipeline import (
 from chad.types import AssetClass, RoutedSignal, SignalSide, StrategyName
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stop_bus(monkeypatch):
+    # NEW-GAP-033b / Box 031: force the stop-bus check to False so that the
+    # production short-circuit in build_kraken_intents_from_routed_signals
+    # does not consult live runtime/stop_bus.json. Production behavior is
+    # correct and unchanged; this fixture only isolates the Kraken intent
+    # builder tests from a real-world latency excursion that would
+    # otherwise legitimately return [] and mask the per-signal intent
+    # assertions we care about.
+    import chad.risk.stop_bus_state as sbs
+    import chad.execution.execution_pipeline as ep
+
+    monkeypatch.setattr(sbs, "is_stop_bus_active", lambda *_a, **_kw: False)
+    monkeypatch.setattr(ep, "_stop_bus_active", lambda: False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

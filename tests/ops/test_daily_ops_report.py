@@ -108,9 +108,9 @@ def test_summarize_ledger_payload_wrapped_and_untrusted_detection(ops_module, mo
         ledger,
         [
             # Trusted realized (pnl counts)
-            {"timestamp_utc": "2026-01-16T00:00:01Z", "payload": {"strategy": "beta", "symbol": "AAPL", "pnl": 1.25, "extra": {}}},
+            {"timestamp_utc": "2026-01-16T00:00:01Z", "payload": {"strategy": "beta_trend", "symbol": "AAPL", "pnl": 1.25, "extra": {}}},
             # Untrusted entry-only (counts as record, counts as untrusted, pnl still included if present; our summarizer includes pnl if finite)
-            {"timestamp_utc": "2026-01-16T00:00:02Z", "payload": {"strategy": "beta", "symbol": "AAPL", "pnl": 0.0, "extra": {"pnl_untrusted": True}}},
+            {"timestamp_utc": "2026-01-16T00:00:02Z", "payload": {"strategy": "beta_trend", "symbol": "AAPL", "pnl": 0.0, "extra": {"pnl_untrusted": True}}},
             # Another trusted negative
             {"timestamp_utc": "2026-01-16T00:00:03Z", "payload": {"strategy": "alpha", "symbol": "MSFT", "pnl": -2.0, "extra": {}}},
         ],
