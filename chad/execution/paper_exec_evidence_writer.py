@@ -1599,11 +1599,24 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
                 ev.extra = dict(ev.extra) if ev.extra else {}
             ev.extra["pnl_untrusted"] = True
             ev.extra["pnl_untrusted_reason"] = "placeholder_price_without_price_cache"
+            # P0-1 (2026-05-23): preserve original placeholder values under
+            # forensic extra keys, then zero the top-level numeric fields so
+            # the row cannot be misread as a real $100 fill by any consumer
+            # that only checks top-level fill_price/expected_price.
+            ev.extra["trust_state"] = "PLACEHOLDER"
+            ev.extra["placeholder_fill_price"] = final_fill
+            ev.extra["placeholder_expected_price"] = final_expected
+            ev.extra["placeholder_price_cache"] = cached  # 0.0 here = missing
             tags_list = list(ev.tags) if ev.tags else []
-            for t in ("pnl_untrusted", "placeholder_price"):
+            for t in ("pnl_untrusted", "placeholder", "placeholder_price"):
                 if t not in tags_list:
                     tags_list.append(t)
             ev.tags = tuple(tags_list)
+            ev.reject = True
+            ev.status = "rejected"
+            ev.fill_price = 0.0
+            ev.notional = 0.0
+            ev.expected_price = 0.0
         except Exception:
             pass
 
@@ -1622,14 +1635,28 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
                 if not isinstance(ev.extra, dict):
                     ev.extra = dict(ev.extra) if ev.extra else {}
                 ev.extra["pnl_untrusted"] = True
+                # P0-1 (2026-05-23): retain the original deviating values in
+                # extra for forensic audit, but zero out the top-level
+                # fill_price/notional/expected_price so the row no longer
+                # carries the numeric $100 placeholder fingerprint. The
+                # row is still persisted (audit trail), still rejected, and
+                # still cannot enter trusted PnL — but a future grep for
+                # fill_price=100.0 will not match this record.
                 ev.extra["pnl_untrusted_reason"] = (
-                    f"fill_price={final_fill} deviates "
-                    f"{deviation*100:.0f}% from price_cache={cached}"
+                    f"placeholder_no_broker_confirmed_fill_price "
+                    f"(deviation={deviation*100:.0f}%; "
+                    f"placeholder_fill_price={final_fill}; "
+                    f"price_cache={cached})"
                 )
+                ev.extra["trust_state"] = "PLACEHOLDER"
+                ev.extra["placeholder_fill_price"] = final_fill
+                ev.extra["placeholder_expected_price"] = final_expected
+                ev.extra["placeholder_price_cache"] = cached
                 # Also tag for tag-based untrusted detectors.
                 tags_list = list(ev.tags) if ev.tags else []
-                if "pnl_untrusted" not in tags_list:
-                    tags_list.append("pnl_untrusted")
+                for _t in ("pnl_untrusted", "placeholder"):
+                    if _t not in tags_list:
+                        tags_list.append(_t)
                 ev.tags = tuple(tags_list)
                 # Demote the record from "filled" to "rejected" so the
                 # placeholder cannot enter trade_closer FIFO matching even
@@ -1638,6 +1665,17 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
                 # status/reject make it ineligible for realized PnL.
                 ev.reject = True
                 ev.status = "rejected"
+                # P0-1: zero out the numeric placeholder fingerprint on the
+                # top-level fields. fill_price=0.0 (no broker-confirmed
+                # numeric price), notional=0.0 (cannot be quantity*0), and
+                # expected_price=0.0 so the row no longer carries the
+                # canonical $100 forensic fingerprint at any top-level
+                # field. The original deviating values are preserved under
+                # ev.extra["placeholder_*"] so audit and root-cause analysis
+                # remain fully reconstructible.
+                ev.fill_price = 0.0
+                ev.notional = 0.0
+                ev.expected_price = 0.0
             except Exception:
                 pass
 
