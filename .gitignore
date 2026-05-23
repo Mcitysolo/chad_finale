@@ -24,3 +24,6 @@ wip_quarantine_*/
 runtime/pnl_state.json
 *.bak
 *.pre_*
+
+# Forensic-archive directory (P3-1 telegram dedupe + P3-2 dynamic_caps backups)
+_archive/
