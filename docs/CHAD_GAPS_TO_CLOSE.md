@@ -47,7 +47,7 @@ Here is the unified final list. Everything in one place.
 | D2T2 | BAG LMT discipline — MKT coerced to LMT, no-price BAG hard-blocked | ✅ Built |
 | D2T3 | Offline quote check — synthetic mid vs estimated debit, tolerance gate | ✅ Built |
 | D2T3B | Live quote probe — read-only IBKR snapshot, real SPY prices confirmed | ✅ Built |
-| D2T3C | BAG limit-price unit normalisation — ÷100 for IBKR lmtPrice | ⬜ Next engineering task |
+| D2T3C | BAG limit-price unit normalisation — per-share contract preserved at adapter (no ÷100 conversion needed); ÷100 applied only at paper-fill `notional` boundary | ✅ Built (BOX-051 OFFICIAL: contract documented in `runtime/completion_matrix_evidence/BOX-051_OFFICIAL_BAG_Tier_3C_limit_price_unit_normalization.md`; pinned by `chad/tests/test_box051_official_bag_lmt_unit_normalization.py` + 6 prior BAG test files, 76 tests total) |
 | D2T4 | BAG bracket/OCA or failsafe exit — unmanaged position protection | ⬜ Pre-live requirement |
 | D2T5 | spread_id-aware position guard — prevents concurrent BAG collision | ⬜ Pre-live requirement |
 | D2T6 | Live BAG fill harness — broker-confirmed round-trip test | ⬜ Pre-live requirement |
