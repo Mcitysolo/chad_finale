@@ -353,6 +353,7 @@ def main() -> int:
 
     mismatches: List[Dict[str, Any]] = []
     drifts: List[Dict[str, Any]] = []
+    diagnostic_drifts: List[Dict[str, Any]] = []
     excluded: List[str] = []
     futures_excluded: List[str] = []
     symbols = set(chad_side) | set(broker_side)
@@ -383,7 +384,14 @@ def main() -> int:
                     "(no strategy attribution; broker moved independently)",
                     sym, c, b, diff,
                 )
-                drifts.append({"symbol": sym, "chad": c, "broker": b, "diff": diff})
+                # PR-09: route broker_sync-only advisory entries to
+                # diagnostic_drifts. The drifts[] field is reserved for
+                # strategy-attributable drifts that MUST trip live_readiness
+                # RED (GAP-041 safety net preserved). Today's classifier
+                # never lands here when strategies are involved — see else.
+                diagnostic_drifts.append(
+                    {"symbol": sym, "chad": c, "broker": b, "diff": diff, "kind": "broker_sync_only"}
+                )
             else:
                 mismatches.append({"symbol": sym, "chad": c, "broker": b, "diff": diff})
                 worst = max(worst, diff)
@@ -417,14 +425,15 @@ def main() -> int:
         "worst_diff": worst,
         "mismatches": mismatches,
         "drifts": drifts,
+        "diagnostic_drifts": diagnostic_drifts,
         "excluded_symbols": excluded,
         "futures_excluded_symbols": futures_excluded,
         "exclusion_policy": EXCLUSION_POLICY,
         "notes": [],
     })
     LOG.info(
-        "reconciliation status=%s worst_diff=%.2f mismatches=%d drifts=%d futures_excluded=%d",
-        status, worst, len(mismatches), len(drifts), len(futures_excluded),
+        "reconciliation status=%s worst_diff=%.2f mismatches=%d drifts=%d diagnostic_drifts=%d futures_excluded=%d",
+        status, worst, len(mismatches), len(drifts), len(diagnostic_drifts), len(futures_excluded),
     )
     return 0
 

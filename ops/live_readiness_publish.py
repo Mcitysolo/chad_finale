@@ -245,16 +245,36 @@ def feed_ok() -> Tuple[bool, str]:
 
 
 def lifecycle_truth_ok() -> Tuple[bool, str]:
+    """PR-09: read broker_authority_status as the authoritative truth field
+    when positions_truth selects the broker-authority path. The legacy
+    truth_ok boolean is still the gate (broker_authority_status is derived
+    from it), but the reason string now surfaces both signals so operators
+    can tell which path published the answer.
+
+    Lifecycle replay diagnostic (evidence.reconciliation_status,
+    replay_diagnostic_status) is visibility-only when
+    replay_diagnostic_blocks_truth=false and is intentionally not consulted
+    here.
+    """
     try:
         truth = read_json_dict(TRUTH_PATH)
         lifecycle = read_json_dict(LIFECYCLE_PATH)
-        if not bool(truth.get("truth_ok", False)):
-            return False, f"truth_ok={truth.get('truth_ok', False)} source={truth.get('truth_source')}"
+        truth_ok = bool(truth.get("truth_ok", False))
+        truth_source = truth.get("truth_source")
+        broker_status = str(truth.get("broker_authority_status") or "").upper()
+        if not truth_ok:
+            return False, (
+                f"truth_ok={truth_ok} source={truth_source} "
+                f"broker_authority_status={broker_status or 'ABSENT'}"
+            )
         if bool(lifecycle.get("gap_flag", True)):
             return False, "lifecycle_gap_flag=true"
         if bool(lifecycle.get("backlog_flag", True)):
             return False, "lifecycle_backlog_flag=true"
-        return True, "lifecycle_truth=GREEN"
+        return True, (
+            f"lifecycle_truth=GREEN broker_authority_status={broker_status or 'GREEN_INFERRED'} "
+            f"source={truth_source}"
+        )
     except Exception as exc:
         return False, f"lifecycle_truth_unreadable:{type(exc).__name__}"
 

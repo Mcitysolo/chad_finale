@@ -583,6 +583,42 @@ def build_positions_truth(
     else:
         truth_source = "FAIL_CLOSED_BOOTSTRAP_SCOPE_UNPROVEN"
 
+    # PR-09: separate broker-authority truth from replay diagnostics.
+    # broker_authority_* answers "did the broker snapshot reconcile with the
+    # IBKR paper ledger?" — the actual gate for paper/live readiness.
+    # replay_diagnostic_* answers "did lifecycle-replay reproduce that scope?"
+    # — useful evidence but never authoritative when truth_source selects the
+    # broker-authority path. replay_diagnostic_blocks_truth=false in that case.
+    broker_authority_status = "GREEN" if truth_ok else "RED"
+    if truth_ok:
+        broker_authority_reason = (
+            f"BROKER_AUTHORITY_GREEN: upstream={reconciliation_status_upstream or 'GREEN'} "
+            f"snapshot={snapshot_positions_count} ledger={ledger_state_positions_count}"
+        )
+    else:
+        missing_pieces = []
+        if not upstream_green:
+            missing_pieces.append(f"upstream={reconciliation_status_upstream or 'UNKNOWN'}")
+        if not bool(ledger_state):
+            missing_pieces.append("ledger_state_missing")
+        if snapshot_positions_count <= 0:
+            missing_pieces.append("snapshot_empty")
+        if ledger_state_positions_count != snapshot_positions_count:
+            missing_pieces.append(
+                f"count_mismatch_ledger={ledger_state_positions_count}_vs_snapshot={snapshot_positions_count}"
+            )
+        broker_authority_reason = "BROKER_AUTHORITY_RED: " + " ".join(missing_pieces or ["unknown"])
+
+    replay_diagnostic_status = reconciliation_status
+    if scope_mismatch:
+        replay_diagnostic_status = "PARTIAL"
+    elif replay_coverage_status == "PARTIAL_REPLAY_COVERAGE":
+        replay_diagnostic_status = "PARTIAL"
+    replay_diagnostic_reason = reconciliation_status_reason
+    replay_diagnostic_blocks_truth = not bool(
+        truth_source.startswith("BROKER_SNAPSHOT_RECONCILED_WITH_LEDGER")
+    )
+
     payload_nohash: Dict[str, Any] = {
         "schema_version": "positions_truth.v1",
         "as_of_event_ts_utc": evidence.last_event_ts_utc,
@@ -591,6 +627,11 @@ def build_positions_truth(
         "fees_included": bool(fees_present),
         "truth_ok": bool(truth_ok),
         "truth_source": truth_source,
+        "broker_authority_status": broker_authority_status,
+        "broker_authority_reason": broker_authority_reason,
+        "replay_diagnostic_status": replay_diagnostic_status,
+        "replay_diagnostic_reason": replay_diagnostic_reason,
+        "replay_diagnostic_blocks_truth": bool(replay_diagnostic_blocks_truth),
         "evidence": {
             "broker_events_present": bool(evidence.exists),
             "broker_events_newest_file": evidence.newest_file,
@@ -628,7 +669,13 @@ def build_positions_truth(
             "and runtime/ibkr_paper_ledger_state.json reconcile GREEN and position counts align. "
             "Lifecycle replay evidence remains diagnostic only. "
             "If replay scope is mismatched against a manual/IBKR holdings book, that mismatch does not block "
-            "broker-authority truth for this path."
+            "broker-authority truth for this path. "
+            "PR-09 contract: broker_authority_status/reason carry the authoritative paper/live truth; "
+            "replay_diagnostic_status/reason are visibility-only and replay_diagnostic_blocks_truth=false "
+            "whenever truth_source begins with BROKER_SNAPSHOT_RECONCILED_WITH_LEDGER. "
+            "evidence.reconciliation_status and evidence.reconciliation_status_upstream are preserved verbatim "
+            "for backward compatibility (upstream = reconciliation_state.json::status; reconciliation_status "
+            "= replay-coverage classifier)."
         ),
     }
     payload_nohash["hash_sha256"] = _sha256_prefixed({k: v for k, v in payload_nohash.items() if k != "hash_sha256"})

@@ -479,6 +479,13 @@ class Exterminator:
         status = (recon.get("status") or "").upper()
         mismatches = recon.get("mismatches") or []
         drifts = recon.get("drifts") or []
+        # PR-09: broker_sync-only advisory entries now live in
+        # diagnostic_drifts (drifts[] is reserved for strategy-attributable
+        # drifts that MUST trip live_readiness RED). For the EX009 visibility
+        # surface, combine both so operators continue to see broker-side
+        # advisory entries without losing the GAP-041 fail-closed contract.
+        diagnostic_drifts = recon.get("diagnostic_drifts") or []
+        advisory_drifts = list(drifts) + list(diagnostic_drifts)
         if status in ("RED", "FAIL", "MISMATCH") or mismatches:
             return [Finding(
                 id="EX009C", severity=SEVERITY_CRITICAL, category="reconciliation",
@@ -487,12 +494,22 @@ class Exterminator:
                 evidence={"status": status, "mismatch_count": len(mismatches), "mismatches": mismatches[:10]},
                 recommended_next_action="Halt new entries; investigate broker truth before any further trading.",
             )]
-        if status == "GREEN" and drifts:
+        if status == "GREEN" and advisory_drifts:
             return [Finding(
                 id="EX009", severity=SEVERITY_WARNING, category="reconciliation",
                 title="Reconciliation GREEN with tracked drifts",
-                summary=f"Status GREEN but {len(drifts)} drift entries on broker side.",
-                evidence={"status": status, "drift_count": len(drifts), "drifts": drifts[:10], "worst_diff": recon.get("worst_diff")},
+                summary=(
+                    f"Status GREEN but {len(advisory_drifts)} drift entries on broker side "
+                    f"(strategy-attributable={len(drifts)} diagnostic={len(diagnostic_drifts)})."
+                ),
+                evidence={
+                    "status": status,
+                    "drift_count": len(advisory_drifts),
+                    "strategy_drift_count": len(drifts),
+                    "diagnostic_drift_count": len(diagnostic_drifts),
+                    "drifts": advisory_drifts[:10],
+                    "worst_diff": recon.get("worst_diff"),
+                },
                 recommended_next_action="Reconcile or formally exclude each drift before live promotion (SSOT v9.0 §6 #10).",
             )]
         return []
