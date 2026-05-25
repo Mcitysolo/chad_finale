@@ -27,7 +27,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "runtime"
@@ -40,6 +40,20 @@ IBKR_CLIENT_ID = 88
 CONNECT_TIMEOUT_SEC = 20
 DEFAULT_CONTRACT_DETAILS_TIMEOUT_SEC = 30
 OPTIONS_CHAIN_TIMEOUT_ENV = "CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS"
+# PR-04: bounded retry/backoff. The headline 2026-05-25 failure ("SPY=
+# timeout_after_30.0s") was a single-attempt run that gave up on the first
+# slow IBKR farm response. Multiple short retries with backoff lets us
+# absorb transient stalls without changing the failure-loud contract:
+# every attempt is logged, and when *every* attempt fails we still write
+# the empty-cache-with-error-field that R17/R18 already monitor.
+OPTIONS_CHAIN_REFRESH_ATTEMPTS_ENV = "CHAD_OPTIONS_CHAIN_REFRESH_ATTEMPTS"
+OPTIONS_CHAIN_REFRESH_BACKOFF_ENV = "CHAD_OPTIONS_CHAIN_REFRESH_BACKOFF_SECONDS"
+DEFAULT_REFRESH_ATTEMPTS = 3
+DEFAULT_REFRESH_BACKOFF_SECONDS = 5.0
+MAX_REFRESH_ATTEMPTS = 10  # safety cap
+FAILURE_ARTIFACT_NAME = "options_chain_refresh_failure.json"
+FAILURE_ARTIFACT_SCHEMA = "options_chain_refresh_failure.v1"
+SERVICE_ENTRYPOINT = "python -m chad.market_data.options_chain_refresh"
 PRICE_PCT_WINDOW = 0.10
 # Phase B Item 6: cache schema version. v1 (implicit) = expirations + strikes
 # only. v2 adds per-symbol spot_price so the synthetic Greeks publisher can
@@ -83,6 +97,70 @@ def _utc_now_iso() -> str:
 
 def _log(msg: str) -> None:
     print(f"{_ts()} {msg}", flush=True)
+
+
+def _resolve_int_env(name: str, default: int, *, lo: int, hi: int) -> int:
+    """Read a positive bounded int env var, falling back to ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        _log(
+            f"WARNING env_invalid name={name} value={raw!r} reason=non_numeric "
+            f"— falling back to default {default}"
+        )
+        return default
+    if v < lo or v > hi:
+        _log(
+            f"WARNING env_invalid name={name} value={raw!r} reason=out_of_range "
+            f"[{lo},{hi}] — falling back to default {default}"
+        )
+        return default
+    return v
+
+
+def _resolve_float_env(
+    name: str, default: float, *, lo: float, hi: float
+) -> float:
+    """Read a positive finite float env var, falling back to ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        _log(
+            f"WARNING env_invalid name={name} value={raw!r} reason=non_numeric "
+            f"— falling back to default {default}"
+        )
+        return default
+    if not math.isfinite(v) or v < lo or v > hi:
+        _log(
+            f"WARNING env_invalid name={name} value={raw!r} "
+            f"reason=non_finite_or_out_of_range — falling back to default {default}"
+        )
+        return default
+    return v
+
+
+def _resolve_refresh_attempts() -> int:
+    return _resolve_int_env(
+        OPTIONS_CHAIN_REFRESH_ATTEMPTS_ENV,
+        DEFAULT_REFRESH_ATTEMPTS,
+        lo=1,
+        hi=MAX_REFRESH_ATTEMPTS,
+    )
+
+
+def _resolve_refresh_backoff_seconds() -> float:
+    return _resolve_float_env(
+        OPTIONS_CHAIN_REFRESH_BACKOFF_ENV,
+        DEFAULT_REFRESH_BACKOFF_SECONDS,
+        lo=0.0,
+        hi=600.0,
+    )
 
 
 def _resolve_contract_details_timeout() -> float:
@@ -334,6 +412,81 @@ def _refresh_symbol(ib: Any, symbol: str) -> Dict[str, Any]:
     }
 
 
+def _read_last_successful_ts(cache_path: Path) -> Optional[str]:
+    """Best-effort read of the prior cache's ``ts_utc`` for failure lineage."""
+    try:
+        if not cache_path.is_file():
+            return None
+        d = json.loads(cache_path.read_text(encoding="utf-8"))
+        chains = d.get("chains") if isinstance(d, dict) else None
+        ts = d.get("ts_utc") if isinstance(d, dict) else None
+        if isinstance(chains, dict) and chains and isinstance(ts, str):
+            return ts
+    except Exception:
+        return None
+    return None
+
+
+def _classify_blocked_reason(symbol_errors: Dict[str, str]) -> str:
+    """Infer the operator-facing blocked_reason from collected per-symbol
+    errors. The label is informational — health-monitor rules R17/R18 do
+    not branch on it — but it gives operators an immediate read on whether
+    the failure is local code, IBKR farm degradation, or contract data.
+    """
+    if not symbol_errors:
+        return "unknown"
+    reasons = list(symbol_errors.values())
+    if all("timeout_after" in r for r in reasons):
+        return "ibkr_contract_details_unresponsive"
+    if all("could not resolve spot price" in r for r in reasons):
+        return "ibkr_spot_unavailable"
+    if all("qualifyContracts" in r for r in reasons):
+        return "ibkr_qualify_contracts_failed"
+    return "mixed_failures"
+
+
+def _write_failure_artifact(
+    *,
+    symbol_errors: Dict[str, str],
+    symbol_attempts: Dict[str, List[Dict[str, Any]]],
+    max_attempts: int,
+    timeout_seconds: float,
+    backoff_seconds: float,
+    last_successful_ts: Optional[str] = None,
+) -> None:
+    """Emit runtime/options_chain_refresh_failure.json (Pattern E).
+
+    ``last_successful_ts`` should be captured by the caller BEFORE the empty
+    cache is written; if omitted we still try to recover it from disk.
+    """
+    if last_successful_ts is None:
+        last_successful_ts = _read_last_successful_ts(CACHE_PATH)
+    blocked_reason = _classify_blocked_reason(symbol_errors)
+    payload: Dict[str, Any] = {
+        "schema_version": FAILURE_ARTIFACT_SCHEMA,
+        "ts_utc": _utc_now_iso(),
+        "status": "failed",
+        "provider": "ibkr_contract_details",
+        "service_entrypoint": SERVICE_ENTRYPOINT,
+        "max_attempts": int(max_attempts),
+        "per_call_timeout_seconds": float(timeout_seconds),
+        "backoff_seconds": float(backoff_seconds),
+        "symbol_errors": dict(symbol_errors),
+        "attempts": {k: list(v) for k, v in symbol_attempts.items()},
+        "error_type": "all_symbols_failed",
+        "error_message": "all_symbols_failed: "
+        + "; ".join(f"{s}={r}" for s, r in symbol_errors.items()),
+        "last_successful_ts": last_successful_ts,
+        "blocked_reason": blocked_reason,
+    }
+    fp = RUNTIME_DIR / FAILURE_ARTIFACT_NAME
+    _atomic_write(fp, payload)
+    _log(
+        f"failure_artifact_written path={fp} "
+        f"blocked_reason={blocked_reason} last_successful_ts={last_successful_ts}"
+    )
+
+
 def _atomic_write(cache_path: Path, cache_doc: Dict[str, Any]) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(cache_path) + f".tmp.{os.getpid()}")
@@ -392,33 +545,105 @@ def run(symbols: Sequence[str]) -> int:
 
         chains: Dict[str, Any] = {}
         symbol_errors: Dict[str, str] = {}
+        symbol_attempts: Dict[str, List[Dict[str, Any]]] = {}
         success = 0
         failure = 0
+
+        max_attempts = _resolve_refresh_attempts()
+        backoff_seconds = _resolve_refresh_backoff_seconds()
+        timeout_seconds = _resolve_contract_details_timeout()
+        _log(
+            f"refresh_config attempts={max_attempts} "
+            f"backoff_seconds={backoff_seconds} "
+            f"per_call_timeout_seconds={timeout_seconds}"
+        )
 
         for raw_sym in symbols:
             sym = raw_sym.strip().upper()
             if not sym:
                 continue
-            try:
-                chain = _refresh_symbol(ib, sym)
+            attempts_log: List[Dict[str, Any]] = []
+            symbol_attempts[sym] = attempts_log
+            last_error: str = ""
+            chain: Optional[Dict[str, Any]] = None  # type: ignore[assignment]
+            for attempt_idx in range(1, max_attempts + 1):
+                attempt_ts = _utc_now_iso()
+                try:
+                    chain = _refresh_symbol(ib, sym)
+                    attempts_log.append(
+                        {
+                            "attempt": attempt_idx,
+                            "ts_utc": attempt_ts,
+                            "result": "success",
+                            "strikes": len(chain.get("strikes") or []),
+                            "expirations": len(chain.get("expirations") or []),
+                        }
+                    )
+                    _log(
+                        f"{sym}: attempt={attempt_idx}/{max_attempts} "
+                        f"result=success strikes={len(chain['strikes'])} "
+                        f"expiries={len(chain['expirations'])}"
+                    )
+                    break
+                except OptionsChainTimeoutError as exc:
+                    last_error = f"timeout_after_{exc.timeout_seconds}s"
+                    attempts_log.append(
+                        {
+                            "attempt": attempt_idx,
+                            "ts_utc": attempt_ts,
+                            "result": "timeout",
+                            "error_type": "OptionsChainTimeoutError",
+                            "timeout_seconds": float(exc.timeout_seconds),
+                        }
+                    )
+                    _log(
+                        f"{sym}: attempt={attempt_idx}/{max_attempts} "
+                        f"result=timeout err={exc}"
+                    )
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    attempts_log.append(
+                        {
+                            "attempt": attempt_idx,
+                            "ts_utc": attempt_ts,
+                            "result": "error",
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                        }
+                    )
+                    _log(
+                        f"{sym}: attempt={attempt_idx}/{max_attempts} "
+                        f"result=error err={exc}"
+                    )
+                # Backoff before next attempt (skip after the last).
+                if attempt_idx < max_attempts and backoff_seconds > 0:
+                    _log(
+                        f"{sym}: backing off {backoff_seconds}s before "
+                        f"attempt {attempt_idx + 1}/{max_attempts}"
+                    )
+                    try:
+                        ib.sleep(backoff_seconds)
+                    except Exception:
+                        # Fall back to plain wait if the IB stub lacks sleep.
+                        import time as _time
+
+                        _time.sleep(backoff_seconds)
+
+            if chain is not None:
                 chains[sym] = chain
-                _log(
-                    f"{sym}: {len(chain['strikes'])} strikes, "
-                    f"{len(chain['expirations'])} expiries written"
-                )
                 success += 1
-            except OptionsChainTimeoutError as exc:
-                symbol_errors[sym] = (
-                    f"timeout_after_{exc.timeout_seconds}s"
+            else:
+                symbol_errors[sym] = last_error or "no_attempts_succeeded"
+                _log(
+                    f"{sym}: FAILED after attempts={max_attempts} "
+                    f"last_error={last_error!r}"
                 )
-                _log(f"{sym}: FAILED err=timeout ({exc})")
-                failure += 1
-            except Exception as exc:
-                symbol_errors[sym] = f"{type(exc).__name__}: {exc}"
-                _log(f"{sym}: FAILED err={exc}")
                 failure += 1
 
         if not chains:
+            # Snapshot the prior cache's ts_utc BEFORE we overwrite it, so the
+            # failure artifact can quote the last successful refresh.
+            last_successful_ts = _read_last_successful_ts(CACHE_PATH)
             error_msg = (
                 "all_symbols_failed: "
                 + (
@@ -445,7 +670,27 @@ def run(symbols: Sequence[str]) -> int:
                     f"ERROR atomic write of empty cache failed path={CACHE_PATH} "
                     f"err={exc}"
                 )
-            _log(f"SUMMARY success={success} failure={failure} (empty cache written)")
+            # Pattern E — emit a structured failure artifact so operators see
+            # attempts, blocked_reason, and the last_successful_ts of the
+            # prior chain without parsing the cache error string.
+            try:
+                _write_failure_artifact(
+                    symbol_errors=symbol_errors,
+                    symbol_attempts=symbol_attempts,
+                    max_attempts=max_attempts,
+                    timeout_seconds=timeout_seconds,
+                    backoff_seconds=backoff_seconds,
+                    last_successful_ts=last_successful_ts,
+                )
+            except Exception as exc:
+                _log(
+                    f"ERROR failure-artifact write failed path={FAILURE_ARTIFACT_NAME} "
+                    f"err={exc}"
+                )
+            _log(
+                f"SUMMARY success={success} failure={failure} "
+                f"(empty cache + failure artifact written)"
+            )
             return 1
 
         cache_doc = {
@@ -463,6 +708,16 @@ def run(symbols: Sequence[str]) -> int:
         except Exception as exc:
             _log(f"ERROR atomic write failed path={CACHE_PATH} err={exc}")
             return 1
+
+        # When the run is healthy (no symbol_errors at all) clear any prior
+        # failure artifact so the operator surface reflects current truth.
+        if not symbol_errors:
+            try:
+                fp = RUNTIME_DIR / FAILURE_ARTIFACT_NAME
+                if fp.is_file():
+                    fp.unlink()
+            except Exception:
+                pass
 
         _log(f"SUMMARY success={success} failure={failure}")
         return 0 if failure == 0 else 1
