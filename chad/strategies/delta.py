@@ -46,7 +46,12 @@ Core Logic
    - do not adjust size unless change >= min_delta_size
 """
 
+import json
+import logging
+import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from chad.types import (
@@ -65,6 +70,29 @@ from chad.strategies._upstream_exclusion import (
 )
 
 Number = float
+
+LOG = logging.getLogger("chad.strategies.delta")
+
+# PR-02: price-cache ground truth used as the cross-check reference for
+# delta's upstream price validation. The path is resolved lazily so tests
+# can monkey-patch it via the env var.
+_PRICE_CACHE_PATH = Path(
+    os.environ.get(
+        "CHAD_PRICE_CACHE_PATH",
+        "/home/ubuntu/chad_finale/runtime/price_cache.json",
+    )
+)
+
+# Symbols where a fill_price of 100.0 is the canonical "no-live-price"
+# placeholder fingerprint (mirrors paper_exec_evidence_writer._LIQUID_PRICED_EQUITIES).
+# Delta cross-checks resolved prices against the broker price_cache for
+# these symbols and abstains on a >50% deviation.
+_LIQUID_PRICED_ETFS = frozenset({"SPY", "QQQ", "IWM", "DIA"})
+
+# Cross-check deviation threshold. Matches the paper_exec_evidence_writer
+# deviation guard so delta upstream catches the same placeholder pattern
+# the writer would otherwise tag downstream.
+_PRICE_CACHE_DEVIATION_THRESHOLD = 0.50
 
 
 # -------------------------
@@ -232,6 +260,138 @@ def _rolling_max(values: Sequence[float], period: int) -> List[float]:
     return out
 
 
+def _is_finite_positive(value: Any) -> bool:
+    """True only when value parses as a finite, strictly positive float.
+
+    Rejects None, non-numeric, NaN, +/-Inf, 0, and negative values in a
+    single call.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(v):
+        return False
+    return v > 0.0
+
+
+def _load_price_cache_entry(symbol: str) -> float:
+    """Read runtime/price_cache.json::prices[symbol] as a float.
+
+    Returns 0.0 on any failure (missing file, missing key, parse error)
+    so the caller can treat absence and corruption identically.
+    Resolves the path at call time so test monkey-patches via
+    CHAD_PRICE_CACHE_PATH take effect.
+    """
+    try:
+        path = Path(
+            os.environ.get("CHAD_PRICE_CACHE_PATH", str(_PRICE_CACHE_PATH))
+        )
+        if not path.is_file():
+            return 0.0
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    if not isinstance(data, dict):
+        return 0.0
+    prices = data.get("prices")
+    if not isinstance(prices, dict):
+        return 0.0
+    raw = prices.get(symbol)
+    try:
+        return float(raw) if raw is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _resolve_positive_price(
+    ctx: Any,
+    sym: str,
+    prices: Mapping[str, Any],
+) -> Optional[Tuple[float, str]]:
+    """PR-02: resolve a strictly-positive price for sym across all sources
+    delta is willing to trust, and cross-check against runtime/price_cache.json.
+
+    Source priority (first finite-positive wins):
+      1. ``prices[sym]`` (caller-supplied prices map)
+      2. ``ctx.ticks[sym].price`` (live tick)
+      3. last close in ``ctx.bars[sym]``
+      4. ``runtime/price_cache.json::prices[sym]`` (broker cache)
+
+    Validation: None / non-numeric / NaN / +/-Inf / 0 / negative -> abstain.
+
+    Cross-check (PR-02 placeholder defense): for liquid equity/ETF symbols
+    that have a positive entry in runtime/price_cache.json, the resolved
+    candidate must agree with the cache within
+    ``_PRICE_CACHE_DEVIATION_THRESHOLD`` (50%). A larger deviation matches
+    the $100-placeholder fingerprint that paper_exec_evidence_writer's
+    deviation guard catches downstream; abstaining upstream is the
+    PR-02-mandated fix so the placeholder row is never emitted.
+
+    Returns (price, source_label) on success; None on abstain. Callers
+    that want to log on abstain should do so with the symbol and side in
+    scope so the message reads cleanly in journalctl.
+    """
+    cached = _load_price_cache_entry(sym)
+
+    candidates: List[Tuple[Any, str]] = [(prices.get(sym), "prices_map")]
+
+    tick = None
+    try:
+        tick = ctx.ticks.get(sym) if hasattr(ctx, "ticks") and ctx.ticks is not None else None
+    except Exception:
+        tick = None
+    if tick is not None:
+        candidates.append((getattr(tick, "price", None), "ctx_ticks"))
+
+    last_close: Any = None
+    try:
+        bars_map = _get_mapping(ctx, "bars")
+        bars = bars_map.get(sym) if bars_map else None
+        if isinstance(bars, (list, tuple)) and bars:
+            last_bar = bars[-1]
+            if isinstance(last_bar, dict):
+                last_close = last_bar.get("close") or last_bar.get("c")
+            elif isinstance(last_bar, (list, tuple)) and len(last_bar) >= 5:
+                last_close = last_bar[-2]
+    except Exception:
+        last_close = None
+    candidates.append((last_close, "ctx_bars_last_close"))
+
+    if cached > 0.0:
+        candidates.append((cached, "price_cache_json"))
+
+    chosen: Optional[Tuple[float, str]] = None
+    for raw_val, source in candidates:
+        if _is_finite_positive(raw_val):
+            chosen = (float(raw_val), source)
+            break
+
+    if chosen is None:
+        return None
+
+    px, source = chosen
+
+    # Cross-check against the broker price_cache. Only applied to liquid
+    # equity/ETF symbols where the placeholder fingerprint pattern is known
+    # to occur, and only when the cache itself carries a positive reference.
+    # The cache path itself is always trusted on this branch — we just
+    # mirrored from it.
+    if (
+        source != "price_cache_json"
+        and sym in _LIQUID_PRICED_ETFS
+        and cached > 0.0
+    ):
+        try:
+            deviation = abs(px - cached) / cached
+        except ZeroDivisionError:
+            deviation = 0.0
+        if deviation > _PRICE_CACHE_DEVIATION_THRESHOLD:
+            return None
+
+    return px, source
+
+
 def _asset_class(sym: str) -> AssetClass:
     # Keep simple + stable for policy/routing
     if sym in {"SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "GLD", "LQD", "VWO", "IEMG"}:
@@ -375,13 +535,21 @@ def _propose_for_symbol(sym: str, ctx: MarketContext, p: DeltaParams, prices: Ma
     if portfolio.cash < p.min_cash:
         return []
 
-    px = _safe_float(prices.get(sym), 0.0)
-    if px <= 0.0:
-        tick = ctx.ticks.get(sym)
-        if tick is not None and tick.price > 0:
-            px = float(tick.price)
-    if px <= 0.0:
+    # PR-02: gate the entire per-symbol pipeline on a strictly-positive
+    # price that survives cross-check against runtime/price_cache.json.
+    # Abstaining here prevents BOTH the entry (BUY) and exit (SELL) paths
+    # from emitting a TradeSignal that downstream would otherwise resolve
+    # to the $100 placeholder fingerprint (caught by P0-1 at the writer
+    # but persisted as a rejected row in FILLS_*.ndjson).
+    resolved = _resolve_positive_price(ctx, sym, prices)
+    if resolved is None:
+        # One INFO-level log per (symbol, cycle) so the abstain reason is
+        # discoverable in journalctl. The strategy emits no SELL signal,
+        # so any open position is left to the position-reconciler / guard
+        # subsystem rather than being closed against a suspect price.
+        LOG.info("DELTA_ABSTAIN_NO_VALID_PRICE symbol=%s", sym)
         return []
+    px, _price_source = resolved
 
     pos: Optional[Position] = portfolio.positions.get(sym)
     qty = float(pos.quantity) if pos is not None else 0.0
