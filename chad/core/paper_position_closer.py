@@ -35,18 +35,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from typing import Any, TYPE_CHECKING
 
+# PR-03 (ib_async Phase 2): migrated from ib_insync to ib_async. ib_async
+# preserves the full ib_insync public API surface (IB, Stock, MarketOrder,
+# LimitOrder, Order, Contract, util.patchAsyncio, ...) so the migration is
+# import-only — no call-site changes are required.
 if TYPE_CHECKING:
-    from ib_insync import IB, MarketOrder, LimitOrder, Stock  # type: ignore
+    from ib_async import IB, MarketOrder, LimitOrder, Stock  # type: ignore
 else:
-    from ib_insync import IB, MarketOrder, LimitOrder, Stock  # runtime import
+    from ib_async import IB, MarketOrder, LimitOrder, Stock  # runtime import
 
 
 def _lazy_ibkr_types() -> tuple[Any, Any, Any, Any]:
     """
-    Lazy import to keep ib_insync out of sys.modules unless execution code runs.
+    Lazy import accessor for the ib_async broker symbols. Originally added to
+    keep the broker library out of ``sys.modules`` on import; the module-level
+    import above now pulls ib_async unconditionally, but the helper is kept
+    for callers that prefer explicit, late-bound resolution.
     Returns: (IB, MarketOrder, LimitOrder, Stock)
     """
-    from ib_insync import IB, MarketOrder, LimitOrder, Stock  # type: ignore
+    from ib_async import IB, MarketOrder, LimitOrder, Stock  # type: ignore
     return IB, MarketOrder, LimitOrder, Stock
 
 

@@ -71,8 +71,9 @@ LOGGER = logging.getLogger("chad.paper_shadow_runner")
 # ---------------------------------------------------------------------------
 # Backward-compatible arming + execute gating API (TEST CONTRACT)
 # ---------------------------------------------------------------------------
-# These symbols are intentionally lightweight and must NOT import ib_insync.
-# They exist so safety gating remains auditable and stable across refactors.
+# These symbols are intentionally lightweight and must NOT import the broker
+# library (ib_async). They exist so safety gating remains auditable and stable
+# across refactors.
 
 ARM_ENV_NAME = "CHAD_PAPER_SHADOW_ARM"
 ARM_PHRASE = "I_UNDERSTAND_PAPER_CAN_PLACE_ORDERS"
@@ -101,7 +102,7 @@ def is_armed() -> bool:
 def should_place_paper_orders(cfg: PaperShadowConfig) -> tuple[bool, list[str]]:
     """
     Public gating: used by tests and callers to decide if paper orders may be placed.
-    Does not touch brokers, does not import ib_insync.
+    Does not touch brokers, does not import the broker library (ib_async).
     """
     reasons: list[str] = []
     if not bool(cfg.enabled):
@@ -592,7 +593,11 @@ class IBKRClient:
         self.ib = None
 
     def connect(self, *, retries: int) -> None:
-        from ib_insync import IB  # type: ignore
+        # PR-03 (ib_async Phase 2): migrated from ib_insync to ib_async.
+        # ib_async preserves the full ib_insync API surface so this is an
+        # import-only swap — IB(), ib.connect(), ib.isConnected(),
+        # ib.disconnect() all behave identically.
+        from ib_async import IB  # type: ignore
 
         last: Optional[Exception] = None
         for attempt in range(max(0, retries) + 1):
@@ -771,7 +776,9 @@ def _parse_hours_point(today_ymd: str, token: str) -> datetime:
 # =============================================================================
 
 def place_mkt_order(ib: Any, *, symbol: str, exchange: str, currency: str, side: str, qty: float) -> Any:
-    from ib_insync import Stock, MarketOrder  # type: ignore
+    # PR-03 (ib_async Phase 2): migrated from ib_insync to ib_async. The
+    # Stock and MarketOrder constructors carry the same shape under ib_async.
+    from ib_async import Stock, MarketOrder  # type: ignore
 
     c = Stock(symbol, exchange, currency)
     order = MarketOrder(side.upper(), float(qty))

@@ -108,16 +108,25 @@ PHASE1_MIGRATED_FILES: tuple[str, ...] = (
     "chad/core/live_loop.py",
     "chad/execution/ibkr_adapter.py",
     "chad/execution/ibkr_trade_router.py",
-)
-
-# Production source files still importing ib_insync that are explicitly
-# deferred to Phase 2. Each entry is on an active broker path or in a
-# disallow-listed category. Phase 2 will migrate these with dedicated
-# IBKR safety tests.
-PHASE2_DEFERRED_FILES: tuple[str, ...] = (
+    # PR-03 (ib_async Phase 2 completion): the last two production
+    # execution-path importers. paper_position_closer is a CLI/oneshot
+    # exit-only helper (no scheduled systemd unit). paper_shadow_runner
+    # is invoked via the wrapper subprocess (chad-paper-shadow-exec)
+    # with all broker calls gated behind the I_UNDERSTAND_PAPER_CAN_PLACE_ORDERS
+    # arm phrase. Both migrations are import-only — call-sites for IB(),
+    # ib.connect/disconnect/isConnected/placeOrder/cancelOrder and the
+    # Stock/MarketOrder/LimitOrder constructors are preserved verbatim
+    # under ib_async.
     "chad/core/paper_position_closer.py",
     "chad/core/paper_shadow_runner.py",
 )
+
+# Production source files still importing ib_insync that are explicitly
+# deferred. PR-03 closed the last two entries — keeping the tuple as an
+# empty allowlist preserves the invariant ("any production importer must
+# appear here") so future regressions are caught immediately rather than
+# silently widening the surface.
+PHASE2_DEFERRED_FILES: tuple[str, ...] = ()
 
 
 # GAP-A019 Phase 1A re-classification candidates. Documentation-only.

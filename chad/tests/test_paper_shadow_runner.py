@@ -41,10 +41,14 @@ def test_should_place_paper_orders_requires_arm(monkeypatch) -> None:
 def test_module_does_not_import_ib_insync_on_safe_paths(monkeypatch) -> None:
     """
     Import safety contract:
-    Calling the gating functions must not *cause* ib_insync to be imported.
+    Calling the gating functions must not *cause* the broker library to be
+    imported. PR-03 strengthened this from "ib_insync only" to also reject
+    ib_async because the entire point of the gating layer is to defer
+    broker code until the operator has explicitly armed.
 
-    Note: other tests may legitimately import ib_insync earlier in the same pytest process.
-    So we assert on the delta: the call must not introduce a new import.
+    Note: other tests may legitimately import ib_insync or ib_async earlier
+    in the same pytest process. So we assert on the delta: the call must
+    not introduce a new import.
     """
     monkeypatch.delenv(ARM_ENV_NAME, raising=False)
 
@@ -52,5 +56,7 @@ def test_module_does_not_import_ib_insync_on_safe_paths(monkeypatch) -> None:
     _ = should_place_paper_orders(PaperShadowConfig(enabled=False))
     after = set(sys.modules.keys())
 
-    # The gating call must not be the reason ib_insync appears.
-    assert "ib_insync" not in (after - before)
+    # The gating call must not be the reason ib_insync or ib_async appears.
+    delta = after - before
+    assert "ib_insync" not in delta
+    assert "ib_async" not in delta
