@@ -54,6 +54,17 @@ except Exception as _exc:  # pragma: no cover - defensive
 
 _PRICE_CACHE_PATH = Path("/home/ubuntu/chad_finale/runtime/price_cache.json")
 
+# PR-02b: synthesized close-fill price resolver.
+# - tier 1 walks recent broker-confirmed fills (data/fills/FILLS_*.ndjson)
+# - tier 2 reads runtime/price_cache.json with ts_utc/ttl_seconds freshness
+# - if both miss, apply_close_intents abstains (no $100 placeholder emission)
+_FILLS_DIR = Path("/home/ubuntu/chad_finale/data/fills")
+_BROKER_FILL_SCAN_DAYS = 2
+_PRICE_CACHE_TTL_DEFAULT_SECONDS = 300
+_REJECTED_FILL_STATUSES = frozenset(
+    {"rejected", "error", "failed", "cancelled", "inactive"}
+)
+
 
 def _iter_strategy_signal(routed_signals: Iterable) -> Iterable:
     """
@@ -203,6 +214,113 @@ def _load_price(symbol: str) -> float:
         return 0.0
 
 
+def _load_fresh_cache_price(symbol: str) -> float:
+    """PR-02b tier-2: read price_cache.json with TTL freshness check.
+
+    Returns 0.0 on missing file, parse error, missing/unparseable ts_utc,
+    age > ttl_seconds, or missing/non-positive symbol entry. The freshness
+    guard prevents reuse of a stale snapshot from before a price feed drop.
+    """
+    try:
+        data = json.loads(_PRICE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    ts_utc = str(data.get("ts_utc") or "").strip()
+    if not ts_utc:
+        return 0.0
+    try:
+        cache_time = datetime.fromisoformat(ts_utc.replace("Z", "+00:00"))
+        if cache_time.tzinfo is None:
+            cache_time = cache_time.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - cache_time).total_seconds()
+    except Exception:
+        return 0.0
+    try:
+        ttl_s = float(data.get("ttl_seconds") or _PRICE_CACHE_TTL_DEFAULT_SECONDS)
+    except (TypeError, ValueError):
+        ttl_s = float(_PRICE_CACHE_TTL_DEFAULT_SECONDS)
+    if age_s > ttl_s:
+        return 0.0
+    try:
+        return float((data.get("prices") or {}).get(symbol, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _load_recent_broker_fill_price(symbol: str) -> float:
+    """PR-02b tier-1: walk the last N days of data/fills/FILLS_*.ndjson
+    for the most-recent non-rejected, positively-priced, not-pnl_untrusted
+    fill matching ``symbol``. Returns 0.0 if none found.
+
+    Scanning is bounded to the two most-recent daily files so the cost is
+    O(today + yesterday) per close intent — well below one reconciler cycle.
+    """
+    sym_norm = str(symbol or "").strip().upper()
+    if not sym_norm:
+        return 0.0
+    try:
+        files = sorted(_FILLS_DIR.glob("FILLS_*.ndjson"))[-_BROKER_FILL_SCAN_DAYS:]
+    except Exception:
+        return 0.0
+    best_ts = ""
+    best_price = 0.0
+    for f in reversed(files):
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for line in reversed(text.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            p = payload if isinstance(payload, dict) else (row if isinstance(row, dict) else {})
+            if str(p.get("symbol", "")).strip().upper() != sym_norm:
+                continue
+            if bool(p.get("reject", False)):
+                continue
+            status_norm = str(p.get("status", "")).strip().lower()
+            if status_norm in _REJECTED_FILL_STATUSES:
+                continue
+            extra = p.get("extra") if isinstance(p.get("extra"), dict) else {}
+            if bool(extra.get("pnl_untrusted", False)):
+                continue
+            try:
+                fp = float(p.get("fill_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if fp <= 0.0:
+                continue
+            ts = str(p.get("fill_time_utc") or p.get("entry_time_utc") or "")
+            if ts >= best_ts:
+                best_ts = ts
+                best_price = fp
+        if best_price > 0.0:
+            return best_price
+    return best_price
+
+
+def _resolve_close_fill_price(symbol: str) -> float:
+    """PR-02b cascade: broker-confirmed fill → fresh price_cache → abstain (0.0).
+
+    Callers MUST treat a 0.0 result as "no usable price available — abstain
+    from synthesizing a close fill" rather than falling back to a magic
+    constant (100.0). The legacy ``_load_price`` is intentionally not
+    consulted here — its missing freshness check is the root cause of the
+    pre-PR-02b reconciler $100 placeholder emissions on IWM/SPY.
+    """
+    px = _load_recent_broker_fill_price(symbol)
+    if px > 0.0:
+        return px
+    px = _load_fresh_cache_price(symbol)
+    if px > 0.0:
+        return px
+    return 0.0
+
+
 def _close_intent_to_ibkr(close: dict):
     """
     Wrap a close-intent dict in a minimal object that matches the
@@ -340,7 +458,22 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
             # not pnl_untrusted) — not just absence-of-rejection.
             confirmed_fills: List[dict] = []
             for order in submitted:
-                fill_price = _load_price(order.symbol)
+                # PR-02b: never emit a synthesized close-fill at the legacy
+                # $100 placeholder fallback. Resolve a real price via the
+                # broker-fill → fresh-cache cascade; if neither tier yields
+                # a positive price, abstain (skip the evidence write) and
+                # let the next reconciler cycle retry. Guard mutation
+                # already requires positive confirmation (ISSUE-29 ext.),
+                # so skipping the write keeps the guard open by design.
+                fill_price = _resolve_close_fill_price(order.symbol)
+                if fill_price <= 0.0:
+                    LOG.warning(
+                        "RECONCILER_CLOSE_ABSTAIN_NO_PRICE symbol=%s side=%s "
+                        "qty=%s reason=no_broker_fill_and_no_fresh_price_cache "
+                        "— evidence write skipped; guard remains open",
+                        order.symbol, order.side, getattr(order, "quantity", "?"),
+                    )
+                    continue
                 try:
                     # Calibration fix (2026-04-22 per Audit-O): thread
                     # expected_price through reconciler close evidence too.

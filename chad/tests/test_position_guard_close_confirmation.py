@@ -319,9 +319,15 @@ def test_reconciler_preserves_existing_reject_skip(monkeypatch, tmp_state):
         "strategy": "reconciler",
     }]
 
-    # Make _load_price return a positive value so the evidence path can
-    # at least try to normalize.
-    monkeypatch.setattr(position_reconciler, "_load_price", lambda sym: 100.0)
+    # Make the PR-02b close-fill price resolver return a positive value
+    # so the evidence path can at least try to normalize. The legacy
+    # _load_price helper is no longer the production resolver after
+    # PR-02b — the cascade _resolve_close_fill_price is.
+    monkeypatch.setattr(
+        position_reconciler,
+        "_resolve_close_fill_price",
+        lambda sym: 100.0,
+    )
 
     position_reconciler.apply_close_intents(close_intents, _RejectAdapter())
 
