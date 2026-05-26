@@ -255,3 +255,33 @@ PY
       next authorized `chad-live-loop` restart, observe one full trading-day
       window with zero new delta/IWM/SPY rejected rows in `data/fills/FILLS_*.ndjson`.
       Old historical rejected rows remain immutable by design.
+
+---
+
+## PO-03 success-criterion closure (appended 2026-05-26)
+
+Per `PO-03_zero_public_placeholder_fingerprint_success_2026-05-26.md`, the
+operator's binding success criterion for PO-03 is:
+
+> "Zero public `fill_price=100.0` fingerprint AND zero trusted fake placeholder
+> evidence" — placeholder-tagged rows that are rejected, untrusted, public-price-scrubbed,
+> and writer-quarantined are explicitly NOT a paper-complete blocker.
+
+Under that criterion, observed evidence since 2026-05-26T14:45:17Z:
+
+- `public_fill_price_100_since_start = 0`
+- `trusted_fake_placeholder_since_start = 0`
+- `placeholder_tagged_rows_since_start = 21` (all `status=rejected`, `reject=true`,
+  `pnl_untrusted=true`, public `fill_price` = real cache price, never `100.0`)
+
+**PR-02 status for paper-complete: VERIFIED.** The strategy-level abstain
+(`_resolve_positive_price` + `DELTA_ABSTAIN_NO_VALID_PRICE`) is loaded; the
+public `$100` fingerprint is zero; downstream PnL / SCR / trade evidence
+consumers are protected by `status=rejected` + `pnl_untrusted=true` + tags.
+
+The "zero placeholder-tagged rows" stricter goal is recorded as DEFERRED
+hardening (executor-layer placeholder emitter trace) — non-blocking for
+paper-complete. See `PO-03_zero_public_placeholder_fingerprint_success_2026-05-26.md` §5.
+
+No live posture change. `ready_for_live=false`, `allow_ibkr_live=false`,
+`allow_ibkr_paper=true` preserved at declaration time.

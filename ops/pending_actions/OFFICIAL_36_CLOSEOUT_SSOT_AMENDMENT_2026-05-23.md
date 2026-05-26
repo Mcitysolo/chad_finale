@@ -161,3 +161,28 @@ Until that operator-authorized doc cycle lands, the official count of record rem
 ---
 
 FINAL STATUS: Pending Action **landed** (this document); SSOT mutation **deferred** to operator-authorized doc cycle.
+
+---
+
+## 10. PO-03 success-criterion declaration cross-reference (appended 2026-05-26)
+
+Per the operator decision recorded in
+`PO-03_zero_public_placeholder_fingerprint_success_2026-05-26.md`, PO-03's
+paper-complete success criterion is **"zero public `fill_price=100.0` fingerprint
+and zero trusted fake placeholder evidence."** Placeholder-tagged rows that are
+rejected, untrusted, public-price-scrubbed, and writer-quarantined are explicitly
+NOT a paper-complete blocker.
+
+Under that criterion:
+
+- **PR-02** (delta upstream abstain) — VERIFIED for paper-complete.
+- **PR-02b** (reconciler upstream placeholder fix) — VERIFIED for paper-complete.
+- Strict "zero placeholder-tagged rows" — DEFERRED hardening, non-blocking.
+
+This cross-reference does not modify the §1–§4 official-count math of this
+SSOT amendment; PR-02 / PR-02b had already been counted as engineering-shipped.
+It only clarifies that under the PO-03 success criterion their status for the
+paper-complete observation register is VERIFIED, not PARTIAL.
+
+No live posture change. `ready_for_live=false`, `allow_ibkr_live=false`,
+`allow_ibkr_paper=true` preserved at declaration time.

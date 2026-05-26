@@ -212,3 +212,33 @@ python3 -c "import json; print('ready_for_live=', json.load(open('runtime/live_r
 python3 -c "import json; d=json.load(open('runtime/positions_truth.json')); print({k:d.get(k) for k in ('truth_ok','broker_authority_status','replay_diagnostic_status','replay_diagnostic_blocks_truth')})"
 python3 -c "import json; print('stop_bus_active=', json.load(open('runtime/stop_bus.json')).get('active'))"
 ```
+
+---
+
+## PO-03 success-criterion closure (appended 2026-05-26)
+
+Per `PO-03_zero_public_placeholder_fingerprint_success_2026-05-26.md`, the
+operator's binding success criterion for PO-03 is:
+
+> "Zero public `fill_price=100.0` fingerprint AND zero trusted fake placeholder
+> evidence" — placeholder-tagged rows that are rejected, untrusted, public-price-scrubbed,
+> and writer-quarantined are explicitly NOT a paper-complete blocker.
+
+Under that criterion, observed evidence since 2026-05-26T14:45:17Z:
+
+- `public_fill_price_100_since_start = 0`
+- `trusted_fake_placeholder_since_start = 0`
+- `placeholder_tagged_rows_since_start = 21` (delta=14, reconciler=7; all `status=rejected`,
+  `reject=true`, `pnl_untrusted=true`, public `fill_price` = real cache price, never `100.0`)
+
+**PR-02b status for paper-complete: VERIFIED.** The reconciler-level synthesized
+close-fill placeholder emission was silenced at the reconciler layer (commit
+`5c5507e`); the public `$100` fingerprint is zero; downstream PnL / SCR / trade
+evidence consumers are protected by `status=rejected` + `pnl_untrusted=true` + tags.
+
+The "zero placeholder-tagged rows" stricter goal is recorded as DEFERRED
+hardening (executor-layer placeholder emitter trace) — non-blocking for
+paper-complete. See `PO-03_zero_public_placeholder_fingerprint_success_2026-05-26.md` §5.
+
+No live posture change. `ready_for_live=false`, `allow_ibkr_live=false`,
+`allow_ibkr_paper=true` preserved at declaration time.
