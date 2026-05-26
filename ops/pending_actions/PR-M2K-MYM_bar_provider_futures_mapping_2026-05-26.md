@@ -4,7 +4,7 @@
 - prepared_by: audit (read-only)
 - target_branch: main (HEAD at audit time: 5961be2)
 - governance: surgical edit, one change, one file, no config mutation, no live posture change
-- status: APPLIED (code patch landed in commit-to-be-issued at end of this session; runtime observation §5.6 still pending operator-discretion daemon recycle)
+- status: VERIFIED (code patch in commit cdab294; runtime observation §10.1 confirms M2K/MYM bars now present in ibkr_bars_cache.json after 2026-05-26T20:14:19Z daemon recycle, zero Error 200, zero M2K bar_stale, safety posture preserved)
 - linked evidence: reports/parity_audit/STRATEGY_UTILIZATION_BLOCKER_AUDIT_20260526T173158Z.md (§3, §5)
 
 ---
@@ -219,12 +219,12 @@ If the operator chooses NOT to recycle the daemon, the running process retains t
 
 ## 6. Current status
 
-**PARTIAL** — patch documented but not applied. Will move to **VERIFIED** only after:
-1. Code patch applied (single commit, file = `chad/market_data/ibkr_bar_provider.py` + new test file).
-2. §5.1–§5.5 all green.
-3. Runtime observation §5.6 confirms fresh M2K and MYM bars in `runtime/ibkr_bars_cache.json` AND absence of further `bar_stale symbol=M2K` GATE_REJECT lines in `chad-live-loop` after the daemon recycles.
+**VERIFIED** — all three gating conditions satisfied:
+1. ✅ Code patch applied (commit cdab294, single commit, file = `chad/market_data/ibkr_bar_provider.py` + new test file).
+2. ✅ §5.1–§5.5 all green at apply time (see §10).
+3. ✅ Runtime observation §5.6 confirmed at 2026-05-26T20:23:40Z — fresh M2K and MYM bars present in `runtime/ibkr_bars_cache.json` and zero `bar_stale symbol=M2K` GATE_REJECT lines in `chad-live-loop` since the 2026-05-26T20:14:19Z daemon recycle. Full evidence in §10.1.
 
-Until then, M2K trading via gamma_futures remains blocked at the data_freshness gate; MYM remains blocked by a combination of bar-stale and invalid_quantity. All other strategies and the live/paper safety machinery are unaffected.
+M2K data_freshness gate now passes; gamma_futures M2K signals reach the position-conflict suppression layer (`same_side_position_open` — correct given the broker holds -16 M2K short). MYM bars are fresh; MYM signals now flow but stop at `invalid_quantity` (whole-units rounding from 0.987 → 0; out of scope, see §8). Live/paper safety machinery unaffected.
 
 ---
 
@@ -293,6 +293,69 @@ CHAD stays PAPER throughout. allow_ibkr_live remains False. No service restart i
   - `trade_lifecycle_state.backlog_flag` = False (unchanged)
   - `position_guard_drift.drift_count` = 1 (was 0 at audit start) — drift entry is `alpha_futures|MES` (GAP-028 PERMISSIVE observation, broker_truth_missing). **Unrelated to this patch**; separate operator surface.
   - No `systemctl` actions taken. No `runtime/*.json` edited. No `config/*` edited.
-- runtime observation status: PENDING. Patched code is on disk but the running `chad-ibkr-bar-provider` daemon process still executes the old code until it recycles naturally. No forced recycle was issued. After the next operator-discretion recycle, expect `runtime/ibkr_bars_cache.json` to grow from 32 → 34 symbols and the `Error 200 Stock(symbol='M2K'|'MYM',exchange='SMART')` lines to disappear from `journalctl -u chad-ibkr-bar-provider`.
+- runtime observation status: **VERIFIED** (see §10.1 for evidence).
 
-Move to **VERIFIED** only after that runtime observation lands.
+---
+
+## 10.1 Runtime verification evidence (operator-authorized daemon recycle)
+
+- date verified: 2026-05-26
+- operator GO: explicit authorization to restart `chad-ibkr-bar-provider.service` only (no IB Gateway restart, no chad-live-loop restart, no runtime/config edits, no order activity)
+- pre-restart daemon: PID 2880191, running since 2026-05-18T12:11:21Z, executing pre-patch code in memory
+- restart command issued: `sudo systemctl restart chad-ibkr-bar-provider.service` at 2026-05-26T20:14:19Z
+- post-restart daemon: PID 1126396, IB-async `Synchronization complete` and `ibkr_bar_provider.daemon_running` logged at 2026-05-26T20:14:20Z
+
+### 10.1.1 Bars cache rewrite (Check 1)
+
+`runtime/ibkr_bars_cache.json` next rewrite at 2026-05-26T20:23:40Z:
+- pre-restart: `bar_count=1498`, `symbol_count=32`, **M2K absent, MYM absent**
+- post-restart: `bar_count=1645`, `symbol_count=35`, **M2K present (51 bars, latest close=2927.5, ts=2026-05-26 15:13:00-05:00), MYM present (51 bars, latest close=50549.0, ts=2026-05-26 15:13:00-05:00)**
+- delta vs §5.6 prediction: predicted 32→34; observed 32→35. The extra symbol is **MCL**, which was also being mis-resolved at runtime pre-restart but is not in scope for this PR. MCL is already listed in `FUTURES_SYMBOLS` (line 78), so no code change is required for MCL; it is being properly served as Future post-recycle. Logged as side observation in §8.
+
+### 10.1.2 Contract dispatch (Check 2)
+
+Daemon logs post-restart show M2K resolving to a Future contract (no further `Stock(symbol='M2K', exchange='SMART')` lines):
+
+```
+2026-05-26 20:14:19,820Z INFO ib_async.wrapper position: Position(account='DUK902770',
+  contract=Future(conId=770561189, symbol='M2K',
+  lastTradeDateOrContractMonth='20260618', multiplier='5', currency='USD',
+  localSymbol='M2KM6', tradingClass='M2K'), position=-16.0, avgCost=14345.88)
+```
+
+MYM contract type confirmed indirectly by §10.1.3 (zero `Stock(symbol='MYM')` requests post-restart and 51 bars now stored under `symbols.MYM`).
+
+### 10.1.3 IB Error 200 for M2K/MYM (Check 3)
+
+```
+journalctl -u chad-ibkr-bar-provider --since "2026-05-26 20:14:19 UTC" \
+  | grep -E "Error 200.*(M2K|MYM)" | wc -l
+→ 0
+```
+
+Pre-restart baseline: 43 Error-200 lines for M2K/MYM in the 10 minutes ending at restart. Post-restart: zero Error-200 lines for M2K/MYM (and zero Error-200 of any kind) across 26 minutes of observation.
+
+### 10.1.4 live-loop M2K bar_stale (Check 4)
+
+```
+journalctl -u chad-live-loop --since "2026-05-26 20:14:19 UTC" \
+  | grep -E "bar_stale.*M2K|M2K.*bar_stale" | wc -l
+→ 0
+```
+
+Pre-restart: `GATE_REJECT gate=data_freshness reason=bar_stale:age=338176.8s>max=172800s symbol=M2K strategy=gamma_futures` firing every gamma_futures cycle. Post-restart: 16 fresh M2K signal cycles observed in 30 minutes; all pass A4 data_freshness and proceed to position-conflict suppression (`SKIP suppression=same_side_position_open` — correct given the broker -16 M2K position).
+
+### 10.1.5 No fake fill evidence (Check 5)
+
+`find runtime/ -type f -newermt "2026-05-26 20:14:19" | grep -iE 'evidence|fill|paper.*exec'` returns no new files. The only execution-path activity in live-loop logs post-restart is the pre-existing P0-1-hardened `SKIP_EVIDENCE_UNCONFIRMED_ORDER_STATUS ... reason=unconfirmed_order_status:duplicate_blocked` path for M6E and MGC, which explicitly does not write paper fills. `trade_closer_state.json` mtime advance reflects normal publisher cadence, not new M2K/MYM fill entries.
+
+### 10.1.6 Safety posture preserved
+
+| Key | Pre-restart | Post-restart | Source |
+|---|---|---|---|
+| `ready_for_live` | False | False (ts 2026-05-26T20:31:04Z) | `runtime/live_readiness.json` |
+| `allow_ibkr_live` | False | False (ts 2026-05-26T20:40:08Z) | `runtime/decision_trace_heartbeat.json` |
+| `allow_ibkr_paper` | True | True (ts 2026-05-26T20:40:08Z) | `runtime/decision_trace_heartbeat.json` |
+| `stop_bus.active` | False | False | `runtime/stop_bus.json` |
+
+No `systemctl` action issued beyond the single authorized `chad-ibkr-bar-provider` restart. No `runtime/*.json` edited. No `config/*` edited. No broker orders placed or cancelled. CHAD remains PAPER.
