@@ -81,7 +81,7 @@ OPS-OMEGA-01 (outside the 72-item Elite checklist) is independently `CLOSED — 
   - `chad/core/paper_position_closer.py:39,41,49`
   - `chad/core/paper_shadow_runner.py:595,774`
   - `chad/ops/ibkr_broker_events_collector.py:11-12,80,658` is a **noise-filter substring + docstrings only** (non-runtime) and may be retained or scoped out separately.
-  Remaining work: migrate the 2 runtime files from `ib_insync` to `ib_async`; add `chad/tests/test_ib_insync_zero_imports_in_production.py`; obtain operator GO for restarting `chad-paper-position-closer.service` and `chad-paper-shadow-runner.service`.
+  Remaining work (status 2026-05-26): the 2 runtime files are migrated to `ib_async` via PR-03 (commit `d476e8c`); the `test_ib_insync_zero_imports_in_production.py` enforcement is in `chad/tests/test_pr03_ib_async_phase2_migration.py`; `chad-paper-position-closer.service` does not exist as a systemd unit (see PR-03 Pending Action lines 87-88 and BOX-038 §3.1 — it is a CLI/oneshot module, no service to restart); `chad-paper-shadow-runner.service` remains MASKED under the 2026-05-06 quiesce policy formalized by `PR-06_shadow_runner_quiesce_formalization_2026-05-26.md` (Path A) and any future re-arm requires a separate operator-approved Path B Pending Action.
 - **P2-9 — `chad-options-chain-refresh.service` still failing operationally.** Alert wiring (R17/R18) is shipped; the service itself is `× failed (Result: exit-code) since Fri 2026-05-22 12:30:38 UTC` (`status=1/FAILURE`). A reproduction attempt hung on IB connect (`127.0.0.1:4002`). Remaining work: diagnose IB connect / market-hours dependency in `chad/market_data/options_chain_refresh.py`; obtain operator GO to restart after fix; confirm cache artifact freshness.
 
 ## 5. Items BLOCKED (24)
