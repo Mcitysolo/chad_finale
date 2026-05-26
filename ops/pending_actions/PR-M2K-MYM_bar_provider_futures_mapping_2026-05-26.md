@@ -4,7 +4,7 @@
 - prepared_by: audit (read-only)
 - target_branch: main (HEAD at audit time: 5961be2)
 - governance: surgical edit, one change, one file, no config mutation, no live posture change
-- status: PENDING — code change NOT applied; doc only
+- status: APPLIED (code patch landed in commit-to-be-issued at end of this session; runtime observation §5.6 still pending operator-discretion daemon recycle)
 - linked evidence: reports/parity_audit/STRATEGY_UTILIZATION_BLOCKER_AUDIT_20260526T173158Z.md (§3, §5)
 
 ---
@@ -262,3 +262,37 @@ Operator GO required before applying the code change. Recommended ordering after
 ```
 
 CHAD stays PAPER throughout. allow_ibkr_live remains False. No service restart is forced.
+
+---
+
+## 10. Application record (post-apply)
+
+- date applied: 2026-05-26
+- applied by: governed surgical patch (chad-finale repo, branch main)
+- baseline before patch: HEAD=bb2eccb (Pending-Action commit), 2529 tests passing on second-run baseline (one transient flake on `test_canonical_equity_source.py::test_canonical_sources_agree_within_skew_tolerance` cleared on re-run)
+- files changed (explicit; no `git add .` used):
+  - `chad/market_data/ibkr_bar_provider.py` — added "M2K","MYM" to `FUTURES_SYMBOLS`; added "M2K":"CME" and "MYM":"CBOT" to `exchange_map`; extended `DEFAULT_UNIVERSE` for symmetry (defensive fallback only)
+  - `chad/tests/test_ibkr_bar_provider_futures_mapping.py` — new file, 10 cases (set membership, M2K/MYM dispatch, MYM→CBOT guard, existing-mapping regression, SIL→SI remap retention, equity & unknown-symbol fallbacks)
+  - this Pending Action doc (status moved to APPLIED, plus this §10 record)
+- tests after patch:
+  - new targeted file: 10 / 10 PASS
+  - keyword filter `ibkr_bar_provider or futures_mapping or M2K or MYM or bars`: 51 / 51 PASS
+  - full suite: 2538 PASS + 1 PRE-EXISTING FAIL (`test_canonical_equity_source.py::test_canonical_sources_agree_within_skew_tolerance`); fail count math = baseline 2528 + 10 new = 2538 PASS (delta exactly the 10 new tests, zero new failures). The 1 failing test is the BOX-034 canonical equity divergence (`pnl_state.account_equity=$179,451` vs `portfolio_snapshot total=$246,654`, drift ≈ $67k) — **unrelated to this patch** (the patch does not touch pnl_state or portfolio_snapshot publishers). Recommended: separate Pending Action under BOX-034 §4a.
+- static smoke (CHAD_SKIP_IB_CONNECT=1):
+  - `M2K` → `Future(symbol=M2K, exchange=CME, tradingClass=M2K)` ✓
+  - `MYM` → `Future(symbol=MYM, exchange=CBOT, tradingClass=MYM)` ✓
+  - All 8 existing futures roots unchanged ✓ (MES/MNQ/MCL/MGC/M6E/ZN/ZB/SIL→SI)
+  - `SPY` still `Stock(SMART)` ✓ (equity path unaffected)
+- no-live-posture confirmation:
+  - `ready_for_live` = False (unchanged)
+  - `allow_ibkr_live` = False (unchanged)
+  - `allow_ibkr_paper` = True (unchanged)
+  - `stop_bus.active` = False (unchanged)
+  - `reconciliation_state.status` = GREEN (unchanged)
+  - `positions_truth.broker_authority_status` = GREEN (unchanged)
+  - `trade_lifecycle_state.backlog_flag` = False (unchanged)
+  - `position_guard_drift.drift_count` = 1 (was 0 at audit start) — drift entry is `alpha_futures|MES` (GAP-028 PERMISSIVE observation, broker_truth_missing). **Unrelated to this patch**; separate operator surface.
+  - No `systemctl` actions taken. No `runtime/*.json` edited. No `config/*` edited.
+- runtime observation status: PENDING. Patched code is on disk but the running `chad-ibkr-bar-provider` daemon process still executes the old code until it recycles naturally. No forced recycle was issued. After the next operator-discretion recycle, expect `runtime/ibkr_bars_cache.json` to grow from 32 → 34 symbols and the `Error 200 Stock(symbol='M2K'|'MYM',exchange='SMART')` lines to disappear from `journalctl -u chad-ibkr-bar-provider`.
+
+Move to **VERIFIED** only after that runtime observation lands.

@@ -77,6 +77,7 @@ PER_SYMBOL_DELAY_S = 0.5
 FUTURES_SYMBOLS = {
     "MES", "MNQ", "MCL", "MGC",    # Alpha/Gamma futures
     "ZN", "ZB", "M6E", "SIL",       # Omega Macro
+    "MYM", "M2K",                   # Micro Dow / Micro Russell — gamma_futures + alpha_futures
 }
 
 # Full universe for bar subscriptions (fallback when config/universe.json is missing)
@@ -84,7 +85,7 @@ DEFAULT_UNIVERSE = [
     # Equities/ETFs
     "SPY", "QQQ", "IWM", "GLD", "TLT",
     # Futures
-    "MES", "MNQ", "MCL", "MGC", "ZN", "ZB", "M6E", "SIL",
+    "MES", "MNQ", "MCL", "MGC", "ZN", "ZB", "M6E", "SIL", "MYM", "M2K",
 ]
 
 
@@ -218,6 +219,8 @@ def _make_ib_contract(symbol: str, ib: Any = None) -> Any:
             "M6E": "CME",
             "SIL": "COMEX",
             "SI": "COMEX",
+            "MYM": "CBOT",
+            "M2K": "CME",
         }
         ibkr_sym = ibkr_sym_map.get(sym, sym)
         exchange = exchange_map.get(sym, "CME")
