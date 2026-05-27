@@ -804,6 +804,71 @@ def rule_options_chain_refresh_health(findings: List[Finding]) -> None:
             pass
 
 
+def rule_options_chain_refresh_failure_artifact(findings: List[Finding]) -> None:
+    """R17b (OPTIONS-CHAIN-1) — read the dedicated failure artifact emitted by
+    chad-options-chain-refresh.service (``_write_failure_artifact`` writes
+    ``runtime/options_chain_refresh_failure.json``). A *fresh* failure
+    artefact promotes to CRITICAL even when the cache itself is benign
+    (e.g. the cache may still hold yesterday's content while today's refresh
+    explicitly failed).
+
+      * file missing                                   → silent (no finding)
+      * artefact present + age <= 2h                   → CRITICAL
+      * artefact present + age > 2h                    → WARNING (stale failure;
+        a fresh successful refresh would have cleared it)
+    """
+    try:
+        from chad.market_data.options_chain_freshness import (
+            is_failure_artifact_fresh,
+        )
+    except Exception:
+        return
+    fresh, details = is_failure_artifact_fresh()
+    if not details["failure_artifact_exists"]:
+        return
+    reason = details.get("failure_artifact_reason") or "unknown"
+    age_s = details.get("failure_artifact_age_seconds")
+    age_label = f"{int(age_s)}s" if isinstance(age_s, (int, float)) else "unknown_age"
+    if fresh:
+        findings.append(Finding(
+            rule_id="R17b",
+            severity="CRITICAL",
+            title="Options chain refresh failure artifact is fresh",
+            description=(
+                "runtime/options_chain_refresh_failure.json is present and "
+                f"recent (age={age_label}; blocked_reason={reason}). The most "
+                "recent refresh attempt failed; options-routed strategies "
+                "must fail-closed via chain_usability() until the next "
+                "successful refresh."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=(
+                "options_chain_refresh_failure.json "
+                f"age_s={age_label} reason={reason}"
+            ),
+        ))
+    else:
+        findings.append(Finding(
+            rule_id="R17b",
+            severity="WARNING",
+            title="Options chain refresh failure artifact is stale",
+            description=(
+                "runtime/options_chain_refresh_failure.json exists but its "
+                f"ts_utc is older than 2h (age={age_label}). Either a fresh "
+                "successful refresh has not run yet to clear it, or the "
+                "refresh writer is no longer emitting failure artefacts on "
+                "success."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=(
+                "options_chain_refresh_failure.json "
+                f"age_s={age_label} reason={reason}"
+            ),
+        ))
+
+
 def rule_options_greeks_freshness(findings: List[Finding]) -> None:
     """R18 (NEW-GAP-044) — companion rule that flags silently-stale Greeks.
 
@@ -937,6 +1002,7 @@ def run_all_rules() -> List[Finding]:
         rule_tier_daily_loss_approaching,
         rule_setup_family_skip_rate,
         rule_options_chain_refresh_health,
+        rule_options_chain_refresh_failure_artifact,
         rule_options_greeks_freshness,
     ]:
         try:

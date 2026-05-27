@@ -163,7 +163,22 @@ def _vix_regime(vix: float) -> str:
 
 
 def _load_chain_cache() -> Optional[Dict]:
-    """Load options chain cache if fresh."""
+    """Load options chain cache if fresh.
+
+    OPTIONS-CHAIN-1 fail-closed: defer to the shared chain_usability()
+    validator which also consults the failure artefact. Returning None
+    causes the caller to fall back to synthetic pricing rather than acting
+    on stale or known-bad chain data.
+    """
+    try:
+        from chad.market_data.options_chain_freshness import chain_usability
+        verdict = chain_usability()
+        if not verdict.usable:
+            return None
+    except Exception:
+        # If the freshness check itself fails, fall through to the legacy
+        # path — it has its own TTL check.
+        pass
     try:
         if not CHAINS_CACHE_PATH.exists():
             return None
