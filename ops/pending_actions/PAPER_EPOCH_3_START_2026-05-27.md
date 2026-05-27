@@ -164,6 +164,28 @@ Start (re-base) the 5-session paper soak at the next clean US-equity open. No se
 
 If at any time during Epoch 3 the operator wishes to flip `runtime/epoch_state.json::active_epoch` from `CHAD_v8.9_Paper_Epoch_2` to `CHAD_v8.9_Paper_Epoch_3` (and to archive Epoch 2 state into `runtime/archive/epoch_2_pre_20260527*/`), that is a separate Pending Action requiring explicit operator approval — it is not authorized by this declaration because it would immediately re-label per_strategy_loss_guard, trade_stats_engine, dashboard, and exterminator records.
 
+## 12. Day-0 evidence (2026-05-27)
+
+| Field | Value |
+|---|---|
+| Date / window | 2026-05-27 |
+| Verdict | **DIRTY / NOT COUNTABLE** |
+| Reason | stop_bus active from **2026-05-27T04:24:23Z** to **2026-05-27T11:35:36Z** |
+| Halt duration | **7h 11m** |
+| Root cause | IB Gateway connect latency / socket backpressure deadlock |
+| Recovery | Operator-authorized `chad-ibgateway.service` restart |
+| stop_bus clear path | Cleared naturally via `auto_recovery:broker_latency_clean_streak=5` (no manual stop_bus clear) |
+| regime_state | Refreshed after live-loop resumed |
+| Live enablement | **None** (ready_for_live remained false; allow_ibkr_live remained false) |
+| Broker orders / cancellations | **None** placed or cancelled by operator or by CHAD during the halt |
+| Next clean soak window | **2026-05-28T00:00:00Z** if no further blockers |
+
+Day-0 is therefore excluded from the §8 "5 clean sessions" tally. The §7.2 stop_bus halt budget (< 1h/day soft) was exceeded by a factor of ~7×, which alone disqualifies the day; the absence of new fills, the operator-authorized service restart, and the >7h live-loop halt make this an explicit DIRTY day.
+
+## 13. Deferred hardening note
+
+**IBKR-RELIABILITY:** investigate socket draining / Gateway backpressure when live-loop is halted under stop_bus. Today's 7h 11m halt resolved only after an operator-authorized `chad-ibgateway.service` restart, indicating the live-loop's internal `auto_recovery:broker_latency_clean_streak=5` path was unable to re-establish a healthy IB Gateway socket on its own once latency had compounded. Scope of the deferred work: characterise the deadlock (Gateway-side queue vs. ib_async socket vs. CHAD reader-loop backpressure), define a safe in-process recovery (e.g. bounded socket reset under stop_bus) that does not require a systemd restart, and add an observability counter to runtime/ibkr_status.json for "consecutive cycles with avg_latency_ms above stop threshold". This is a deferred Pending Action — no code change is authorized by this declaration.
+
 ---
 
 **Declared by:** Team CHAD
