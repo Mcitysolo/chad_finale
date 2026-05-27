@@ -804,6 +804,57 @@ def rule_options_chain_refresh_health(findings: List[Finding]) -> None:
             pass
 
 
+def rule_ibkr_sustained_latency(findings: List[Finding]) -> None:
+    """R19 (STOP-BUS-RECOVERY-1) — promote the sustained-latency counter to
+    a loud Telegram alert.
+
+    Reads runtime/ibkr_status.json::consecutive_cycles_above_stop_threshold
+    (emitted by chad/ops/ibkr_reliability_tracker.py via the healthcheck).
+    When the counter is >= the configured alert-at value (default 5), a
+    CRITICAL Finding is emitted so the existing Telegram pipeline surfaces
+    the pattern before the stop_bus latches.
+
+    The publisher's own auto-recovery (clean_streak=5) is unchanged; this
+    rule is observability only.
+    """
+    status_path = RUNTIME / "ibkr_status.json"
+    if not status_path.is_file():
+        return
+    try:
+        from chad.ops.ibkr_reliability_tracker import (
+            should_alert,
+            DEFAULT_ALERT_AT_CONSECUTIVE,
+        )
+    except Exception:
+        return
+    doc = _read_json(status_path)
+    fire, alert = should_alert(doc, alert_at=DEFAULT_ALERT_AT_CONSECUTIVE)
+    if not fire:
+        return
+    findings.append(Finding(
+        rule_id="R19",
+        severity="CRITICAL",
+        title="IBKR sustained latency above stop threshold",
+        description=(
+            f"avg_latency_ms has been above the stop threshold for "
+            f"{alert['consecutive_cycles_above_stop_threshold']} consecutive "
+            f"healthcheck cycles (threshold={alert['stop_threshold_ms']:.0f}ms, "
+            f"max_in_window={alert['max_latency_observed_in_window']!r}ms). "
+            "The publisher's own auto-recovery (clean_streak=5) is still in "
+            "effect; this finding is operator-visible defense-in-depth."
+        ),
+        remedy_type="NOTIFY_ONLY",
+        remedy_action="notify",
+        evidence=(
+            "ibkr_status.json "
+            f"consecutive_cycles_above_stop_threshold={alert['consecutive_cycles_above_stop_threshold']} "
+            f"recovery_state={alert['current_recovery_state']} "
+            f"last_above_at={alert['last_above_threshold_at']} "
+            f"last_gateway_churn_at={alert['last_gateway_churn_at']}"
+        ),
+    ))
+
+
 def rule_options_chain_refresh_failure_artifact(findings: List[Finding]) -> None:
     """R17b (OPTIONS-CHAIN-1) — read the dedicated failure artifact emitted by
     chad-options-chain-refresh.service (``_write_failure_artifact`` writes
@@ -1004,6 +1055,7 @@ def run_all_rules() -> List[Finding]:
         rule_options_chain_refresh_health,
         rule_options_chain_refresh_failure_artifact,
         rule_options_greeks_freshness,
+        rule_ibkr_sustained_latency,
     ]:
         try:
             fn(findings)
