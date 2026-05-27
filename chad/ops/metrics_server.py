@@ -58,7 +58,11 @@ RUNTIME_SCR_PATH = RUNTIME_DIR / "scr_state.json"
 RUNTIME_VAR_STATE_PATH = RUNTIME_DIR / "var_state.json"
 RUNTIME_DRAWDOWN_STATE_PATH = RUNTIME_DIR / "drawdown_state.json"
 
-DEFAULT_HOST = os.environ.get("CHAD_METRICS_HOST", "0.0.0.0")
+# PORT-BINDING-1: default to localhost-only. The CHAD_METRICS_HOST env
+# var remains the documented override (set to "0.0.0.0" only with an
+# explicit operator-approved reason — AWS Security Group default-deny
+# is the second layer of defense).
+DEFAULT_HOST = os.environ.get("CHAD_METRICS_HOST", "127.0.0.1")
 DEFAULT_PORT = int(os.environ.get("CHAD_METRICS_PORT", "9620"))
 DEFAULT_DAYS_BACK = int(os.environ.get("CHAD_METRICS_DAYS_BACK", "7"))
 DEFAULT_MAX_TRADES = int(os.environ.get("CHAD_METRICS_MAX_TRADES", "5000"))

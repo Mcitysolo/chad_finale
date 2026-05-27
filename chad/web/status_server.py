@@ -200,7 +200,11 @@ def main() -> None:
     log = _get_logger()
     app = create_app()
 
-    host = os.environ.get("CHAD_STATUS_HOST", "0.0.0.0")
+    # PORT-BINDING-1: default to localhost-only. The CHAD_STATUS_HOST env
+    # var remains the documented override (set to "0.0.0.0" only with an
+    # explicit operator-approved reason — AWS Security Group default-deny
+    # is the second layer of defense).
+    host = os.environ.get("CHAD_STATUS_HOST", "127.0.0.1")
     port_raw = os.environ.get("CHAD_STATUS_PORT", "9619")
     try:
         port = int(port_raw)
