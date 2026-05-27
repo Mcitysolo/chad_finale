@@ -1,0 +1,19 @@
+{
+  "status": "GREEN",
+  "broker_source": "test",
+  "chad_state_source": "position_guard.json",
+  "counts": {
+    "chad": 2,
+    "broker": 2
+  },
+  "worst_diff": 0,
+  "mismatches": [],
+  "drifts": [],
+  "diagnostic_drifts": [],
+  "excluded_symbols": [],
+  "futures_excluded_symbols": [],
+  "exclusion_policy": [],
+  "notes": "",
+  "ts_utc": "2026-05-27T20:00:00Z",
+  "ttl_seconds": 600
+}

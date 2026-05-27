@@ -1,0 +1,26 @@
+{
+  "h1": {
+    "symbol": "AAPL",
+    "qty": 100.0,
+    "conId": 1,
+    "secType": "STK",
+    "strategy": "manual",
+    "avg_cost": 150.0,
+    "currency": "USD",
+    "opened_at_utc": "2026-05-27T20:00:00Z",
+    "account_id": "X",
+    "tags": []
+  },
+  "h2": {
+    "symbol": "MSFT",
+    "qty": -50.0,
+    "conId": 2,
+    "secType": "STK",
+    "strategy": "manual",
+    "avg_cost": 300.0,
+    "currency": "USD",
+    "opened_at_utc": "2026-05-27T20:00:00Z",
+    "account_id": "X",
+    "tags": []
+  }
+}

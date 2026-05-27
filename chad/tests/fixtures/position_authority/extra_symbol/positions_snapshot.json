@@ -1,0 +1,32 @@
+{
+  "positions": [
+    {
+      "symbol": "AAPL",
+      "position": 100.0,
+      "conId": 1,
+      "secType": "STK",
+      "avgCost": 150.0,
+      "currency": "USD"
+    },
+    {
+      "symbol": "MSFT",
+      "position": -50.0,
+      "conId": 2,
+      "secType": "STK",
+      "avgCost": 300.0,
+      "currency": "USD"
+    },
+    {
+      "symbol": "TSLA",
+      "position": 10.0,
+      "conId": 4,
+      "secType": "STK",
+      "avgCost": 200.0,
+      "currency": "USD"
+    }
+  ],
+  "positions_count": 3,
+  "source": "test",
+  "ts_utc": "2026-05-27T20:00:00Z",
+  "ttl_seconds": 600
+}
