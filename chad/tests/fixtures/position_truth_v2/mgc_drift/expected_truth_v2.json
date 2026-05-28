@@ -1,0 +1,17 @@
+{
+  "expected_global_authority_health": "RED",
+  "expected_positions": {
+    "MGC": {
+      "merge_rule": "M5",
+      "value_source": "FAIL_CLOSED",
+      "qty": null,
+      "side": "UNKNOWN",
+      "snapshot_value": null,
+      "ledger_value": -1.0,
+      "delta_reason": "missing_in_one_source",
+      "fail_closed": true,
+      "authority_decision": "FAIL_CLOSED"
+    }
+  },
+  "expected_fail_closed_symbols": ["MGC"]
+}

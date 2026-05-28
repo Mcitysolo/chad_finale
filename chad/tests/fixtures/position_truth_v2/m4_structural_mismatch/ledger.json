@@ -1,0 +1,12 @@
+{
+  "spy4444": {
+    "symbol": "SPY",
+    "qty": -1.0,
+    "secType": "STK",
+    "conId": 756733,
+    "account_id": "DUK902770",
+    "opened_at_utc": "2026-05-28T01:00:30Z",
+    "strategy": "alpha_options",
+    "source_strategies": ["alpha_options"]
+  }
+}

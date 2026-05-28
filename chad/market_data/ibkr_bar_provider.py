@@ -456,6 +456,37 @@ class IBKRBarProvider:
     # Polling loop
     # --------------------------
 
+    def _filter_expired_futures(self) -> set:
+        """FUTURES-ROLL-1 — return the set of futures symbols whose front-month
+        contract is expired or expires today, per runtime/futures_roll_state.json.
+
+        Emits one structured warning per (symbol, session-day) so the journal
+        does not flood with one log per cycle (stops the SILK6-class
+        Error 162 spam noted in the 2026-05-27 audit).
+        """
+        try:
+            from chad.market_data.futures_expiry_gate import filter_universe
+        except Exception:
+            return set()
+        futures_only = [s for s in self._universe if _is_futures_symbol(s)]
+        if not futures_only:
+            return set()
+
+        def _warn(verdict):
+            LOGGER.warning(
+                "ibkr_bar_provider.futures_expiry_gate_skip",
+                extra={
+                    "symbol": verdict.symbol,
+                    "reason": verdict.reason,
+                    "current_expiry": verdict.current_expiry,
+                    "next_expiry": verdict.next_expiry,
+                    "roll_state_present": verdict.roll_state_present,
+                },
+            )
+
+        _kept, skipped = filter_universe(futures_only, log_callback=_warn)
+        return {v.symbol for v in skipped}
+
     def poll_once(
         self,
         duration: str = "3600 S",
@@ -466,9 +497,19 @@ class IBKRBarProvider:
 
         Errors for individual symbols are logged and skipped — never crash
         the caller. Returns dict of symbol -> bar count written.
+
+        FUTURES-ROLL-1 expiry gate: before issuing any IBKR request, skip
+        futures symbols whose front-month contract is expired or expires
+        today (per runtime/futures_roll_state.json). One warning is emitted
+        per (symbol, session-day) — not per cycle — to stop the SILK6-class
+        Error 162 spam.
         """
         results: Dict[str, int] = {}
+        expired_skipped = self._filter_expired_futures()
         for sym in self._universe:
+            if sym in expired_skipped:
+                results[sym] = 0
+                continue
             try:
                 bars = self.fetch_historical_bars(
                     sym,
@@ -576,10 +617,15 @@ class IBKRBarProvider:
         """
         Fetch historical bars for all universe symbols.
 
-        Returns dict of symbol -> bar count.
+        Returns dict of symbol -> bar count. FUTURES-ROLL-1: expired-future
+        symbols are skipped (see _filter_expired_futures).
         """
         results: Dict[str, int] = {}
+        expired_skipped = self._filter_expired_futures()
         for sym in self._universe:
+            if sym in expired_skipped:
+                results[sym] = 0
+                continue
             try:
                 bars = self.fetch_historical_bars(sym, duration=duration, bar_size=bar_size)
                 results[sym] = len(bars)

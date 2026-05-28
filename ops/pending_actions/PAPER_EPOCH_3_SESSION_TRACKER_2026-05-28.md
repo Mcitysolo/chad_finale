@@ -55,6 +55,8 @@ A session is marked **PASS** only if **every** criterion below holds (or is expl
 19. **No signal_guard clearing** — no `runtime/signal_guard.json` operator edit.
 20. **No position_guard manual closes** except via `scripts/close_guard_entry.py` with fail-closed gates honoured.
 
+> **RED-window classification reference:** Any `broker_authority_RED` window during this session shall be classified per the mechanical evidence-gated rule defined in `ops/pending_actions/SESSION_SOAK_MECHANICAL_EVIDENCE_GATE_RULE_2026-05-27.md`. Until the evaluator referenced in §8 of that rule is implemented, every RED window defaults to FAIL / NOT COUNTABLE.
+
 ## 4. Tracker baseline (at creation, 2026-05-27T13:33Z)
 
 | Gate | Observed | Source |

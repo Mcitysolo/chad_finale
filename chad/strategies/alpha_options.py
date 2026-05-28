@@ -240,7 +240,24 @@ def _load_chain_from_cache(symbol: str) -> Optional[OptionsChain]:
 
     The chain_provider daemon writes runtime/options_chains_cache.json.
     This function reads it without requiring an IBKR connection.
+
+    OPTIONS-CHAIN-1 fail-closed: if the shared freshness validator reports
+    the cache is stale or a fresh failure artefact exists, return None so
+    the strategy abstains rather than acting on stale/known-bad data.
     """
+    try:
+        from chad.market_data.options_chain_freshness import chain_usability
+        verdict = chain_usability()
+        if not verdict.usable:
+            LOG.warning(
+                "alpha_options: chain_cache_unusable reason=%s symbol=%s",
+                verdict.reason, symbol,
+            )
+            return None
+    except Exception as _exc:
+        LOG.warning("alpha_options: chain_freshness_check_failed exc=%s", _exc)
+        # If the freshness check itself fails, fall through to the legacy
+        # load — the legacy load is already best-effort.
     try:
         if not CHAINS_CACHE_PATH.is_file():
             return None

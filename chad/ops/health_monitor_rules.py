@@ -804,6 +804,122 @@ def rule_options_chain_refresh_health(findings: List[Finding]) -> None:
             pass
 
 
+def rule_ibkr_sustained_latency(findings: List[Finding]) -> None:
+    """R19 (STOP-BUS-RECOVERY-1) — promote the sustained-latency counter to
+    a loud Telegram alert.
+
+    Reads runtime/ibkr_status.json::consecutive_cycles_above_stop_threshold
+    (emitted by chad/ops/ibkr_reliability_tracker.py via the healthcheck).
+    When the counter is >= the configured alert-at value (default 5), a
+    CRITICAL Finding is emitted so the existing Telegram pipeline surfaces
+    the pattern before the stop_bus latches.
+
+    The publisher's own auto-recovery (clean_streak=5) is unchanged; this
+    rule is observability only.
+    """
+    status_path = RUNTIME / "ibkr_status.json"
+    if not status_path.is_file():
+        return
+    try:
+        from chad.ops.ibkr_reliability_tracker import (
+            should_alert,
+            DEFAULT_ALERT_AT_CONSECUTIVE,
+        )
+    except Exception:
+        return
+    doc = _read_json(status_path)
+    fire, alert = should_alert(doc, alert_at=DEFAULT_ALERT_AT_CONSECUTIVE)
+    if not fire:
+        return
+    findings.append(Finding(
+        rule_id="R19",
+        severity="CRITICAL",
+        title="IBKR sustained latency above stop threshold",
+        description=(
+            f"avg_latency_ms has been above the stop threshold for "
+            f"{alert['consecutive_cycles_above_stop_threshold']} consecutive "
+            f"healthcheck cycles (threshold={alert['stop_threshold_ms']:.0f}ms, "
+            f"max_in_window={alert['max_latency_observed_in_window']!r}ms). "
+            "The publisher's own auto-recovery (clean_streak=5) is still in "
+            "effect; this finding is operator-visible defense-in-depth."
+        ),
+        remedy_type="NOTIFY_ONLY",
+        remedy_action="notify",
+        evidence=(
+            "ibkr_status.json "
+            f"consecutive_cycles_above_stop_threshold={alert['consecutive_cycles_above_stop_threshold']} "
+            f"recovery_state={alert['current_recovery_state']} "
+            f"last_above_at={alert['last_above_threshold_at']} "
+            f"last_gateway_churn_at={alert['last_gateway_churn_at']}"
+        ),
+    ))
+
+
+def rule_options_chain_refresh_failure_artifact(findings: List[Finding]) -> None:
+    """R17b (OPTIONS-CHAIN-1) — read the dedicated failure artifact emitted by
+    chad-options-chain-refresh.service (``_write_failure_artifact`` writes
+    ``runtime/options_chain_refresh_failure.json``). A *fresh* failure
+    artefact promotes to CRITICAL even when the cache itself is benign
+    (e.g. the cache may still hold yesterday's content while today's refresh
+    explicitly failed).
+
+      * file missing                                   → silent (no finding)
+      * artefact present + age <= 2h                   → CRITICAL
+      * artefact present + age > 2h                    → WARNING (stale failure;
+        a fresh successful refresh would have cleared it)
+    """
+    try:
+        from chad.market_data.options_chain_freshness import (
+            is_failure_artifact_fresh,
+        )
+    except Exception:
+        return
+    fresh, details = is_failure_artifact_fresh()
+    if not details["failure_artifact_exists"]:
+        return
+    reason = details.get("failure_artifact_reason") or "unknown"
+    age_s = details.get("failure_artifact_age_seconds")
+    age_label = f"{int(age_s)}s" if isinstance(age_s, (int, float)) else "unknown_age"
+    if fresh:
+        findings.append(Finding(
+            rule_id="R17b",
+            severity="CRITICAL",
+            title="Options chain refresh failure artifact is fresh",
+            description=(
+                "runtime/options_chain_refresh_failure.json is present and "
+                f"recent (age={age_label}; blocked_reason={reason}). The most "
+                "recent refresh attempt failed; options-routed strategies "
+                "must fail-closed via chain_usability() until the next "
+                "successful refresh."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=(
+                "options_chain_refresh_failure.json "
+                f"age_s={age_label} reason={reason}"
+            ),
+        ))
+    else:
+        findings.append(Finding(
+            rule_id="R17b",
+            severity="WARNING",
+            title="Options chain refresh failure artifact is stale",
+            description=(
+                "runtime/options_chain_refresh_failure.json exists but its "
+                f"ts_utc is older than 2h (age={age_label}). Either a fresh "
+                "successful refresh has not run yet to clear it, or the "
+                "refresh writer is no longer emitting failure artefacts on "
+                "success."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="notify",
+            evidence=(
+                "options_chain_refresh_failure.json "
+                f"age_s={age_label} reason={reason}"
+            ),
+        ))
+
+
 def rule_options_greeks_freshness(findings: List[Finding]) -> None:
     """R18 (NEW-GAP-044) — companion rule that flags silently-stale Greeks.
 
@@ -937,7 +1053,9 @@ def run_all_rules() -> List[Finding]:
         rule_tier_daily_loss_approaching,
         rule_setup_family_skip_rate,
         rule_options_chain_refresh_health,
+        rule_options_chain_refresh_failure_artifact,
         rule_options_greeks_freshness,
+        rule_ibkr_sustained_latency,
     ]:
         try:
             fn(findings)

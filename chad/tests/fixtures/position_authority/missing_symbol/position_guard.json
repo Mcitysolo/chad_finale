@@ -1,0 +1,22 @@
+{
+  "manual|AAPL": {
+    "open": true,
+    "opened_at": "2026-05-27T20:00:00Z",
+    "updated_at_utc": "2026-05-27T20:00:00Z",
+    "strategy": "manual",
+    "symbol": "AAPL",
+    "side": "BUY",
+    "quantity": 100.0,
+    "source": "test"
+  },
+  "manual|MSFT": {
+    "open": true,
+    "opened_at": "2026-05-27T20:00:00Z",
+    "updated_at_utc": "2026-05-27T20:00:00Z",
+    "strategy": "manual",
+    "symbol": "MSFT",
+    "side": "SELL",
+    "quantity": 50.0,
+    "source": "test"
+  }
+}

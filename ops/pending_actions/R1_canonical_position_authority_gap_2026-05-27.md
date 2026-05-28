@@ -1,3 +1,15 @@
+> **STATUS UPDATE 2026-05-27:**
+> Decision 1 institutional response landed in commit <will-be-filled-after-commit>.
+> Per-surface authority designation is REPLACED by the `position_truth_v2`
+> engine — see `docs/design/POSITION_TRUTH_V2_ENGINE_DESIGN_2026-05-27.md`.
+> Code stub at `chad/core/position_truth_engine.py` and schema at
+> `chad/schemas/position_truth_v2.py` implement the 5 merge rules in
+> §9 of the design.
+>
+> Production wiring (`positions_truth.json` repointing) is deferred to
+> a separate operator-authorized phase per the migration plan in §12
+> of the design.
+
 # R1 — Canonical Position-Authority Gap (positions_snapshot vs ibkr_paper_ledger_state)
 
 # Status: PROPOSED

@@ -43,6 +43,7 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from chad.utils.runtime_json import stable_json_dumps, write_runtime_state_json
@@ -244,6 +245,15 @@ def main() -> int:
     # Run the check
     st = _healthcheck(host, port, client_id, timeout_s, bool(args.quiet_ibinsync))
     payload = _as_payload(st)
+
+    # STOP-BUS-RECOVERY-1 observability: augment with sustained-latency tracker
+    # fields (no behaviour change; values are emitted on the next natural cycle
+    # by reading the previous ibkr_status.json from disk).
+    try:
+        from chad.ops.ibkr_reliability_tracker import merge_reliability_into_payload
+        payload = merge_reliability_into_payload(payload, Path(_runtime_path()))
+    except Exception:
+        pass
 
     # Write CSB-compliant runtime STATE with TTL
     path = Path(_runtime_path())

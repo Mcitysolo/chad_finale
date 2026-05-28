@@ -1,0 +1,9 @@
+{
+  "ts_utc": "2026-05-28T01:05:00Z",
+  "source": "ibkr_portfolio_collector_v2",
+  "positions": [
+    {"symbol": "TSLA", "position": 18.0, "secType": "STK", "conId": 76792991, "avgCost": 240.5, "currency": "USD"}
+  ],
+  "positions_count": 1,
+  "ttl_seconds": 300
+}

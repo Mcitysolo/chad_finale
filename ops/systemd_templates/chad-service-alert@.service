@@ -1,0 +1,45 @@
+# CHAD service-failure alert template unit.
+#
+# This is a systemd *template* unit. It is instantiated as
+#   chad-service-alert@<unit-name>.service
+# and is invoked via OnFailure= directives on other CHAD services. The %i
+# specifier in this file expands to the failed unit's full name at the
+# moment of activation.
+#
+# Responsibilities:
+#   - Capture a tail of the failed unit's journal (read-only).
+#   - Capture a metadata-only snapshot of key runtime/*.json files
+#     (mtime + size; NEVER reads contents).
+#   - Persist a structured artifact under reports/service_failures/.
+#   - Send a Telegram alert via the canonical chad.utils.telegram_notify path.
+#
+# Channel-2 design only — install via the Channel-1 operator-authorized
+# runbook at ops/runbooks/INSTALL_chad_service_alert_template_2026-05-27.md
+# (per CLAUDE.md governance rule #6).
+
+[Unit]
+Description=CHAD service failure alert for %i
+After=network.target
+# Defensive: don't loop if the alert service itself fails
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/telegram.env
+EnvironmentFile=-/etc/chad/chad.env
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 \
+  -m chad.ops.service_failure_alert \
+  --failed-unit %i \
+  --severity HIGH \
+  --include-journal-tail 50 \
+  --include-runtime-snapshot
+# If the alert itself fails, log and exit; do NOT restart
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

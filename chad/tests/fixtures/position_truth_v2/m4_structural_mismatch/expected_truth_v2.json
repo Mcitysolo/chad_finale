@@ -1,0 +1,18 @@
+{
+  "expected_global_authority_health": "RED",
+  "expected_positions": {
+    "SPY": {
+      "merge_rule": "M4",
+      "value_source": "DISAGREEMENT",
+      "qty": null,
+      "side": "UNKNOWN",
+      "snapshot_value": 1.0,
+      "ledger_value": -1.0,
+      "delta": -2.0,
+      "delta_reason": "structural_mismatch",
+      "fail_closed": true,
+      "authority_decision": "FAIL_CLOSED"
+    }
+  },
+  "expected_fail_closed_symbols": ["SPY"]
+}
