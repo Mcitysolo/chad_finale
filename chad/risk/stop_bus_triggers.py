@@ -27,6 +27,7 @@ halt decision while these triggers contribute additional signals.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -44,6 +45,33 @@ DEFAULT_DATA_STALENESS_THRESHOLD: float = 0.80
 DEFAULT_DATA_STALENESS_MIN_SAMPLES: int = 5
 
 DEFAULT_BROKER_LATENCY_THRESHOLD_MS: float = 2000.0
+
+# --- Fix A: symmetric hysteresis on the broker_latency TRIP side ----------
+# The auto-clear (release) side in chad/risk/stop_bus_state.py already demands
+# a SUSTAINED clean streak before it lets the bus go:
+#     DEFAULT_AUTO_CLEAR_CONSECUTIVE_CLEAN_REQUIRED = 5   (count gate)
+#     DEFAULT_AUTO_CLEAR_MIN_CLEAN_SECONDS          = 240 (wall-clock gate)
+# The trip side historically fired on a SINGLE cycle above threshold, so a
+# one-cycle latency spike could halt trading for ~one auto-clear window. These
+# constants give the trip side the same count + wall-clock discipline. The
+# count gate is kept symmetric with the clear side (5 == 5); the wall-clock
+# floor is intentionally shorter (60s vs the clear side's 240s) so a genuine
+# sustained breach still halts promptly.
+DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED: int = 5
+DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS: float = 60.0
+DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED: bool = True
+
+# Env-var threading note (Fix A Phase D): these knobs are consumed via the
+# ``config`` mapping passed to evaluate_all_stop_triggers (cfg keys:
+# broker_latency_trip_consecutive_required, broker_latency_trip_min_breach_seconds,
+# broker_latency_trip_hysteresis_enabled). Today chad/core/live_loop.py calls
+# stop_bus_state.evaluate_and_persist WITHOUT a config dict, so the module
+# defaults above apply. To make these operator-tunable, assemble a config dict
+# where the snapshot is built (live_loop._build_stop_bus_snapshot already reads
+# CHAD_* env vars) and read CHAD_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED (int),
+# CHAD_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS (float),
+# CHAD_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED (bool: 1/true/yes). No new config
+# layer is introduced in this commit.
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +198,65 @@ def check_data_staleness(
     )
 
 
+def _check_time_gate(
+    last_above_threshold_at: Optional[str],
+    min_seconds: float,
+) -> bool:
+    """Return True iff ``last_above_threshold_at`` is at least ``min_seconds``
+    of wall-clock in the past.
+
+    Mirrors the elapsed-time discipline in
+    stop_bus_state._maybe_auto_clear_on_clean_streak (which compares
+    ``now - streak_start`` against ``auto_clear_min_clean_seconds``). Fails
+    closed: an empty, missing, or unparseable timestamp returns False so a
+    transient spike or a malformed value can never satisfy the trip's time
+    gate. Accepts ISO-8601 with a trailing 'Z' or an explicit offset; a naive
+    timestamp is assumed UTC.
+    """
+    if not last_above_threshold_at:
+        return False
+    raw = str(last_above_threshold_at).strip()
+    if not raw:
+        return False
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        elapsed = (datetime.now(timezone.utc) - parsed).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    return elapsed >= float(min_seconds)
+
+
 def check_broker_latency(
     avg_latency_ms: float,
     threshold_ms: float = DEFAULT_BROKER_LATENCY_THRESHOLD_MS,
+    *,
+    consecutive_cycles_above: Optional[int] = None,
+    last_above_threshold_at: Optional[str] = None,
+    trip_consecutive_required: int = DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED,
+    trip_min_breach_seconds: float = DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS,
+    hysteresis_enabled: bool = DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED,
 ) -> StopTriggerResult:
-    """Return active=True when avg broker submission latency exceeds threshold."""
+    """Return active=True when avg broker submission latency breaches threshold.
+
+    Legacy single-cycle behaviour (active = latency > threshold) is preserved
+    whenever hysteresis is disabled OR the caller does not supply the
+    ``consecutive_cycles_above`` counter — this keeps un-migrated callers and
+    existing tests intact.
+
+    When hysteresis is enabled AND the counter is supplied, the trigger trips
+    ONLY on a SUSTAINED breach: both a count gate (``consecutive_cycles_above
+    >= trip_consecutive_required``) and a wall-clock gate
+    (``now - last_above_threshold_at >= trip_min_breach_seconds``) must pass.
+    This is the symmetric counterpart of the auto-clear hysteresis on the
+    release side (stop_bus_state._maybe_auto_clear_on_clean_streak).
+    """
     try:
         lat = float(avg_latency_ms)
     except (TypeError, ValueError):
@@ -183,14 +265,64 @@ def check_broker_latency(
         thr = float(threshold_ms)
     except (TypeError, ValueError):
         return StopTriggerResult("broker_latency", False, "invalid_threshold")
+    if thr <= 0:
+        return StopTriggerResult("broker_latency", False, "invalid_threshold")
 
-    active = lat > thr
-    reason = f"avg_latency_ms={lat:.1f}>threshold={thr:.1f}" if active else "ok"
+    above_now = lat > thr
+
+    # Backward-compat path: legacy single-cycle behaviour when hysteresis is
+    # disabled OR the caller did not pass the consecutive-cycle counter.
+    if not hysteresis_enabled or consecutive_cycles_above is None:
+        active = above_now
+        reason = f"avg_latency_ms={lat:.1f}>threshold={thr:.1f}" if above_now else "ok"
+        return StopTriggerResult(
+            "broker_latency",
+            active,
+            reason,
+            {"avg_latency_ms": lat, "threshold_ms": thr},
+        )
+
+    # Hysteresis path: trip ONLY when BOTH the count gate and the wall-clock
+    # time gate pass. Either gate failing keeps the trigger inactive.
+    try:
+        counter = int(consecutive_cycles_above)
+    except (TypeError, ValueError):
+        counter = 0
+    try:
+        required = int(trip_consecutive_required)
+    except (TypeError, ValueError):
+        required = DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED
+    try:
+        min_seconds = float(trip_min_breach_seconds)
+    except (TypeError, ValueError):
+        min_seconds = DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS
+
+    count_gate = above_now and counter >= required
+    time_gate = above_now and _check_time_gate(last_above_threshold_at, min_seconds)
+    active = count_gate and time_gate
+
+    if active:
+        reason = (
+            f"sustained_latency:avg_latency_ms={lat:.1f}>threshold={thr:.1f}"
+            f" consecutive={counter}/{required}"
+        )
+    elif not above_now:
+        reason = "ok"
+    else:
+        reason = (
+            f"transient:avg_latency_ms={lat:.1f}>threshold={thr:.1f}"
+            f" consecutive={counter}/{required}_below_trip_streak"
+        )
     return StopTriggerResult(
         "broker_latency",
         active,
         reason,
-        {"avg_latency_ms": lat, "threshold_ms": thr},
+        {
+            "avg_latency_ms": lat,
+            "threshold_ms": thr,
+            "consecutive_cycles_above": counter,
+            "trip_consecutive_required": required,
+        },
     )
 
 
@@ -272,6 +404,26 @@ def evaluate_all_stop_triggers(
                 threshold_ms=float(
                     cfg.get("broker_latency_threshold_ms", DEFAULT_BROKER_LATENCY_THRESHOLD_MS)
                 ),
+                consecutive_cycles_above=snap.get("consecutive_cycles_above_stop_threshold"),
+                last_above_threshold_at=snap.get("last_above_threshold_at"),
+                trip_consecutive_required=int(
+                    cfg.get(
+                        "broker_latency_trip_consecutive_required",
+                        DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED,
+                    )
+                ),
+                trip_min_breach_seconds=float(
+                    cfg.get(
+                        "broker_latency_trip_min_breach_seconds",
+                        DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS,
+                    )
+                ),
+                hysteresis_enabled=bool(
+                    cfg.get(
+                        "broker_latency_trip_hysteresis_enabled",
+                        DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED,
+                    )
+                ),
             )
         )
 
@@ -290,6 +442,9 @@ __all__ = [
     "DEFAULT_DATA_STALENESS_THRESHOLD",
     "DEFAULT_DATA_STALENESS_MIN_SAMPLES",
     "DEFAULT_BROKER_LATENCY_THRESHOLD_MS",
+    "DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED",
+    "DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS",
+    "DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED",
     "StopTriggerResult",
     "check_daily_loss_limit",
     "check_reject_rate",

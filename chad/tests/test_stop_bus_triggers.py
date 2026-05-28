@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from chad.risk.stop_bus_triggers import (
+    DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED,
+    DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS,
     check_broker_latency,
     check_daily_loss_limit,
     check_data_staleness,
     check_reject_rate,
     evaluate_all_stop_triggers,
 )
+
+
+def _iso_z_seconds_ago(seconds: float) -> str:
+    """Produce a UTC ISO-8601 'Z'-suffixed timestamp ``seconds`` in the past.
+
+    Matches the exact format ibkr_reliability_tracker emits for
+    ``last_above_threshold_at`` (strftime '%Y-%m-%dT%H:%M:%SZ').
+    """
+    dt = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
@@ -130,3 +144,161 @@ def test_evaluate_all_never_raises_on_garbage_input():
     # Must not raise.
     result = evaluate_all_stop_triggers(snap)
     assert result["any_active"] is False
+
+
+# ---------------------------------------------------------------------------
+# broker_latency — Fix A: symmetric hysteresis on the trip side
+# ---------------------------------------------------------------------------
+
+
+class TestBrokerLatencyHysteresis:
+    """Fix A: the trip side requires a SUSTAINED breach (count + wall-clock
+    gates), mirroring the auto-clear discipline on the release side. Legacy
+    single-cycle behaviour is preserved for un-migrated callers."""
+
+    def test_legacy_single_cycle_when_hysteresis_disabled(self):
+        # hysteresis_enabled=False -> single above-threshold cycle trips.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=1,
+            last_above_threshold_at=_iso_z_seconds_ago(0),
+            hysteresis_enabled=False,
+        )
+        assert r.active is True
+        assert "avg_latency_ms" in r.reason
+
+    def test_legacy_single_cycle_when_counter_not_passed(self):
+        # consecutive_cycles_above=None (default) -> legacy behaviour even with
+        # hysteresis enabled. Protects callers that have not migrated.
+        r = check_broker_latency(avg_latency_ms=3000.0, threshold_ms=2000.0)
+        assert r.active is True
+
+    def test_single_cycle_spike_does_not_trip_with_hysteresis(self):
+        # Today's 18:12Z incident: one 2962ms-class cycle must NOT halt.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=1,
+            last_above_threshold_at=_iso_z_seconds_ago(0),
+            hysteresis_enabled=True,
+        )
+        assert r.active is False
+        assert "transient" in r.reason or "below_trip_streak" in r.reason
+
+    def test_4_cycle_breach_does_not_trip(self):
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=4,
+            last_above_threshold_at=_iso_z_seconds_ago(120),
+            trip_consecutive_required=5,
+            hysteresis_enabled=True,
+        )
+        assert r.active is False
+
+    def test_5_cycle_sustained_breach_trips(self):
+        # Count gate (5/5) AND time gate (120s > 60s default) both pass.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(120),
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is True
+        assert "sustained_latency" in r.reason
+        assert r.details["consecutive_cycles_above"] == 5
+
+    def test_count_met_but_time_gate_fails(self):
+        # Count gate passes (5/5) but breach only 10s old < 60s floor.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(10),
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is False
+
+    def test_recovery_during_climb_does_not_trip(self):
+        # First: climbing (3 cycles, above). Second: recovered (counter reset).
+        first = check_broker_latency(
+            avg_latency_ms=2500.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=3,
+            last_above_threshold_at=_iso_z_seconds_ago(40),
+            trip_consecutive_required=5,
+            hysteresis_enabled=True,
+        )
+        second = check_broker_latency(
+            avg_latency_ms=600.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=0,
+            last_above_threshold_at=_iso_z_seconds_ago(40),
+            trip_consecutive_required=5,
+            hysteresis_enabled=True,
+        )
+        assert first.active is False
+        assert second.active is False
+        assert second.reason == "ok"
+
+    def test_hard_wedge_scenario_today_morning(self):
+        # Today's 04:28-17:34Z hard wedge: 715 consecutive cycles at 8221ms.
+        # MUST still trip under Fix A.
+        r = check_broker_latency(
+            avg_latency_ms=8221.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=715,
+            last_above_threshold_at=_iso_z_seconds_ago(3600),
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is True
+        assert "sustained_latency" in r.reason
+
+    def test_invalid_latency_returns_inactive(self):
+        r = check_broker_latency(
+            avg_latency_ms="not-a-number",
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(120),
+            hysteresis_enabled=True,
+        )
+        assert r.active is False
+        assert r.reason == "invalid_latency"
+
+    def test_invalid_threshold_returns_inactive(self):
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=0.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(120),
+            hysteresis_enabled=True,
+        )
+        assert r.active is False
+        assert r.reason == "invalid_threshold"
+
+    def test_invalid_timestamp_blocks_time_gate(self):
+        # Count gate passes but the timestamp is unparseable; the time gate
+        # must fail closed so the trigger stays inactive.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at="garbage",
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is False
+
+    def test_defaults_are_symmetric_with_clear_side_count(self):
+        # The trip count gate default mirrors the auto-clear clean-streak (5).
+        assert DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED == 5
+        assert DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS == 60.0
