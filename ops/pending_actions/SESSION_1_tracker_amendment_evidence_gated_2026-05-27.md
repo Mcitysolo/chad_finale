@@ -1,3 +1,9 @@
+> **SUPERSEDED-BY:**
+> ops/pending_actions/SESSION_SOAK_MECHANICAL_EVIDENCE_GATE_RULE_2026-05-27.md
+>
+> This document is preserved for audit history. The mechanical
+> evidence-gated rule above is the authoritative source.
+
 # Session 1 tracker amendment — evidence-gated treatment of broker_authority_RED windows
 
 # HIGH_ID: (cross-cuts TRUTH-RECONCILE-1 / Session 1 evaluation)
