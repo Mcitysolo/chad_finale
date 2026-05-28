@@ -855,6 +855,87 @@ def rule_ibkr_sustained_latency(findings: List[Finding]) -> None:
     ))
 
 
+def rule_ibkr_gateway_version(findings: List[Finding]) -> None:
+    """R20 — surface Gateway version staleness as an audit finding.
+
+    Reads a cached ``runtime/ibkr_gateway_version.json`` if present and fresh
+    (< 24h); otherwise invokes ``chad.tools.ibkr_gateway_version_check``
+    programmatically against the live install tree. Severity follows the
+    tool's classification:
+
+        tool "info"    -> no finding (current; nothing to surface)
+        tool "warning" -> WARNING
+        tool "stale"   -> CRITICAL
+        tool "unknown" -> WARNING (detection failed; operator should look)
+
+    This rule is observability only — it triggers no remediation action.
+    """
+    cache_path = RUNTIME / "ibkr_gateway_version.json"
+    report = None
+    age = _age(cache_path)
+    if age is not None and age < 86400:
+        cached = _read_json(cache_path)
+        if cached.get("schema_version") == "ibkr_gateway_version_check.v1":
+            report = cached
+    if report is None:
+        try:
+            from chad.tools.ibkr_gateway_version_check import build_report
+            report = build_report()
+        except Exception:
+            return
+
+    comp = report.get("comparison", {})
+    severity = comp.get("severity", "unknown")
+    installed = report.get("installed", {})
+    target = report.get("target", {})
+
+    sev_map = {
+        "info": None,
+        "warning": "WARNING",
+        "stale": "CRITICAL",
+        "unknown": "WARNING",
+    }
+    finding_severity = sev_map.get(severity, "WARNING")
+    if finding_severity is None:
+        return  # current — nothing to surface
+
+    if severity == "unknown":
+        title = "IBKR Gateway version could not be determined"
+        description = (
+            "chad.tools.ibkr_gateway_version_check could not derive an "
+            f"installed build from {installed.get('install_path')!r} "
+            f"(detection_error={installed.get('detection_error')!r}). "
+            "Operator should verify the Gateway install tree."
+        )
+    else:
+        description = (
+            f"Installed IB Gateway build {installed.get('build')} "
+            f"({installed.get('display')}) is behind the recommended target "
+            f"build {target.get('build')} ({target.get('display')}) by "
+            f"{comp.get('build_delta')} builds. Recommendation: "
+            f"{report.get('recommendation')}. See "
+            "ops/pending_actions/IBKR_GATEWAY_VERSION_UPGRADE_2026-05-28.md."
+        )
+        title = "IBKR Gateway version is stale" if severity == "stale" \
+            else "IBKR Gateway version upgrade recommended"
+
+    findings.append(Finding(
+        rule_id="R20",
+        severity=finding_severity,
+        title=title,
+        description=description,
+        remedy_type="NOTIFY_ONLY",
+        remedy_action="notify",
+        evidence=(
+            f"installed_build={installed.get('build')} "
+            f"display={installed.get('display')} "
+            f"detection_source={installed.get('detection_source')} "
+            f"install_path={installed.get('install_path')} "
+            f"target_build={target.get('build')} severity={severity}"
+        ),
+    ))
+
+
 def rule_options_chain_refresh_failure_artifact(findings: List[Finding]) -> None:
     """R17b (OPTIONS-CHAIN-1) — read the dedicated failure artifact emitted by
     chad-options-chain-refresh.service (``_write_failure_artifact`` writes
@@ -1056,6 +1137,7 @@ def run_all_rules() -> List[Finding]:
         rule_options_chain_refresh_failure_artifact,
         rule_options_greeks_freshness,
         rule_ibkr_sustained_latency,
+        rule_ibkr_gateway_version,
     ]:
         try:
             fn(findings)
