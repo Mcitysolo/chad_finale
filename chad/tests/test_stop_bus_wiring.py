@@ -118,3 +118,75 @@ def test_execution_pipeline_allows_intents_when_bus_inactive(monkeypatch):
     # Empty plan in, empty list out — but not short-circuited by STOP.
     result = build_ibkr_intents_from_plan(plan)
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Fix A activation: live_loop snapshot/config carry the hysteresis inputs
+# ---------------------------------------------------------------------------
+
+
+def test_live_loop_snapshot_carries_hysteresis_fields(tmp_path: Path):
+    import logging
+    from chad.core.live_loop import _build_stop_bus_snapshot
+
+    status = tmp_path / "ibkr_status.json"
+    status.write_text(json.dumps({
+        "latency_ms": 8221.0,
+        "consecutive_cycles_above_stop_threshold": 715,
+        "last_above_threshold_at": "2026-05-28T17:34:00Z",
+        "breach_streak_started_at": "2026-05-28T04:28:00Z",
+    }), encoding="utf-8")
+
+    snap = _build_stop_bus_snapshot(logging.getLogger("test"), ibkr_status_path=status)
+    assert snap["avg_latency_ms"] == 8221.0
+    assert snap["consecutive_cycles_above_stop_threshold"] == 715
+    assert snap["last_above_threshold_at"] == "2026-05-28T17:34:00Z"
+    assert snap["breach_streak_started_at"] == "2026-05-28T04:28:00Z"
+
+
+def test_live_loop_stop_bus_config_carries_hysteresis_keys():
+    from chad.core.live_loop import _build_stop_bus_config
+
+    cfg = _build_stop_bus_config()
+    assert cfg["broker_latency_trip_consecutive_required"] == 5
+    assert cfg["broker_latency_trip_min_breach_seconds"] == 60.0
+    assert cfg["broker_latency_trip_hysteresis_enabled"] is True
+
+
+def test_live_loop_stop_bus_config_env_override(monkeypatch):
+    from chad.core.live_loop import _build_stop_bus_config
+
+    monkeypatch.setenv("CHAD_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED", "9")
+    monkeypatch.setenv("CHAD_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS", "120")
+    monkeypatch.setenv("CHAD_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED", "0")
+    cfg = _build_stop_bus_config()
+    assert cfg["broker_latency_trip_consecutive_required"] == 9
+    assert cfg["broker_latency_trip_min_breach_seconds"] == 120.0
+    assert cfg["broker_latency_trip_hysteresis_enabled"] is False
+
+
+def test_live_loop_snapshot_resilient_to_missing_artifact(tmp_path: Path):
+    import logging
+    from chad.core.live_loop import _build_stop_bus_snapshot
+
+    missing = tmp_path / "does_not_exist.json"
+    # Must not raise, and must not carry hysteresis keys -> aggregator falls
+    # back to legacy single-cycle behaviour (counter=None).
+    snap = _build_stop_bus_snapshot(logging.getLogger("test"), ibkr_status_path=missing)
+    assert isinstance(snap, dict)
+    assert "avg_latency_ms" not in snap
+    assert "consecutive_cycles_above_stop_threshold" not in snap
+    assert "breach_streak_started_at" not in snap
+
+
+def test_live_loop_snapshot_old_format_artifact_falls_back_to_legacy(tmp_path: Path):
+    import logging
+    from chad.core.live_loop import _build_stop_bus_snapshot
+
+    # Pre-activation artifact: latency present, hysteresis fields absent.
+    status = tmp_path / "ibkr_status.json"
+    status.write_text(json.dumps({"latency_ms": 3000.0}), encoding="utf-8")
+    snap = _build_stop_bus_snapshot(logging.getLogger("test"), ibkr_status_path=status)
+    assert snap["avg_latency_ms"] == 3000.0
+    assert "consecutive_cycles_above_stop_threshold" not in snap
+    assert "breach_streak_started_at" not in snap

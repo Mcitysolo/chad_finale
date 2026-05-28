@@ -299,11 +299,21 @@ def _load_optional_metric(name: str) -> Optional[float]:
     return None
 
 
-def _build_stop_bus_snapshot(logger: logging.Logger) -> Dict[str, Any]:
+def _build_stop_bus_snapshot(
+    logger: logging.Logger,
+    ibkr_status_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Best-effort snapshot of halt-trigger inputs.
 
     Missing inputs are simply omitted — the aggregator skips any trigger
     whose keys aren't present, so partial snapshots are fine.
+
+    ``ibkr_status_path`` is overridable for tests; production uses the canonical
+    runtime artifact. Fix A activation: this snapshot now also carries the
+    sustained-breach hysteresis inputs (consecutive_cycles_above_stop_threshold,
+    last_above_threshold_at, breach_streak_started_at) when the tracker has
+    published them. A missing/old artifact simply omits those keys, so the
+    broker_latency trigger falls back to legacy single-cycle behaviour.
     """
     snap: Dict[str, Any] = {}
 
@@ -328,15 +338,28 @@ def _build_stop_bus_snapshot(logger: logging.Logger) -> Dict[str, Any]:
     except (TypeError, ValueError):
         pass
 
-    # Broker latency: ibkr_status.json publishes last latency measurement.
+    # Broker latency: ibkr_status.json publishes the latency measurement plus
+    # the reliability-tracker hysteresis fields (Fix A activation). All are
+    # read best-effort; a missing/old artifact leaves the hysteresis keys
+    # absent and the broker_latency trigger uses legacy single-cycle behaviour.
     try:
-        status_path = Path("/home/ubuntu/chad_finale/runtime/ibkr_status.json")
+        status_path = ibkr_status_path or Path(
+            "/home/ubuntu/chad_finale/runtime/ibkr_status.json"
+        )
         if status_path.is_file():
             status = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(status, dict):
                 lat = status.get("latency_ms") or status.get("avg_latency_ms")
                 if lat is not None:
                     snap["avg_latency_ms"] = float(lat)
+                if "consecutive_cycles_above_stop_threshold" in status:
+                    snap["consecutive_cycles_above_stop_threshold"] = status.get(
+                        "consecutive_cycles_above_stop_threshold"
+                    )
+                if "last_above_threshold_at" in status:
+                    snap["last_above_threshold_at"] = status.get("last_above_threshold_at")
+                if "breach_streak_started_at" in status:
+                    snap["breach_streak_started_at"] = status.get("breach_streak_started_at")
     except Exception:
         pass
 
@@ -344,6 +367,53 @@ def _build_stop_bus_snapshot(logger: logging.Logger) -> Dict[str, Any]:
     # that the current codebase does not yet publish; they are left
     # unpopulated and the aggregator skips them cleanly.
     return snap
+
+
+def _build_stop_bus_config() -> Dict[str, Any]:
+    """Assemble the stop-bus trigger config from operator env vars (Fix A
+    activation). Threads the broker_latency hysteresis knobs introduced in
+    f3ab3d8 so they are tunable without a code change; each falls back to the
+    module default baked into chad/risk/stop_bus_triggers.py.
+    """
+    from chad.risk.stop_bus_triggers import (
+        DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED,
+        DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS,
+        DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED,
+    )
+
+    cfg: Dict[str, Any] = {}
+    try:
+        cfg["broker_latency_trip_consecutive_required"] = int(
+            os.environ.get(
+                "CHAD_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED",
+                DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED,
+            )
+        )
+    except (TypeError, ValueError):
+        cfg["broker_latency_trip_consecutive_required"] = (
+            DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED
+        )
+    try:
+        cfg["broker_latency_trip_min_breach_seconds"] = float(
+            os.environ.get(
+                "CHAD_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS",
+                DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS,
+            )
+        )
+    except (TypeError, ValueError):
+        cfg["broker_latency_trip_min_breach_seconds"] = (
+            DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS
+        )
+    raw = os.environ.get("CHAD_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED")
+    if raw is None:
+        cfg["broker_latency_trip_hysteresis_enabled"] = (
+            DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED
+        )
+    else:
+        cfg["broker_latency_trip_hysteresis_enabled"] = (
+            str(raw).strip().lower() in ("1", "true", "yes")
+        )
+    return cfg
 
 
 def _build_router_signal_map(signals: List[object]) -> Dict[Tuple[str, str, str, float], object]:
@@ -808,8 +878,10 @@ def run_once(logger: logging.Logger) -> None:
     try:
         from chad.risk.stop_bus_state import evaluate_and_persist
         snapshot = _build_stop_bus_snapshot(logger)
+        sb_config = _build_stop_bus_config()
         sb_result = evaluate_and_persist(
             snapshot=snapshot,
+            config=sb_config,
             triggered_by="live_loop.run_once",
         )
         if sb_result.get("any_active"):

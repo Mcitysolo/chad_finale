@@ -191,3 +191,67 @@ def test_health_rule_no_finding_below_threshold(monkeypatch, tmp_path):
     hmr.rule_ibkr_sustained_latency(findings)
     r19 = [f for f in findings if f.rule_id == "R19"]
     assert not r19
+
+
+# ---------------------------------------------------------------------------
+# Fix A activation: breach_streak_started_at (stamp-once streak anchor)
+# ---------------------------------------------------------------------------
+
+
+def test_breach_streak_started_at_stamped_on_first_above():
+    # Streak begins (counter 0 -> 1): anchor stamped to now.
+    prev = {"latency_ms": 500, "ts_utc": _ts(NOW - timedelta(seconds=60)),
+            "consecutive_cycles_above_stop_threshold": 0, "client_id": 9001}
+    cur = {"latency_ms": 2500, "client_id": 9001}
+    fields = tr.compute_reliability_fields(prev, cur, now=NOW)
+    assert fields.consecutive_cycles_above_stop_threshold == 1
+    assert fields.breach_streak_started_at == _ts(NOW)
+    assert fields.as_payload()["breach_streak_started_at"] == _ts(NOW)
+
+
+def test_breach_streak_started_at_preserved_across_cycles():
+    # Streak continues: anchor preserved, NOT re-stamped.
+    anchor = "2026-01-01T00:00:00Z"
+    prev = {"latency_ms": 2500, "ts_utc": _ts(NOW - timedelta(seconds=60)),
+            "consecutive_cycles_above_stop_threshold": 3,
+            "breach_streak_started_at": anchor, "client_id": 9001}
+    cur = {"latency_ms": 2700, "client_id": 9001}
+    fields = tr.compute_reliability_fields(prev, cur, now=NOW)
+    assert fields.consecutive_cycles_above_stop_threshold == 4
+    assert fields.breach_streak_started_at == anchor
+
+
+def test_breach_streak_started_at_cleared_on_recovery():
+    # Streak ends (cur below threshold): anchor cleared to "".
+    prev = {"latency_ms": 2500, "ts_utc": _ts(NOW - timedelta(seconds=60)),
+            "consecutive_cycles_above_stop_threshold": 5,
+            "breach_streak_started_at": "2026-01-01T00:00:00Z", "client_id": 9001}
+    cur = {"latency_ms": 600, "client_id": 9001}
+    fields = tr.compute_reliability_fields(prev, cur, now=NOW)
+    assert fields.consecutive_cycles_above_stop_threshold == 0
+    assert fields.breach_streak_started_at == ""
+
+
+def test_last_above_threshold_at_still_restamps_for_compat():
+    # last_above_threshold_at must keep updating every above cycle (compat),
+    # while breach_streak_started_at stays pinned to the streak start.
+    anchor = "2026-01-01T00:00:00Z"
+    prev = {"latency_ms": 2500,
+            "ts_utc": _ts(NOW - timedelta(seconds=60)),
+            "consecutive_cycles_above_stop_threshold": 3,
+            "last_above_threshold_at": _ts(NOW - timedelta(seconds=70)),
+            "breach_streak_started_at": anchor, "client_id": 9001}
+    cur = {"latency_ms": 2700, "client_id": 9001}
+    fields = tr.compute_reliability_fields(prev, cur, now=NOW)
+    assert fields.last_above_threshold_at == _ts(NOW)   # re-stamped
+    assert fields.breach_streak_started_at == anchor    # preserved
+
+
+def test_breach_streak_started_at_fallback_when_missing_prev():
+    # Mid-streak but the field is absent from prev (e.g. first cycle after the
+    # tracker upgrade): fall back to stamping now rather than leaving it blank.
+    prev = {"latency_ms": 2500, "ts_utc": _ts(NOW - timedelta(seconds=60)),
+            "consecutive_cycles_above_stop_threshold": 2, "client_id": 9001}
+    cur = {"latency_ms": 2600, "client_id": 9001}
+    fields = tr.compute_reliability_fields(prev, cur, now=NOW)
+    assert fields.breach_streak_started_at == _ts(NOW)

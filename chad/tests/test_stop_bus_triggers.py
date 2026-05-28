@@ -302,3 +302,51 @@ class TestBrokerLatencyHysteresis:
         # The trip count gate default mirrors the auto-clear clean-streak (5).
         assert DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED == 5
         assert DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS == 60.0
+
+    def test_breach_streak_started_at_preferred_over_last_above(self):
+        # breach anchor is old enough (61s); last_above is ~now. If the trigger
+        # used last_above it would NOT trip (time gate ~0s). Using the breach
+        # anchor it trips — proving breach_streak_started_at takes precedence.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(0),
+            breach_streak_started_at=_iso_z_seconds_ago(61),
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is True
+        assert "sustained_latency" in r.reason
+
+    def test_falls_back_to_last_above_when_breach_streak_missing(self):
+        # breach_streak_started_at absent -> fall back to last_above (f3ab3d8
+        # behaviour preserved).
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(61),
+            breach_streak_started_at=None,
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is True
+
+    def test_breach_streak_recent_does_not_trip_even_if_last_above_old(self):
+        # Inverse precedence check: breach anchor is fresh (10s) so the trip is
+        # suppressed even though last_above is stale (120s). Confirms the breach
+        # anchor — not last_above — drives the time gate.
+        r = check_broker_latency(
+            avg_latency_ms=3000.0,
+            threshold_ms=2000.0,
+            consecutive_cycles_above=5,
+            last_above_threshold_at=_iso_z_seconds_ago(120),
+            breach_streak_started_at=_iso_z_seconds_ago(10),
+            trip_consecutive_required=5,
+            trip_min_breach_seconds=60.0,
+            hysteresis_enabled=True,
+        )
+        assert r.active is False

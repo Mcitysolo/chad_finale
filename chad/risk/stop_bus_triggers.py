@@ -239,6 +239,7 @@ def check_broker_latency(
     *,
     consecutive_cycles_above: Optional[int] = None,
     last_above_threshold_at: Optional[str] = None,
+    breach_streak_started_at: Optional[str] = None,
     trip_consecutive_required: int = DEFAULT_BROKER_LATENCY_TRIP_CONSECUTIVE_REQUIRED,
     trip_min_breach_seconds: float = DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS,
     hysteresis_enabled: bool = DEFAULT_BROKER_LATENCY_TRIP_HYSTERESIS_ENABLED,
@@ -253,9 +254,18 @@ def check_broker_latency(
     When hysteresis is enabled AND the counter is supplied, the trigger trips
     ONLY on a SUSTAINED breach: both a count gate (``consecutive_cycles_above
     >= trip_consecutive_required``) and a wall-clock gate
-    (``now - last_above_threshold_at >= trip_min_breach_seconds``) must pass.
-    This is the symmetric counterpart of the auto-clear hysteresis on the
-    release side (stop_bus_state._maybe_auto_clear_on_clean_streak).
+    (``now - breach_anchor >= trip_min_breach_seconds``) must pass. This is the
+    symmetric counterpart of the auto-clear hysteresis on the release side
+    (stop_bus_state._maybe_auto_clear_on_clean_streak).
+
+    Time-gate anchor selection: prefer ``breach_streak_started_at`` (stamped
+    once when the breach streak begins, so ``now - anchor`` measures the true
+    breach age). Fall back to ``last_above_threshold_at`` when the streak-start
+    field is absent — this keeps callers/tests that only inject a single
+    timestamp working. NOTE: in production ``last_above_threshold_at`` is
+    re-stamped every above cycle (≈ now during a sustained breach), so relying
+    on it alone would make the time gate read ≈0s and never trip; that is
+    exactly why ``breach_streak_started_at`` exists.
     """
     try:
         lat = float(avg_latency_ms)
@@ -297,8 +307,12 @@ def check_broker_latency(
     except (TypeError, ValueError):
         min_seconds = DEFAULT_BROKER_LATENCY_TRIP_MIN_BREACH_SECONDS
 
+    # Prefer the breach-streak-start anchor (stamped once → true breach age);
+    # fall back to last_above_threshold_at for callers that supply only a
+    # single timestamp. An empty/missing anchor fails the gate closed.
+    time_anchor = breach_streak_started_at or last_above_threshold_at
     count_gate = above_now and counter >= required
-    time_gate = above_now and _check_time_gate(last_above_threshold_at, min_seconds)
+    time_gate = above_now and _check_time_gate(time_anchor, min_seconds)
     active = count_gate and time_gate
 
     if active:
@@ -406,6 +420,7 @@ def evaluate_all_stop_triggers(
                 ),
                 consecutive_cycles_above=snap.get("consecutive_cycles_above_stop_threshold"),
                 last_above_threshold_at=snap.get("last_above_threshold_at"),
+                breach_streak_started_at=snap.get("breach_streak_started_at"),
                 trip_consecutive_required=int(
                     cfg.get(
                         "broker_latency_trip_consecutive_required",

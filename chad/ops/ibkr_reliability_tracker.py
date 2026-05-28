@@ -2,7 +2,13 @@
 
 Observability-only helper that augments runtime/ibkr_status.json with:
   - consecutive_cycles_above_stop_threshold: int
-  - last_above_threshold_at: ISO-8601 UTC or None
+  - last_above_threshold_at: ISO-8601 UTC or None  (MOST RECENT above-threshold
+    cycle — re-stamped every above cycle; kept for backward compatibility)
+  - breach_streak_started_at: ISO-8601 UTC or ""  (WHEN THE CURRENT BREACH STREAK
+    BEGAN — stamped once at counter 0->1, preserved across the streak, cleared on
+    recovery; the correct anchor for stop_bus's broker_latency time gate. Mirrors
+    stop_bus_state auto-clear's last_clean_metric_ts. Backward-compatible additive
+    field — schema_version intentionally not bumped.)
   - max_latency_observed_in_window: float (ms)
   - current_recovery_state: "healthy" / "degrading" / "above_threshold" / "recovering"
   - last_gateway_churn_at: ISO-8601 UTC or None  (detected when client_id changes
@@ -42,6 +48,18 @@ class ReliabilityFields:
     max_latency_observed_in_window: float
     current_recovery_state: str
     last_gateway_churn_at: str | None
+    # Fix A activation: anchor for the stop_bus broker_latency time gate.
+    # NOTE the deliberate asymmetry with last_above_threshold_at:
+    #   - last_above_threshold_at   = the MOST RECENT above-threshold cycle
+    #                                 (re-stamped every above cycle; kept for
+    #                                 backward-compatible downstream consumers).
+    #   - breach_streak_started_at  = WHEN THE CURRENT BREACH STREAK BEGAN
+    #                                 (stamped once when counter goes 0->1,
+    #                                 preserved across the streak, cleared on
+    #                                 recovery). This mirrors the auto-clear
+    #                                 last_clean_metric_ts pattern and is the
+    #                                 correct anchor for "breach age >= N s".
+    breach_streak_started_at: str = ""
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -52,6 +70,7 @@ class ReliabilityFields:
             "max_latency_observed_in_window": float(self.max_latency_observed_in_window),
             "current_recovery_state": self.current_recovery_state,
             "last_gateway_churn_at": self.last_gateway_churn_at,
+            "breach_streak_started_at": self.breach_streak_started_at,
         }
 
 
@@ -104,6 +123,7 @@ def compute_reliability_fields(
 
     prev_counter = int(prev_payload.get("consecutive_cycles_above_stop_threshold") or 0)
     prev_last_above = prev_payload.get("last_above_threshold_at")
+    prev_breach_streak = prev_payload.get("breach_streak_started_at") or ""
     prev_max_in_window = _safe_float(prev_payload.get("max_latency_observed_in_window")) or 0.0
     prev_max_ts = _parse_ts(prev_payload.get("ts_utc"))
     prev_client_id = prev_payload.get("client_id")
@@ -111,12 +131,22 @@ def compute_reliability_fields(
     prev_churn_at = prev_payload.get("last_gateway_churn_at")
     explicit_churn = bool(current_payload.get("gateway_churn"))
 
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     if above:
         counter = prev_counter + 1
-        last_above_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        last_above_at = now_iso
+        # breach_streak_started_at: stamp ONCE when the breach streak begins
+        # (counter 0->1), then preserve it through subsequent above cycles.
+        # This mirrors stop_bus_state._maybe_auto_clear_on_clean_streak's
+        # last_clean_metric_ts (stamped once at streak start, preserved).
+        if prev_counter == 0:
+            breach_streak_started_at = now_iso
+        else:
+            breach_streak_started_at = prev_breach_streak or now_iso
     else:
         counter = 0
         last_above_at = prev_last_above
+        breach_streak_started_at = ""  # streak ended — clear the anchor
 
     # max_latency_observed_in_window: keep the larger of (prev within window) and current.
     if prev_max_ts is not None and (now - prev_max_ts).total_seconds() <= window_seconds:
@@ -153,6 +183,7 @@ def compute_reliability_fields(
         max_latency_observed_in_window=max_in_window,
         current_recovery_state=state,
         last_gateway_churn_at=last_churn,
+        breach_streak_started_at=breach_streak_started_at,
     )
 
 
