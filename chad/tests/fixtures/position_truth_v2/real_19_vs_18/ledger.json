@@ -1,0 +1,21 @@
+{
+  "aapl0001": {"symbol": "AAPL", "qty": 130.0, "secType": "STK", "conId": 265598, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:00Z", "strategy": "alpha_intraday"},
+  "msft0002": {"symbol": "MSFT", "qty": 50.0, "secType": "STK", "conId": 272093, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:01Z", "strategy": "alpha_intraday"},
+  "spy00003": {"symbol": "SPY", "qty": 11.0, "secType": "STK", "conId": 756733, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:02Z", "strategy": "alpha_options"},
+  "qqq00004": {"symbol": "QQQ", "qty": 25.0, "secType": "STK", "conId": 320227571, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:03Z", "strategy": "alpha_intraday"},
+  "mes00005": {"symbol": "MES", "qty": 4.0, "secType": "FUT", "conId": 770561194, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:04Z", "strategy": "alpha_futures"},
+  "mnq00006": {"symbol": "MNQ", "qty": 2.0, "secType": "FUT", "conId": 770561300, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:05Z", "strategy": "alpha_futures"},
+  "cvx00007": {"symbol": "CVX", "qty": -54.0, "secType": "STK", "conId": 5684, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:06Z", "strategy": "alpha_intraday"},
+  "bac00008": {"symbol": "BAC", "qty": -26.0, "secType": "STK", "conId": 10098, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:07Z", "strategy": "alpha_intraday"},
+  "amzn0009": {"symbol": "AMZN", "qty": 12.0, "secType": "STK", "conId": 16156253, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:08Z", "strategy": "alpha_intraday"},
+  "meta0010": {"symbol": "META", "qty": 8.0, "secType": "STK", "conId": 107113386, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:09Z", "strategy": "alpha_intraday"},
+  "goog0011": {"symbol": "GOOG", "qty": 5.0, "secType": "STK", "conId": 30351181, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:10Z", "strategy": "alpha_intraday"},
+  "nvda0012": {"symbol": "NVDA", "qty": 15.0, "secType": "STK", "conId": 4815747, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:11Z", "strategy": "alpha_intraday"},
+  "tsla0013": {"symbol": "TSLA", "qty": 7.0, "secType": "STK", "conId": 76792991, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:12Z", "strategy": "alpha_intraday"},
+  "amd00014": {"symbol": "AMD", "qty": 9.0, "secType": "STK", "conId": 4391, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:13Z", "strategy": "alpha_intraday"},
+  "jpm00015": {"symbol": "JPM", "qty": 4.0, "secType": "STK", "conId": 8314, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:14Z", "strategy": "alpha_intraday"},
+  "ba000016": {"symbol": "BA", "qty": -3.0, "secType": "STK", "conId": 4762, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:15Z", "strategy": "alpha_intraday"},
+  "dis00017": {"symbol": "DIS", "qty": 6.0, "secType": "STK", "conId": 6927, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:16Z", "strategy": "alpha_intraday"},
+  "wmt00018": {"symbol": "WMT", "qty": 10.0, "secType": "STK", "conId": 10824, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:17Z", "strategy": "alpha_intraday"},
+  "mgc00019": {"symbol": "MGC", "qty": -1.0, "secType": "FUT", "conId": 770561500, "account_id": "DUK902770", "opened_at_utc": "2026-05-28T00:55:18Z", "strategy": "alpha_futures"}
+}

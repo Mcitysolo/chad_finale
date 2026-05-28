@@ -1,0 +1,17 @@
+{
+  "expected_global_authority_health": "RED",
+  "expected_positions": {
+    "QQQ": {
+      "merge_rule": "M5",
+      "value_source": "FAIL_CLOSED",
+      "qty": null,
+      "side": "UNKNOWN",
+      "snapshot_value": 10.0,
+      "ledger_value": 10.0,
+      "delta_reason": "stale_source",
+      "fail_closed": true,
+      "authority_decision": "FAIL_CLOSED"
+    }
+  },
+  "expected_fail_closed_symbols": ["QQQ"]
+}

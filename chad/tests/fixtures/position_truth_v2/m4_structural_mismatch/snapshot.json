@@ -1,0 +1,9 @@
+{
+  "ts_utc": "2026-05-28T01:00:00Z",
+  "source": "ibkr_portfolio_collector_v2",
+  "positions": [
+    {"symbol": "SPY", "position": 1.0, "secType": "STK", "conId": 756733, "avgCost": 738.0, "currency": "USD"}
+  ],
+  "positions_count": 1,
+  "ttl_seconds": 300
+}

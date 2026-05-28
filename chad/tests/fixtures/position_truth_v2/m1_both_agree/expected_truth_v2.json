@@ -1,0 +1,15 @@
+{
+  "expected_global_authority_health": "GREEN",
+  "expected_positions": {
+    "AAPL": {
+      "merge_rule": "M1",
+      "value_source": "both",
+      "qty": 100.0,
+      "side": "LONG",
+      "agreement": true,
+      "fail_closed": false,
+      "delta_reason": "in_agreement"
+    }
+  },
+  "expected_fail_closed_symbols": []
+}

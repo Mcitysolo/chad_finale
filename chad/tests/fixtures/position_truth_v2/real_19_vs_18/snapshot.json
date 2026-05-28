@@ -1,0 +1,26 @@
+{
+  "ts_utc": "2026-05-28T01:00:00Z",
+  "source": "ibkr_portfolio_collector_v2",
+  "positions": [
+    {"symbol": "AAPL", "position": 130.0, "secType": "STK", "conId": 265598, "avgCost": 190.0, "currency": "USD"},
+    {"symbol": "MSFT", "position": 50.0, "secType": "STK", "conId": 272093, "avgCost": 420.0, "currency": "USD"},
+    {"symbol": "SPY", "position": 11.0, "secType": "STK", "conId": 756733, "avgCost": 738.0, "currency": "USD"},
+    {"symbol": "QQQ", "position": 25.0, "secType": "STK", "conId": 320227571, "avgCost": 500.0, "currency": "USD"},
+    {"symbol": "MES", "position": 4.0, "secType": "FUT", "conId": 770561194, "avgCost": 37655.0, "currency": "USD"},
+    {"symbol": "MNQ", "position": 2.0, "secType": "FUT", "conId": 770561300, "avgCost": 21000.0, "currency": "USD"},
+    {"symbol": "CVX", "position": -54.0, "secType": "STK", "conId": 5684, "avgCost": 190.8, "currency": "USD"},
+    {"symbol": "BAC", "position": -26.0, "secType": "STK", "conId": 10098, "avgCost": 41.0, "currency": "USD"},
+    {"symbol": "AMZN", "position": 12.0, "secType": "STK", "conId": 16156253, "avgCost": 200.0, "currency": "USD"},
+    {"symbol": "META", "position": 8.0, "secType": "STK", "conId": 107113386, "avgCost": 600.0, "currency": "USD"},
+    {"symbol": "GOOG", "position": 5.0, "secType": "STK", "conId": 30351181, "avgCost": 180.0, "currency": "USD"},
+    {"symbol": "NVDA", "position": 15.0, "secType": "STK", "conId": 4815747, "avgCost": 145.0, "currency": "USD"},
+    {"symbol": "TSLA", "position": 7.0, "secType": "STK", "conId": 76792991, "avgCost": 240.0, "currency": "USD"},
+    {"symbol": "AMD", "position": 9.0, "secType": "STK", "conId": 4391, "avgCost": 130.0, "currency": "USD"},
+    {"symbol": "JPM", "position": 4.0, "secType": "STK", "conId": 8314, "avgCost": 250.0, "currency": "USD"},
+    {"symbol": "BA", "position": -3.0, "secType": "STK", "conId": 4762, "avgCost": 220.0, "currency": "USD"},
+    {"symbol": "DIS", "position": 6.0, "secType": "STK", "conId": 6927, "avgCost": 110.0, "currency": "USD"},
+    {"symbol": "WMT", "position": 10.0, "secType": "STK", "conId": 10824, "avgCost": 95.0, "currency": "USD"}
+  ],
+  "positions_count": 18,
+  "ttl_seconds": 300
+}

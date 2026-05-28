@@ -1,0 +1,18 @@
+{
+  "expected_global_authority_health": "DEGRADED",
+  "expected_positions": {
+    "TSLA": {
+      "merge_rule": "M3",
+      "value_source": "snapshot",
+      "qty": 18.0,
+      "side": "LONG",
+      "snapshot_value": 18.0,
+      "ledger_value": 17.0,
+      "delta": -1.0,
+      "delta_reason": "missed_fill_event",
+      "fail_closed": true,
+      "authority_decision": "snapshot"
+    }
+  },
+  "expected_fail_closed_symbols": ["TSLA"]
+}

@@ -1,0 +1,18 @@
+{
+  "expected_global_authority_health": "YELLOW",
+  "expected_positions": {
+    "M6E": {
+      "merge_rule": "M2",
+      "value_source": "ledger",
+      "qty": 56.0,
+      "side": "LONG",
+      "snapshot_value": 58.0,
+      "ledger_value": 56.0,
+      "delta": -2.0,
+      "delta_reason": "ledger_lag_within_cadence",
+      "fail_closed": false,
+      "authority_decision": "ledger"
+    }
+  },
+  "expected_fail_closed_symbols": []
+}

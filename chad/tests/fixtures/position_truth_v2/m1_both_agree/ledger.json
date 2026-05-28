@@ -1,0 +1,12 @@
+{
+  "aaaa1111": {
+    "symbol": "AAPL",
+    "qty": 100.0,
+    "secType": "STK",
+    "conId": 265598,
+    "account_id": "DUK902770",
+    "opened_at_utc": "2026-05-28T00:59:50Z",
+    "strategy": "alpha_intraday",
+    "source_strategies": ["alpha_intraday"]
+  }
+}

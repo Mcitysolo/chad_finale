@@ -1,0 +1,12 @@
+{
+  "qqq5555": {
+    "symbol": "QQQ",
+    "qty": 10.0,
+    "secType": "STK",
+    "conId": 320227571,
+    "account_id": "DUK902770",
+    "opened_at_utc": "2026-05-28T01:00:00Z",
+    "strategy": "alpha_intraday",
+    "source_strategies": ["alpha_intraday"]
+  }
+}

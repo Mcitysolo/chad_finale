@@ -1,0 +1,9 @@
+{
+  "ts_utc": "2020-01-01T00:00:00Z",
+  "source": "ibkr_portfolio_collector_v2",
+  "positions": [
+    {"symbol": "QQQ", "position": 10.0, "secType": "STK", "conId": 320227571, "avgCost": 500.0, "currency": "USD"}
+  ],
+  "positions_count": 1,
+  "ttl_seconds": 300
+}

@@ -1,0 +1,8 @@
+{
+  "expected_global_authority_health": "RED",
+  "expected_total_symbols": 19,
+  "expected_m1_count": 18,
+  "expected_m5_symbols": ["MGC"],
+  "expected_fail_closed_symbols": ["MGC"],
+  "note": "18 symbols agree on both surfaces (M1). MGC is present only in the ledger (qty=-1 SHORT) and missing from the snapshot — classified M5 with delta_reason=missing_in_one_source. Global health = max severity = M5 RED."
+}
