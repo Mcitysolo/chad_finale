@@ -816,6 +816,9 @@ def rule_ibkr_sustained_latency(findings: List[Finding]) -> None:
 
     The publisher's own auto-recovery (clean_streak=5) is unchanged; this
     rule is observability only.
+
+    Alert pipeline status documented in
+    ops/pending_actions/HEALTH_ALERT_PIPELINE_operational_2026-05-28.md
     """
     status_path = RUNTIME / "ibkr_status.json"
     if not status_path.is_file():
@@ -869,6 +872,9 @@ def rule_ibkr_gateway_version(findings: List[Finding]) -> None:
         tool "unknown" -> WARNING (detection failed; operator should look)
 
     This rule is observability only — it triggers no remediation action.
+
+    Alert pipeline status documented in
+    ops/pending_actions/HEALTH_ALERT_PIPELINE_operational_2026-05-28.md
     """
     cache_path = RUNTIME / "ibkr_gateway_version.json"
     report = None
