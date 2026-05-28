@@ -1,0 +1,38 @@
+# CHAD IB Gateway nightly-restart timer.
+#
+# Fires chad-ibgateway-nightly-restart.service once per day at 03:15 UTC.
+#
+# Why 03:15 UTC:
+#   * Well after chad-ibkr-daily-bars-refresh.timer (02:45 UTC) has completed,
+#     so the restart cannot collide with the nightly bars refresh.
+#   * ~10 hours before US market open (13:30 UTC) — no live decision impact.
+#   * Outside any market session.
+#   * Inside the soak window, but Fix A hysteresis (f3ab3d8 + 291bb84) plus the
+#     Decision 2 mechanical rule classify a brief, no-decision-impact restart
+#     event as EXPLAINED rather than FAIL.
+#
+# Why RandomizedDelaySec=180:
+#   Spreads the actual fire across 03:15-03:18 UTC to avoid exact-second
+#   contention with any other job scheduled at 03:15.
+#
+# Why Persistent=true:
+#   If the system was down at the scheduled time, the restart fires on the
+#   next boot rather than being silently skipped.
+#
+# Channel-2 design only — install via the Channel-1 operator-authorized
+# runbook at ops/runbooks/INSTALL_chad_ibgateway_nightly_restart_2026-05-28.md
+# (per CLAUDE.md governance rule #6).
+
+[Unit]
+Description=Timer: nightly restart of chad-ibgateway.service at 03:15 UTC
+Documentation=ops/runbooks/INSTALL_chad_ibgateway_nightly_restart.md
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+RandomizedDelaySec=180
+Persistent=true
+AccuracySec=1min
+Unit=chad-ibgateway-nightly-restart.service
+
+[Install]
+WantedBy=timers.target

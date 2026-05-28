@@ -1,0 +1,50 @@
+# CHAD IB Gateway nightly-restart oneshot unit.
+#
+# Triggered by chad-ibgateway-nightly-restart.timer at 03:15 UTC daily.
+#
+# Purpose:
+#   Proactively restart chad-ibgateway.service once per night to clear the
+#   recurring socket-leak wedge before it can accumulate and wedge the
+#   Gateway. The wedge pattern is documented in
+#     ops/pending_actions/IBKR_RELIABILITY_socket_backpressure_and_gateway_churn_2026-05-27.md
+#   Incident #3 of this pattern caused a 13-hour halt on 2026-05-28
+#   (04:28-17:34 UTC) that dirtied Paper Epoch 3 Session 1.
+#
+# Why a brief restart is safe:
+#   Fix A symmetric hysteresis on broker_latency (commits f3ab3d8 + 291bb84,
+#   production-active since 2026-05-28T19:55:24Z) tolerates the brief 60-90s
+#   restart window without tripping stop_bus. A single-cycle latency spike
+#   during Gateway warm-up no longer halts trading.
+#
+# Why this runs as root:
+#   `systemctl restart chad-ibgateway.service` requires root. The verifier
+#   invoked in ExecStartPost is read-only and emits an alert artifact only;
+#   it does not mutate runtime/*, stop_bus, or touch the broker.
+#
+# Channel-2 design only — install via the Channel-1 operator-authorized
+# runbook at ops/runbooks/INSTALL_chad_ibgateway_nightly_restart_2026-05-28.md
+# (per CLAUDE.md governance rule #6).
+
+[Unit]
+Description=CHAD IB Gateway Nightly Restart (clears socket leaks before they wedge)
+Documentation=ops/runbooks/INSTALL_chad_ibgateway_nightly_restart.md
+After=chad-ibgateway.service
+Requires=chad-ibgateway.service
+
+[Service]
+Type=oneshot
+User=root
+TimeoutStartSec=300
+# Stop chad-ibgateway cleanly, wait, verify it came back up
+ExecStart=/usr/bin/systemctl restart chad-ibgateway.service
+# Wait 60s for IBC + Java login sequence to complete (audit showed ~15-25s
+# typical, but allow margin for slow Sun reauth)
+ExecStartPost=/bin/sleep 60
+# Run the read-only verifier — emits alert artifact if Gateway not healthy
+ExecStartPost=/home/ubuntu/chad_finale/venv/bin/python3 /home/ubuntu/chad_finale/scripts/post_gateway_restart_verify.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-ibgateway-nightly-restart
+
+[Install]
+WantedBy=multi-user.target

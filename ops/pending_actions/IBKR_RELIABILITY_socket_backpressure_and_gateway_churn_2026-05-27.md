@@ -1,3 +1,19 @@
+> **STATUS UPDATE 2026-05-28:**
+> Partial implementation landed via Fix B (commit `bbab921`).
+> Channel 2 artifacts created:
+> - `ops/systemd_templates/chad-ibgateway-nightly-restart.service`
+> - `ops/systemd_templates/chad-ibgateway-nightly-restart.timer`
+> - `scripts/post_gateway_restart_verify.py`
+> - `ops/runbooks/INSTALL_chad_ibgateway_nightly_restart_2026-05-28.md`
+>
+> Scope of Fix B: SCHEDULED restart only (prevents the socket-leak wedge
+> by restarting before it can wedge). The detect-and-auto-restart-on-wedge
+> behavior (full IBKR_AUTO_RECOVERY) remains pending as a separate phase.
+> Prerequisite already live: Fix A symmetric hysteresis (`f3ab3d8` + `291bb84`)
+> ensures the restart window does not trip stop_bus.
+>
+> Awaiting Channel 1 operator-authorized install per CLAUDE.md rule #6.
+
 # IBKR-RELIABILITY — Socket Backpressure and IB Gateway Churn (live-loop cannot self-recover from sustained latency)
 
 # Status: PROPOSED
