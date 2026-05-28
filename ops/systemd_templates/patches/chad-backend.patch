@@ -1,0 +1,48 @@
+# Patch for /etc/systemd/system/chad-backend.service
+# Adds OnFailure= directive routing failures to chad-service-alert@.service
+# AND closes PORT-BINDING-1 by switching uvicorn --host from 0.0.0.0 to 127.0.0.1.
+# Applied via Channel 1 install runbook (see ops/runbooks/INSTALL_chad_service_alert_template_2026-05-27.md)
+# Per CLAUDE.md rule #6: requires explicit operator authorization for the unit edit
+#
+# ---------------------------------------------------------------------------
+# Block 1 — OnFailure directive
+# ---------------------------------------------------------------------------
+#
+# In the [Unit] section, add:
+#
+#   OnFailure=chad-service-alert@%n.service
+#
+# %n expands to the failed unit's full name (chad-backend.service)
+# at the time of failure, which becomes the %i in the templated alert unit.
+#
+# No other lines in the [Unit] section should be modified.
+# A backup of the unit file must be taken before this patch is applied:
+#   sudo cp /etc/systemd/system/chad-backend.service \
+#     /etc/systemd/system/chad-backend.service.bak.2026-05-27
+#
+# After the edit:
+#   sudo systemctl daemon-reload
+# (the OnFailure directive activates on the next natural failure)
+#
+# ---------------------------------------------------------------------------
+# Block 2 — Port binding (PORT-BINDING-1)
+# ---------------------------------------------------------------------------
+#
+# Additionally, in the ExecStart line, change the uvicorn --host argument
+# from 0.0.0.0 to 127.0.0.1.
+#
+# Before:
+#   ExecStart=/home/ubuntu/chad_finale/venv/bin/uvicorn chad.dashboard.api:app --host 0.0.0.0 --port 9618
+# After:
+#   ExecStart=/home/ubuntu/chad_finale/venv/bin/uvicorn chad.dashboard.api:app --host 127.0.0.1 --port 9618
+#
+# This closes PORT-BINDING-1 for port 9618. The nginx reverse proxy at
+# chadtrades.com remains the only external surface for this backend.
+#
+# If the live ExecStart line in the unit file uses different exact flags
+# (different module path, additional --workers, etc.), the operator must
+# adapt the patch during install. The patch documents intent, not a literal
+# sed substitution.
+#
+# The ExecStart change only takes effect on the next service restart, which
+# remains operator-authorized (CLAUDE.md rule #7).

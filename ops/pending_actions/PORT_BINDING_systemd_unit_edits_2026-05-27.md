@@ -1,3 +1,13 @@
+> **STATUS UPDATE 2026-05-27:**
+> Channel 2 design and patch artifacts landed in commit <will-be-filled-after-commit>.
+> See:
+> - `ops/systemd_templates/chad-service-alert@.service`
+> - `ops/systemd_templates/patches/chad-backend.patch`
+> - `config/port_binding_allowlist.json`
+> - `ops/runbooks/INSTALL_chad_service_alert_template_2026-05-27.md`
+>
+> Awaiting Channel 1 operator-authorized install per CLAUDE.md rule #6.
+
 # PORT-BINDING systemd unit edits — chad-backend.service (port 9618)
 
 # HIGH_ID: PORT-BINDING-1 (systemd portion)

@@ -1,0 +1,13 @@
+{
+  "schema_version": "port_binding_allowlist.v1",
+  "comment": "Services explicitly permitted to bind to 0.0.0.0. All other CHAD services must bind to 127.0.0.1. Validator enforces this.",
+  "allowlist": {
+    "chad-dashboard": {
+      "port": 8765,
+      "bind": "0.0.0.0",
+      "reason": "nginx-fronted; public chadtrades.com surface",
+      "reviewed_utc": "2026-05-27",
+      "reviewed_by": "operator"
+    }
+  }
+}

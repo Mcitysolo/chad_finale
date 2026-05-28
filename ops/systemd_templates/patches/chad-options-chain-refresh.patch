@@ -1,0 +1,21 @@
+# Patch for /etc/systemd/system/chad-options-chain-refresh.service
+# Adds OnFailure= directive routing failures to chad-service-alert@.service
+# Applied via Channel 1 install runbook (see ops/runbooks/INSTALL_chad_service_alert_template_2026-05-27.md)
+# Per CLAUDE.md rule #6: requires explicit operator authorization for the unit edit
+#
+# In the [Unit] section, add:
+#
+#   OnFailure=chad-service-alert@%n.service
+#
+# %n expands to the failed unit's full name (chad-options-chain-refresh.service)
+# at the time of failure, which becomes the %i in the templated alert unit.
+#
+# No other lines in the unit file should be modified.
+# A backup of the unit file must be taken before this patch is applied:
+#   sudo cp /etc/systemd/system/chad-options-chain-refresh.service \
+#     /etc/systemd/system/chad-options-chain-refresh.service.bak.2026-05-27
+#
+# After the edit:
+#   sudo systemctl daemon-reload
+# (do NOT restart the target unit; the OnFailure directive activates on
+#  the next natural failure)

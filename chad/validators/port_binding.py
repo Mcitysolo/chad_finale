@@ -26,11 +26,47 @@ EXIT_OK = 0
 EXIT_NONLOCAL_DEFAULT = 2
 EXIT_LIVE_CHECK_MISMATCH = 3
 
+ALLOWLIST_FILE = REPO_ROOT / "config" / "port_binding_allowlist.json"
+ALLOWLIST_SCHEMA_VERSION = "port_binding_allowlist.v1"
+
 ALLOWLIST: dict[int, str] = {
     # port -> documented reason. Empty dict means "no port may default to non-localhost".
     # Add an entry here only with explicit operator approval recorded in
     # ops/pending_actions/.
+    # NOTE: This in-code dict is overlaid by load_allowlist_file() at evaluate()
+    # time. The on-disk file at config/port_binding_allowlist.json is the
+    # canonical operator-domain source.
 }
+
+
+def load_allowlist_file(path: Path | None = None) -> dict[int, dict]:
+    """Load the operator-domain allowlist JSON. Returns a {port: entry} map.
+
+    Missing file → empty dict (no allowlist entries).
+    Wrong schema_version → raises ValueError.
+    """
+    fp = path or ALLOWLIST_FILE
+    if not fp.is_file():
+        return {}
+    try:
+        doc = json.loads(fp.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"port_binding_allowlist.json malformed: {exc}") from exc
+    sv = doc.get("schema_version")
+    if sv != ALLOWLIST_SCHEMA_VERSION:
+        raise ValueError(
+            f"port_binding_allowlist.json schema_version mismatch: "
+            f"got {sv!r}, expected {ALLOWLIST_SCHEMA_VERSION!r}"
+        )
+    out: dict[int, dict] = {}
+    for service, entry in (doc.get("allowlist") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        port = entry.get("port")
+        if not isinstance(port, int):
+            continue
+        out[port] = {"service": service, **entry}
+    return out
 
 
 @dataclass
@@ -136,7 +172,25 @@ def run_audit(*, live_check: bool = False) -> list[PortAudit]:
     return audits
 
 
-def evaluate(audits: list[PortAudit]) -> tuple[int, dict]:
+def evaluate(audits: list[PortAudit], *, file_allowlist: dict[int, dict] | None = None) -> tuple[int, dict]:
+    """Classify each audit as pass / warning (allowlisted) / failure.
+
+    ``file_allowlist`` overlays the in-code ``ALLOWLIST`` dict. When omitted,
+    the canonical operator-domain file at ``config/port_binding_allowlist.json``
+    is loaded.
+    """
+    if file_allowlist is None:
+        try:
+            file_allowlist = load_allowlist_file()
+        except ValueError as exc:
+            # Surface schema problems as a hard failure — operator must fix.
+            return EXIT_NONLOCAL_DEFAULT, {
+                "validator": "port_binding.v1",
+                "error": str(exc),
+                "audits": [asdict(a) for a in audits],
+                "failures": [{"port": None, "owner": "allowlist_file", "code_default_host": "n/a", "reason": str(exc)}],
+                "warnings": [],
+            }
     failures: list[dict] = []
     warnings: list[dict] = []
     for a in audits:
@@ -151,12 +205,18 @@ def evaluate(audits: list[PortAudit]) -> tuple[int, dict]:
             continue
         if a.is_localhost:
             continue
-        if a.allowlist_reason:
+        # Resolve allowlist: in-code reason wins if present; else file overlay.
+        reason: str | None = a.allowlist_reason
+        file_entry = file_allowlist.get(a.port)
+        if reason is None and file_entry is not None:
+            reason = f"{file_entry.get('service', 'unknown')}: {file_entry.get('reason', 'allowlisted (file)')}"
+        if reason:
             warnings.append({
                 "port": a.port,
                 "owner": a.owner,
                 "code_default_host": a.code_default_host,
-                "allowlist_reason": a.allowlist_reason,
+                "allowlist_reason": reason,
+                "allowlist_source": "file" if (a.allowlist_reason is None and file_entry is not None) else "in_code",
             })
             continue
         failures.append({
@@ -169,6 +229,8 @@ def evaluate(audits: list[PortAudit]) -> tuple[int, dict]:
         "audits": [asdict(a) for a in audits],
         "failures": failures,
         "warnings": warnings,
+        "allowlist_file_loaded": file_allowlist is not None and len(file_allowlist) > 0,
+        "allowlist_file_entries": sorted(file_allowlist.keys()) if file_allowlist else [],
     }
     code = EXIT_NONLOCAL_DEFAULT if failures else EXIT_OK
     return code, report

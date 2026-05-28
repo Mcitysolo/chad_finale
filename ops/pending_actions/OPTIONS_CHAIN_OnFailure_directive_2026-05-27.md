@@ -1,3 +1,12 @@
+> **STATUS UPDATE 2026-05-27:**
+> Channel 2 design and patch artifacts landed in commit <will-be-filled-after-commit>.
+> See:
+> - `ops/systemd_templates/chad-service-alert@.service`
+> - `ops/systemd_templates/patches/chad-options-chain-refresh.patch`
+> - `ops/runbooks/INSTALL_chad_service_alert_template_2026-05-27.md`
+>
+> Awaiting Channel 1 operator-authorized install per CLAUDE.md rule #6.
+
 # OPTIONS-CHAIN OnFailure directive — chad-options-chain-refresh.service
 
 # HIGH_ID: OPTIONS-CHAIN-1 (companion / systemd portion)
