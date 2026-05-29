@@ -5,7 +5,7 @@
 #
 # In the [Unit] section, add:
 #
-#   OnFailure=chad-service-alert@%n.service
+#   OnFailure=chad-service-alert@%N.service
 #
 # %n expands to the failed unit's full name (chad-options-chain-refresh.service)
 # at the time of failure, which becomes the %i in the templated alert unit.

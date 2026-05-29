@@ -1,48 +1,98 @@
-# Patch for /etc/systemd/system/chad-backend.service
+# Patch for chad-backend.service (REGENERATED 2026-05-29 against production reality)
+#
 # Adds OnFailure= directive routing failures to chad-service-alert@.service
 # AND closes PORT-BINDING-1 by switching uvicorn --host from 0.0.0.0 to 127.0.0.1.
-# Applied via Channel 1 install runbook (see ops/runbooks/INSTALL_chad_service_alert_template_2026-05-27.md)
-# Per CLAUDE.md rule #6: requires explicit operator authorization for the unit edit
+#
+# IMPORTANT NOTES (vs. the 2026-05-27 stale patch this supersedes):
+#
+# 1. The ExecStart actually in production is:
+#      /bin/bash -lc 'cd "/home/ubuntu/chad_finale" && exec \
+#        /home/ubuntu/chad_finale/venv/bin/python3 -m uvicorn backend.app:app \
+#        --host 0.0.0.0 --port 9618 --log-level info'
+#
+#    NOT the older `uvicorn chad.dashboard.api:app` that the previous patch
+#    referenced. The 2026-05-27 patch was written against an older codebase.
+#
+# 2. The winning ExecStart is defined in:
+#      /etc/systemd/system/chad-backend.service.d/override.conf
+#    NOT the main unit file. systemd applies drop-ins alphabetically and
+#    `override.conf` sorts AFTER `99-root-fix.conf` (lowercase `o` > digit `9`).
+#    Editing the main unit's ExecStart has NO effect because override.conf
+#    overrides it.
+#
+# 3. The OnFailure specifier must be %N (capital), not %n (lowercase).
+#    %n expands to the full unit name INCLUDING `.service`, producing the
+#    invalid template instance `chad-service-alert@chad-backend.service.service`
+#    (double `.service`). %N expands to the unit name WITHOUT the suffix,
+#    producing the correct `chad-service-alert@chad-backend.service`.
+#
+# Applied via Channel 1 install per CLAUDE.md rule #6.
 #
 # ---------------------------------------------------------------------------
-# Block 1 — OnFailure directive
+# Block 1 — OnFailure directive (in main unit's [Unit] section)
 # ---------------------------------------------------------------------------
 #
-# In the [Unit] section, add:
-#
-#   OnFailure=chad-service-alert@%n.service
-#
-# %n expands to the failed unit's full name (chad-backend.service)
-# at the time of failure, which becomes the %i in the templated alert unit.
-#
-# No other lines in the [Unit] section should be modified.
-# A backup of the unit file must be taken before this patch is applied:
+# Backup first:
 #   sudo cp /etc/systemd/system/chad-backend.service \
-#     /etc/systemd/system/chad-backend.service.bak.2026-05-27
+#     /etc/systemd/system/chad-backend.service.bak.2026-05-29
 #
-# After the edit:
-#   sudo systemctl daemon-reload
-# (the OnFailure directive activates on the next natural failure)
+# In the [Unit] section of /etc/systemd/system/chad-backend.service, add:
+#
+#   OnFailure=chad-service-alert@%N.service
+#
+# (Insert after the existing `Wants=network-online.target` line.)
 #
 # ---------------------------------------------------------------------------
-# Block 2 — Port binding (PORT-BINDING-1)
+# Block 2 — Port binding (PORT-BINDING-1) via override.conf
 # ---------------------------------------------------------------------------
 #
-# Additionally, in the ExecStart line, change the uvicorn --host argument
-# from 0.0.0.0 to 127.0.0.1.
+# Backup first:
+#   sudo cp /etc/systemd/system/chad-backend.service.d/override.conf \
+#     /etc/systemd/system/chad-backend.service.d/override.conf.bak.2026-05-29
+#
+# In /etc/systemd/system/chad-backend.service.d/override.conf, change the
+# ExecStart's `--host 0.0.0.0` to `--host 127.0.0.1`.
 #
 # Before:
-#   ExecStart=/home/ubuntu/chad_finale/venv/bin/uvicorn chad.dashboard.api:app --host 0.0.0.0 --port 9618
+#   ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && exec \
+#     /home/ubuntu/chad_finale/venv/bin/python3 -m uvicorn backend.app:app \
+#     --host 0.0.0.0 --port 9618 --log-level info'
 # After:
-#   ExecStart=/home/ubuntu/chad_finale/venv/bin/uvicorn chad.dashboard.api:app --host 127.0.0.1 --port 9618
+#   ExecStart=/bin/bash -lc 'cd "/home/ubuntu/chad_finale" && exec \
+#     /home/ubuntu/chad_finale/venv/bin/python3 -m uvicorn backend.app:app \
+#     --host 127.0.0.1 --port 9618 --log-level info'
+#
+# NOTE: Drop-ins that clear ExecStart with `ExecStart=` then re-define it
+# must use the exact full command. sed substitution targeting only the
+# `--host 0.0.0.0` segment is the safest approach.
 #
 # This closes PORT-BINDING-1 for port 9618. The nginx reverse proxy at
 # chadtrades.com remains the only external surface for this backend.
 #
-# If the live ExecStart line in the unit file uses different exact flags
-# (different module path, additional --workers, etc.), the operator must
-# adapt the patch during install. The patch documents intent, not a literal
-# sed substitution.
+# Ports 9619 and 9620 are OUT OF SCOPE for this patch — they are owned by
+# different processes and require separate identification + fix.
 #
-# The ExecStart change only takes effect on the next service restart, which
-# remains operator-authorized (CLAUDE.md rule #7).
+# ---------------------------------------------------------------------------
+# Apply procedure
+# ---------------------------------------------------------------------------
+#
+# 1. Apply Block 1 edit (main unit OnFailure).
+# 2. Apply Block 2 edit (override.conf --host).
+# 3. sudo systemctl daemon-reload
+# 4. sudo systemctl restart chad-backend.service
+#    (Required — ExecStart change only takes effect on restart.
+#     Brief service interruption ~5-10s while uvicorn rebinds.)
+# 5. Verify:
+#      ss -tlnp | grep :9618   → expect 127.0.0.1:9618 (NOT 0.0.0.0:9618)
+#      systemctl show chad-backend.service --property=OnFailure
+#        → expect OnFailure=chad-service-alert@chad-backend.service
+#      curl -fsS http://127.0.0.1:9618/health → expect 200
+#      curl -fsS https://chadtrades.com/health → expect 200 (via nginx)
+#
+# Rollback:
+#   sudo cp /etc/systemd/system/chad-backend.service.bak.2026-05-29 \
+#     /etc/systemd/system/chad-backend.service
+#   sudo cp /etc/systemd/system/chad-backend.service.d/override.conf.bak.2026-05-29 \
+#     /etc/systemd/system/chad-backend.service.d/override.conf
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart chad-backend.service
