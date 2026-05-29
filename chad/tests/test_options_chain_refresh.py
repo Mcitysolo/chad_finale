@@ -10,13 +10,13 @@ broker. They verify:
 
 - ``_resolve_contract_details_timeout`` honors ``CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS``
   and falls back safely on missing/invalid values.
-- ``_fetch_chain_via_contract_details`` raises a typed ``OptionsChainTimeoutError``
+- ``_fetch_chain_via_secdef_opt_params`` raises a typed ``OptionsChainTimeoutError``
   when the underlying IBKR call exceeds the configured bound.
 - ``run`` writes a valid empty cache artifact (with ``ts_utc`` and an
   ``error`` field) when every symbol times out, and exits with rc != 0
   rather than hanging.
-- Normal-success behavior is preserved: when the fake IB returns
-  contract details, the cache file is written with populated chains.
+- Normal-success behavior is preserved: when the fake IB returns a
+  reqSecDefOptParams result, the cache file is written with populated chains.
 """
 
 from __future__ import annotations
@@ -39,32 +39,36 @@ from chad.market_data import options_chain_refresh as ocr
 # ---------------------------------------------------------------------------
 
 
-class _FakeContract:
+class _FakeOptionChain:
+    """Minimal ib_async OptionChain stand-in (reqSecDefOptParams result).
+
+    Exposes the same attributes the production discovery path reads:
+    ``exchange``, ``expirations``, ``strikes``, ``tradingClass``,
+    ``multiplier``.
+    """
+
     def __init__(
         self,
         *,
-        expiry: str,
-        strike: float,
-        right: str,
         exchange: str = "SMART",
+        expirations: Optional[List[str]] = None,
+        strikes: Optional[List[float]] = None,
+        trading_class: str = "SPY",
+        multiplier: str = "100",
     ) -> None:
-        self.lastTradeDateOrContractMonth = expiry
-        self.strike = float(strike)
-        self.right = right
         self.exchange = exchange
-
-
-class _FakeDetail:
-    def __init__(self, contract: _FakeContract) -> None:
-        self.contract = contract
+        self.expirations = list(expirations or [])
+        self.strikes = list(strikes or [])
+        self.tradingClass = trading_class
+        self.multiplier = multiplier
 
 
 class _FakeIB:
     """
-    Minimal IB-like object. ``mode='timeout'`` makes the contract-details
+    Minimal IB-like object. ``mode='timeout'`` makes the chain-params
     fetch hang past any reasonable timeout (caller is expected to bound
     it via ``asyncio.wait_for``). ``mode='success'`` returns a small,
-    valid set of details immediately.
+    valid reqSecDefOptParams result immediately.
     """
 
     def __init__(self, *, mode: str, spot: float = 500.0) -> None:
@@ -104,26 +108,25 @@ class _FakeIB:
         return None
 
     # --- chain metadata ------------------------------------------------------
-    async def reqContractDetailsAsync(self, _template: Any) -> List[_FakeDetail]:
+    async def reqSecDefOptParamsAsync(self, **_kwargs: Any) -> List[_FakeOptionChain]:
         if self.mode == "timeout":
             await asyncio.sleep(3600)  # caller MUST bound this
             return []
-        # success mode: emit a few contracts spanning two near expiries
+        # success mode: emit a SMART chain spanning two near expiries
         # straddling spot. Use distant-enough dates to pass the DTE filter.
         from datetime import date, timedelta
-
 
         today = date.today()
         e1 = (today + timedelta(days=25)).strftime("%Y%m%d")
         e2 = (today + timedelta(days=40)).strftime("%Y%m%d")
-        details: List[_FakeDetail] = []
-        for exp in (e1, e2):
-            for k in (self.spot - 5, self.spot, self.spot + 5):
-                for right in ("C", "P"):
-                    details.append(
-                        _FakeDetail(_FakeContract(expiry=exp, strike=k, right=right))
-                    )
-        return details
+        strikes = [self.spot - 5, self.spot, self.spot + 5]
+        return [
+            _FakeOptionChain(
+                exchange="SMART",
+                expirations=[e1, e2],
+                strikes=strikes,
+            )
+        ]
 
     # --- event loop ----------------------------------------------------------
     def run(self, awaitable: Any) -> Any:
@@ -171,25 +174,30 @@ def test_resolve_timeout_falls_back_on_invalid_env(
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_chain_via_contract_details_raises_timeout(
+def test_fetch_chain_via_secdef_opt_params_raises_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(ocr.OPTIONS_CHAIN_TIMEOUT_ENV, "0.05")
     fake_ib = _FakeIB(mode="timeout")
+    # The new discovery path qualifies the underlying for its conId before
+    # calling reqSecDefOptParams; install the fake so ``from ib_async import
+    # Stock`` resolves to a contract carrying a conId.
+    _install_fake_ib_insync(monkeypatch, fake_ib)
 
     with pytest.raises(ocr.OptionsChainTimeoutError) as excinfo:
-        ocr._fetch_chain_via_contract_details(fake_ib, "SPY", spot=500.0)
+        ocr._fetch_chain_via_secdef_opt_params(fake_ib, "SPY", spot=500.0)
 
     assert excinfo.value.symbol == "SPY"
     assert excinfo.value.timeout_seconds == pytest.approx(0.05)
 
 
-def test_fetch_chain_via_contract_details_success_returns_data(
+def test_fetch_chain_via_secdef_opt_params_success_returns_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(ocr.OPTIONS_CHAIN_TIMEOUT_ENV, "5")
     fake_ib = _FakeIB(mode="success", spot=500.0)
-    expirations, strikes, exchange = ocr._fetch_chain_via_contract_details(
+    _install_fake_ib_insync(monkeypatch, fake_ib)
+    expirations, strikes, exchange = ocr._fetch_chain_via_secdef_opt_params(
         fake_ib, "SPY", spot=500.0
     )
     assert expirations, "expected at least one expiry"

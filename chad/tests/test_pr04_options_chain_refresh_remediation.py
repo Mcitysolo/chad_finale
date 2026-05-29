@@ -46,33 +46,32 @@ class _FakeEvent:
         return self
 
 
-class _FakeContract:
+class _FakeOptionChain:
+    """ib_async OptionChain stand-in (reqSecDefOptParams result)."""
+
     def __init__(
         self,
         *,
-        expiry: str,
-        strike: float,
-        right: str,
         exchange: str = "SMART",
+        expirations: List[str] | None = None,
+        strikes: List[float] | None = None,
+        trading_class: str = "SPY",
+        multiplier: str = "100",
     ) -> None:
-        self.lastTradeDateOrContractMonth = expiry
-        self.strike = float(strike)
-        self.right = right
         self.exchange = exchange
-
-
-class _FakeDetail:
-    def __init__(self, contract: _FakeContract) -> None:
-        self.contract = contract
+        self.expirations = list(expirations or [])
+        self.strikes = list(strikes or [])
+        self.tradingClass = trading_class
+        self.multiplier = multiplier
 
 
 class _FakeIB:
-    """Fake IBKR client whose contract-details behavior is mode-driven.
+    """Fake IBKR client whose chain-params behavior is mode-driven.
 
-    ``mode='timeout'`` hangs every contract-details fetch past any reasonable
-    timeout so the caller must bound it. ``mode='success'`` returns a valid
-    set of contracts. ``mode='flaky'`` fails the first ``flaky_failures``
-    attempts and then succeeds.
+    ``mode='timeout'`` hangs every reqSecDefOptParams fetch past any
+    reasonable timeout so the caller must bound it. ``mode='success'``
+    returns a valid chain. ``mode='flaky'`` fails the first
+    ``flaky_failures`` attempts and then succeeds.
     """
 
     def __init__(
@@ -123,7 +122,7 @@ class _FakeIB:
     def sleep(self, seconds: float) -> None:
         self.sleep_calls.append(float(seconds))
 
-    async def reqContractDetailsAsync(self, _template: Any) -> List[_FakeDetail]:
+    async def reqSecDefOptParamsAsync(self, **_kwargs: Any) -> List[_FakeOptionChain]:
         if self.mode == "timeout":
             await asyncio.sleep(3600)
             return []
@@ -134,14 +133,14 @@ class _FakeIB:
         today = date.today()
         e1 = (today + timedelta(days=25)).strftime("%Y%m%d")
         e2 = (today + timedelta(days=40)).strftime("%Y%m%d")
-        details: List[_FakeDetail] = []
-        for exp in (e1, e2):
-            for k in (self.spot - 5, self.spot, self.spot + 5):
-                for right in ("C", "P"):
-                    details.append(
-                        _FakeDetail(_FakeContract(expiry=exp, strike=k, right=right))
-                    )
-        return details
+        strikes = [self.spot - 5, self.spot, self.spot + 5]
+        return [
+            _FakeOptionChain(
+                exchange="SMART",
+                expirations=[e1, e2],
+                strikes=strikes,
+            )
+        ]
 
     def run(self, awaitable: Any) -> Any:
         return asyncio.new_event_loop().run_until_complete(awaitable)
@@ -233,12 +232,15 @@ def test_full_timeout_writes_failure_artifact_and_empty_cache(
     payload = json.loads(failure.read_text(encoding="utf-8"))
     assert payload["schema_version"] == ocr.FAILURE_ARTIFACT_SCHEMA
     assert payload["status"] == "failed"
-    assert payload["provider"] == "ibkr_contract_details"
+    # PR-05: discovery API is now reqSecDefOptParams, so the failure
+    # artifact's provider / blocked_reason labels reflect that API. The
+    # schema_version is unchanged (options_chain_refresh_failure.v1).
+    assert payload["provider"] == "ibkr_secdef_opt_params"
     assert payload["service_entrypoint"] == ocr.SERVICE_ENTRYPOINT
     assert payload["max_attempts"] == 2
     assert payload["error_type"] == "all_symbols_failed"
     assert "SPY" in payload["symbol_errors"]
-    assert payload["blocked_reason"] == "ibkr_contract_details_unresponsive"
+    assert payload["blocked_reason"] == "ibkr_secdef_opt_params_unresponsive"
 
 
 # ---------------------------------------------------------------------------

@@ -4,13 +4,21 @@ chad/market_data/options_chain_refresh.py
 
 Pre-market options chain cache refresh service.
 
-Connects to IBKR Gateway, fetches SPY option contract details via
-reqContractDetails (filtered to ~10% of spot, nearest 2 expiries,
-both calls and puts), and writes runtime/options_chains_cache.json
-in the schema consumed by chad.strategies.alpha_options.
+Connects to IBKR Gateway and discovers the SPY option chain *structure*
+(expirations + strikes per exchange) via ``reqSecDefOptParams`` — a single
+metadata round-trip that is not subject to the per-contract pacing limits
+that made the legacy bulk ``reqContractDetails`` filter time out. The raw
+chain is then narrowed locally to the subset the strategies actually use
+(~10% of spot for strikes, nearest expirations within MAX_EXPIRY_DTE) and
+written to runtime/options_chains_cache.json in the schema consumed by
+chad.strategies.alpha_options and chad.strategies.omega_momentum_options.
 
-This is the only place in CHAD where reqContractDetails is permitted —
-it runs once before market open, off the hot trading path.
+PR-05: the discovery API is ``reqSecDefOptParams``. No per-contract
+``reqContractDetails`` resolution is needed because the cache schema stores
+only the chain structure (``expirations`` + ``strikes`` arrays) — the
+consumers select strikes/expiries from those arrays, they never read
+per-strike contract objects. The service runs once before market open, off
+the hot trading path.
 
 CLI:
     python -m chad.market_data.options_chain_refresh
@@ -281,69 +289,153 @@ def _fetch_spy_price(ib: Any, symbol: str) -> float:
     return price
 
 
-def _fetch_chain_via_contract_details(
+# ---------------------------------------------------------------------------
+# PR-05 — chain discovery via reqSecDefOptParams
+#
+# The legacy bulk reqContractDetails(template) call enumerated every SPY
+# option contract and was throttled by IBKR per-contract pacing, timing out
+# at 30s and producing an empty cache. reqSecDefOptParams returns the chain
+# *structure* (expirations + strikes per exchange/tradingClass) in a single
+# metadata round-trip that pacing does not throttle. We then filter locally
+# to the same subset the legacy path produced (nearest expirations within
+# MAX_EXPIRY_DTE, strikes within +/- PRICE_PCT_WINDOW of spot) so the cache
+# schema and downstream semantics are byte-for-byte equivalent.
+# ---------------------------------------------------------------------------
+
+PREFERRED_OPTIONS_EXCHANGE = "SMART"
+
+
+def _resolve_underlying_conid(ib: Any, symbol: str) -> int:
+    """Qualify the underlying STK and return its conId.
+
+    ``reqSecDefOptParams`` requires the underlying ``conId``. Qualification
+    is a cheap metadata call (not pacing-throttled). Raises a RuntimeError
+    whose message contains ``qualifyContracts`` so the caller's
+    ``blocked_reason`` classifier can attribute the failure.
+    """
+    from ib_async import Stock
+
+    stock = Stock(symbol, "SMART", "USD")
+    qualified = ib.qualifyContracts(stock)
+    if not qualified:
+        raise RuntimeError(f"qualifyContracts failed for {symbol} (no contract)")
+    con_id = 0
+    for candidate in (qualified[0], stock):
+        try:
+            con_id = int(getattr(candidate, "conId", 0) or 0)
+        except (TypeError, ValueError):
+            con_id = 0
+        if con_id > 0:
+            break
+    if con_id <= 0:
+        raise RuntimeError(
+            f"qualifyContracts returned no conId for {symbol}"
+        )
+    _log(f"underlying_qualified symbol={symbol} conId={con_id}")
+    return con_id
+
+
+def _req_sec_def_opt_params(
     ib: Any,
     symbol: str,
-    spot: float,
-) -> Tuple[List[str], List[float], str]:
-    """
-    Use reqContractDetails to enumerate SPY option contracts within
-    +/- PRICE_PCT_WINDOW of spot, restricted to the nearest MAX_EXPIRIES
-    expiries. Returns (expirations, strikes, exchange).
-    """
-    from ib_async import Option
+    con_id: int,
+    sec_type: str,
+    timeout_sec: float,
+) -> List[Any]:
+    """Bounded ``reqSecDefOptParams`` call.
 
-    template = Option(
-        symbol=symbol,
-        lastTradeDateOrContractMonth="",
-        strike=0.0,
-        right="",
-        exchange="SMART",
-        currency="USD",
-    )
-
-    # ISSUE-50 fix: bound the IBKR options-chain metadata fetch with a
-    # configurable timeout (CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS, default
-    # 30s). The synchronous ib.reqContractDetails call has no internal
-    # timeout and was hanging the whole refresh service when IBKR
-    # Gateway / data servers stalled. On timeout we raise a typed error
-    # so the caller can log a WARNING and write a valid empty/error
-    # cache artifact instead of leaving the service hung.
-    timeout_sec = _resolve_contract_details_timeout()
+    Mirrors the PR-04 hardening contract: the metadata fetch is bounded by
+    ``CHAD_OPTIONS_CHAIN_TIMEOUT_SECONDS`` via ``asyncio.wait_for`` and a
+    timeout is surfaced as the typed ``OptionsChainTimeoutError`` so the
+    caller writes a valid empty/error artifact instead of hanging.
+    """
     try:
-        details = ib.run(
+        chains = ib.run(
             asyncio.wait_for(
-                ib.reqContractDetailsAsync(template),
+                ib.reqSecDefOptParamsAsync(
+                    underlyingSymbol=symbol,
+                    futFopExchange="",
+                    underlyingSecType=sec_type,
+                    underlyingConId=con_id,
+                ),
                 timeout=timeout_sec,
             )
         )
     except asyncio.TimeoutError as exc:
         _log(
-            f"WARNING options_chain_reqcontractdetails_timeout symbol={symbol} "
-            f"timeout={timeout_sec}s — IBKR data servers unresponsive, aborting symbol"
+            f"WARNING options_chain_reqsecdefoptparams_timeout symbol={symbol} "
+            f"timeout={timeout_sec}s — IBKR unresponsive, aborting symbol"
         )
         raise OptionsChainTimeoutError(
             symbol=symbol, timeout_seconds=timeout_sec
         ) from exc
-    if not details:
-        raise RuntimeError(f"reqContractDetails returned empty for {symbol}")
+    if not chains:
+        raise RuntimeError(f"reqSecDefOptParams returned empty for {symbol}")
+    return list(chains)
 
-    lo = spot * (1.0 - PRICE_PCT_WINDOW)
-    hi = spot * (1.0 + PRICE_PCT_WINDOW)
 
-    all_expiries_set = set()
-    for det in details:
-        c = getattr(det, "contract", None)
-        if c is None:
-            continue
-        exp = getattr(c, "lastTradeDateOrContractMonth", "") or ""
-        if exp:
-            all_expiries_set.add(str(exp))
+def _select_exchange_chains(
+    chains: Sequence[Any],
+    preferred_exchange: str = PREFERRED_OPTIONS_EXCHANGE,
+) -> Tuple[List[Any], str]:
+    """Pick the chain entries for the preferred exchange.
 
-    # Cap by DTE so the cache stays bounded even if IBKR returns LEAPs.
-    today = datetime.now(timezone.utc).date()
+    ``reqSecDefOptParams`` returns one entry per (exchange, tradingClass,
+    multiplier). The legacy path routed through SMART, so we prefer the
+    SMART entries to preserve identical exchange coverage. When no SMART
+    entry is present we fall back to merging every exchange's entries and
+    label the result with the first concrete exchange seen.
+    """
+    preferred_upper = preferred_exchange.upper()
+    preferred = [
+        c
+        for c in chains
+        if str(getattr(c, "exchange", "") or "").upper() == preferred_upper
+    ]
+    if preferred:
+        return preferred, preferred_exchange
+    label = ""
+    for c in chains:
+        exch = str(getattr(c, "exchange", "") or "")
+        if exch:
+            label = exch
+            break
+    return list(chains), (label or PREFERRED_OPTIONS_EXCHANGE)
+
+
+def _union_chain_params(chains: Sequence[Any]) -> Tuple[set, set]:
+    """Union expirations (str) and strikes (float) across the given entries."""
+    expirations: set = set()
+    strikes: set = set()
+    for c in chains:
+        for exp in getattr(c, "expirations", None) or []:
+            text = str(exp).strip()
+            if text:
+                expirations.add(text)
+        for stk in getattr(c, "strikes", None) or []:
+            try:
+                v = float(stk)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v) and v > 0:
+                strikes.add(v)
+    return expirations, strikes
+
+
+def _filter_expirations(
+    expirations: Sequence[str],
+    *,
+    today: Optional[Any] = None,
+) -> List[str]:
+    """Keep expirations within [0, MAX_EXPIRY_DTE] days, nearest MAX_EXPIRIES.
+
+    Mirrors the legacy DTE bounding: drops past dates and LEAPs beyond
+    MAX_EXPIRY_DTE, then caps to the MAX_EXPIRIES nearest, sorted ascending.
+    """
+    if today is None:
+        today = datetime.now(timezone.utc).date()
     bounded: List[str] = []
-    for exp_str in sorted(all_expiries_set):
+    for exp_str in sorted(set(str(e).strip() for e in expirations if str(e).strip())):
         try:
             exp_date = datetime.strptime(exp_str, "%Y%m%d").date()
         except ValueError:
@@ -352,44 +444,64 @@ def _fetch_chain_via_contract_details(
         if dte < 0 or dte > MAX_EXPIRY_DTE:
             continue
         bounded.append(exp_str)
-    nearest_expiries = bounded[:MAX_EXPIRIES]
-    nearest_set = set(nearest_expiries)
+    return bounded[:MAX_EXPIRIES]
 
-    strikes_set = set()
-    exchange = ""
-    for det in details:
-        c = getattr(det, "contract", None)
-        if c is None:
-            continue
-        exp = str(getattr(c, "lastTradeDateOrContractMonth", "") or "")
-        if exp not in nearest_set:
-            continue
-        right = str(getattr(c, "right", "") or "").upper()
-        if right not in ("C", "P"):
-            continue
-        try:
-            strike = float(getattr(c, "strike", 0.0) or 0.0)
-        except Exception:
-            continue
-        if strike <= 0 or strike < lo or strike > hi:
-            continue
-        strikes_set.add(strike)
-        if not exchange:
-            exch = str(getattr(c, "exchange", "") or "")
-            if exch:
-                exchange = exch
 
-    return (
-        sorted(nearest_expiries),
-        sorted(strikes_set),
-        exchange or "SMART",
+def _filter_strikes(strikes: Sequence[float], spot: float) -> List[float]:
+    """Keep strikes within +/- PRICE_PCT_WINDOW of spot, sorted ascending."""
+    if not spot or spot <= 0:
+        return sorted({float(s) for s in strikes})
+    lo = spot * (1.0 - PRICE_PCT_WINDOW)
+    hi = spot * (1.0 + PRICE_PCT_WINDOW)
+    return sorted({float(s) for s in strikes if lo <= float(s) <= hi})
+
+
+def _fetch_chain_via_secdef_opt_params(
+    ib: Any,
+    symbol: str,
+    spot: float,
+    *,
+    sec_type: str = "STK",
+) -> Tuple[List[str], List[float], str]:
+    """
+    Discover the SPY option chain via ``reqSecDefOptParams`` and narrow it
+    to the subset the strategies use. Returns (expirations, strikes,
+    exchange) in the same shape the legacy reqContractDetails path returned.
+
+    Steps (each a single-responsibility helper, so the path is testable in
+    isolation and reproducible for identical IBKR responses):
+      1. qualify the underlying → conId
+      2. reqSecDefOptParams (bounded by the configurable timeout)
+      3. select the SMART exchange entries (fall back to merge-all)
+      4. union expirations + strikes across the selected entries
+      5. DTE-bound + cap expirations; window-filter strikes around spot
+    """
+    timeout_sec = _resolve_contract_details_timeout()
+    con_id = _resolve_underlying_conid(ib, symbol)
+    raw_chains = _req_sec_def_opt_params(
+        ib, symbol, con_id, sec_type, timeout_sec
     )
+    selected, exchange = _select_exchange_chains(raw_chains)
+    _log(
+        f"secdef_opt_params symbol={symbol} entries_total={len(raw_chains)} "
+        f"entries_selected={len(selected)} exchange={exchange}"
+    )
+    all_expirations, all_strikes = _union_chain_params(selected)
+    expirations = _filter_expirations(all_expirations)
+    strikes = _filter_strikes(all_strikes, spot)
+    _log(
+        f"secdef_opt_params_filtered symbol={symbol} spot={spot} "
+        f"expirations={len(expirations)}/{len(all_expirations)} "
+        f"strikes={len(strikes)}/{len(all_strikes)} "
+        f"window=+/-{PRICE_PCT_WINDOW:.0%} max_dte={MAX_EXPIRY_DTE}"
+    )
+    return expirations, strikes, (exchange or PREFERRED_OPTIONS_EXCHANGE)
 
 
 def _refresh_symbol(ib: Any, symbol: str) -> Dict[str, Any]:
     """Build a single chain dict in the schema alpha_options expects."""
     spot = _fetch_spy_price(ib, symbol)
-    expirations, strikes, exchange = _fetch_chain_via_contract_details(
+    expirations, strikes, exchange = _fetch_chain_via_secdef_opt_params(
         ib, symbol, spot
     )
     if not expirations or not strikes:
@@ -437,7 +549,7 @@ def _classify_blocked_reason(symbol_errors: Dict[str, str]) -> str:
         return "unknown"
     reasons = list(symbol_errors.values())
     if all("timeout_after" in r for r in reasons):
-        return "ibkr_contract_details_unresponsive"
+        return "ibkr_secdef_opt_params_unresponsive"
     if all("could not resolve spot price" in r for r in reasons):
         return "ibkr_spot_unavailable"
     if all("qualifyContracts" in r for r in reasons):
@@ -466,7 +578,7 @@ def _write_failure_artifact(
         "schema_version": FAILURE_ARTIFACT_SCHEMA,
         "ts_utc": _utc_now_iso(),
         "status": "failed",
-        "provider": "ibkr_contract_details",
+        "provider": "ibkr_secdef_opt_params",
         "service_entrypoint": SERVICE_ENTRYPOINT,
         "max_attempts": int(max_attempts),
         "per_call_timeout_seconds": float(timeout_seconds),
