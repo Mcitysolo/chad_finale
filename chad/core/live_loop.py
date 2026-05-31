@@ -135,7 +135,7 @@ from chad.execution.execution_config import (
 )
 _paper_adapter = IbkrAdapter(
     config=IbkrConfig(
-        dry_run=(_get_exec_mode() != _ExecMode.IBKR_LIVE),
+        dry_run=(_get_exec_mode() != _ExecMode.IBKR_PAPER),
     ),
     ib_factory=lambda: ib,
 )
