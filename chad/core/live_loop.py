@@ -65,7 +65,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from chad.core.live_execution_router import (
     build_live_signals,
@@ -195,6 +195,19 @@ from chad.risk.symbol_performance_blocker import is_symbol_blocked
 
 
 _KRAKEN_BALANCE_PROVIDER = None  # lazy singleton
+
+
+def _futures_execution_disabled(env: Mapping[str, str]) -> bool:
+    """True when any futures-disable flag is set. Reversible env stopgap."""
+    truthy = {"1", "true", "yes", "on"}
+    falsy = {"0", "false", "no", "off"}
+    if env.get("CHAD_DISABLE_FUTURES_EXECUTION", "").strip().lower() in truthy:
+        return True
+    if env.get("CHAD_DISABLE_FUTURES", "").strip().lower() in truthy:
+        return True
+    if env.get("CHAD_FUTURES_EXECUTION_ENABLED", "").strip().lower() in falsy:
+        return True
+    return False
 
 
 def _refresh_kraken_balance_snapshot(logger: logging.Logger) -> None:
@@ -2046,6 +2059,24 @@ def run_once(logger: logging.Logger) -> None:
                     )
             except Exception:
                 _intent_is_exit = False
+
+            _gate_sec_type = str(getattr(intent, "sec_type", "") or "").upper()
+            if (
+                _futures_execution_disabled(os.environ)
+                and _gate_sec_type == "FUT"
+                and not _intent_is_exit
+                and not is_flip_signal(intent)
+            ):
+                logger.warning(
+                    "FUTURES_EXECUTION_DISABLED_SKIP symbol=%s strategy=%s sec_type=%s "
+                    "side=%s qty=%s reason=env_guard",
+                    getattr(intent, "symbol", "?"),
+                    getattr(intent, "strategy", "?"),
+                    _gate_sec_type,
+                    getattr(intent, "side", "?"),
+                    getattr(intent, "quantity", "?"),
+                )
+                continue
 
             if _intent_is_exit:
                 logger.info(
