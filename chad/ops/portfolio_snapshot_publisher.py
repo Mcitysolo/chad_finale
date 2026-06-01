@@ -130,13 +130,30 @@ def main() -> int:
         LOG.error("ibkr_equity_fetch_failed_no_write")
         return 1
 
-    payload = {
-        "ibkr_equity": float(ibkr_equity),
-        "coinbase_equity": 0.0,  # CAD-based, Coinbase not used
-        "kraken_equity": float(kraken_equity),
-        "ts_utc": _utc_now_iso(),
-        "ttl_seconds": TTL_SECONDS,
-    }
+    # BOX-034A §3 (single-writer): the v2 collector
+    # (chad/portfolio/ibkr_portfolio_collector_v2.py, chad-ibkr-collector.timer)
+    # is the SOLE value-setter of the canonical `ibkr_equity` key, in the
+    # broker-native base currency (CAD). This publisher previously also wrote
+    # `ibkr_equity` with a USD-converted figure, creating an intermittent
+    # CAD<->USD dual-writer race on the same key. We now PRESERVE whatever the
+    # collector last wrote (read-through, like the coinbase/merge writers) and
+    # record our USD-converted figure under the display-only key
+    # `ibkr_equity_usd_display`, which no risk/sizing/caps path reads. Because
+    # this file is overwritten wholesale, preserving the existing key (rather
+    # than dropping it) avoids a transient window where `ibkr_equity` is absent.
+    try:
+        existing = json.loads(OUT_PATH.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    except Exception:
+        existing = {}
+
+    payload = dict(existing)
+    payload["coinbase_equity"] = 0.0  # CAD-based, Coinbase not used
+    payload["kraken_equity"] = float(kraken_equity)
+    payload["ibkr_equity_usd_display"] = float(ibkr_equity)
+    payload["ts_utc"] = _utc_now_iso()
+    payload["ttl_seconds"] = TTL_SECONDS
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     tmp = OUT_PATH.with_suffix(".json.tmp")
