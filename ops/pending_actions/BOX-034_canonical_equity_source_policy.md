@@ -1,5 +1,17 @@
 # BOX-034 — Canonical equity source policy (GAP-007)
 
+> **AMENDMENT STATUS — added 2026-06-01.** This policy is **amended by**
+> `ops/pending_actions/BOX-034A_canonical_equity_currency_unification_2026-06-01.md` (commit fe59de5).
+> BOX-034A declares one base currency (**CAD**) and one writer for `ibkr_equity`, and
+> root-causes the §4a drift as a **CAD↔USD dual-writer race** (confirmed live 2026-06-01) —
+> not staleness or dropped legs.
+>
+> **Supersession is CONDITIONAL and PENDING.** BOX-034A §8 gates implementation on operator GO.
+> Until that GO ships: sections **§3b, §3c, §4a, §5** below describe **current (defective)** behavior
+> and remain what the live system + `test_canonical_equity_source.py` actually enforce.
+> On BOX-034A implementation they are **superseded** by BOX-034A §3–§6.
+> The "USD" assertions in §3b/§4a are NOT correct truth — they are the defect BOX-034A fixes.
+
 Generated: 2026-05-20T00:38:00Z (CHAD Box 034)
 
 ## 1. Background
@@ -12,6 +24,8 @@ the operator being told. Box 034 closes that gap by formally declaring
 the canonical sources and the temporal-skew rules.
 
 ## 2. Equity-source inventory
+
+> [BOX-034A] The two writers here are not benign interleaving — they write ibkr_equity in different currencies (collector→CAD, publisher→USD). This race is the root cause of the §4a drift.
 
 | # | File | Schema | Key(s) | Writer | TTL | Refresh cadence |
 |---|------|--------|--------|--------|-----|-----------------|
@@ -52,6 +66,8 @@ They MUST be respected by all current and future consumer modules.
 
 ### 3b. Ops / risk truth — `portfolio_snapshot.json` (sum of native equities)
 
+> [BOX-034A — superseded on implementation] The "USD" assertion is incorrect; the v2 collector emits CAD. Canonical currency is CAD (BOX-034A §2).
+
 - **Canonical source for drawdown guard, withdrawal manager, business
   phase tracker, equity-history publisher, health monitor, daily-ops
   report's `inputs.portfolio_snapshot` block, and any non-operator
@@ -72,6 +88,8 @@ They MUST be respected by all current and future consumer modules.
 
 ### 3c. Broker raw — IBKR `NetLiquidation` (read inside the collector)
 
+> [BOX-034A — superseded on implementation] get_net_liquidation ignores the currency tag; BOX-034A §3 makes it currency-aware and fail-closed.
+
 - **Canonical raw source.** Every other equity number in CHAD
   ultimately derives from this read.
 - Producer: `chad/portfolio/ibkr_portfolio_collector_v2.py::get_net_liquidation`.
@@ -80,6 +98,8 @@ They MUST be respected by all current and future consumer modules.
 ## 4. Temporal-skew policy
 
 ### 4a. Acceptable skew between canonical sources
+
+> [BOX-034A — superseded on implementation] Drift is a CAD↔USD currency flip, not staleness; reconciliation must be currency-explicit (BOX-034A §5).
 
 Let `pnl_eq = pnl_state.account_equity` and
 `snap_total = portfolio_snapshot.{ibkr_equity + kraken_equity + coinbase_equity}`.
@@ -126,6 +146,8 @@ MUST be reviewed if any new source is added — particularly any source
 with a TTL > 300 s must be placed AFTER the canonical chain.
 
 ## 5. Enforcement
+
+> [BOX-034A — superseded on implementation] The enforcement test must also assert currency==CAD and bound sampling skew (BOX-034A §6); the current test passes on a lucky same-currency read.
 
 Box 034 adds `chad/tests/test_canonical_equity_source.py` which asserts:
 
