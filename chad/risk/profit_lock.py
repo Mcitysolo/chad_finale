@@ -770,6 +770,39 @@ class ProfitLockEngine:
 
         # Side-write canonical pnl_state.json from the same computation
         inputs = state.get("inputs", {})
+
+        # BOX-034A Inc 3 Step 1b: additively propagate currency tags onto the
+        # operator-facing account_equity. We co-locate a read of the SAME
+        # dynamic_caps.json that DynamicCapsEquityProvider sources from (matched
+        # by the equity_source string), so this needs no EquityProvider ABC
+        # change. Additive only — NO reader assertions here. Fail-closed False
+        # on any ambiguity (unknown equity, fallback source, absent key, read
+        # error). The currency uses the dynamic_caps tag when the equity came
+        # from there, else the configured base.
+        base_currency = os.environ.get("CHAD_BASE_CURRENCY", "CAD").strip().upper() or "CAD"
+        _equity_source = inputs.get("equity_source")
+        _equity_known = bool(inputs.get("equity_known", False))
+        _account_equity = inputs.get("account_equity")
+        _dynamic_caps_path = self.repo_root / "runtime" / "dynamic_caps.json"
+        _from_dynamic_caps = _equity_source == str(_dynamic_caps_path)
+
+        account_equity_currency = base_currency
+        account_equity_currency_ok = False
+        if _from_dynamic_caps:
+            try:
+                _dc = json.loads(_dynamic_caps_path.read_text(encoding="utf-8"))
+            except Exception:
+                _dc = {}
+            if isinstance(_dc, dict):
+                _dc_currency = _dc.get("total_equity_currency")
+                if isinstance(_dc_currency, str) and _dc_currency.strip():
+                    account_equity_currency = _dc_currency.strip().upper()
+                account_equity_currency_ok = (
+                    _equity_known
+                    and _account_equity is not None
+                    and _dc.get("total_equity_currency_ok") is True
+                )
+
         pnl_state = {
             "schema_version": "pnl_state.v1",
             "ts_utc": state["ts_utc"],
@@ -778,6 +811,8 @@ class ProfitLockEngine:
             "trade_count": int(inputs.get("trade_count", 0)),
             "pnl_pct_of_equity": float(inputs.get("pnl_pct_of_equity", 0.0)),
             "account_equity": inputs.get("account_equity"),
+            "account_equity_currency": account_equity_currency,
+            "account_equity_currency_ok": bool(account_equity_currency_ok),
             "equity_known": bool(inputs.get("equity_known", False)),
             "pnl_sources": list(inputs.get("pnl_sources", [])),
             "source": "profit_lock_engine",
