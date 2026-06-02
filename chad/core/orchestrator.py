@@ -112,6 +112,35 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _derive_total_equity_currency_ok(
+    *,
+    ibkr_equity: float,
+    kraken_equity: float,
+    ibkr_currency_ok: Optional[bool],
+    kraken_currency_ok: Optional[bool],
+) -> bool:
+    """
+    Derive ``total_equity_currency_ok`` for dynamic_caps (BOX-034A Inc 3 Step 1a).
+
+    The result is the AND over *active* legs, where an active leg is one among
+    {ibkr, kraken} carrying equity > 0. Coinbase is excluded entirely (it is
+    always 0.0 and is never currency-tagged upstream).
+
+    Fail-closed semantics:
+      - An active leg whose ``_ok`` flag is absent (None) or not strictly True
+        counts as False.
+      - All-zero / no active legs -> False.
+    """
+    active_oks: list[bool] = []
+    if _finite_float(ibkr_equity, 0.0) > 0.0:
+        active_oks.append(ibkr_currency_ok is True)
+    if _finite_float(kraken_equity, 0.0) > 0.0:
+        active_oks.append(kraken_currency_ok is True)
+    if not active_oks:
+        return False
+    return all(active_oks)
+
+
 def _env_str(name: str, default: str) -> str:
     v = os.environ.get(name)
     s = str(v).strip() if v is not None else ""
@@ -715,13 +744,19 @@ class Orchestrator:
     # Snapshot loader
     # --------------------------
 
-    def _load_portfolio_snapshot(self) -> Tuple[PortfolioSnapshot, bool]:
+    def _load_portfolio_snapshot(self) -> Tuple[PortfolioSnapshot, bool, bool]:
         """
         Load snapshot from JSON if available, else fallback env vars.
 
         Supported keys:
           - ibkr_equity / coinbase_equity / kraken_equity
           - legacy: ibkr_equity_usd / coinbase_equity_usd / total_equity_usd
+
+        Returns ``(snapshot, used_fallback, total_equity_currency_ok)``. The
+        third element (BOX-034A Inc 3 Step 1a) is the AND over active legs of
+        their per-leg ``*_currency_ok`` flags read from the snapshot dict; the
+        env-fallback path carries no currency tags and is therefore fail-closed
+        (False).
         """
         path = self._settings.portfolio_snapshot_path
         obj = _safe_json_load(path)
@@ -738,6 +773,13 @@ class Orchestrator:
                     kraken_equity=_finite_float(kraken_raw, 0.0),
                 )
 
+                total_equity_currency_ok = _derive_total_equity_currency_ok(
+                    ibkr_equity=snap.ibkr_equity,
+                    kraken_equity=snap.kraken_equity,
+                    ibkr_currency_ok=obj.get("ibkr_equity_currency_ok"),
+                    kraken_currency_ok=obj.get("kraken_equity_currency_ok"),
+                )
+
                 self._log.info(
                     "orchestrator.portfolio_snapshot_loaded",
                     extra={
@@ -746,9 +788,10 @@ class Orchestrator:
                         "coinbase_equity": snap.coinbase_equity,
                         "kraken_equity": snap.kraken_equity,
                         "total_equity": snap.total_equity,
+                        "total_equity_currency_ok": total_equity_currency_ok,
                     },
                 )
-                return snap, False
+                return snap, False, total_equity_currency_ok
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("orchestrator.portfolio_snapshot_invalid", extra={"path": str(path), "error": str(exc)})
 
@@ -772,7 +815,8 @@ class Orchestrator:
                 "total_equity": snap.total_equity,
             },
         )
-        return snap, True
+        # Env-fallback snapshot carries no per-leg currency tags -> fail-closed.
+        return snap, True, False
 
     # --------------------------
     # Allocation -> allocator
@@ -849,7 +893,7 @@ class Orchestrator:
             },
         )
 
-        snapshot, used_fallback = self._load_portfolio_snapshot()
+        snapshot, used_fallback, total_equity_currency_ok = self._load_portfolio_snapshot()
         allocator, allocator_mode = self._build_allocator()
 
         # Domain 2: gather fresh runtime state for trace enrichment (best-effort).
@@ -866,6 +910,13 @@ class Orchestrator:
         _executions_today = _count_fills_today(self._repo_root)
 
         payload = allocator.build_payload(snapshot=snapshot)
+
+        # BOX-034A Inc 3 Step 1a: additively tag the total equity with its base
+        # currency and a derived currency_ok (AND over active legs). Additive
+        # only — no reader assertions here (warn-before-enforce, later step).
+        base_currency = os.environ.get("CHAD_BASE_CURRENCY", "CAD").strip().upper() or "CAD"
+        payload["total_equity_currency"] = base_currency
+        payload["total_equity_currency_ok"] = bool(total_equity_currency_ok)
 
         out_path = self._settings.dynamic_caps_path
         _atomic_write_json(out_path, payload, indent=2)
