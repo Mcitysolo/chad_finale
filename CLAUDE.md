@@ -24,7 +24,7 @@
 cd /home/ubuntu/chad_finale && source venv/bin/activate
 python3 -m py_compile <changed_file>
 python3 -m pytest chad/tests/ -x -q 2>&1 | tail -20
-python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
+CHAD_SKIP_IB_CONNECT=1 python3 -m chad.core.full_cycle_preview 2>&1 | tail -30
 
 ## Live Promotion Checklist
 
@@ -39,7 +39,7 @@ python3 chad/core/full_cycle_preview.py --dry-run 2>&1 | tail -30
 2. Disk cleanup — prune backup archives to below 75% usage
 3. IB Gateway latency — investigate and resolve dangerous (>750ms) classification
 4. Verify all 1465 tests pass after reboot
-5. Run full_cycle_preview.py --dry-run clean
+5. Run full_cycle_preview.py clean
 6. Confirm live_readiness.json flips to ready_for_live: true
 7. Run scripts/lint_systemd_wants_symlinks.sh — require exit 0 (GAP-032 preventive guard; chad-scoped regular-file count must be 0)
 8. Review open paper positions (MES short) before mode switch
