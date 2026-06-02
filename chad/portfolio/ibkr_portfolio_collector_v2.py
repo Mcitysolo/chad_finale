@@ -279,6 +279,19 @@ class IBKRPortfolioCollector:
             "kraken_equity": float(kraken_equity),
         }
 
+        # BOX-034B Step 2: carry forward publisher-authored snapshot keys that
+        # this collector does NOT author (kraken currency tags + the cosmetic
+        # ibkr USD display). The payload is written wholesale, so any prior key
+        # not re-listed is otherwise dropped — which silently stripped the
+        # kraken_equity_currency/_ok tags every 2-min cycle and prevented a
+        # stable total_equity_currency_ok. We PRESERVE (read-through) these
+        # verbatim, never author them: present-only (no .get default) so a
+        # cold/empty snapshot omits them rather than emitting null — the next
+        # publisher run self-heals the tags.
+        for _k in ("kraken_equity_currency", "kraken_equity_currency_ok", "ibkr_equity_usd_display"):
+            if _k in data:
+                new_payload[_k] = data[_k]
+
         _atomic_write_json(path, new_payload)
         return path
 
