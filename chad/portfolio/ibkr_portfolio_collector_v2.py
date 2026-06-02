@@ -143,7 +143,25 @@ class IBKRPortfolioCollector:
 
     def get_net_liquidation(self) -> float:
         """
-        Returns NetLiquidation (USD) for the configured account, or sum across accounts if not set.
+        Returns NetLiquidation for the configured account, or sum across accounts if not set.
+
+        Backward-compatible thin wrapper around
+        :meth:`get_net_liquidation_with_currency` that discards the currency
+        tag (used by the ``print`` CLI command).
+        """
+        value, _currency = self.get_net_liquidation_with_currency()
+        return value
+
+    def get_net_liquidation_with_currency(self) -> "tuple[float, str]":
+        """
+        Returns (NetLiquidation, currency) for the configured account, or the
+        sum across accounts if no account is configured.
+
+        The currency tag comes from the NetLiquidation AccountValue row
+        (IBKR reports NetLiquidation in the account's base currency). When
+        summing across multiple accounts the currency is only returned if
+        every contributing account agrees; otherwise an empty string is
+        returned so the caller's fail-closed gate engages (BOX-034A §3).
         """
         from ib_async import IB  # type: ignore[import]
 
@@ -151,16 +169,19 @@ class IBKRPortfolioCollector:
         try:
             ib.connect(self._cfg.host, self._cfg.port, clientId=self._cfg.client_id, readonly=True, timeout=6.0)
 
-            # accountSummary returns a list of AccountValue(tag, value, currency, account)
+            # accountSummary returns a list of AccountValue(account, tag, value, currency, modelCode)
             rows = ib.accountSummary()
             values_by_account: Dict[str, float] = {}
+            currency_by_account: Dict[str, str] = {}
             for r in rows:
                 try:
                     if str(getattr(r, "tag", "")) != "NetLiquidation":
                         continue
                     acct = str(getattr(r, "account", "")).strip()
                     val = float(getattr(r, "value", "0") or 0.0)
+                    ccy = str(getattr(r, "currency", "") or "").strip().upper()
                     values_by_account[acct] = val
+                    currency_by_account[acct] = ccy
                 except Exception:
                     continue
 
@@ -172,10 +193,13 @@ class IBKRPortfolioCollector:
                 if acct not in values_by_account:
                     raise RuntimeError(f"IBKR_ACCOUNT_ID={acct!r} not found in NetLiquidation summary")
                 total = values_by_account[acct]
+                currency = currency_by_account.get(acct, "")
             else:
                 total = sum(values_by_account.values())
+                distinct = {c for c in currency_by_account.values() if c}
+                currency = next(iter(distinct)) if len(distinct) == 1 else ""
 
-            return float(total)
+            return float(total), currency
         finally:
             try:
                 ib.disconnect()
@@ -196,6 +220,14 @@ class IBKRPortfolioCollector:
         Read existing portfolio_snapshot.json (if any), overwrite ibkr_equity
         with current NetLiquidation, preserve coinbase_equity and kraken_equity,
         write updated snapshot back atomically, TTL-stamped.
+
+        BOX-034A §3 currency gate (fail-closed): the snapshot's ibkr_equity is
+        canonical in the configured base currency (CHAD_BASE_CURRENCY, default
+        CAD). The collector reads the NetLiquidation row's currency tag and
+        only overwrites ibkr_equity when it matches the base. On a mismatch it
+        does NOT write the wrong-currency value — it preserves the prior
+        canonical value (read-through), logs a loud error, and records
+        ibkr_equity_currency_ok=false so monitoring can see it.
         """
         path = snapshot_path or self._default_snapshot_path()
 
@@ -207,7 +239,8 @@ class IBKRPortfolioCollector:
         else:
             data = {}
 
-        ibkr_equity = self.get_net_liquidation()
+        base = os.environ.get("CHAD_BASE_CURRENCY", "CAD").strip().upper() or "CAD"
+        ibkr_equity, row_currency = self.get_net_liquidation_with_currency()
 
         # Preserve other venues if present
         def _to_float(x: Any) -> float:
@@ -219,10 +252,29 @@ class IBKRPortfolioCollector:
         coinbase_equity = _to_float(data.get("coinbase_equity", 0.0))
         kraken_equity = _to_float(data.get("kraken_equity", 0.0))
 
+        if row_currency == base:
+            equity_to_write = float(ibkr_equity)
+            currency_ok = True
+        else:
+            # Fail-closed: do NOT overwrite the canonical CAD value with a
+            # wrong-currency reading. Preserve the prior canonical value
+            # (read-through), exactly as the publisher does.
+            equity_to_write = _to_float(data.get("ibkr_equity", 0.0))
+            currency_ok = False
+            print(
+                "[IBKR PORTFOLIO] IBKR_NETLIQ_CURRENCY_MISMATCH "
+                f"expected={base} got={row_currency!r} — preserving last-known "
+                "ibkr_equity, NOT writing wrong-currency value",
+                file=sys.stderr,
+                flush=True,
+            )
+
         new_payload: Dict[str, Any] = {
             "ts_utc": _utc_now_iso(),
             "ttl_seconds": int(PORTFOLIO_SNAPSHOT_TTL_SECONDS),
-            "ibkr_equity": float(ibkr_equity),
+            "ibkr_equity": float(equity_to_write),
+            "ibkr_equity_currency": base,
+            "ibkr_equity_currency_ok": bool(currency_ok),
             "coinbase_equity": float(coinbase_equity),
             "kraken_equity": float(kraken_equity),
         }
