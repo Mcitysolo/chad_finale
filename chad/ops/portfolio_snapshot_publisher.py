@@ -37,6 +37,14 @@ IBKR_CLIENT_ID = 84  # dedicated clientId, not colliding with live-loop (99)
 IBKR_TIMEOUT_SEC = 15
 TTL_SECONDS = 300
 
+# BOX-034A Inc 3 Step 0b: sane USDCAD band (CAD-per-USD). A live mid outside
+# this band is treated as garbage/inverted (e.g. ~0.73 = USD-per-CAD) and is
+# rejected -> None. There is NO fallback constant: None means "no live rate",
+# which callers turn into fail-closed behaviour (never a currency-tagged fake
+# value). The band catches both inverted quotes and outright garbage at source.
+USDCAD_BAND_LOW = 1.20
+USDCAD_BAND_HIGH = 1.50
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -53,13 +61,86 @@ def _read_kraken_usd_equity() -> float:
         return 0.0
 
 
-def _ibkr_equity_usd() -> Optional[float]:
+def _validate_usdcad(mid: Optional[float]) -> Optional[float]:
     """
-    Connect to IBKR readonly, read NetLiquidation, convert CAD→USD if needed.
+    Return ``mid`` iff it is a sane CAD-per-USD rate in [USDCAD_BAND_LOW,
+    USDCAD_BAND_HIGH]; otherwise None.
 
-    Returns USD equity or None on failure.
+    NO fallback. An unavailable (None), non-numeric, NaN, inverted (~0.73 =
+    USD-per-CAD) or otherwise out-of-band quote yields None — never a fabricated
+    constant. None is the unambiguous "no live rate" signal.
+    """
+    if mid is None:
+        return None
+    try:
+        m = float(mid)
+    except (TypeError, ValueError):
+        return None
+    if m != m:  # NaN
+        return None
+    if m < USDCAD_BAND_LOW or m > USDCAD_BAND_HIGH:
+        return None
+    return m
+
+
+def _fetch_usdcad_mid() -> Optional[float]:
+    """
+    Connect to IBKR readonly and fetch the live USDCAD mid (CAD per USD).
+
+    Returns the raw mid (bid/ask mid, else last), or None if the quote is
+    unavailable. Band validation is the caller's job (_get_live_usdcad_rate).
     """
     from ib_async import IB, Forex
+
+    ib = IB()
+    try:
+        ib.connect(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID,
+                   readonly=True, timeout=IBKR_TIMEOUT_SEC)
+        fx_contract = Forex("USDCAD")
+        ib.qualifyContracts(fx_contract)
+        ticker = ib.reqMktData(fx_contract, "", False, False)
+        ib.sleep(2)  # wait for quote
+        mid: Optional[float] = None
+        if ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
+            mid = (ticker.bid + ticker.ask) / 2
+        elif ticker.last and ticker.last > 0:
+            mid = ticker.last
+        ib.cancelMktData(fx_contract)
+        return mid
+    except Exception as exc:
+        LOG.warning("usdcad_fetch_failed: %s", exc)
+        return None
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+
+
+def _get_live_usdcad_rate(fetcher=None) -> Optional[float]:
+    """
+    Single source of the live, validated USDCAD rate (CAD per USD).
+
+    Returns the validated mid when a live quote is available and in-band, else
+    None. NO fallback constant is ever returned. ``fetcher`` is injectable for
+    testing; production uses _fetch_usdcad_mid.
+    """
+    if fetcher is None:
+        fetcher = _fetch_usdcad_mid
+    return _validate_usdcad(fetcher())
+
+
+def _ibkr_equity_usd(usdcad: Optional[float]) -> Optional[float]:
+    """
+    Connect to IBKR readonly, read NetLiquidation, convert CAD→USD using the
+    supplied live ``usdcad`` (CAD per USD). Used ONLY for the display-only
+    ``ibkr_equity_usd_display`` key (no risk/sizing/caps path reads it).
+
+    Returns USD equity, or None on failure. NEVER fabricates a rate: if
+    NetLiquidation is CAD and ``usdcad`` is None, returns None so the display
+    key stays None rather than carrying a USD figure derived from a fake rate.
+    """
+    from ib_async import IB
 
     ib = IB()
     try:
@@ -83,25 +164,12 @@ def _ibkr_equity_usd() -> Optional[float]:
             return net_liq_value
 
         if currency == "CAD":
-            # Use IBKR's own FX quote so conversion matches broker truth
-            fx_contract = Forex("USDCAD")
-            ib.qualifyContracts(fx_contract)
-            ticker = ib.reqMktData(fx_contract, "", False, False)
-            ib.sleep(2)  # wait for quote
-            mid = None
-            if ticker.bid and ticker.ask and ticker.bid > 0 and ticker.ask > 0:
-                mid = (ticker.bid + ticker.ask) / 2
-            elif ticker.last and ticker.last > 0:
-                mid = ticker.last
-            ib.cancelMktData(fx_contract)
-
-            if mid is None or mid <= 0:
-                LOG.warning("usd_cad_quote_unavailable, falling back to 1.40")
-                mid = 1.40  # rough fallback
-
-            usd = net_liq_value / mid
+            if usdcad is None:
+                LOG.warning("ibkr_equity_usd_display_unavailable: no live usdcad rate")
+                return None
+            usd = net_liq_value / usdcad  # CAD / (CAD per USD) = USD
             LOG.info("converted CAD %.2f / %.4f = USD %.2f",
-                     net_liq_value, mid, usd)
+                     net_liq_value, usdcad, usd)
             return usd
 
         LOG.warning("ibkr_unexpected_currency: %s", currency)
@@ -123,12 +191,12 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    ibkr_equity = _ibkr_equity_usd()
-    kraken_equity = _read_kraken_usd_equity()
-
-    if ibkr_equity is None:
-        LOG.error("ibkr_equity_fetch_failed_no_write")
-        return 1
+    # BOX-034A Inc 3 Step 0b: one live USDCAD fetch, used for BOTH the IBKR USD
+    # display value and the Kraken USD→CAD conversion (consistent rate, no
+    # double FX call). None == no usable live rate -> fail-closed downstream.
+    usdcad = _get_live_usdcad_rate()
+    ibkr_equity_usd = _ibkr_equity_usd(usdcad)
+    kraken_usd = _read_kraken_usd_equity()
 
     # BOX-034A §3 (single-writer): the v2 collector
     # (chad/portfolio/ibkr_portfolio_collector_v2.py, chad-ibkr-collector.timer)
@@ -150,8 +218,32 @@ def main() -> int:
 
     payload = dict(existing)
     payload["coinbase_equity"] = 0.0  # CAD-based, Coinbase not used
-    payload["kraken_equity"] = float(kraken_equity)
-    payload["ibkr_equity_usd_display"] = float(ibkr_equity)
+
+    # Display-only USD figure; never fabricated from a fake rate. None when the
+    # live USDCAD rate (or IBKR equity) is unavailable. No consumer reads it.
+    payload["ibkr_equity_usd_display"] = (
+        float(ibkr_equity_usd) if ibkr_equity_usd is not None else None
+    )
+
+    # BOX-034A Inc 3 Step 0b: Kraken balances are read as a USD-equivalent;
+    # convert to the CAD base so the snapshot is currency-consistent (ibkr_equity
+    # is already CAD via the v2 collector).
+    if usdcad is not None:
+        kraken_cad = float(kraken_usd) * usdcad  # USD * (CAD per USD) = CAD
+        payload["kraken_equity"] = kraken_cad
+        payload["kraken_equity_currency"] = "CAD"
+        payload["kraken_equity_currency_ok"] = True
+    else:
+        # FAIL-CLOSED: never tag a USD figure as CAD. Preserve the prior
+        # kraken_equity (already copied via read-through), flag it untrusted,
+        # and log loudly. The next cycle with a live rate self-heals.
+        payload["kraken_equity_currency_ok"] = False
+        LOG.error(
+            "KRAKEN_FX_UNAVAILABLE: no live USDCAD rate at write time; preserving "
+            "prior kraken_equity=%s unconverted, kraken_equity_currency_ok=false",
+            payload.get("kraken_equity"),
+        )
+
     payload["ts_utc"] = _utc_now_iso()
     payload["ttl_seconds"] = TTL_SECONDS
 
@@ -160,9 +252,13 @@ def main() -> int:
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(OUT_PATH)
 
-    total = ibkr_equity + kraken_equity
-    LOG.info("portfolio_snapshot_published ibkr_usd=%.2f kraken_usd=%.2f total_usd=%.2f",
-             ibkr_equity, kraken_equity, total)
+    kraken_out = payload.get("kraken_equity")
+    LOG.info(
+        "portfolio_snapshot_published ibkr_usd_display=%s kraken_cad=%s usdcad=%s",
+        ("%.2f" % ibkr_equity_usd) if ibkr_equity_usd is not None else "None",
+        ("%.2f" % kraken_out) if isinstance(kraken_out, (int, float)) else kraken_out,
+        ("%.4f" % usdcad) if usdcad is not None else "None",
+    )
     return 0
 
 
