@@ -1,5 +1,6 @@
 # BOX-034A — Canonical Equity Currency Unification (amends BOX-034)
 Date: 2026-06-01 · Status: PENDING (spec; no implementation until operator GO)
+Related follow-ups: BOX-034B (kraken_equity single-writer), BOX-034C (snapshot oneshot watchdog).
 Risk class: RISK MUTATION (equity feeds sizing, caps, VaR, drawdown, margin)
 
 ## 1. Root cause (confirmed live 2026-06-01)

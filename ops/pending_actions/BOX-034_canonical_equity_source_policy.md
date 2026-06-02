@@ -11,6 +11,7 @@
 > and remain what the live system + `test_canonical_equity_source.py` actually enforce.
 > On BOX-034A implementation they are **superseded** by BOX-034A §3–§6.
 > The "USD" assertions in §3b/§4a are NOT correct truth — they are the defect BOX-034A fixes.
+> Follow-up lineage: BOX-034A (currency unification), BOX-034B (kraken_equity single-writer), BOX-034C (snapshot oneshot watchdog/timeout).
 
 Generated: 2026-05-20T00:38:00Z (CHAD Box 034)
 

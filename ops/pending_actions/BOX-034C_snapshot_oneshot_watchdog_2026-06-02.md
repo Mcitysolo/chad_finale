@@ -1,6 +1,7 @@
 ---
 # BOX-034C — Snapshot Oneshot Watchdog / Timeout (robustness follow-up)
 Date: 2026-06-02 · Status: PENDING (no implementation until operator GO)
+Part of the BOX-034 lineage — parent: BOX-034 (canonical equity source policy); siblings: BOX-034A (currency unification), BOX-034B (kraken_equity single-writer).
 Risk class: robustness/observability
 
 ## 1. Problem (discovered 2026-06-02)

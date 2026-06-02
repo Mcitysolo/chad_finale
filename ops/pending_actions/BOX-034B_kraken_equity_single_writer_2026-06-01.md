@@ -1,5 +1,6 @@
 # BOX-034B — kraken_equity Single-Writer Unification (follow-up to BOX-034A)
 Date: 2026-06-01 · Status: PENDING (corrected after Step 1 investigation; no implementation until operator GO)
+Related follow-up: BOX-034C (snapshot oneshot watchdog/timeout — publisher-hang fragility surfaced during this box's Step 0b).
 Risk class: correctness/governance; value impact de-minimis (~0.06% of total equity)
 
 ## 1. Problem (CORRECTED after Step 1 investigation 2026-06-01)
