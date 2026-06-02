@@ -16,19 +16,19 @@ CHAD_BASE_CURRENCY = CAD (broker-native). All internal equity/cash/notional/sizi
 - Exactly ONE writer owns portfolio_snapshot.ibkr_equity: the v2 collector (already emits CAD).
 - v2 collector becomes currency-AWARE: read the NetLiquidation currency tag, assert == CAD, fail-closed (no bare ibkr_equity write) if it ever differs.
 - ops/portfolio_snapshot_publisher MUST NOT write ibkr_equity. If USD display is wanted, it writes ibkr_equity_usd_display only (no risk path reads it).
-- Every equity file (portfolio_snapshot, dynamic_caps, pnl_state) carries an explicit `currency` field; every reader asserts currency == CAD.
+- Currency-labeling convention (resolved 2026-06-01): every equity VALUE carries a sibling `<value>_currency` field — NOT a single file-level `currency`, which is ambiguous in multi-venue files (portfolio_snapshot holds ibkr/coinbase/kraken equities). Broker-sourced values also carry a `<value>_currency_ok` health flag. Canonical names: `ibkr_equity_currency` + `ibkr_equity_currency_ok` (portfolio_snapshot, shipped Inc 2), `total_equity_currency` (dynamic_caps), `account_equity_currency` (pnl_state). Every reader asserts the relevant `<value>_currency` == CHAD_BASE_CURRENCY (CAD).
 
 ## 4. Consumers
 dynamic_caps.total_equity, pnl_state.account_equity, portfolio_risk_cap, portfolio_var, drawdown_guard, profit_lock, position sizing — all derive from the single CAD source; none apply FX.
 
 ## 5. Reconciliation test (rewrite of BOX-034 §4a)
 - Compare pnl_state.account_equity vs portfolio_snapshot total in CAD, within max(1.0 CAD, 0.05% of total).
-- Assert both files carry currency == CAD.
+- Assert the relevant per-value currency fields (`account_equity_currency`, snapshot `ibkr_equity_currency`) == CAD, per the §3 convention.
 - Bound timing skew: both samples within a defined freshness window (or derive pnl_state from the same snapshot atomically) so residual drift is sampling-lag only, never currency.
 
 ## 6. Acceptance criteria (PROVEN TO BIND, not "code exists")
 - grep proof: exactly one service writes ibkr_equity.
-- portfolio_snapshot / dynamic_caps / pnl_state all carry currency=CAD.
+- portfolio_snapshot / dynamic_caps / pnl_state all carry their per-value currency tags == CAD (`ibkr_equity_currency`, `total_equity_currency`, `account_equity_currency`).
 - Reconciliation test passes across a full 300s window (multiple live samples), not one lucky read.
 - portfolio_risk_cap shows no CAD<->USD oscillation across a 10-min observation.
 - Fail-closed test: NetLiquidation currency tag != CAD -> collector refuses the bare write.
