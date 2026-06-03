@@ -1,6 +1,6 @@
 # BOX-034A Inc 3 — Pending Action: Restart chad-orchestrator.service to activate Step 2 warn-mode (Consumers 3/4) live
 
-**Status:** PENDING — awaiting explicit operator GO (governance rule #7, live service restart)
+**Status:** COMPLETED 2026-06-03 15:56:55 UTC — see Completion Record
 **Date:** 2026-06-03
 **Related:** BOX-034A; Inc 3 Step 2 (commit d0f7a78); prior restart PA (step1a, commit fc51872)
 
@@ -48,3 +48,9 @@ Warn-only; nil rollback need. A firing CURRENCY_WARN_* is diagnostic (a currency
 ## 8. Notes
 - Activates Step 2 readers in WARN mode only. The enforce flip (warn -> fail-closed) is a SEPARATE later PA, gated on a clean warn-silence window.
 - Inc 4 (reconciliation-test rewrite) remains for BOX-034A closeout.
+
+## 9. Completion Record
+- Restart executed 2026-06-03 15:56:55 UTC; new MainPID 3474306 (was 2970790); clean systemd deactivation of old daemon, clean init of new, zero tracebacks.
+- Pre-state: CURRENCY_WARN_ count = 0 over the prior ~14.5h (profit_lock-side Consumers 1/2/5 live + silent); 1a tags intact.
+- VERIFIED 2026-06-03 ~15:59Z: 5 cycles post-restart, CURRENCY_WARN_ count = 0 (Consumers 3/4 armed + silent); dynamic_caps total_equity_currency=CAD/_ok=true (no regression); total_equity numerically continuous (315661 -> 314999 -> 315027, market drift only).
+- Step 2 (d0f7a78) now LIVE across all 5 consumers (warn-mode). Remaining for BOX-034A: enforce flip (warn -> fail-closed, separate gated PA); Inc 4 reconciliation-test rewrite.
