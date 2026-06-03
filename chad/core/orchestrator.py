@@ -780,6 +780,25 @@ class Orchestrator:
                     kraken_currency_ok=obj.get("kraken_equity_currency_ok"),
                 )
 
+                # BOX-034A Inc 3 Step 2: WARN-MODE currency assertion on the
+                # per-leg snapshot equities feeding the allocator (warn-only;
+                # never raises / alters legs / changes control flow). The
+                # PortfolioSnapshot dataclass strips currency, so this is the
+                # upstream point where the per-leg *_currency_ok flags are still
+                # in scope. Warn per ACTIVE leg (equity>0) whose flag is not True.
+                for _leg_name, _leg_equity, _leg_ok in (
+                    ("ibkr", snap.ibkr_equity, obj.get("ibkr_equity_currency_ok")),
+                    ("kraken", snap.kraken_equity, obj.get("kraken_equity_currency_ok")),
+                ):
+                    if _finite_float(_leg_equity, 0.0) > 0.0 and _leg_ok is not True:
+                        self._log.warning(
+                            "CURRENCY_WARN_SNAPSHOT_LEG leg=%s ok=%s",
+                            _leg_name,
+                            _leg_ok,
+                        )
+                if total_equity_currency_ok is False:
+                    self._log.warning("CURRENCY_WARN_TOTAL_EQUITY_OK_FALSE")
+
                 self._log.info(
                     "orchestrator.portfolio_snapshot_loaded",
                     extra={
@@ -917,6 +936,16 @@ class Orchestrator:
         base_currency = os.environ.get("CHAD_BASE_CURRENCY", "CAD").strip().upper() or "CAD"
         payload["total_equity_currency"] = base_currency
         payload["total_equity_currency_ok"] = bool(total_equity_currency_ok)
+
+        # BOX-034A Inc 3 Step 2: WARN-MODE currency assertion guarding the
+        # portfolio_risk_cap just computed from this (currency-blind) equity
+        # (warn-only; never raises / alters payload / changes control flow).
+        if (not total_equity_currency_ok) or base_currency != "CAD":
+            self._log.warning(
+                "CURRENCY_WARN_RISK_CAP_UNVERIFIED ok=%s base=%s",
+                total_equity_currency_ok,
+                base_currency,
+            )
 
         out_path = self._settings.dynamic_caps_path
         _atomic_write_json(out_path, payload, indent=2)

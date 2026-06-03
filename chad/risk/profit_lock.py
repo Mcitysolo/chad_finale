@@ -241,6 +241,18 @@ class DynamicCapsEquityProvider(EquityProvider):
             return None, str(path)
         value = _safe_float(data.get(self.key), default=-1.0)
         if value > 0.0:
+            # BOX-034A Inc 3 Step 2: WARN-MODE currency assertion (warn-only;
+            # never raises / alters value / changes control flow). Sibling tags
+            # (total_equity_currency / _ok) are in scope here from the same dict.
+            _base = os.environ.get("CHAD_BASE_CURRENCY", "CAD").strip().upper() or "CAD"
+            _cur = data.get("total_equity_currency")
+            if _cur != _base or data.get("total_equity_currency_ok") is not True:
+                logger.warning(
+                    "CURRENCY_WARN_DYNCAPS_PROVIDER currency=%s ok=%s expected=%s",
+                    _cur,
+                    data.get("total_equity_currency_ok"),
+                    _base,
+                )
             return value, str(path)
         return None, str(path)
 
@@ -306,6 +318,15 @@ class CompositeEquityProvider(EquityProvider):
             value, source = await provider.get_equity(repo_root)
             last_source = source
             if value is not None and value > 0.0:
+                # BOX-034A Inc 3 Step 2: WARN-MODE untagged-fallback flag
+                # (warn-only). Fires only when equity resolves from a non-dynamic
+                # caps provider (FileEquityProvider sources carry no currency tags
+                # and cannot be asserted). Silent when DynamicCapsEquityProvider
+                # is the resolver.
+                if not isinstance(provider, DynamicCapsEquityProvider):
+                    logger.warning(
+                        "CURRENCY_WARN_UNTAGGED_FALLBACK source=%s", source
+                    )
                 return value, source
         return None, last_source
 
@@ -802,6 +823,20 @@ class ProfitLockEngine:
                     and _account_equity is not None
                     and _dc.get("total_equity_currency_ok") is True
                 )
+
+        # BOX-034A Inc 3 Step 2: WARN-MODE currency assertion on the equity
+        # consumed for the profit-lock sizing decision (warn-only; never raises
+        # / alters equity / changes control flow). Fires only when equity came
+        # from dynamic_caps yet currency is unverified or != base.
+        if _from_dynamic_caps and (
+            account_equity_currency_ok is not True
+            or account_equity_currency != base_currency
+        ):
+            logger.warning(
+                "CURRENCY_WARN_PNL_STATE currency=%s ok=%s source=dynamic_caps",
+                account_equity_currency,
+                account_equity_currency_ok,
+            )
 
         pnl_state = {
             "schema_version": "pnl_state.v1",
