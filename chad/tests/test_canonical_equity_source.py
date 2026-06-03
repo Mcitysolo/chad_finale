@@ -17,7 +17,9 @@ runtime directory.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -81,31 +83,157 @@ def test_portfolio_snapshot_schema_matches_canonical_section_3b() -> None:
         )
 
 
-def test_canonical_sources_agree_within_skew_tolerance() -> None:
-    """§4a: when both canonical files exist with non-null equity values,
-    pnl_state.account_equity must agree with the sum of per-venue
-    portfolio_snapshot equities within max(1.0 USD, 0.05 % of total)."""
+def _parse_ts_utc(value):
+    """Tolerant ISO-8601 UTC parser.
+
+    Handles the runtime ts_utc shapes seen across the canonical files:
+    trailing ``Z`` with or without fractional seconds (pnl_state uses
+    ``...:12Z``; portfolio_snapshot/dynamic_caps use ``...:13.281798Z``) and
+    explicit ``+00:00`` offsets. Returns a timezone-aware datetime, or None
+    when the value is missing/unparseable (caller treats None as skip, never
+    fail — an unparseable timestamp is sampling/format noise, not a currency
+    defect).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def test_canonical_single_source_exactness_hermetic(tmp_path) -> None:
+    """BOX-034A §5 / Inc 4 (4A): account_equity is sourced EXACTLY from
+    dynamic_caps.total_equity, with no live-generation skew.
+
+    Hermetic by construction: build a temp ``runtime/dynamic_caps.json`` with a
+    known value + CAD currency tags, drive the real
+    ``DynamicCapsEquityProvider`` against it, and assert it returns that value
+    bit-for-bit from that exact file. This retires the flake permanently — the
+    earlier live exact-compare (pnl_state vs dynamic_caps) could lag by one
+    futures-marking cycle because account_equity is profit_lock's last read of
+    dynamic_caps; here there is only one generation, so the relationship is
+    deterministic.
+    """
+    from chad.risk.profit_lock import DynamicCapsEquityProvider
+
+    X = 312027.3862987942
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    dc_path = runtime / "dynamic_caps.json"
+    dc_path.write_text(
+        json.dumps(
+            {
+                "total_equity": X,
+                "total_equity_currency": "CAD",
+                "total_equity_currency_ok": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    provider = DynamicCapsEquityProvider()
+    value, source = asyncio.run(provider.get_equity(tmp_path))
+
+    assert value is not None, "provider returned None for a valid positive dynamic_caps.total_equity"
+    assert abs(float(value) - X) <= 1e-9 * max(1.0, X), (
+        f"DynamicCapsEquityProvider must return total_equity exactly; got {value!r} vs {X!r}"
+    )
+    assert source == str(dc_path), (
+        f"provider source must point at the dynamic_caps.json it read; got {source!r}"
+    )
+    # Currency tags read back canonical (fixture integrity + §3 convention).
+    dc = json.loads(dc_path.read_text(encoding="utf-8"))
+    assert dc.get("total_equity_currency") == "CAD"
+    assert dc.get("total_equity_currency_ok") is True
+
+
+def test_canonical_sources_agree_cross_file_bounded() -> None:
+    """BOX-034A §5 / Inc 4 (4B): live cross-file sanity rewrite of the former
+    skew test. Currency must ALWAYS bind; the numeric compare is skew-gated and
+    given a futures-aware tolerance so it never flakes on sampling lag.
+
+    pnl_state.account_equity and the portfolio_snapshot leg-sum are the two ends
+    of one derivation chain (snapshot legs -> dynamic_caps.total_equity ->
+    account_equity), written by independent timers; the precision invariant is
+    owned by the hermetic 4A test above. Here we only assert (a) currency never
+    drifts, and (b) the two files, when same-generation/fresh, sum to roughly
+    the same CAD total.
+    """
     pnl = _load(RUNTIME / "pnl_state.json")
     snap = _load(RUNTIME / "portfolio_snapshot.json")
     if pnl is None or snap is None:
-        pytest.skip("Both canonical files required for skew check")
+        pytest.skip("Both canonical files required for cross-file check")
     pnl_eq = pnl.get("account_equity")
     if pnl_eq is None:
         pytest.skip("pnl_state.account_equity is null in this environment")
     try:
-        snap_total = float(snap.get("ibkr_equity", 0.0) or 0.0) \
-                   + float(snap.get("kraken_equity", 0.0) or 0.0) \
-                   + float(snap.get("coinbase_equity", 0.0) or 0.0)
+        legs = {
+            "ibkr_equity": float(snap.get("ibkr_equity", 0.0) or 0.0),
+            "kraken_equity": float(snap.get("kraken_equity", 0.0) or 0.0),
+            "coinbase_equity": float(snap.get("coinbase_equity", 0.0) or 0.0),
+        }
     except (TypeError, ValueError) as exc:
         pytest.fail(f"portfolio_snapshot legs not numeric: {exc}")
+    snap_total = sum(legs.values())
     if snap_total <= 0.0:
         pytest.skip("portfolio_snapshot total is non-positive in this environment")
-    tolerance = max(1.0, 0.0005 * snap_total)
+
+    # --- CURRENCY-EXPLICIT (hard asserts; currency must NEVER drift) ---------
+    assert pnl.get("account_equity_currency") == "CAD", (
+        f"pnl_state.account_equity_currency must be CAD; got "
+        f"{pnl.get('account_equity_currency')!r}"
+    )
+    assert pnl.get("account_equity_currency_ok") is True, (
+        "pnl_state.account_equity_currency_ok must be True"
+    )
+    # Per-leg currency, CONDITIONAL: only venues with a non-zero/non-null equity
+    # carry currency tags (e.g. coinbase_equity=0 has no tag — skip it).
+    for leg_key, leg_val in legs.items():
+        if leg_val == 0.0:
+            continue
+        cur = snap.get(f"{leg_key}_currency")
+        ok = snap.get(f"{leg_key}_currency_ok")
+        assert cur == "CAD", (
+            f"portfolio_snapshot.{leg_key}_currency must be CAD for non-zero leg; got {cur!r}"
+        )
+        assert ok is True, (
+            f"portfolio_snapshot.{leg_key}_currency_ok must be True for non-zero leg"
+        )
+
+    # --- SKEW / STALENESS GATE (skip, never fail) ---------------------------
+    ts_pnl = _parse_ts_utc(pnl.get("ts_utc"))
+    ts_snap = _parse_ts_utc(snap.get("ts_utc"))
+    if ts_pnl is None or ts_snap is None:
+        pytest.skip("unparseable ts_utc: drift is sampling/format noise, not currency")
+    now = datetime.now(timezone.utc)
+    pnl_ttl = int(pnl.get("ttl_seconds", 0) or 0)
+    snap_ttl = int(snap.get("ttl_seconds", 0) or 0)
+    if pnl_ttl > 0 and (now - ts_pnl).total_seconds() > pnl_ttl:
+        pytest.skip("generation skew / staleness: drift is sampling-lag, not currency")
+    if snap_ttl > 0 and (now - ts_snap).total_seconds() > snap_ttl:
+        pytest.skip("generation skew / staleness: drift is sampling-lag, not currency")
+    if abs((ts_pnl - ts_snap).total_seconds()) > 300:  # snapshot cadence
+        pytest.skip("generation skew / staleness: drift is sampling-lag, not currency")
+
+    # --- TOLERANT NUMERIC -----------------------------------------------------
+    # Coarse cross-file currency/sanity bound; the precision invariant is owned
+    # by test_canonical_single_source_exactness_hermetic (4A). 0.5% is sized to
+    # absorb ~$4M futures notional marking across the 300s snapshot cadence
+    # (observed worst-case cross-generation drift ~0.22%).
+    tolerance = max(1.0, 0.005 * snap_total)
     drift = abs(float(pnl_eq) - snap_total)
     assert drift <= tolerance, (
-        f"Canonical equity skew exceeded tolerance: pnl_state.account_equity="
-        f"{pnl_eq} vs portfolio_snapshot total={snap_total:.2f}; drift={drift:.4f} > tolerance={tolerance:.4f}. "
-        "See ops/pending_actions/BOX-034_canonical_equity_source_policy.md §4a."
+        f"Canonical equity cross-file drift exceeded bound (in-window): "
+        f"pnl_state.account_equity={pnl_eq} vs portfolio_snapshot total={snap_total:.2f}; "
+        f"drift={drift:.4f} > tolerance={tolerance:.4f}. "
+        "See ops/pending_actions/BOX-034A_canonical_equity_currency_unification_2026-06-01.md §5."
     )
 
 
