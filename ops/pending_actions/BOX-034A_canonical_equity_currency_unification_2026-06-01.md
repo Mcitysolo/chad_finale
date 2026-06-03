@@ -1,5 +1,5 @@
 # BOX-034A — Canonical Equity Currency Unification (amends BOX-034)
-Date: 2026-06-01 · Status: PENDING (spec; no implementation until operator GO)
+Date: 2026-06-01 · Status: IN PROGRESS — Inc 2 + Inc 3 Step 1a/1b shipped & live-verified; Inc 3 Step 2 (warn-mode) shipped; enforce flip + Inc 4 remaining (see §9)
 Related follow-ups: BOX-034B (kraken_equity single-writer), BOX-034C (snapshot oneshot watchdog).
 Risk class: RISK MUTATION (equity feeds sizing, caps, VaR, drawdown, margin)
 
@@ -39,3 +39,10 @@ USD display reporting (cosmetic); the `manual`/`config_default` seeded positions
 
 ## 8. Implementation gate
 Risk mutation: NO code until operator GO on this spec. Then Channel 2 implements with tests; verify §6 on the live box across a full timer window before commit.
+- Reconciliation (2026-06-03): the shipped increments to date are NON-MUTATING — additive currency-tag writers (Inc 2, Inc 3 Step 1a/1b) and WARN-ONLY reader assertions (Inc 3 Step 2). None change any equity value, cap, or control flow. This gate continues to bind the still-pending RISK-MUTATING step: the Step 2 enforce flip (warn -> fail-closed), which gets its own operator GO + §6 live verification. See §9 for per-increment status.
+
+## 9. Implementation status (progress tracking)
+- Inc 2 — portfolio_snapshot per-value currency tags (`ibkr_equity_currency` / `ibkr_equity_currency_ok`): SHIPPED & live (recorded inline §3).
+- Inc 3 Step 1a (commit b6d333f) + Step 1b (commit 40a9c55): writers additively tag `dynamic_caps.total_equity_currency`/`_ok` and `pnl_state.account_equity_currency`/`_ok`. LIVE + verified 2026-06-03 via orchestrator restart — both files read CAD with `_ok=true` (pnl_state auto-flipped on the next profit-lock oneshot). Ref restart PA `BOX-034A_orchestrator_restart_step1a_2026-06-02` (commit fc51872, Completion Record §10).
+- Inc 3 Step 2 (commit d0f7a78): WARN-MODE currency assertions across the 5 equity consumers (greppable `CURRENCY_WARN_*` markers: DYNCAPS_PROVIDER, PNL_STATE, SNAPSHOT_LEG, TOTAL_EQUITY_OK_FALSE, RISK_CAP_UNVERIFIED, UNTAGGED_FALLBACK). Warn-only — no enforcement, no control-flow or equity-value change; 10 caplog tests (FIRES + SILENT per consumer). SHIPPED (committed); pending live activation (orchestrator restart picks up the warn code) + warn-silence confirmation in live logs.
+- REMAINING: (a) Step 2 enforce flip — warn -> fail-closed assertion at consumers; RISK-MUTATING, bound by the §8 gate (own operator GO + §6 live verification). (b) Inc 4 — reconciliation-test rewrite per §5.
