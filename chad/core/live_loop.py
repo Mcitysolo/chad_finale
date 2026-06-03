@@ -210,6 +210,151 @@ def _futures_execution_disabled(env: Mapping[str, str]) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Bug B Fix A: cumulative broker-truth per-symbol futures position cap.
+#
+# The same-side dedupe is strategy-scoped and ledger-backed; its attribution
+# window is why the env gate above could not be removed. This cap is the
+# durable guard: it bounds every FUT open against the BROKER-TRUTH net
+# position for the symbol (any strategy attribution), consults NO env flag,
+# and fail-closes when broker truth cannot be verified. Exits/flips always
+# pass (same classification as the env gate).
+# ---------------------------------------------------------------------------
+
+_POSITIONS_TRUTH_PATH = Path("/home/ubuntu/chad_finale/runtime/positions_truth.json")
+
+
+def _build_futures_position_caps() -> Dict[str, int]:
+    """Per-symbol cumulative position caps, derived from the strategy
+    instrument spec tables (single source of truth), min() on conflict."""
+    try:
+        from chad.strategies.alpha_futures import DEFAULT_SPECS as _alpha_specs
+        from chad.strategies.omega_macro import OMEGA_MACRO_SPECS as _omega_specs
+
+        caps: Dict[str, int] = {}
+        for table in (_alpha_specs, _omega_specs):
+            for sym, spec in table.items():
+                cap = int(getattr(spec, "max_contracts", 0) or 0)
+                key = str(sym).strip().upper()
+                caps[key] = min(caps[key], cap) if key in caps else cap
+        return caps
+    except Exception:
+        # FAIL-CLOSED FALLBACK — not the source of truth; tune caps in the
+        # spec tables (alpha_futures.DEFAULT_SPECS / OMEGA_MACRO_SPECS),
+        # never here. Snapshot of the derived table as of 2026-06-03.
+        return {
+            "MES": 5,
+            "MNQ": 5,
+            "MCL": 2,
+            "MGC": 5,
+            "MYM": 5,
+            "M2K": 5,
+            "ZN": 3,
+            "ZB": 2,
+            "M6E": 3,
+        }
+
+
+_FUTURES_POSITION_CAPS: Dict[str, int] = _build_futures_position_caps()
+
+
+def _read_broker_truth_for_caps(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Load positions_truth.json fresh + broker-authority GREEN, else None.
+
+    Uses the ttl-aware reader (live_gate.read_runtime_state_json): missing,
+    unparseable, or stale-beyond-ttl all return None. Additionally requires
+    broker_authority_status == GREEN and truth_ok is True — fail-closed on
+    any doubt.
+    """
+    from chad.core.live_gate import read_runtime_state_json
+
+    truth_path = path or _POSITIONS_TRUTH_PATH
+    try:
+        obj, _fr = read_runtime_state_json(truth_path, default_ttl_s=120)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if str(obj.get("broker_authority_status", "")).strip().upper() != "GREEN":
+        return None
+    if obj.get("truth_ok") is not True:
+        return None
+    return obj
+
+
+def _futures_net_from_truth(truth_obj: Mapping[str, Any], symbol: str) -> Optional[float]:
+    """Signed net broker position for *symbol* from a loaded truth object.
+
+    Sums `position` over FUT entries matching the symbol. No matching entry
+    means flat (0.0). A malformed position value returns None (fail-closed —
+    cannot verify).
+    """
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    net = 0.0
+    for entry in truth_obj.get("positions") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("secType", "")).strip().upper() != "FUT":
+            continue
+        if str(entry.get("symbol", "")).strip().upper() != sym:
+            continue
+        try:
+            net += float(entry.get("position"))
+        except (TypeError, ValueError):
+            return None
+    return net
+
+
+def _futures_net_broker_position(symbol: str, path: Optional[Path] = None) -> Optional[float]:
+    """Signed net broker position for a futures symbol, from broker truth.
+
+    Returns None when positions_truth is unreadable / stale / not
+    broker-authority GREEN, or carries a malformed position — callers must
+    treat None as "cannot verify" and refuse futures opens (fail-closed).
+    """
+    truth_obj = _read_broker_truth_for_caps(path)
+    if truth_obj is None:
+        return None
+    return _futures_net_from_truth(truth_obj, symbol)
+
+
+def _futures_cap_check(
+    symbol: str,
+    side: str,
+    quantity: float,
+    broker_net: Optional[float],
+    pending_adds: Dict[str, float],
+    caps: Optional[Mapping[str, int]] = None,
+) -> Tuple[str, float, float, int]:
+    """Cap decision for one FUT open intent (exits/flips never reach this).
+
+    Returns (verdict, net_incl_pending, projected, cap) where verdict is:
+      - "unverified": broker_net is None — fail-closed, refuse.
+      - "block": the trade would GROW |net| beyond the per-symbol cap.
+      - "allow": within cap, or a reduce — the signed quantity is registered
+        into *pending_adds* so later intents this cycle project cumulatively.
+
+    Unknown symbols resolve to cap 0 (a futures symbol absent from the spec
+    tables must not open uncapped).
+    """
+    sym = str(symbol or "").strip().upper()
+    cap_table: Mapping[str, int] = _FUTURES_POSITION_CAPS if caps is None else caps
+    cap = int(cap_table.get(sym, 0))
+    if broker_net is None:
+        return "unverified", 0.0, 0.0, cap
+    signed = float(quantity or 0.0)
+    if str(side or "").strip().upper() == "SELL":
+        signed = -signed
+    net_incl_pending = float(broker_net) + float(pending_adds.get(sym, 0.0))
+    projected = net_incl_pending + signed
+    if abs(projected) > cap and abs(projected) > abs(net_incl_pending):
+        return "block", net_incl_pending, projected, cap
+    pending_adds[sym] = pending_adds.get(sym, 0.0) + signed
+    return "allow", net_incl_pending, projected, cap
+
+
 def _refresh_kraken_balance_snapshot(logger: logging.Logger) -> None:
     """
     Refresh runtime/kraken_balances.json on a 5-minute interval.
@@ -1852,6 +1997,15 @@ def run_once(logger: logging.Logger) -> None:
 
     emitted = 0
 
+    # Bug B Fix A: broker truth is read ONCE per run_once() cycle (lazily, on
+    # the first FUT open intent) and reused across all intents this cycle.
+    # _futures_pending_adds tracks signed quantities of FUT opens APPROVED
+    # earlier in this same cycle, so two strategies adding to one symbol in a
+    # single cycle project against the cap cumulatively, not independently.
+    _futures_truth_obj: Optional[Dict[str, Any]] = None
+    _futures_truth_loaded = False
+    _futures_pending_adds: Dict[str, float] = {}
+
     for intent in intents:
         try:
             _attach_strategy_to_intent(intent, routed_signal_map)
@@ -2061,6 +2215,64 @@ def run_once(logger: logging.Logger) -> None:
                 _intent_is_exit = False
 
             _gate_sec_type = str(getattr(intent, "sec_type", "") or "").upper()
+
+            # --- Bug B Fix A: cumulative broker-truth futures position cap ---
+            # PRIMARY guard for futures opens. Consults NO env flag — binds
+            # with the env gate (below, redundant backup) ON or OFF. Exits
+            # and flips always pass, same classification as the gate. Refuses
+            # when the projected net (broker truth + this cycle's approved
+            # adds + this intent) would GROW the position beyond the
+            # per-symbol cap; reduces pass. Fail-closed when broker truth
+            # cannot be verified.
+            if (
+                _gate_sec_type == "FUT"
+                and not _intent_is_exit
+                and not is_flip_signal(intent)
+            ):
+                _cap_symbol = str(getattr(intent, "symbol", "") or "").strip().upper()
+                if not _futures_truth_loaded:
+                    _futures_truth_obj = _read_broker_truth_for_caps()
+                    _futures_truth_loaded = True
+                _broker_net = (
+                    _futures_net_from_truth(_futures_truth_obj, _cap_symbol)
+                    if _futures_truth_obj is not None
+                    else None
+                )
+                _cap_verdict, _cap_net, _cap_projected, _cap_value = _futures_cap_check(
+                    _cap_symbol,
+                    str(getattr(intent, "side", "") or ""),
+                    float(getattr(intent, "quantity", 0.0) or 0.0),
+                    _broker_net,
+                    _futures_pending_adds,
+                )
+                if _cap_verdict == "unverified":
+                    logger.warning(
+                        "FUTURES_POSITION_CAP_UNVERIFIED symbol=%s strategy=%s side=%s "
+                        "qty=%s reason=positions_truth_unavailable_or_stale (fail-closed)",
+                        _cap_symbol,
+                        getattr(intent, "strategy", "?"),
+                        getattr(intent, "side", "?"),
+                        getattr(intent, "quantity", "?"),
+                    )
+                    continue
+                if _cap_verdict == "block":
+                    logger.warning(
+                        "FUTURES_POSITION_CAP_BLOCK symbol=%s strategy=%s side=%s qty=%s "
+                        "net=%.1f projected=%.1f cap=%d reason=cumulative_cap",
+                        _cap_symbol,
+                        getattr(intent, "strategy", "?"),
+                        getattr(intent, "side", "?"),
+                        getattr(intent, "quantity", "?"),
+                        _cap_net,
+                        _cap_projected,
+                        _cap_value,
+                    )
+                    continue
+                # "allow": _futures_cap_check registered the signed qty into
+                # _futures_pending_adds — later intents this cycle project
+                # against the cap cumulatively.
+            # --- end Bug B Fix A cap ---
+
             if (
                 _futures_execution_disabled(os.environ)
                 and _gate_sec_type == "FUT"
