@@ -1,6 +1,6 @@
 # BOX-034A Inc 3 — Pending Action: Restart chad-orchestrator.service to activate Step 1a currency tagging live
 
-**Status:** PENDING — awaiting explicit operator GO (governance rule #7, live service restart)
+**Status:** COMPLETED 2026-06-03 01:27:37 UTC — see section 10 Completion Record
 **Date:** 2026-06-02
 **Author:** TEAM CHAD
 **Related:** BOX-034A (canonical equity currency unification); Inc 3 Step 1a (commit b6d333f); Step 1b (commit 40a9c55)
@@ -56,3 +56,9 @@ Restart ships only additive keys via committed code; expected rollback need is n
 - `total_equity_currency` defaults to "CAD" via code default (unit sets no `CHAD_BASE_CURRENCY`); CAD is the intended base. Optional future hardening: set `CHAD_BASE_CURRENCY=CAD` explicitly in the Environment of all currency-aware units (collector/publisher/orchestrator) so the tag never relies on a code default — a separate unit-change PA, not required here.
 - This PA activates Step 1a (writers) only. Step 2 reader assertions (warn-before-enforce) and Inc 4 (reconciliation test rewrite) remain separate.
 - Finding: the ~15-day-stale orchestrator means orchestrator-side changes are not live until restarted. A periodic-restart or restart-on-change policy for `chad-orchestrator.service` is a candidate ops item (cf. BOX-034C watchdog family).
+
+## 10. Completion Record
+- Restart executed 2026-06-03 01:27:37 UTC; new MainPID 2970790 (was 2874768); clean systemd deactivation of old daemon, clean init of new, zero tracebacks.
+- SAFE verdict confirmed empirically: total_equity numerically continuous across the boundary (313656.93 old daemon 01:26:53 to new daemon 01:27:38); sizing math unchanged.
+- VERIFIED 2026-06-03 02:00Z: dynamic_caps total_equity_currency=CAD, total_equity_currency_ok=true; pnl_state account_equity_currency=CAD, account_equity_currency_ok=true (auto-flipped via profit-lock oneshot); account_equity == dynamic_caps.total_equity (single-sourced); error scan empty.
+- Step 1a (b6d333f) + Step 1b (40a9c55) now LIVE. Remaining for BOX-034A: Step 2 reader assertions (warn-before-enforce), Inc 4 reconciliation-test rewrite.
