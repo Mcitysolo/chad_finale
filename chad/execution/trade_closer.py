@@ -660,8 +660,23 @@ class TradeCloser:
                     continue
                 if payload.get("schema_version") != "closed_trade.v1":
                     continue
+                # Bug B Fix B (consumer defense, 2026-06-03): ignore harvester
+                # phantom round-trips. The paper-fill harvester historically
+                # wrote a closed_trade.v1 record per OPEN fill (pnl=0, single
+                # fill_id, tag ibkr_harvest); seeding those fill_ids marked
+                # opens as already-consumed so they never entered the FIFO —
+                # the futures-runaway feedback gap. Legitimate FIFO closes
+                # always carry [open_id, close_id] (2 ids) and never the tag
+                # (validated: 2,432 records, zero crossover on either test).
+                tags_field = payload.get("tags")
+                if isinstance(tags_field, (list, tuple)) and any(
+                    str(t).strip().lower() == "ibkr_harvest" for t in tags_field
+                ):
+                    continue
                 fids = payload.get("fill_ids")
                 if not isinstance(fids, (list, tuple)):
+                    continue
+                if len(fids) < 2:
                     continue
                 for fid in fids:
                     if not fid:

@@ -284,7 +284,6 @@ def harvest(dry_run: bool = False) -> Dict[str, Any]:
 
     guard = load_position_guard()
     already_harvested = load_harvested_ids()
-    already_traded = load_harvested_trade_ids()
 
     day = _utc_ymd()
     fills_path = FILLS_DIR / f"FILLS_{day}.ndjson"
@@ -292,13 +291,7 @@ def harvest(dry_run: bool = False) -> Dict[str, Any]:
 
     fills_wrote = 0
     fills_skipped = 0
-    trades_wrote = 0
-    trades_skipped = 0
     new_fill_ids: Set[str] = set()
-    new_trade_ids: Set[str] = set()
-
-    # Collect trade history records grouped by date
-    trade_records_by_date: Dict[str, List[Dict[str, Any]]] = {}
 
     for fill in fills:
         contract = fill.contract
@@ -306,11 +299,9 @@ def harvest(dry_run: bool = False) -> Dict[str, Any]:
 
         exec_id = execution.execId
         fill_is_new = exec_id not in already_harvested
-        trade_is_new = exec_id not in already_traded
 
-        if not fill_is_new and not trade_is_new:
+        if not fill_is_new:
             fills_skipped += 1
-            trades_skipped += 1
             continue
 
         symbol = contract.symbol
@@ -394,9 +385,7 @@ def harvest(dry_run: bool = False) -> Dict[str, Any]:
         }
 
         # --- Write fill record (existing behavior) ---
-        if not fill_is_new:
-            fills_skipped += 1
-        elif dry_run:
+        if dry_run:
             logger.info("[DRY-RUN] Would write fill: %s %s %.0f @ %.2f strategy=%s",
                         symbol, side, quantity, fill_price, strategy)
             fills_wrote += 1
@@ -408,76 +397,27 @@ def harvest(dry_run: bool = False) -> Dict[str, Any]:
             fills_wrote += 1
             new_fill_ids.add(exec_id)
 
-        # --- Build trade history record ---
-        if not trade_is_new:
-            trades_skipped += 1
-        else:
-            # Determine the fill date for file naming
-            if hasattr(fill_time, "strftime"):
-                fill_day = fill_time.astimezone(timezone.utc).strftime("%Y%m%d")
-            else:
-                fill_day = day
-
-            # Contract multiplier
-            contract_mult = 1.0
-            if sec_type == "FUT" and hasattr(contract, "multiplier") and contract.multiplier:
-                try:
-                    contract_mult = float(contract.multiplier)
-                except (ValueError, TypeError):
-                    pass
-
-            trade_payload: Dict[str, Any] = {
-                "schema_version": TRADE_SCHEMA_VERSION,
-                "strategy": strategy,
-                "symbol": symbol.upper(),
-                "side": side,
-                "pnl": 0.0,
-                "entry_time_utc": fill_time_utc,
-                "exit_time_utc": fill_time_utc,
-                "fill_price": fill_price,
-                "entry_price": fill_price,
-                "exit_price": fill_price,
-                "quantity": quantity,
-                "contract_multiplier": contract_mult,
-                "notional": round(notional, 4),
-                "fill_ids": [fill_id],
-                "broker": "ibkr_paper",
-                "account_id": acct,
-                "is_live": False,
-                "tags": ["paper", "filled", "ibkr_harvest"] + ([strategy] if strategy != "unknown" else []),
-            }
-
-            if not dry_run:
-                trade_records_by_date.setdefault(fill_day, []).append(trade_payload)
-                logger.info("Queued trade history: %s %s %.0f @ %.2f strategy=%s exec_id=%s",
-                            symbol, side, quantity, fill_price, strategy, exec_id)
-            else:
-                logger.info("[DRY-RUN] Would write trade history: %s %s %.0f @ %.2f strategy=%s",
-                            symbol, side, quantity, fill_price, strategy)
-            trades_wrote += 1
-            new_trade_ids.add(exec_id)
-
-    # --- Write trade history records (atomic per date file) ---
-    if not dry_run:
-        for trade_day, records in trade_records_by_date.items():
-            trade_path = TRADES_DIR / f"trade_history_{trade_day}.ndjson"
-            for rec in records:
-                append_hash_chained_record(trade_path, rec)
-            logger.info("Wrote %d trade history records to %s", len(records), trade_path.name)
+        # Bug B Fix B (2026-06-03): the closed_trade.v1 trade-history bridge is
+        # REMOVED. It wrote a zero-PnL "round trip" record (entry==exit, single
+        # fill_id, tag ibkr_harvest) for every harvested OPEN fill, which
+        # TradeCloser.seed_processed_from_trade_history() consumed as proof the
+        # fill was already matched — so opens never entered the FIFO, the
+        # position guard auto-closed each cycle, and same-side dedupe never
+        # blocked re-entry (the futures runaway). closed_trade.v1 emission is
+        # TradeCloser's responsibility; the harvester owns FILLS_*.ndjson only.
 
     # --- Update dedup tracker ---
-    if not dry_run and (new_fill_ids or new_trade_ids):
-        save_harvested_ids(
-            fill_ids=already_harvested | new_fill_ids,
-            trade_ids=already_traded | new_trade_ids,
-        )
+    if not dry_run and new_fill_ids:
+        save_harvested_ids(fill_ids=already_harvested | new_fill_ids)
 
     return {
         "ok": True,
         "fills_wrote": fills_wrote,
         "fills_skipped": fills_skipped,
-        "trades_wrote": trades_wrote,
-        "trades_skipped": trades_skipped,
+        # Bug B Fix B: trade-history emission removed; keys kept at 0 for
+        # output compatibility with existing log/JSON consumers.
+        "trades_wrote": 0,
+        "trades_skipped": 0,
     }
 
 
