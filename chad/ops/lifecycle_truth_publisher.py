@@ -690,7 +690,7 @@ def publish_once(*, repo_root: Path, runtime_dir: Path, data_dir: Path) -> None:
     runtime_dir.mkdir(parents=True, exist_ok=True)
 
     ttl_lifecycle = _env_int("CHAD_TRADE_LIFECYCLE_TTL_SECONDS", 60)
-    ttl_truth = _env_int("CHAD_POSITIONS_TRUTH_TTL_SECONDS", 60)
+    ttl_truth = _env_int("CHAD_POSITIONS_TRUTH_TTL_SECONDS", 90)
 
     evidence = _find_broker_events(data_dir)
     fills_evidence = _find_ledger_evidence(data_dir, "fills")
