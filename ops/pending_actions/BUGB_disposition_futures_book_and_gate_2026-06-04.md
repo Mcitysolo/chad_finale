@@ -16,8 +16,9 @@ Bug B core is closed (Fix B + Fix A live-verified; env gate armed AND cap proven
 - Static: YES. Last futures fill 2026-06-01T17:19:39Z (pre-fix); zero futures fills since; net pinned via CAP_BLOCK every cycle. MES/MGC are replay-only artifacts, flat at broker.
 - LIVE RISK, NOT FROZEN PnL: mark-to-market moves with prices. Total is +$33.5K CAD now (M6E has flipped to a small loss as EUR slid; MCL carries the book). The +PnL can erode; this remains a live ~17.9x position.
 
-## 3. Open-order caveat — resolve BEFORE any flatten
-M6E order 5137 was carried REAL_BROKER_ORDER_ACTIVE on 2026-05-27. This audit made NO broker calls. Before any flatten: re-probe live working orders (reqAllOpenOrdersAsync, not the clientId-scoped variant) and cancel/verify 5137. Do not flatten on top of an unknown working order.
+## 3. Open-order caveat — RESOLVED 2026-06-04 (re-probe before actual flatten)
+M6E order 5137 was carried REAL_BROKER_ORDER_ACTIVE on 2026-05-27. Verified 2026-06-04 via read-only IBKR probe (ib_async readonly=True, clientId 9777 confirmed free, reqAllOpenOrdersAsync across ALL clientIds): the account has ZERO open/working orders, and order 5137 is NOT PRESENT (filled/cancelled/expired since 05-27 — consistent with the last M6E fills landing 2026-06-01 via broker_order_id 7713, after which the book froze at +217). The earlier "5137" broker_events hits were coincidental sha256 substrings, not an order id. No working order of any kind exists to collide with a flatten.
+NOTE: point-in-time read — re-run the same read-only probe immediately before any actual flatten execution as good practice.
 
 ## 4. Gate removal — mechanics + effect
 - The three flags exist ONLY in /etc/systemd/system/chad-live-loop.service.d/91-disable-futures-exec.conf. Removal = delete/disable that drop-in -> daemon-reload -> gated chad-live-loop restart (Channel 1, rules #6/#7, explicit GO).
@@ -40,3 +41,4 @@ The two decisions are independent (flatten needs no gate change; gate removal ne
 
 ## 8. Status log
 - 2026-06-04: authored from read-only disposition audit (positions_truth GREEN @ 01:21:36Z, no broker calls). PENDING operator decision on (A) flatten and (B) gate removal. No action taken.
+- 2026-06-04: §3 open-order caveat RESOLVED via read-only reqAllOpenOrdersAsync probe (clientId 9777, readonly=True) — zero open orders account-wide, order 5137 NOT PRESENT. Overall decision (A flatten / B gate removal) remains PENDING operator decision.
