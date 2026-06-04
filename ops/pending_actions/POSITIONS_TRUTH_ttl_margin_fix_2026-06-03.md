@@ -1,5 +1,5 @@
 # Pending Action — positions_truth ttl 60->90s freshness-margin fix
-Date: 2026-06-03  •  Author: TEAM CHAD (issued) / SOLO (executes)  •  Status: PENDING operator GO  •  Priority: LOW (hardening; does not block Bug B closure)
+Date: 2026-06-03  •  Author: TEAM CHAD (issued) / SOLO (executes)  •  Status: EXECUTED 2026-06-04 (commit 3bfa924; deploy live-verified; §8(b) observation open)  •  Priority: LOW (hardening; does not block Bug B closure)
 
 ## 1. Objective
 Raise the published ttl_seconds on positions_truth.json from 60 to 90 to restore positive freshness margin against the lifecycle-truth-publisher cadence (~61-65s), eliminating the recurring marginal-stale window that produces benign FUTURES_POSITION_CAP_UNVERIFIED noise. No behavior change in normal operation.
@@ -50,3 +50,6 @@ Revert the single literal (90 -> 60); next timer fire restores ttl=60. No restar
 
 ## 10. Status log
 - 2026-06-03: authored from read-first audit (single change site + 6-consumer safety table confirmed). PENDING operator GO.
+- 2026-06-04T00:21:44Z: EXECUTED per §7 — committed at 3bfa924 (line 693 60->90 only; line 692 untouched; only this file staged). py_compile clean; pytest 2813 passed (suite grew +14 vs the 2799 anticipated at authoring — zero failures, zero churn); full_cycle_preview clean (0 orders, no broker calls).
+- 2026-06-04T00:23:20Z: §8(a) deploy live-verified — runtime/positions_truth.json embeds "ttl_seconds": 90 with ts_utc 2026-06-04T00:23:20.784899Z (later than commit time), confirming the oneshot timer published the new value. No service restarted.
+- §8(b) OPEN: zero-new-FUTURES_POSITION_CAP_UNVERIFIED-over-hours observation still pending; CAP_BLOCK expected to continue at the ~10-min cooldown cadence. To be closed on a later verification pass.
