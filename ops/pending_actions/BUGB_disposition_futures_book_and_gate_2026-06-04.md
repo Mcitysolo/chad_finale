@@ -36,9 +36,12 @@ NOTE: point-in-time read — re-run the same read-only probe immediately before 
 - (c) remove gate -> then flatten: DOMINATED; same end state as (b) but a backup-free window at peak exposure. Avoid.
 - (d) keep gate + flatten only: most conservative; removes book risk, defers the gate decision indefinitely.
 
+PREREQUISITE on gate removal (added 2026-06-04): options (b) and (c) — anything that REMOVES the env gate / re-enables futures execution — now require the Bug A fix (L1 event-loop/fd leak) to land FIRST. The env gate is the leak's current mask; re-enabling futures re-arms the high-frequency caller behind the 2026-05-30 fd-exhaustion freeze. The Fix A cap blocks over-cap submits but does not address the leak. Options (a) and (d) (gate stays armed) are unaffected. See PA L1_bug_a_event_loop_leak_2026-06-04.
+
 ## 7. Recommendation (ordering only — NOT advising the flatten trade itself)
 The two decisions are independent (flatten needs no gate change; gate removal needs no flatten — the cap holds either way). If both are ever done, the engineering-safe orderings are (b), or (d) then later (b). (c) is strictly dominated. Whichever path: re-verify/cancel order 5137 broker-side first; gate removal is a separate Channel 1 Pending Action (drop-in change + gated restart, rules #6/#7).
 
 ## 8. Status log
 - 2026-06-04: authored from read-only disposition audit (positions_truth GREEN @ 01:21:36Z, no broker calls). PENDING operator decision on (A) flatten and (B) gate removal. No action taken.
 - 2026-06-04: §3 open-order caveat RESOLVED via read-only reqAllOpenOrdersAsync probe (clientId 9777, readonly=True) — zero open orders account-wide, order 5137 NOT PRESENT. Overall decision (A flatten / B gate removal) remains PENDING operator decision.
+- 2026-06-04: L1/Bug A read-first found the env gate doubles as the mask for a dormant event-loop/fd leak (root cause: per-call thread+loop mint in ibkr_adapter._call_with_timeout). Gate-removal options (b/c) re-classified as GATED on the Bug A fix landing first; flatten (A) and gate-keep options unaffected.
