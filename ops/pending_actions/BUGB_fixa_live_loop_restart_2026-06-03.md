@@ -1,5 +1,5 @@
 # Pending Action — chad-live-loop restart to activate Bug B Fix A
-Date: 2026-06-03  •  Author: TEAM CHAD (issued) / SOLO (executes)  •  Status: PENDING operator GO (rule #7)
+Date: 2026-06-03  •  Author: TEAM CHAD (issued) / SOLO (executes)  •  Status: EXECUTED 2026-06-03T20:24:11Z (restart performed; Fix A live-verified — see §8)
 
 ## 1. Objective
 Restart chad-live-loop.service to load HEAD e4986ad, activating Bug B Fix A — the cumulative broker-truth per-symbol futures position cap. This restart has no other purpose.
@@ -33,3 +33,4 @@ If tracebacks or anomalous behavior: revert with `git revert e4986ad` (or restor
 
 ## 8. Status log
 - 2026-06-03: authored, PENDING operator GO.
+- 2026-06-03T20:24:11Z: EXECUTED — chad-live-loop restarted (ExecMainStartTimestamp 2026-06-03 20:24:11 UTC, new PID 3633421), loading HEAD e4986ad (Fix A cumulative futures cap). §6 acceptance met: FUTURES_POSITION_CAP_BLOCK live-verified same day and binding continuously since (23 CAP_BLOCK events 2026-06-06T16:06:05Z–19:49:33Z per STAGE_0_TRUTH_LOCK_PACKET; reason=cumulative_cap); FUTURES_POSITION_CAP_UNVERIFIED = 0 in all journal windows since ttl fix 3bfa924 (executed f4d8cea); the three env-gate flags survived the restart (91-disable-futures-exec.conf active in new PID). Zero tracebacks. Status-log entry backfilled 2026-06-06 per v9.7 §8.1(b).
