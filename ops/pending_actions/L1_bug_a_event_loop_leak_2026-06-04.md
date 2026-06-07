@@ -9,11 +9,13 @@ Running live_loop (PID 3633421, 23h): fd=37 flat, 10 epoll fds = 10 live (leaked
 
 ## 3. Root cause (smoking gun)
 ibkr_adapter.py:93-123 _call_with_timeout spawns a NEW daemon thread per broker call; inside each, ib_async sync API -> util.run() -> util.getLoop() -> asyncio.new_event_loop()+set_event_loop(), never closed. Every broker call = 1 thread + 1 loop (3 fds), reclaimed only by nondeterministic GC after the thread dies; a TIMED-OUT call leaks a live hung thread+loop permanently. Touchpoints: qualifyContracts (1554,2954), whatIfOrder (2401), placeOrder (2480), openTrades (2796). Normal cadence: GC keeps pace (plateau). Submission/timeout storm: outruns GC -> exhaustion.
+Retry amplification: call-site retry-on-timeout makes the storm mode superlinear — each retry mints a fresh thread+loop while the timed-out predecessor still holds its leaked thread+loop, so one slow-gateway window multiplies fd burn; post-fix, retries queue against the bounded pool instead (observable via the §4 saturation marker).
+Duplicate pattern (2026-06-07 audit): chad/execution/ibkr_trade_router.py:17 _call_with_timeout repeats the per-call daemon-thread mint (same leak-on-timeout mode; any ib_async sync call routed through it mints a loop via util.run() in the throwaway thread). Fixing ibkr_adapter alone leaves this twin armed — extract the bounded executor into a shared module consumed by both (§4).
 NOT the leak (confirmed): live_loop _ensure_thread_event_loop (bounded long-lived listeners); context_builder asyncio.run fallbacks (churn, no accumulation, tool paths only); CLI-entrypoint asyncio.run (one-shot).
 
 ## 4. The change (recommended: bounded executor)
-ibkr_adapter.py: one module-level ThreadPoolExecutor(max_workers≈4), worker-initializer installs one event loop per worker thread once. _call_with_timeout becomes: future = _BROKER_EXECUTOR.submit(fn, *args); future.result(timeout=timeout_s) — SAME signature, SAME BrokerTimeoutError, SAME fail-soft classification -> ZERO call-site changes. Loops become constant ~10-12 fds forever; the 05-30 incident class becomes structurally impossible.
-Deliberate semantic change to accept: if all 4 workers hang, subsequent calls fail fast — correct fail-closed against a dead gateway, but a change from "always mint a fresh thread." Document in the PA.
+One bounded executor in a shared module (consumed by ibkr_adapter.py AND the router twin flagged in §3): a module-level ThreadPoolExecutor, `max_workers=4` (pinned), worker-initializer installs one event loop per worker thread once. Lifecycle: created at module import, daemon workers, per-worker loops live for the process lifetime; no shutdown/teardown path and never recreated (process exit reaps daemon workers). _call_with_timeout becomes: future = _BROKER_EXECUTOR.submit(fn, *args); future.result(timeout=timeout_s) — SAME signature, SAME BrokerTimeoutError, SAME fail-soft classification -> ZERO call-site changes. Loops become constant ~10-12 fds forever; the 05-30 incident class becomes structurally impossible.
+Deliberate semantic change to accept: if all 4 workers hang, subsequent calls fail fast — correct fail-closed against a dead gateway, but a change from "always mint a fresh thread." Document in the PA. Instrument it: when a submit finds the pool saturated, emit log marker `BUG_A_POOL_SATURATED` so this fail-fast mode is journald-observable rather than silent.
 Rejected alternative: per-call thread with loop.close() in finally — kills GC-dependent accumulation but still leaks on every timeout (the danger mode). Executor is the real fix.
 
 ## 5. Sequencing — COUPLED to the Bug B disposition (critical)
@@ -30,6 +32,7 @@ Risk-tightening stability fix; touches the live submit hot path (ibkr_adapter.py
 
 ## 8. Verification
 Tests green. Post-restart: loop/fd count flat over time; an observed broker timeout leaves no live leaked thread; ideally a higher-volume window (or post futures-re-enable) shows no fd growth.
+Mechanical loop-count assertion: count `anon_inode:[eventpoll]` entries under /proc/<live_loop_pid>/fd. Today's adapter shows ~10 (one per leaked loop); after the fix this number must be ≤ max_workers + 1 (one per persistent worker loop + the main-thread loop) and stay flat across cycles, including ones with broker activity. For unit-test fd assertions use `len(os.listdir('/proc/self/fd'))` with a ±2 tolerance band to avoid flaking on pytest plugin fds.
 
 ## 9. Out of scope (separate)
 - Publisher silent-hang (lifecycle/snapshot/reconciliation oneshots lack RuntimeMaxSec): related family, DIFFERENT mechanism (unbounded blocking call -> unit stuck "activating" -> timer won't re-fire). Separate tiny systemd PA (RuntimeMaxSec=), rule #6, explicit instruction required.
@@ -37,3 +40,4 @@ Tests green. Post-restart: loop/fd count flat over time; an observed broker time
 
 ## 10. Status log
 - 2026-06-04: authored from L1/Bug A read-first (leak DORMANT not fixed; root cause = per-call thread+loop mint in ibkr_adapter._call_with_timeout; mask = Bug B env gate). PENDING operator GO.
+- 2026-06-07: refined with audit deltas — router-twin shared-module extraction (§3/§4), retry-amplification note (§3), executor size pinned + lifecycle (§4), pool-saturation log marker (§4), mechanical epoll-fd assertion (§8). Status unchanged: PENDING operator GO.
