@@ -94,8 +94,20 @@ def _write_ledger(trades_dir: Path, records: List[Dict[str, Any]]) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_01_alpha_intraday_vol_explosion_setup_family():
+def test_01_alpha_intraday_vol_explosion_setup_family(monkeypatch: pytest.MonkeyPatch):
     from chad.strategies import alpha_intraday
+    from chad.utils.catalyst_gate import CatalystGateResult
+
+    # Hermetic: neutralize the ambient runtime/news_intel.json catalyst gate so
+    # this setup_family tagging assertion does not depend on live market
+    # catalysts. The gate itself is covered by test_phase_b_item1_catalyst*.py.
+    monkeypatch.setattr(
+        alpha_intraday, "check_catalyst_gate",
+        lambda sym, side: CatalystGateResult(
+            allowed=True, catalyst_strength="none",
+            catalyst_direction="none", block_reason=None,
+        ),
+    )
 
     sig = alpha_intraday._build_signal(
         "SPY", SignalSide.BUY, 0.7, "vol_explosion", "1m",

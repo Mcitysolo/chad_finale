@@ -377,7 +377,18 @@ def test_alpha_intraday_meta_contains_rvol_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from chad.strategies import alpha_intraday as ai
+    from chad.utils.catalyst_gate import CatalystGateResult
 
+    # Hermetic: neutralize the ambient runtime/news_intel.json catalyst gate so
+    # this RVOL-meta assertion does not depend on live market catalysts. The
+    # gate itself is covered by test_phase_b_item1_catalyst*.py.
+    monkeypatch.setattr(
+        ai, "check_catalyst_gate",
+        lambda sym, side: CatalystGateResult(
+            allowed=True, catalyst_strength="none",
+            catalyst_direction="none", block_reason=None,
+        ),
+    )
     monkeypatch.setattr(
         ai, "get_rvol_adjustment",
         lambda sym: RvolGateResult(0.0, None, "unavailable"),
@@ -410,6 +421,17 @@ def test_alpha_intraday_confidence_boosted_on_high_rvol(
 ) -> None:
     from chad.strategies import alpha_intraday as ai
 
+    # Hermetic: neutralize the ambient runtime/news_intel.json catalyst gate so
+    # this RVOL-confidence assertion does not depend on live market catalysts.
+    # The gate itself is covered by test_phase_b_item1_catalyst*.py.
+    from chad.utils.catalyst_gate import CatalystGateResult
+    monkeypatch.setattr(
+        ai, "check_catalyst_gate",
+        lambda sym, side: CatalystGateResult(
+            allowed=True, catalyst_strength="none",
+            catalyst_direction="none", block_reason=None,
+        ),
+    )
     monkeypatch.setattr(
         ai, "get_rvol_adjustment",
         lambda sym: RvolGateResult(RVOL_HIGH_BOOST, 3.5, "high"),
@@ -445,6 +467,17 @@ def test_alpha_intraday_confidence_penalized_on_low_rvol(
 ) -> None:
     from chad.strategies import alpha_intraday as ai
 
+    # Hermetic: neutralize the ambient runtime/news_intel.json catalyst gate so
+    # this RVOL-confidence assertion does not depend on live market catalysts.
+    # The gate itself is covered by test_phase_b_item1_catalyst*.py.
+    from chad.utils.catalyst_gate import CatalystGateResult
+    monkeypatch.setattr(
+        ai, "check_catalyst_gate",
+        lambda sym, side: CatalystGateResult(
+            allowed=True, catalyst_strength="none",
+            catalyst_direction="none", block_reason=None,
+        ),
+    )
     monkeypatch.setattr(
         ai, "get_rvol_adjustment",
         lambda sym: RvolGateResult(-RVOL_LOW_PENALTY, 0.3, "low"),
