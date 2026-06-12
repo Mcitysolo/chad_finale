@@ -50,6 +50,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import tempfile
@@ -1471,6 +1472,139 @@ def simulate_bag_paper_fill(ev: "PaperExecEvidence") -> bool:
     return True
 
 
+# =============================================================================
+# PA-EP1 — modeled IBKR Fixed commission schedule
+# =============================================================================
+# Operator-ratified 2026-06-12 (Evidence Pipeline workstream). Forward-only
+# instrumentation: a modeled commission is stamped onto every genuine paper
+# fill at the normalize_paper_fill_evidence chokepoint so FEES_*.ndjson is
+# cost-adjusted going forward. Broker-reported (nonzero) fees are NEVER
+# overwritten; modeled fees carry fee_model="ibkr_fixed_v1" so the two are
+# forever distinguishable. No historical backfill.
+
+_LOG = logging.getLogger(__name__)
+
+_FEE_MODEL_TAG = "ibkr_fixed_v1"
+
+# Genuine-fill statuses that incur a commission. Deliberately EXCLUDES
+# dry_run / duplicate_* / rejected / error / PendingSubmit — those never
+# traded, so they must carry fee_amount=0 and no fee_model stamp. This set is
+# intentionally NARROWER than trade_closer._TRUSTED_FILL_STATUSES (which
+# includes dry_run for FIFO purposes) — a dry-run order pays no commission.
+_FEE_ELIGIBLE_FILL_STATUSES = frozenset({"paper_fill", "filled", "fill"})
+
+# IBKR Fixed schedule constants (USD).
+_EQUITY_FEE_PER_SHARE = 0.005        # per share
+_EQUITY_FEE_MIN_ORDER = 1.00         # floor per order
+_EQUITY_FEE_MAX_PCT = 0.01           # ceiling: 1.0% of trade value
+_EQUITY_FEE_ASSET_CLASSES = frozenset({"equity", "etf", "stock", "stk"})
+
+_FUTURES_FEE_DEFAULT_PER_CONTRACT = 0.85   # fallback for any unlisted root (micros)
+_FUTURES_FEE_PER_CONTRACT = {
+    "MES": 0.85, "MNQ": 0.85, "M2K": 0.85, "M6E": 0.85, "MCL": 0.85,
+}
+
+_OPTIONS_FEE_PER_CONTRACT = 0.65     # per contract
+_OPTIONS_FEE_MIN_ORDER = 1.00        # floor per order
+
+_CRYPTO_FEE_TAKER_PCT = 0.0026       # 0.26% taker on notional
+
+
+def _model_ibkr_commission(
+    asset_class: Any, qty: Any, price: Any, symbol: Any = ""
+) -> float:
+    """Return a modeled IBKR Fixed-schedule commission (USD) for one fill.
+
+    Pure function — no side effects beyond a loud FEE_MODEL_UNKNOWN_ASSET_CLASS
+    marker for asset classes outside the ratified schedule (returns 0.0 rather
+    than fabricating a fee). ``qty`` is the unit count appropriate to the asset
+    class (shares for equities, contracts for futures/options). For options the
+    caller supplies the per-leg contract count.
+    """
+    ac = _safe_str(asset_class, "").strip().lower()
+    q = abs(_safe_float(qty, 0.0))
+    px = abs(_safe_float(price, 0.0))
+    if q <= 0.0:
+        return 0.0
+
+    if ac in _EQUITY_FEE_ASSET_CLASSES:
+        fee = max(_EQUITY_FEE_MIN_ORDER, q * _EQUITY_FEE_PER_SHARE)
+        trade_value = q * px
+        if trade_value > 0.0:
+            # 1% cap can fall below the $1 floor for tiny orders — cap wins.
+            fee = min(fee, trade_value * _EQUITY_FEE_MAX_PCT)
+        return round(fee, 4)
+
+    if ac == "futures":
+        root = _strip_futures_month_code(_safe_str(symbol, "").strip().upper())
+        per = _FUTURES_FEE_PER_CONTRACT.get(root, _FUTURES_FEE_DEFAULT_PER_CONTRACT)
+        return round(q * per, 4)
+
+    if ac == "options":
+        return round(max(_OPTIONS_FEE_MIN_ORDER, q * _OPTIONS_FEE_PER_CONTRACT), 4)
+
+    if ac == "crypto":
+        return round(q * px * _CRYPTO_FEE_TAKER_PCT, 4)
+
+    _LOG.warning(
+        "FEE_MODEL_UNKNOWN_ASSET_CLASS asset_class=%r symbol=%r qty=%s price=%s "
+        "— commission not modeled (0.0)",
+        asset_class, symbol, q, px,
+    )
+    return 0.0
+
+
+def _apply_modeled_commission(ev: "PaperExecEvidence") -> None:
+    """Stamp a modeled commission onto a genuine paper fill, exactly once.
+
+    Single-application is guaranteed two ways:
+      1. A nonzero ev.fee_amount (a broker-reported fee, or a fee already
+         modeled on a prior normalize() pass) short-circuits immediately, so it
+         is never overwritten or doubled.
+      2. A private ``_fee_modeled`` marker on ev.extra makes repeated
+         normalize() calls idempotent even on the zero-fee unknown-asset path
+         (the live_loop / reconciler pattern normalizes a record twice: an
+         explicit call followed by the write() safety-net call).
+
+    Records that did not genuinely fill (rejected / duplicate_* / dry_run /
+    error / PendingSubmit) are skipped and carry no fee_model stamp.
+    """
+    if not isinstance(ev, PaperExecEvidence):
+        return
+    # (1) Never overwrite a broker-reported / already-modeled nonzero fee.
+    if _safe_float(ev.fee_amount, 0.0) > 0.0:
+        return
+    extra = ev.extra if isinstance(ev.extra, dict) else {}
+    # (2) Idempotency for the zero-fee path.
+    if extra.get("_fee_modeled"):
+        return
+    # Genuine-fill predicate — explicitly NOT rejected/duplicate_*/dry_run/etc.
+    status_norm = _safe_str(ev.status, "").strip().lower()
+    if _safe_bool(ev.reject, False) or status_norm not in _FEE_ELIGIBLE_FILL_STATUSES:
+        return
+
+    asset_class = _safe_str(ev.asset_class, "").strip().lower()
+    price = _safe_float(ev.fill_price, 0.0)
+    symbol = _safe_str(ev.symbol, "")
+    qty = abs(_safe_float(ev.quantity, 0.0))
+    # Options spreads (BAG): commission accrues per leg-contract, so multiply
+    # the spread count by the number of legs in the combo.
+    if asset_class == "options":
+        legs = extra.get("bag_legs")
+        n_legs = len(legs) if isinstance(legs, (list, tuple)) and legs else 1
+        contracts = abs(_safe_float(extra.get("contracts"), qty)) or qty
+        qty = contracts * n_legs
+
+    fee = _model_ibkr_commission(asset_class, qty, price, symbol)
+
+    if not isinstance(ev.extra, dict):
+        ev.extra = dict(ev.extra) if ev.extra else {}
+    ev.extra["_fee_modeled"] = True
+    if fee > 0.0:
+        ev.fee_amount = fee
+        ev.extra["fee_model"] = _FEE_MODEL_TAG
+
+
 def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence":
     """Enforce paper-mode evidence invariants in place. Returns the same object.
 
@@ -1557,6 +1691,7 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
     # with the SPY price (~$720) — and the deviation guard would then flag
     # the legitimate $1.50 debit as a "placeholder fill". Skip both for BAG.
     if bag_active:
+        _apply_modeled_commission(ev)
         return ev
 
     # 2) fill_price — resolve from price cache with futures normalization.
@@ -1725,6 +1860,7 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
             f"price_cache.json or expected_price"
         )
 
+    _apply_modeled_commission(ev)
     return ev
 
 
