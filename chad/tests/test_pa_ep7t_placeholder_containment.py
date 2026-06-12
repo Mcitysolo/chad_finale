@@ -139,14 +139,20 @@ def test_GAP_nonliquid_dollar100_passes_as_fill(price_cache):
 
 
 def test_GAP_nonliquid_filled_dollar100_passes(price_cache):
-    """Same gap with status=FILLED and a pre-existing 'placeholder' tag — still
-    not rejected, $100 retained, fee modeled. GAP."""
+    """Same gap with an inbound status=FILLED and a pre-existing 'placeholder'
+    tag — still not rejected, $100 retained, fee modeled. GAP.
+
+    PA-EP8 update: the inbound FILLED is now canonicalized to paper_fill at the
+    chokepoint (pre-canon literal preserved on extra.status_raw). The
+    containment GAP is unchanged — the record is still NOT force-rejected, keeps
+    its $100 fill_price, and is modeled a fee; only the status literal changed."""
     price_cache({})
     ev = _ev(symbol="ZZZZ", fill_price=100.0, expected_price=100.0, status="FILLED",
              tags=["placeholder"],
              extra={"trust_state": "PLACEHOLDER", "placeholder_fill_price": 100.0})
     normalize_paper_fill_evidence(ev)
-    assert ev.status == "FILLED"            # NOT rejected (current/gap)
+    assert ev.status == "paper_fill"        # PA-EP8: FILLED canonicalized (GAP otherwise unchanged)
+    assert (ev.extra or {}).get("status_raw") == "FILLED"  # provenance preserved
     assert ev.fill_price == pytest.approx(100.0)
     assert bool(ev.reject) is False
     assert (ev.extra or {}).get("fee_model") == FEE_TAG

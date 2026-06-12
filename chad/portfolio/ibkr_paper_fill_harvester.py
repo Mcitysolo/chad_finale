@@ -28,6 +28,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+# PA-EP8: import (do NOT copy) the evidence-writer's canonical status map so
+# the harvester's write path shares the single source of truth for status
+# canonicalization. Module-level import is safe — the writer's top level pulls
+# only stdlib (its chad.* imports are lazy), so there is no import cycle.
+from chad.execution.paper_exec_evidence_writer import _STATUS_CANON as _SHARED_STATUS_CANON
+
 logger = logging.getLogger("chad.ibkr_paper_fill_harvester")
 
 # ---------------------------------------------------------------------------
@@ -383,6 +389,20 @@ def harvest(dry_run: bool = False) -> Dict[str, Any]:
             "tags": tags,
             "venue": "ibkr_paper",
         }
+
+        # PA-EP8 defensive guard (ratified decision 8): canonicalize the
+        # genuine-fill status through the SHARED evidence-writer map (imported,
+        # not copied) so the harvester can never emit a non-canonical fill
+        # literal even if its hardcoded status above ever changes. No-op today
+        # — "paper_fill" is already the canon target, so .get() returns None.
+        # Provenance preserved on extra.status_raw when a remap actually fires.
+        _raw_status = payload.get("status")
+        _canon_status = _SHARED_STATUS_CANON.get(_raw_status)
+        if _canon_status is not None and _canon_status != _raw_status:
+            _p_extra = payload.setdefault("extra", {})
+            if isinstance(_p_extra, dict):
+                _p_extra.setdefault("status_raw", _raw_status)
+            payload["status"] = _canon_status
 
         # --- Write fill record (existing behavior) ---
         if dry_run:

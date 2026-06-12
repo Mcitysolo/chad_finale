@@ -120,6 +120,38 @@ _PAPER_REJECTED_STATUSES = frozenset({
     "error", "failed", "rejected", "cancelled",
 })
 
+# PA-EP8: canonical genuine-fill status remap, applied EXACTLY ONCE at the
+# normalize_paper_fill_evidence chokepoint AFTER the pending→paper_fill
+# translation. Synchronous broker-fill literals (FILLED / filled) collapse to
+# the single canonical trusted status "paper_fill" so SCR / trade_closer /
+# ibkr_paper_ledger_watcher see one value for every genuine fill. The pre-canon
+# literal is preserved on extra.status_raw. This map is the SINGLE SOURCE OF
+# TRUTH for status canonicalization and is imported (never copied) by
+# chad/portfolio/ibkr_paper_fill_harvester.py as a defensive write-path guard.
+# Scope is deliberately minimal: ONLY FILLED/filled map. Every other literal
+# (PendingSubmit / dry_run / duplicate_* / rejected / PARTIAL_*) is left
+# untouched — either handled by an earlier branch or intentionally not a
+# genuine synchronous fill.
+_STATUS_CANON = {
+    "FILLED": "paper_fill",
+    "filled": "paper_fill",
+}
+
+# Status literals the chokepoint already recognizes (canon targets + every
+# status produced/handled by an earlier branch or intentionally passed
+# through). A status that is neither a _STATUS_CANON source nor in this set is
+# genuinely novel and earns a loud STATUS_CANON_UNMAPPED journal marker so an
+# unhandled broker literal can never canonicalize silently. Matched lowercase.
+_STATUS_CANON_KNOWN = frozenset({
+    "paper_fill", "fill",
+    "partial_filled", "partially_filled",
+    "dry_run",
+    "rejected", "error", "failed", "cancelled",
+    "duplicate_blocked", "duplicate_open_order",
+    "pendingsubmit", "presubmitted", "submitted",
+    "apipending", "inactive", "unknown", "",
+})
+
 # Strategies that exclusively trade options instruments. A fill attributed to
 # any of these MUST carry asset_class="options"; if the writer would otherwise
 # persist the fill with asset_class="etf"/"equity" (e.g. because the BAG combo
@@ -1605,6 +1637,44 @@ def _apply_modeled_commission(ev: "PaperExecEvidence") -> None:
         ev.extra["fee_model"] = _FEE_MODEL_TAG
 
 
+def _apply_status_canon(ev: "PaperExecEvidence") -> None:
+    """PA-EP8: collapse a genuine-fill status literal to its canonical form
+    EXACTLY ONCE, recording the pre-canon value on extra.status_raw.
+
+    Applied AFTER the pending→paper_fill translation in
+    normalize_paper_fill_evidence, so a record that became "paper_fill" via the
+    pending path is already a canon TARGET and is left untouched (no
+    status_raw). Idempotent across the explicit-call + write()-safety-net double
+    normalize: the canon target is not itself a map source, and status_raw is
+    written with setdefault.
+
+    A status that is neither a _STATUS_CANON source nor a recognized literal
+    (_STATUS_CANON_KNOWN) passes through unchanged and emits a loud
+    STATUS_CANON_UNMAPPED marker — a novel broker status must never be
+    canonicalized silently.
+    """
+    if not isinstance(ev, PaperExecEvidence):
+        return
+    raw = _safe_str(ev.status, "")
+    canon = _STATUS_CANON.get(raw)
+    if canon is None:
+        # Not a canon source. Emit the loud marker only for genuinely
+        # unrecognized literals; recognized statuses pass silently.
+        if raw and raw.strip().lower() not in _STATUS_CANON_KNOWN:
+            _LOG.warning(
+                "STATUS_CANON_UNMAPPED status=%r symbol=%r side=%r strategy=%r "
+                "— passed through unchanged (no canonical mapping)",
+                ev.status, ev.symbol, ev.side, ev.strategy,
+            )
+        return
+    if canon == raw:
+        return
+    if not isinstance(ev.extra, dict):
+        ev.extra = dict(ev.extra) if ev.extra else {}
+    ev.extra.setdefault("status_raw", raw)
+    ev.status = canon
+
+
 def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence":
     """Enforce paper-mode evidence invariants in place. Returns the same object.
 
@@ -1848,6 +1918,13 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
     if status_norm in _PAPER_PENDING_STATUSES:
         if _safe_float(ev.fill_price, 0.0) > 0.0:
             ev.status = "paper_fill"
+
+    # 3b) PA-EP8 — canonicalize genuine-fill literals (FILLED/filled →
+    # paper_fill) EXACTLY ONCE, after the pending translation above and before
+    # the fee predicate (_apply_modeled_commission at the end of this function)
+    # so canonicalized fills remain fee-eligible. Pre-canon value preserved on
+    # extra.status_raw; unknown literals pass through + STATUS_CANON_UNMAPPED.
+    _apply_status_canon(ev)
 
     # 4) hard invariant — never persist an untrusted record in paper mode.
     final_norm = _safe_str(ev.status, "").strip().lower()
