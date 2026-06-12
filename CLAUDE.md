@@ -5,10 +5,10 @@
 - Canonical root: /home/ubuntu/chad_finale
 - Python binary: python3 (never python)
 - Virtual environment: /home/ubuntu/chad_finale/venv
-- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper; SCR=CONFIDENT, sizing_factor=1.0, sharpe_like=+5.825, effective_trades=190, win_rate=0.774, total_pnl=+$9,880 (as of 2026-05-09; Paper Epoch 2 has reached the CONFIDENT band — full sizing applied, paper_only=false, but live activation still gated by live_readiness publisher)
-- Account equity: ~$183,264 USD paper
+- Current trading posture: PAPER — CHAD_EXECUTION_MODE=paper. SCR snapshot (runtime/scr_state.json @ 2026-06-12T23:23:35Z; ttl_seconds=180 — a moving target, re-read before relying on it): state=CONFIDENT, sizing_factor=1.0, paper_only=false, sharpe_like=+3.55, effective_trades=216, win_rate=0.731, total_pnl=+$27,494 (paper_trades=4171; excluded_untrusted=321, excluded_manual=17). CAVEAT: these are in-sample, paper-fill, partially-contaminated stats per SSOT v9.7 Q3 — NOT validated edge evidence. Live activation still gated by the live_readiness publisher (ready_for_live=false @ 2026-06-12T23:19:20Z).
+- Account equity: ~$219,865 USD paper total (IBKR paper leg ~$219,607) — latest dated equity_history.v1 value (runtime/equity_history.ndjson, date_utc=2026-06-11). CAVEAT: Bug-B futures contamination makes this figure volatile and untrusted as a P&L signal — it swung $240,331 (06-09) → $268,193 (06-10) → $219,865 (06-11) across three days; treat as a contaminated balance, not realized equity.
 - Hardening status: P0-P2 complete, GAP-1 through GAP-25 complete; 2026-04-19/21 Overhaul complete
-- ib_async migration: Phase 1 complete (18 files migrated to ib_async), Phase 2 pending (5 files remaining)
+- ib_async migration: COMPLETE (PHASE1_MIGRATED=23, PHASE2_DEFERRED=0; zero production ib_insync importers). Pinned by chad/tests/test_ib_async_import_parity.py (PHASE2_DEFERRED_FILES==()) and chad/tests/test_pr03_ib_async_phase2_migration.py (verified 2026-06-12).
 
 ## Governance Rules — Non-Negotiable
 1. One change at a time. Baseline, change, verify, proceed.
@@ -68,6 +68,7 @@ CHAD_SKIP_IB_CONNECT=1 python3 -m chad.core.full_cycle_preview 2>&1 | tail -30
 - Execution: chad/execution/ibkr_adapter.py
 - LiveGate: chad/core/live_gate.py
 - Risk and allocation: chad/risk/dynamic_risk_allocator.py
+- Allocator reality (verified 2026-06-12): allocator_v3 / Kelly ceiling is wired but never instantiated — AllocV3Strategy (chad/core/orchestrator.py:592) has zero construction sites; _allocator_factory() returns CorrelationOverlayStrategy(), so the LIVE overlay is correlation_overlay (chad/risk/correlation_strategy.py). The CHAD_ALLOCATOR_MODE=V3 unit env (chad-orchestrator.service.d/40-allocator-v3.conf) is therefore inert — it is read nowhere in code and the V3/Kelly path never executes. This doc does NOT imply V3 is the live allocator.
 - Profit Lock: chad/risk/profit_lock.py
 - Attribution: chad/execution/paper_exec_evidence_writer.py
 - Full preview: chad/core/full_cycle_preview.py
@@ -79,6 +80,16 @@ CHAD_SKIP_IB_CONNECT=1 python3 -m chad.core.full_cycle_preview 2>&1 | tail -30
 - PRE_HARDENING_20260402 — snapshot before P0 hardening began
 - RATIFICATION_MASTER_20260402 — all hardening and GAP items complete
 - REVERT_PRE_OVERHAUL_20260419 — snapshot before 2026-04-19/21 overhaul (commit 45f3728; tarball /home/ubuntu/chad_revert_points/runtime_pre_overhaul_20260419.tar.gz)
+- EVIDENCE_PIPELINE_WAVE1_2026-06-12 — Evidence Pipeline Wave-1 closure record (annotated, on 3185502/PA-EP8)
+
+## Evidence Pipeline (2026-06-12)
+Wave 1 landed (repo-side; the changes activate at the Wave-2 gated restart) — tagged EVIDENCE_PIPELINE_WAVE1_2026-06-12 on 3185502:
+- PA-EP3 (f9454e1): thread intent idempotency_key into evidence execution_id (slippage join fix).
+- PA-EP1 (4ccb0f6): modeled IBKR Fixed commissions at the evidence chokepoint (fee_model=ibkr_fixed_v1, forward-only).
+- PA-EP7-T (fc99c06): containment tripwire for placeholder records (fix deferred to PA-EP7v2).
+- PA-EP8 (3185502): status canonicalization at the evidence chokepoint (FILLED/filled → paper_fill; status_raw provenance; harvester shares the map; replay files intentionally untouched — observability-only per PR-09, pending PA-EP8v2 netting rebuild).
+Day-0 gating remainder (not yet landed): EP6, EP4 (after EP6), EP2a, Bug-B book disposition.
+Backlog: PA-EP7v2 — spec filed at docs/PA_EP7v2_spec.md (commit 7991b26); PA-EP8v2 — replay netting rebuild.
 
 ## Rollback Command
 git checkout RATIFICATION_MASTER_20260402
