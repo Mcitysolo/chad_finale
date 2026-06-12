@@ -2437,6 +2437,15 @@ def run_once(logger: logging.Logger) -> None:
                             quantity=order.quantity,
                             fill_price=0.0,  # resolved by normalizer from price_cache
                             expected_price=_expected_px,
+                            # PA-EP3: thread the canonical intent identifier so
+                            # slippage.v1 / signal_decay records carry a real
+                            # join key (idempotency_key, trace_id fallback —
+                            # same precedence as routing_gates.py:437).
+                            execution_id=(
+                                getattr(intent, "idempotency_key", "")
+                                or getattr(intent, "trace_id", "")
+                                or ""
+                            ),
                             strategy=getattr(intent, "strategy", "") or "",
                             source_strategies=[getattr(intent, "strategy", "") or ""],
                             broker="ibkr_paper",
