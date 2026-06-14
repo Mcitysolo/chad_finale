@@ -322,6 +322,16 @@ class IBKRBarProvider:
         # re-resolve every 60 seconds.
         self._contracts: Dict[str, Any] = {}
 
+        # PA-EP4: durable append-only 1m archive of the live-poll stream.
+        # Lazy import avoids the bar_archive <-> ibkr_bar_provider cycle
+        # (bar_archive imports _bar_ts_to_utc_iso from this module).
+        try:
+            from chad.market_data.bar_archive import BarArchive
+            self._archive: Any = BarArchive()
+        except Exception as exc:  # never let archive setup break the provider
+            LOGGER.warning("ibkr_bar_provider.archive_init_failed", extra={"error": str(exc)})
+            self._archive = None
+
     @property
     def universe(self) -> List[str]:
         return list(self._universe)
@@ -469,6 +479,24 @@ class IBKRBarProvider:
         _atomic_write_json(out_path, payload)
         return out_path
 
+    def _archive_bars_safe(self, symbol: str, bars: List[Bar]) -> None:
+        """PA-EP4 — mirror live-poll bars into the durable append-only archive.
+
+        Fully self-guarded: any archive failure is logged and swallowed so it
+        can never propagate into — or slow — the live poll loop. The live
+        cache write has already completed before this is called.
+        """
+        archive = self._archive
+        if archive is None:
+            return
+        try:
+            archive.append(symbol, bars)
+        except Exception as exc:
+            LOGGER.warning(
+                "ibkr_bar_provider.archive_failed",
+                extra={"symbol": symbol, "error": str(exc)},
+            )
+
     # --------------------------
     # Polling loop
     # --------------------------
@@ -536,13 +564,21 @@ class IBKRBarProvider:
                     use_rth=False,
                 )
                 if bars:
+                    wrote_cache = False
                     try:
                         self.write_1m_bars_file(sym, bars)
+                        wrote_cache = True
                     except Exception as werr:
                         LOGGER.warning(
                             "ibkr_bar_provider.write_1m_failed",
                             extra={"symbol": sym, "error": str(werr)},
                         )
+                    # PA-EP4: after a SUCCESSFUL live cache write, mirror the
+                    # same bars into the durable append-only archive. Fully
+                    # self-guarded — never raises, never blocks the live path
+                    # (the cache write above has already completed).
+                    if wrote_cache:
+                        self._archive_bars_safe(sym, bars)
                 results[sym] = len(bars)
             except Exception as exc:
                 LOGGER.warning(
