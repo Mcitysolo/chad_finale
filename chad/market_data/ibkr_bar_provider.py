@@ -161,6 +161,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _bar_ts_to_utc_iso(raw: Any) -> str:
+    """Normalize an ib_async bar ``.date`` to a true-UTC ISO-8601 string.
+
+    With ``formatDate=1`` ib_async returns tz-aware datetimes in the
+    *exchange-local* zone for intraday bars (e.g. ``2026-06-12 19:00:00-04:00``)
+    and plain ``date`` objects for daily bars. Convert any tz-aware datetime to
+    UTC (instant-preserving) so ``ts_utc`` actually holds UTC. Naive datetimes
+    are assumed UTC (matches the repo's other ts parsers); daily ``date`` values
+    are date-only / UTC-by-construction and pass through unchanged.
+    """
+    if isinstance(raw, datetime):
+        if raw.tzinfo is not None:
+            return raw.astimezone(timezone.utc).isoformat(sep=" ", timespec="seconds")
+        return raw.replace(tzinfo=timezone.utc).isoformat(sep=" ", timespec="seconds")
+    return str(raw)
+
+
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
@@ -367,7 +384,7 @@ class IBKRBarProvider:
 
             bars: List[Bar] = []
             for b in ib_bars:
-                ts = str(getattr(b, "date", ""))
+                ts = _bar_ts_to_utc_iso(getattr(b, "date", ""))
                 o = _safe_float(getattr(b, "open", 0))
                 h = _safe_float(getattr(b, "high", 0))
                 l = _safe_float(getattr(b, "low", 0))
