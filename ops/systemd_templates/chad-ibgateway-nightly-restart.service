@@ -29,7 +29,11 @@
 Description=CHAD IB Gateway Nightly Restart (clears socket leaks before they wedge)
 Documentation=ops/runbooks/INSTALL_chad_ibgateway_nightly_restart.md
 After=chad-ibgateway.service
-Requires=chad-ibgateway.service
+# GAP-004 fix: Wants= (not Requires=). With Requires=, `systemctl restart
+# chad-ibgateway.service` stops the required unit, which propagates a stop to
+# this oneshot mid-ExecStart and SIGTERMs it (Result=signal, status=15 — the
+# self-TERM). Wants= keeps the soft association without stop-propagation.
+Wants=chad-ibgateway.service
 
 [Service]
 Type=oneshot

@@ -2,9 +2,12 @@
 #
 # This is a systemd *template* unit. It is instantiated as
 #   chad-service-alert@<unit-name>.service
-# and is invoked via OnFailure= directives on other CHAD services. The %i
-# specifier in this file expands to the failed unit's full name at the
-# moment of activation.
+# and is invoked via OnFailure= directives on other CHAD services. Callers
+# wire `OnFailure=chad-service-alert@%N.service`, and %N strips the type
+# suffix — so the %i specifier here is the failed unit name WITHOUT its
+# `.service` suffix (e.g. `chad-options-chain-refresh`). The ExecStart below
+# re-appends `.service` so the handler's chad-unit validator accepts it
+# (a bare suffixless name is rejected with exit 2 / EXIT_INVALID_UNIT).
 #
 # Responsibilities:
 #   - Capture a tail of the failed unit's journal (read-only).
@@ -32,7 +35,7 @@ EnvironmentFile=-/etc/chad/telegram.env
 EnvironmentFile=-/etc/chad/chad.env
 ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 \
   -m chad.ops.service_failure_alert \
-  --failed-unit %i \
+  --failed-unit %i.service \
   --severity HIGH \
   --include-journal-tail 50 \
   --include-runtime-snapshot
