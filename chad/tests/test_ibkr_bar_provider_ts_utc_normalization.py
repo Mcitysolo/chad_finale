@@ -15,6 +15,19 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 from chad.market_data import ibkr_bar_provider as bp
+from chad.market_data.ibkr_historical_provider import IBKRHistoricalProvider
+
+
+class _FakeBar:
+    """Minimal stand-in for an ib_async historical bar row."""
+
+    def __init__(self, raw_date: object) -> None:
+        self.date = raw_date
+        self.open = 100.0
+        self.high = 101.0
+        self.low = 99.0
+        self.close = 100.5
+        self.volume = 1000.0
 
 
 def test_aware_edt_datetime_converts_to_utc() -> None:
@@ -46,3 +59,27 @@ def test_date_object_passes_through_via_str() -> None:
 def test_empty_string_degrades_safely() -> None:
     """Missing date attribute ('' fallback) must not crash."""
     assert bp._bar_ts_to_utc_iso("") == ""
+
+
+# --- PA-EP6b: co-writer durability — the historical provider's _parse_bars
+# path must emit true UTC too, so a backfill cannot re-introduce local-labeled
+# bars into data/bars/1m and data/bars/1d.
+
+
+def test_historical_provider_aware_edt_bar_emits_true_utc() -> None:
+    """Backfill path: 19:00 EDT (-04:00) bar → 23:00 UTC ts_utc, same instant."""
+    edt = timezone(timedelta(hours=-4))
+    provider = IBKRHistoricalProvider(ib=None)
+    bars = provider._parse_bars(
+        [_FakeBar(datetime(2026, 6, 12, 19, 0, 0, tzinfo=edt))], "SPY"
+    )
+    assert len(bars) == 1
+    assert bars[0].ts_utc == "2026-06-12 23:00:00+00:00"
+
+
+def test_historical_provider_daily_date_passes_through() -> None:
+    """Backfill path: daily `date` rows pass through str()-unchanged."""
+    provider = IBKRHistoricalProvider(ib=None)
+    bars = provider._parse_bars([_FakeBar(date(2026, 6, 12))], "SPY")
+    assert len(bars) == 1
+    assert bars[0].ts_utc == "2026-06-12"

@@ -32,6 +32,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# PA-EP6b: reuse the bar-provider's true-UTC normalizer so backfills cannot
+# re-introduce local-labeled bars. Import is clean — ibkr_bar_provider has no
+# import-time side effects and does not import this module (no circular dep).
+from chad.market_data.ibkr_bar_provider import _bar_ts_to_utc_iso
+
 LOGGER = logging.getLogger("chad.market_data.ibkr_historical_provider")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -303,7 +308,7 @@ class IBKRHistoricalProvider:
         """Parse IBKR bar objects into Bar dataclasses."""
         bars: List[Bar] = []
         for b in ib_bars:
-            ts = str(getattr(b, "date", ""))
+            ts = _bar_ts_to_utc_iso(getattr(b, "date", ""))
             o = _safe_float(getattr(b, "open", 0))
             h = _safe_float(getattr(b, "high", 0))
             lo = _safe_float(getattr(b, "low", 0))
