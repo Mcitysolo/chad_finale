@@ -935,23 +935,29 @@ def _strip_futures_month_code(symbol: str) -> str:
     return sym
 
 
-def _lookup_paper_fill_price(symbol: str) -> float:
+def _lookup_paper_fill_price(symbol: str, prices: Optional[Dict[str, Any]] = None) -> float:
     """Best-effort price lookup from runtime/price_cache.json.
 
     Tries exact symbol first, then strips futures contract-month suffixes.
     Returns 0.0 on any failure — callers must treat 0.0 as "no price".
+
+    When ``prices`` is provided (the already-read price_cache "prices" map),
+    no file read is performed — this lets the PA-EP2a submit_quote stamp and
+    the fill-price resolution SHARE a single price-cache read. When ``prices``
+    is None (the default, preserving every existing caller), the file is read.
     """
     sym = (symbol or "").strip().upper()
     if not sym:
         return 0.0
-    try:
-        if not PRICE_CACHE_PATH.exists():
+    if prices is None:
+        try:
+            if not PRICE_CACHE_PATH.exists():
+                return 0.0
+            raw = json.loads(PRICE_CACHE_PATH.read_text(encoding="utf-8"))
+            prices = raw.get("prices", {}) if isinstance(raw, dict) else {}
+        except Exception:
             return 0.0
-        raw = json.loads(PRICE_CACHE_PATH.read_text(encoding="utf-8"))
-        prices = raw.get("prices", {}) if isinstance(raw, dict) else {}
-        if not isinstance(prices, dict):
-            return 0.0
-    except Exception:
+    if not isinstance(prices, dict):
         return 0.0
 
     def _coerce(value: Any) -> float:
@@ -973,6 +979,124 @@ def _lookup_paper_fill_price(symbol: str) -> float:
         if v > 0:
             return v
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# PA-EP2a — honest, fail-open, zero-new-I/O submit-quote stamp.
+#
+# At paper-evidence construction the price cache is ALREADY read once to resolve
+# fill_price; that single read is SHARED here to stamp a reference price on the
+# execution evidence. NO live bid/ask/NBBO is reachable on this path without a
+# new blocking broker call (survey EP2a), so bid/ask/spread are ALWAYS null and
+# the stamp is explicitly marked confidence="ref_only_no_nbbo". Nothing is
+# fabricated; no spread is inferred from anything.
+# ---------------------------------------------------------------------------
+
+_SUBMIT_QUOTE_TTL_S = 300  # price_cache.json ttl_seconds — the staleness bound
+
+
+def _read_price_cache_raw() -> Optional[Dict[str, Any]]:
+    """Single fail-open read of runtime/price_cache.json. Parsed dict or None."""
+    try:
+        if not PRICE_CACHE_PATH.exists():
+            return None
+        raw = json.loads(PRICE_CACHE_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+
+
+def _quote_age_seconds(submitted_at_iso: str, quote_ts: str) -> Optional[float]:
+    """submitted_at − quote_ts in seconds, or None if either is unparseable."""
+    def _parse(s: str) -> Optional[datetime]:
+        try:
+            dt = datetime.fromisoformat(str(s).strip().replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    sa = _parse(submitted_at_iso)
+    qt = _parse(quote_ts)
+    if sa is None or qt is None:
+        return None
+    return round((sa - qt).total_seconds(), 3)
+
+
+def _unavailable_submit_quote() -> Dict[str, Any]:
+    """The marker stamp when no reference price is in hand. bid/ask/spread null."""
+    return {
+        "bid": None,
+        "ask": None,
+        "spread": None,
+        "ref_price": None,
+        "quote_ts": None,
+        "quote_age_s": None,
+        "quote_ttl_s": _SUBMIT_QUOTE_TTL_S,
+        "source": "unavailable",
+        "confidence": "none",
+    }
+
+
+def build_submit_quote_stamp(
+    symbol: str,
+    submitted_at_iso: str,
+    cache_raw: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Build the PA-EP2a submit_quote stamp from an ALREADY-READ price cache.
+
+    bid/ask/spread are ALWAYS null — no NBBO is reachable on this path and we
+    fabricate nothing. ref_price is the cache scalar for the symbol (exact, then
+    futures-root), or null when absent. Pure / no I/O: the caller supplies
+    cache_raw (the same dict read for fill-price resolution).
+    """
+    stamp = _unavailable_submit_quote()
+    if not isinstance(cache_raw, Mapping):
+        return stamp
+    prices = cache_raw.get("prices", {})
+    if not isinstance(prices, dict):
+        return stamp
+    ref = _lookup_paper_fill_price(symbol, prices=prices)
+    if ref <= 0.0:
+        return stamp  # symbol absent / non-positive → unavailable marker
+    stamp["ref_price"] = float(ref)
+    stamp["source"] = "price_cache_mid_or_last"
+    stamp["confidence"] = "ref_only_no_nbbo"
+    cache_ts = cache_raw.get("ts_utc")
+    if cache_ts:
+        stamp["quote_ts"] = str(cache_ts)
+        stamp["quote_age_s"] = _quote_age_seconds(submitted_at_iso, str(cache_ts))
+    return stamp
+
+
+def _attach_submit_quote_stamp(
+    ev: "PaperExecEvidence",
+    cache_raw: Optional[Mapping[str, Any]],
+) -> None:
+    """Attach ev.extra['submit_quote'] fail-open. Never raises; never blocks.
+
+    The order has already been submitted by the time this runs (the stamp is
+    built at post-submit evidence construction), so this cannot affect or slow
+    the order under any circumstances.
+    """
+    try:
+        if not isinstance(ev.extra, dict):
+            ev.extra = dict(ev.extra) if ev.extra else {}
+        ev.extra["submit_quote"] = build_submit_quote_stamp(
+            _safe_str(ev.symbol, ""),
+            _safe_str(ev.fill_time_utc, ""),
+            cache_raw,
+        )
+    except Exception as exc:  # fail-open: order + evidence proceed untouched
+        _LOG.warning(
+            "bar_evidence.quote_capture_failed",
+            extra={"symbol": _safe_str(getattr(ev, "symbol", ""), ""), "error": str(exc)},
+        )
+        try:
+            if not isinstance(ev.extra, dict):
+                ev.extra = {}
+            ev.extra["submit_quote"] = _unavailable_submit_quote()
+        except Exception:
+            pass
 
 
 def _resolve_asset_class_safe(symbol: str, sec_type: str = "") -> str:
@@ -1764,8 +1888,21 @@ def normalize_paper_fill_evidence(ev: "PaperExecEvidence") -> "PaperExecEvidence
         _apply_modeled_commission(ev)
         return ev
 
-    # 2) fill_price — resolve from price cache with futures normalization.
-    cached = _lookup_paper_fill_price(ev.symbol)
+    # 2) fill_price — resolve from a SINGLE price-cache read, SHARED with the
+    # PA-EP2a submit_quote stamp below (no second file read, no broker call).
+    # Guarded so a raising read degrades to "no cache" (fill_price then falls
+    # back to expected_price, exactly as when the file is missing).
+    try:
+        _cache_raw = _read_price_cache_raw()
+    except Exception:
+        _cache_raw = None
+    _cache_prices = _cache_raw.get("prices", {}) if isinstance(_cache_raw, dict) else {}
+    if not isinstance(_cache_prices, dict):
+        _cache_prices = {}
+    cached = _lookup_paper_fill_price(ev.symbol, prices=_cache_prices)
+    # PA-EP2a: honest ref-price stamp on the evidence (bid/ask/spread ALWAYS
+    # null; fail-open — never raises, never blocks). Reuses the read above.
+    _attach_submit_quote_stamp(ev, _cache_raw)
     proposed = _safe_float(ev.fill_price, 0.0)
     if proposed <= 0.0:
         if cached > 0.0:
