@@ -144,6 +144,68 @@ def confirm_gate(input_fn: Callable[[str], str] = input) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Exchange resolution (fixes IBKR Warning 321 "Missing order exchange")
+# ---------------------------------------------------------------------------
+
+# Known fallback exchanges for CHAD's micro-futures universe. Used ONLY when
+# the broker / qualifyContracts leaves the contract's exchange blank. NEVER
+# used to guess for an unknown symbol — those orders are skipped, not placed.
+FUTURES_EXCHANGE_MAP = {"M6E": "CME", "M2K": "CME", "MCL": "NYMEX"}
+
+
+def resolve_exchange(
+    ib: Any,
+    contract: Any,
+    *,
+    out: Callable[[str], None] = print,
+) -> Optional[str]:
+    """Resolve a futures contract's order exchange BEFORE submit (fixes the
+    live ValidationError "Warning 321 ... Missing order exchange").
+
+    ib.positions() returns contracts with a conId but a blank exchange; IBKR
+    then rejects the closing order. We resolve in three steps:
+
+      1. ib.qualifyContracts(contract) — fills the full spec (incl. exchange)
+         from the conId.
+      2. If the exchange is STILL blank, fall back to FUTURES_EXCHANGE_MAP
+         keyed by symbol.
+      3. If it is STILL unresolved (unknown symbol / blank), return None — the
+         caller MUST skip the order. We never submit with a missing or guessed
+         exchange.
+
+    Returns the resolved exchange string, or None if it cannot be resolved.
+    The resolved exchange is written back onto ``contract.exchange``.
+    """
+    qf = getattr(ib, "qualifyContracts", None)
+    if callable(qf):
+        try:
+            qf(contract)
+        except Exception as exc:
+            out(
+                f"[flatten] qualifyContracts failed for "
+                f"{getattr(contract, 'symbol', '?')} "
+                f"(conId={getattr(contract, 'conId', '?')}): {exc}"
+            )
+    exchange = str(getattr(contract, "exchange", "") or "").strip()
+    if exchange:
+        return exchange
+    symbol = str(getattr(contract, "symbol", "") or "").upper()
+    mapped = FUTURES_EXCHANGE_MAP.get(symbol)
+    if mapped:
+        try:
+            contract.exchange = mapped
+        except Exception:
+            pass
+        out(
+            f"[flatten] exchange for {symbol} "
+            f"(conId={getattr(contract, 'conId', '?')}) was blank after qualify "
+            f"— using mapped exchange {mapped}"
+        )
+        return mapped
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Order placement (lazy ib_async; injectable for tests)
 # ---------------------------------------------------------------------------
 
@@ -217,14 +279,28 @@ def flatten_futures(
         return "ABORTED"
 
     # PLACE
+    any_skipped = False
     for p, co in closings:
+        contract = getattr(p, "contract", None)
+        # Resolve the exchange BEFORE submit — ib.positions() returns blank
+        # exchanges, which IBKR rejects with Warning 321. Never submit blank.
+        exchange = resolve_exchange(ib, contract, out=out)
+        if not exchange:
+            any_skipped = True
+            out(
+                f"[flatten] !!! SKIPPED {co.symbol} (conId={co.con_id}): could not "
+                f"resolve an exchange — refusing to submit a closing order with a "
+                f"missing/blank exchange (would be IBKR Warning 321). "
+                f"Position left OPEN."
+            )
+            continue
         out(
             f"[flatten] placing {co.action} {co.quantity} {co.symbol} "
-            f"{co.contract_month} (conId={co.con_id})"
+            f"{co.contract_month} (conId={co.con_id}) on {exchange}"
         )
         try:
             trade = place_order_fn(
-                ib, p.contract, co.action, co.quantity, timeout_s=timeout_s, out=out
+                ib, contract, co.action, co.quantity, timeout_s=timeout_s, out=out
             )
             st = getattr(trade, "orderStatus", None)
             out(
@@ -233,13 +309,19 @@ def flatten_futures(
             )
         except Exception as exc:  # one bad order must not abort the rest
             out(f"[flatten] ORDER ERROR {co.symbol} (conId={co.con_id}): {exc}")
+            any_skipped = True
 
     # RE-VERIFY
     remaining = [p for p in (list(ib.positions() or [])) if is_futures(p)]
-    if not remaining:
+    if not remaining and not any_skipped:
         out("FINAL STATUS: FLAT — no futures positions remain")
         return "FLAT"
-    out("FINAL STATUS: INCOMPLETE — futures positions still open:")
+    out("FINAL STATUS: INCOMPLETE — futures positions still open or orders skipped:")
+    if any_skipped:
+        out(
+            "  NOTE: one or more closing orders were SKIPPED (exchange unresolved) "
+            "— those positions were left OPEN"
+        )
     for p in remaining:
         c = getattr(p, "contract", None)
         out(
