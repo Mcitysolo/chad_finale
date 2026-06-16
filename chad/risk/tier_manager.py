@@ -567,19 +567,32 @@ def main() -> int:
     if not snap:
         LOG.error("portfolio_snapshot_missing")
         return 1
-    equity = (
-        float(snap.get("ibkr_equity", 0.0))
-        + float(snap.get("kraken_equity", 0.0))
-        + float(snap.get("coinbase_equity", 0.0))
-    )
+
+    previous_state = _read_json(OUT_PATH)
+    previous_tier = previous_state.get("tier_name")
+
+    # The tier band is driven EXCLUSIVELY by the authoritative USD equity
+    # (portfolio_snapshot_publisher: total_equity_usd_authoritative + usd_ok),
+    # never by the CAD component sum.  FAIL-CLOSED: if usd_ok is false — or the
+    # field is absent / not numeric (e.g. FX unavailable on a weekend, or an
+    # old snapshot) — HOLD the last persisted tier and do NOT recompute.  We
+    # must NEVER fall back to the CAD figure or to a null USD figure.
+    usd_ok = bool(snap.get("usd_ok", False))
+    total_usd = snap.get("total_equity_usd_authoritative")
+    if not (usd_ok and isinstance(total_usd, (int, float))):
+        LOG.warning(
+            "TIER_HELD_NO_USD_RATE held_tier=%s usd_ok=%s total_usd=%s "
+            "(no authoritative USD equity; tier held, CAD never used)",
+            previous_tier, usd_ok, total_usd,
+        )
+        return 0
+
+    equity = float(total_usd)
 
     config = _read_json(TIERS_CONFIG_PATH)
     if not config or "tiers" not in config:
         LOG.error("tiers_config_missing_or_invalid")
         return 1
-
-    previous_state = _read_json(OUT_PATH)
-    previous_tier = previous_state.get("tier_name")
 
     # Best-effort market-open guess for the CLI: if the operator does not
     # supply a flag, assume the market is closed so that pending demotions

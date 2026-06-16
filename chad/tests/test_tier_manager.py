@@ -16,10 +16,12 @@ Covers the 10 acceptance cases for the v9.1 tier ladder
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
+import chad.risk.tier_manager as tmmod
 from chad.risk.tier_manager import (
     TIER_RANK,
     TierManager,
@@ -202,3 +204,146 @@ def test_legacy_pro_alias_migrates_to_scale(tiers_config):
         tiers_config=tiers_config,
     )
     assert tm.tier_name == "SCALE"
+
+
+# ---------------------------------------------------------------------------
+# main() — tier band sourced from authoritative USD equity (fail-closed).
+#
+# The CLI reads runtime/portfolio_snapshot.json and must select the tier from
+# `total_equity_usd_authoritative` / `usd_ok` ONLY — never the CAD component
+# sum (ibkr_equity + kraken_equity + coinbase_equity).  When usd_ok is false
+# (or the USD figure is absent / null) it HOLDS the last persisted tier and
+# does not recompute.  Snapshots below deliberately set the CAD components to
+# values whose CAD sum would resolve to a *different* tier, proving CAD is
+# never consulted.
+# ---------------------------------------------------------------------------
+
+def _run_main(monkeypatch, tmp_path, *, snapshot, prior_state=None):
+    snap_path = tmp_path / "portfolio_snapshot.json"
+    out_path = tmp_path / "tier_state.json"
+    cfg_path = tmp_path / "tiers.json"
+    snap_path.write_text(json.dumps(snapshot), encoding="utf-8")
+    if prior_state is not None:
+        out_path.write_text(json.dumps(prior_state), encoding="utf-8")
+    # use the real production tier bands
+    cfg_path.write_text(TIERS_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(tmmod, "RUNTIME_DIR", tmp_path)
+    monkeypatch.setattr(tmmod, "SNAPSHOT_PATH", snap_path)
+    monkeypatch.setattr(tmmod, "OUT_PATH", out_path)
+    monkeypatch.setattr(tmmod, "TIERS_CONFIG_PATH", cfg_path)
+    rc = tmmod.main()
+    data = json.loads(out_path.read_text(encoding="utf-8")) if out_path.is_file() else None
+    return rc, data
+
+
+def test_main_usd_ok_137k_selects_pro_growth(monkeypatch, tmp_path):
+    # USD 137k -> PRO_GROWTH band [25k, 160k).  The CAD sum (~198k) would be
+    # SCALE; prove the CAD sum is NOT used.
+    snapshot = {
+        "ibkr_equity": 197_935.4,        # CAD — must be ignored
+        "kraken_equity": 258.5,          # CAD — must be ignored
+        "coinbase_equity": 0.0,
+        "total_equity_usd_authoritative": 137_000.0,
+        "usd_ok": True,
+    }
+    rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot)
+    assert rc == 0
+    assert data["tier_name"] == "PRO_GROWTH"
+    assert data["current_equity_usd"] == 137_000.0   # USD figure, not CAD sum
+    cad_sum = 197_935.4 + 258.5 + 0.0                 # ~198k -> would be SCALE
+    assert data["current_equity_usd"] != cad_sum
+    assert data["tier_name"] != "SCALE"
+
+
+def test_main_usd_ok_above_160k_selects_scale(monkeypatch, tmp_path):
+    # USD >160k -> SCALE.  The tiny CAD sum (100) would be MICRO; prove USD
+    # drives the band, not CAD.
+    snapshot = {
+        "ibkr_equity": 100.0,            # CAD — would be MICRO if used
+        "kraken_equity": 0.0,
+        "coinbase_equity": 0.0,
+        "total_equity_usd_authoritative": 165_000.0,
+        "usd_ok": True,
+    }
+    rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot)
+    assert rc == 0
+    assert data["tier_name"] == "SCALE"
+    assert data["current_equity_usd"] == 165_000.0
+    assert data["tier_name"] != "MICRO"
+
+
+def test_main_usd_not_ok_holds_prior_tier_no_cad_fallback(monkeypatch, tmp_path, caplog):
+    # usd_ok false (FX unavailable) -> HOLD the last persisted tier; do NOT
+    # recompute and NEVER fall back to the CAD sum.  The CAD sum here (~600k)
+    # would resolve to SCALE — proving CAD is never consulted.
+    snapshot = {
+        "ibkr_equity": 500_000.0,        # CAD — must NEVER be used
+        "kraken_equity": 100_000.0,      # CAD — must NEVER be used
+        "coinbase_equity": 0.0,
+        "total_equity_usd_authoritative": None,
+        "usd_ok": False,
+    }
+    prior = {
+        "schema_version": "tier_state.v2",
+        "tier_name": "PRO_GROWTH",
+        "current_equity_usd": 137_000.0,
+    }
+    with caplog.at_level(logging.WARNING, logger=tmmod.LOG.name):
+        rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot, prior_state=prior)
+    assert rc == 0
+    # tier_state.json is left untouched (held) — no recompute occurred.
+    assert data == prior
+    assert data["tier_name"] == "PRO_GROWTH"
+    assert data["current_equity_usd"] == 137_000.0   # untouched; NOT the CAD sum
+    cad_sum = 500_000.0 + 100_000.0 + 0.0             # ~600k -> would be SCALE
+    assert data["current_equity_usd"] != cad_sum
+    assert data["tier_name"] != "SCALE"
+    assert any("TIER_HELD_NO_USD_RATE" in r.getMessage() for r in caplog.records)
+
+
+def test_main_usd_field_absent_treated_as_not_ok(monkeypatch, tmp_path, caplog):
+    # An old snapshot lacking the authoritative-USD fields entirely must be
+    # treated as fail-closed (hold), never CAD-summed.
+    snapshot = {
+        "ibkr_equity": 500_000.0,        # CAD
+        "kraken_equity": 100_000.0,      # CAD
+        "coinbase_equity": 0.0,
+    }
+    prior = {"schema_version": "tier_state.v2", "tier_name": "STARTER",
+             "current_equity_usd": 10_000.0}
+    with caplog.at_level(logging.WARNING, logger=tmmod.LOG.name):
+        rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot, prior_state=prior)
+    assert rc == 0
+    assert data == prior                              # held, no recompute
+    assert any("TIER_HELD_NO_USD_RATE" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Demotion-deferral state machine is preserved unchanged by the USD-source fix:
+# a SCALE -> PRO_GROWTH demotion is queued (deferred) while the market is open
+# and only applies once the market is closed.
+# ---------------------------------------------------------------------------
+
+def test_demotion_deferral_preserved_scale_to_pro_growth(tiers_config):
+    # equity 140k is below SCALE's demotion gate (144k) but, with the market
+    # open, the SCALE -> PRO_GROWTH demotion must DEFER, not apply instantly.
+    tm_open = TierManager(
+        equity=140_000.0,
+        current_tier="SCALE",
+        market_open=True,
+        tiers_config=tiers_config,
+    )
+    assert tm_open.tier_name == "SCALE"              # held, not instant
+    assert tm_open.demotion_pending is True
+    assert tm_open.demotion_pending_to == "PRO_GROWTH"
+    assert tm_open.demotion_pending_reason == "mid_session_demotion_deferred"
+
+    # Off-session, the same equity applies the demotion.
+    tm_closed = TierManager(
+        equity=140_000.0,
+        current_tier="SCALE",
+        market_open=False,
+        tiers_config=tiers_config,
+    )
+    assert tm_closed.tier_name == "PRO_GROWTH"
+    assert tm_closed.demotion_pending is False
