@@ -109,6 +109,28 @@ def _read_equity_history() -> List[Dict[str, Any]]:
     return out
 
 
+def _row_equity_cad(row: Dict[str, Any]) -> float:
+    """Continuity-safe per-row equity read for the HWM / drawdown math.
+
+    Prefers the honest ``total_equity_cad`` key (equity_history.v2); falls back
+    to the legacy ``total_equity_usd`` key, which historically carried the same
+    broker-native CAD figure. Both are the same CAD basis, so the series stays
+    continuous across the v1->v2 relabel (no phantom drawdown discontinuity).
+    The new v2 ``total_equity_usd`` (true USD / null) is never reached here
+    because v2 rows always carry ``total_equity_cad``. Missing/non-numeric -> 0.0
+    (matches the prior ``r.get(..., 0.0)`` behaviour).
+    """
+    for k in ("total_equity_cad", "total_equity_usd"):
+        v = row.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 def _load_policy() -> Dict[str, Any]:
     on_disk = _read_json(POLICY_PATH)
     if not on_disk:
@@ -152,9 +174,9 @@ def compute_authorization(
     require_confident = bool(policy["require_scr_confident"])
     min_history = int(policy["minimum_history_days"])
 
-    # Compute high water mark from history
+    # Compute high water mark from history (continuous CAD series)
     if history:
-        equities = [float(r.get("total_equity_usd", 0.0)) for r in history]
+        equities = [_row_equity_cad(r) for r in history]
         hwm = max(equities)
     else:
         hwm = current_equity
@@ -166,7 +188,7 @@ def compute_authorization(
         try:
             ts = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
             if ts > cutoff:
-                recent.append(float(r["total_equity_usd"]))
+                recent.append(_row_equity_cad(r))
         except Exception:
             continue
     recent.append(current_equity)

@@ -91,7 +91,13 @@ def _read_equity_history(path: Optional[Path] = None) -> List[Dict[str, Any]]:
 def _row_equity(row: Any) -> Optional[float]:
     if not isinstance(row, dict):
         return None
-    for k in ("total_equity_usd", "equity_usd", "total_equity", "equity"):
+    # Continuity-safe key priority. ``total_equity_cad`` is the honest CAD series
+    # written by equity_history.v2; the legacy ``total_equity_usd`` key carried
+    # the SAME CAD figure in v1 rows, so reading it as a fallback keeps the HWM
+    # series continuous across the relabel. ``total_equity_cad`` MUST be tried
+    # first: in v2 rows ``total_equity_usd`` now holds the true-USD figure (or
+    # null), which must never feed the currency-agnostic drawdown math.
+    for k in ("total_equity_cad", "total_equity_usd", "equity_usd", "total_equity", "equity"):
         v = row.get(k)
         if v is None:
             continue
