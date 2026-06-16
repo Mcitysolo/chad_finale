@@ -427,7 +427,9 @@ class PortfolioSnapshotWriter:
 
     Behaviour:
       * If file exists: preserve existing ibkr-equity (supports both ibkr_equity
-        and ibkr_equity_usd), update coinbase_equity (canonical).
+        and ibkr_equity_usd), update coinbase_equity (canonical), and carry
+        forward ALL other keys verbatim (kraken_equity, the publisher's
+        authoritative USD block, currency tags, ts/ttl, any future field).
       * If missing: create new snapshot with ibkr_equity = 0.0, coinbase_equity
         from Coinbase.
 
@@ -470,10 +472,15 @@ class PortfolioSnapshotWriter:
         except (TypeError, ValueError):
             ibkr_equity_val = 0.0
 
-        new_payload: Dict[str, Any] = {
-            "ibkr_equity": ibkr_equity_val,
-            "coinbase_equity": float(coinbase_equity_usd),
-        }
+        # Preserve ALL keys this writer does not own (kraken_equity, the
+        # publisher's authoritative USD block — total_equity_usd_authoritative /
+        # usd_ok / usdcad_rate_used — currency tags, ts/ttl, any future field).
+        # The payload is written wholesale, so start from the existing snapshot
+        # (read-through; fail-soft {}) and overlay ONLY the keys this writer
+        # authors, instead of erasing everything except ibkr/coinbase each merge.
+        new_payload: Dict[str, Any] = dict(existing)
+        new_payload["ibkr_equity"] = ibkr_equity_val
+        new_payload["coinbase_equity"] = float(coinbase_equity_usd)
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")

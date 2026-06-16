@@ -269,28 +269,29 @@ class IBKRPortfolioCollector:
                 flush=True,
             )
 
-        new_payload: Dict[str, Any] = {
-            "ts_utc": _utc_now_iso(),
-            "ttl_seconds": int(PORTFOLIO_SNAPSHOT_TTL_SECONDS),
-            "ibkr_equity": float(equity_to_write),
-            "ibkr_equity_currency": base,
-            "ibkr_equity_currency_ok": bool(currency_ok),
-            "coinbase_equity": float(coinbase_equity),
-            "kraken_equity": float(kraken_equity),
-        }
-
-        # BOX-034B Step 2: carry forward publisher-authored snapshot keys that
-        # this collector does NOT author (kraken currency tags + the cosmetic
-        # ibkr USD display). The payload is written wholesale, so any prior key
-        # not re-listed is otherwise dropped — which silently stripped the
-        # kraken_equity_currency/_ok tags every 2-min cycle and prevented a
-        # stable total_equity_currency_ok. We PRESERVE (read-through) these
-        # verbatim, never author them: present-only (no .get default) so a
-        # cold/empty snapshot omits them rather than emitting null — the next
-        # publisher run self-heals the tags.
-        for _k in ("kraken_equity_currency", "kraken_equity_currency_ok", "ibkr_equity_usd_display"):
-            if _k in data:
-                new_payload[_k] = data[_k]
+        # BOX-034B Step 2 (generalized): the payload is written wholesale, so any
+        # prior key this collector does NOT re-list is dropped. Previously a
+        # hardcoded 3-key allowlist (kraken currency tags + ibkr USD display) was
+        # carried forward — but that still silently erased the publisher-authored
+        # authoritative USD block (total_equity_usd_authoritative / usd_ok /
+        # usdcad_rate_used) and any future field on every 2-min collector cycle,
+        # starving the tier-manager between publisher runs. We now PRESERVE ALL
+        # unknown keys generically: start from the existing snapshot (read-through;
+        # fail-soft {} on missing/corrupt above) and overlay ONLY the keys this
+        # collector authors. No allowlist — a cold/empty snapshot (data == {})
+        # yields exactly the owned keys, so nothing is fabricated as null.
+        new_payload: Dict[str, Any] = dict(data)
+        new_payload.update(
+            {
+                "ts_utc": _utc_now_iso(),
+                "ttl_seconds": int(PORTFOLIO_SNAPSHOT_TTL_SECONDS),
+                "ibkr_equity": float(equity_to_write),
+                "ibkr_equity_currency": base,
+                "ibkr_equity_currency_ok": bool(currency_ok),
+                "coinbase_equity": float(coinbase_equity),
+                "kraken_equity": float(kraken_equity),
+            }
+        )
 
         _atomic_write_json(path, new_payload)
         return path

@@ -88,12 +88,34 @@ class PortfolioSnapshot:
 
     def write(self, path: Path) -> None:
         """
-        Atomically write the snapshot JSON back to disk.
+        Atomically write the snapshot JSON back to disk, PRESERVING any keys
+        already on disk that this dataclass does not model.
+
+        This dataclass models only (ibkr_equity, coinbase_equity, kraken_equity),
+        so a plain ``to_dict()`` round-trip silently erased every other key —
+        notably the publisher's authoritative USD block
+        (total_equity_usd_authoritative / usd_ok / usdcad_rate_used) and the
+        currency tags. We now read the existing file (fail-soft: missing/corrupt
+        -> {}), overlay ONLY this snapshot's three owned fields, and write the
+        merged dict atomically (tmp + replace) so unknown keys survive.
         """
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        else:
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        merged: Dict[str, Any] = dict(existing)
+        merged.update(self.to_dict())
+
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(
-            json.dumps(self.to_dict(), indent=2, sort_keys=True),
+            json.dumps(merged, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         tmp.replace(path)
