@@ -55,6 +55,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from chad.utils.market_hours import market_is_open
+
 LOG = logging.getLogger("chad.risk.tier_manager")
 
 REPO_ROOT = Path("/home/ubuntu/chad_finale")
@@ -594,14 +596,17 @@ def main() -> int:
         LOG.error("tiers_config_missing_or_invalid")
         return 1
 
-    # Best-effort market-open guess for the CLI: if the operator does not
-    # supply a flag, assume the market is closed so that pending demotions
-    # are applied promptly on the next CLI run.  Live publishers should
-    # pass `market_open` explicitly via the TierManager class API.
+    # Mid-session demotion deferral (see module docstring): a demotion proposed
+    # while the US equity regular session is open is held until the next market
+    # close.  Compute the REAL market-open state from current UTC via the shared,
+    # pure RTH helper (single source of truth, also used by the dashboard) so the
+    # CLI defers mid-session demotions as designed instead of always applying
+    # them instantly.  Promotions are unaffected — they apply regardless.
+    market_open = market_is_open(datetime.now(timezone.utc))
     tm = TierManager(
         equity=equity,
         current_tier=previous_tier,
-        market_open=False,
+        market_open=market_open,
         tiers_config=config,
     )
 

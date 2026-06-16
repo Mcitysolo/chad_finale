@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from chad.risk.tier_manager import (
     TierManager,
     TierRiskProfile,
 )
+from chad.utils.market_hours import market_is_open
 
 REPO_ROOT = Path("/home/ubuntu/chad_finale")
 TIERS_CONFIG_PATH = REPO_ROOT / "config" / "tiers.json"
@@ -347,3 +349,100 @@ def test_demotion_deferral_preserved_scale_to_pro_growth(tiers_config):
     )
     assert tm_closed.tier_name == "PRO_GROWTH"
     assert tm_closed.demotion_pending is False
+
+
+# ---------------------------------------------------------------------------
+# market_is_open helper — pure RTH boundary checks.
+#
+# RTH window = weekday (Mon-Fri) AND 14:30 <= UTC time-of-day < 21:00.
+# 2026-06-15 is a Monday; 2026-06-13 is a Saturday.
+# ---------------------------------------------------------------------------
+
+def test_market_is_open_just_before_open_closed():
+    # 14:29 UTC on a weekday — one minute before the 14:30 open.
+    assert market_is_open(datetime(2026, 6, 15, 14, 29, tzinfo=timezone.utc)) is False
+
+
+def test_market_is_open_at_open_is_open():
+    # 14:30 UTC exactly — the open boundary is inclusive.
+    assert market_is_open(datetime(2026, 6, 15, 14, 30, tzinfo=timezone.utc)) is True
+
+
+def test_market_is_open_mid_session_is_open():
+    assert market_is_open(datetime(2026, 6, 15, 17, 0, tzinfo=timezone.utc)) is True
+
+
+def test_market_is_open_just_before_close_is_open():
+    # 20:59 UTC — still inside the session (close is exclusive at 21:00).
+    assert market_is_open(datetime(2026, 6, 15, 20, 59, tzinfo=timezone.utc)) is True
+
+
+def test_market_is_open_at_close_is_closed():
+    # 21:00 UTC exactly — the close boundary is exclusive.
+    assert market_is_open(datetime(2026, 6, 15, 21, 0, tzinfo=timezone.utc)) is False
+
+
+def test_market_is_open_after_close_is_closed():
+    # 02:00 UTC on a weekday — deep off-session.
+    assert market_is_open(datetime(2026, 6, 15, 2, 0, tzinfo=timezone.utc)) is False
+
+
+def test_market_is_open_weekend_is_closed():
+    # Saturday mid-session-time-of-day — weekends are always closed.
+    assert market_is_open(datetime(2026, 6, 13, 17, 0, tzinfo=timezone.utc)) is False
+
+
+# ---------------------------------------------------------------------------
+# main() now passes the REAL US-equity market-open state (was hardcoded False).
+# These exercise the CLI through _run_main with tmmod.market_is_open stubbed so
+# the wiring — not a fixed clock — is under test.  Snapshot equity 140k is below
+# SCALE's demotion gate (144k) and resolves naively to PRO_GROWTH; prior tier is
+# SCALE so a SCALE -> PRO_GROWTH demotion is the candidate.
+# ---------------------------------------------------------------------------
+
+_DEMOTE_SNAPSHOT = {
+    "total_equity_usd_authoritative": 140_000.0,
+    "usd_ok": True,
+}
+_PRIOR_SCALE = {"schema_version": "tier_state.v2", "tier_name": "SCALE",
+                "current_equity_usd": 165_000.0}
+
+
+def test_main_demotion_defers_when_market_open(monkeypatch, tmp_path):
+    # With the real helper reporting OPEN, main() must DEFER the demotion:
+    # tier held at SCALE, demotion_pending True, applies at next market open.
+    monkeypatch.setattr(tmmod, "market_is_open", lambda _now: True)
+    rc, data = _run_main(
+        monkeypatch, tmp_path, snapshot=_DEMOTE_SNAPSHOT, prior_state=_PRIOR_SCALE
+    )
+    assert rc == 0
+    assert data["tier_name"] == "SCALE"                       # UNCHANGED
+    assert data["demotion_pending"] is True
+    assert data["demotion_pending_to"] == "PRO_GROWTH"        # lower tier
+    assert data["demotion_pending_reason"] == "mid_session_demotion_deferred"
+    assert data["demotion_applies_at"] == "next_market_open"
+
+
+def test_main_demotion_applies_when_market_closed(monkeypatch, tmp_path):
+    # Same equity, but the real helper reports CLOSED -> demotion APPLIES.
+    monkeypatch.setattr(tmmod, "market_is_open", lambda _now: False)
+    rc, data = _run_main(
+        monkeypatch, tmp_path, snapshot=_DEMOTE_SNAPSHOT, prior_state=_PRIOR_SCALE
+    )
+    assert rc == 0
+    assert data["tier_name"] == "PRO_GROWTH"                  # tier CHANGED
+    assert data["demotion_pending"] is False
+
+
+def test_main_promotion_unaffected_by_market_open(monkeypatch, tmp_path):
+    # A promotion applies regardless of market_open — confirms only the
+    # *demotion* deferral path consults the helper.  Prior PRO_GROWTH, USD 165k
+    # promotes to SCALE even with the market reported OPEN.
+    monkeypatch.setattr(tmmod, "market_is_open", lambda _now: True)
+    snapshot = {"total_equity_usd_authoritative": 165_000.0, "usd_ok": True}
+    prior = {"schema_version": "tier_state.v2", "tier_name": "PRO_GROWTH",
+             "current_equity_usd": 140_000.0}
+    rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot, prior_state=prior)
+    assert rc == 0
+    assert data["tier_name"] == "SCALE"                       # promotion applied
+    assert data["demotion_pending"] is False

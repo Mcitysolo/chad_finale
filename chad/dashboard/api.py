@@ -33,6 +33,7 @@ from chad.intel.strategy_intelligence import (
     _load_dynamic_universe_candidates_context,
     _load_earnings_intel_context,
 )
+from chad.utils.market_hours import market_is_open as _market_is_open
 
 REPO = Path(__file__).resolve().parents[2]
 RUNTIME = REPO / "runtime"
@@ -201,11 +202,9 @@ def _vix_label_legacy(v: float | None) -> str:
     return f"{label} ({v:.0f})"
 
 
-def _market_is_open(now_utc: datetime) -> bool:
-    if now_utc.weekday() >= 5:
-        return False
-    minutes = now_utc.hour * 60 + now_utc.minute
-    return 14 * 60 + 30 <= minutes < 21 * 60
+# _market_is_open relocated to chad.utils.market_hours (single source of truth,
+# shared with chad.risk.tier_manager); imported as _market_is_open above so the
+# existing call site is unchanged.
 
 
 # ------------------------- Auth -------------------------
