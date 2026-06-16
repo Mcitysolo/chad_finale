@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Protocol, Sequence, Tuple, TypeVar, TYPE_CHECKING
 
 from chad.options.spread_spec import OptionsSpreadSpec
+from chad.execution.futures_gate import futures_execution_disabled, is_futures_sec_type
 from chad.types import AssetClass, RoutedSignal, SignalSide
 
 LOGGER = logging.getLogger("chad.execution.ibkr")
@@ -2392,6 +2393,66 @@ class IbkrAdapter:
         submitted_at: datetime,
         idempotency_key: str,
     ) -> SubmittedOrder:
+        # --- Futures execution off-switch: HARD GATE at the broker chokepoint ---
+        # When any futures-disable flag is set, hard-block EVERY futures order
+        # (FUT/FOP, BOTH sides, ALL intent classes incl. exit/flip — this layer
+        # has no notion of exit/flip, so there is no carve-out) before it can
+        # reach the broker. Fail-closed: never call placeOrder/whatIfOrder for a
+        # gated futures contract; return a clean rejected SubmittedOrder
+        # mirroring the open-order-guard reject shape (never raise on the order
+        # path). Equities/options/crypto/forex are unaffected. The predicate is
+        # the single shared source of truth (chad.execution.futures_gate); the
+        # live_loop early skip consults the SAME predicate. This is additive
+        # defense-in-depth on top of the Bug B Fix A per-symbol position cap —
+        # neither replaces the other.
+        if futures_execution_disabled(os.environ) and is_futures_sec_type(intent.sec_type):
+            _intent_class = ""
+            try:
+                _meta = intent.meta if isinstance(intent.meta, Mapping) else {}
+                _intent_class = str(
+                    _meta.get("intent")
+                    or _meta.get("intent_class")
+                    or _meta.get("reason")
+                    or ""
+                ).strip()
+            except Exception:  # noqa: BLE001
+                _intent_class = ""
+            LOGGER.warning(
+                "FUTURES_EXECUTION_GATE_BLOCKED symbol=%s side=%s sec_type=%s "
+                "intent_class=%s strategy=%s reason=futures_execution_disabled",
+                intent.symbol,
+                intent.side,
+                intent.sec_type,
+                _intent_class or "n/a",
+                intent.strategy,
+            )
+            return SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=prepared.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=False,
+                submitted_at=submitted_at,
+                ib_order_id=None,
+                status="futures_execution_disabled",
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                limit_price=intent.limit_price,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                contract_summary=resolved_contract.summary,
+                raw={
+                    "guard": "futures_execution_disabled",
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "sec_type": intent.sec_type,
+                    "intent_class": _intent_class or "n/a",
+                },
+            )
+
         last_exc: Optional[BaseException] = None
 
         for attempt in range(1, self._config.max_submit_retries + 1):

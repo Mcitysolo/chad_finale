@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Optional
 
 import os
 
+from chad.execution.futures_gate import futures_execution_disabled, is_futures_sec_type
+
 LOGGER = logging.getLogger("chad.execution.ibkr_trade_router")
 
 _BROKER_TIMEOUT_S = 10.0
@@ -129,6 +131,35 @@ class IBKRTradeRouter:
         """
         Execute a trade via IBKR. Uses what-if mode by default (no real execution).
         """
+        # --- Futures execution off-switch: HARD GATE at this broker chokepoint ---
+        # Second FUT-capable broker-submit path (alongside ibkr_adapter). When
+        # any futures-disable flag is set, hard-block FUT/FOP submission here —
+        # BOTH sides, what-if AND live — before building or routing anything.
+        # Fail-closed: never call placeOrder for a gated futures contract;
+        # return a clean rejected IBKRTradeResponse (never raise on the order
+        # path). Reuses the SINGLE shared predicate (chad.execution.futures_gate)
+        # so the flag logic is never duplicated. Non-futures secTypes unaffected.
+        if futures_execution_disabled(os.environ) and is_futures_sec_type(req.sec_type):
+            LOGGER.warning(
+                "FUTURES_EXECUTION_GATE_BLOCKED symbol=%s side=%s sec_type=%s "
+                "what_if=%s reason=futures_execution_disabled",
+                req.symbol,
+                req.side,
+                req.sec_type,
+                bool(req.what_if),
+            )
+            return IBKRTradeResponse(
+                order_id=0,
+                status="futures_execution_disabled",
+                raw={
+                    "guard": "futures_execution_disabled",
+                    "symbol": req.symbol,
+                    "side": req.side,
+                    "sec_type": req.sec_type,
+                    "what_if": bool(req.what_if),
+                },
+            )
+
         from ib_async import Contract, Order  # type: ignore[import]
 
         side = req.side.upper()

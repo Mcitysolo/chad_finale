@@ -76,6 +76,7 @@ from chad.core.ibkr_execution_runner import _build_plan_and_intents
 from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
 from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig, resolve_asset_class
+from chad.execution.futures_gate import is_futures_sec_type
 from chad.execution.ibkr_client_ids import LIVE_LOOP as _IBKR_LIVE_LOOP_CLIENT_ID
 from chad.execution.paper_exec_evidence_writer import (
     PaperExecEvidence,
@@ -198,16 +199,15 @@ _KRAKEN_BALANCE_PROVIDER = None  # lazy singleton
 
 
 def _futures_execution_disabled(env: Mapping[str, str]) -> bool:
-    """True when any futures-disable flag is set. Reversible env stopgap."""
-    truthy = {"1", "true", "yes", "on"}
-    falsy = {"0", "false", "no", "off"}
-    if env.get("CHAD_DISABLE_FUTURES_EXECUTION", "").strip().lower() in truthy:
-        return True
-    if env.get("CHAD_DISABLE_FUTURES", "").strip().lower() in truthy:
-        return True
-    if env.get("CHAD_FUTURES_EXECUTION_ENABLED", "").strip().lower() in falsy:
-        return True
-    return False
+    """True when any futures-disable flag is set. Reversible env stopgap.
+
+    Thin wrapper preserved for the existing call sites / tests; the flag logic
+    lives in exactly one place — chad.execution.futures_gate — which the
+    broker-submit chokepoints import as the same single source of truth.
+    """
+    from chad.execution.futures_gate import futures_execution_disabled
+
+    return futures_execution_disabled(env)
 
 
 # ---------------------------------------------------------------------------
@@ -2273,11 +2273,16 @@ def run_once(logger: logging.Logger) -> None:
                 # against the cap cumulatively.
             # --- end Bug B Fix A cap ---
 
+            # Futures execution off-switch (reversible env stopgap). OPERATOR
+            # DECISION: block BOTH sides and ALL intent classes — NO carve-out
+            # for exits/flips. Placed before the position-guard mutations below
+            # (mark_position_open / replace_position) so a gated FUT/FOP intent
+            # can never leave a phantom guard entry. The ibkr_adapter submit
+            # chokepoint enforces the same shared predicate as the hard
+            # backstop; this early skip merely avoids needless downstream work.
             if (
                 _futures_execution_disabled(os.environ)
-                and _gate_sec_type == "FUT"
-                and not _intent_is_exit
-                and not is_flip_signal(intent)
+                and is_futures_sec_type(_gate_sec_type)
             ):
                 logger.warning(
                     "FUTURES_EXECUTION_DISABLED_SKIP symbol=%s strategy=%s sec_type=%s "
