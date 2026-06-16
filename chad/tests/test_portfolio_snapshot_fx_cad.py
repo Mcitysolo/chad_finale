@@ -118,3 +118,71 @@ def test_ibkr_usd_display_none_does_not_block_kraken_cad(monkeypatch, tmp_path):
     assert data["ibkr_equity_usd_display"] is None
     assert data["kraken_equity_currency_ok"] is True
     assert 252.0 < data["kraken_equity"] < 253.7
+
+
+# --------------------------------------------------------------------------
+# Authoritative USD equity (additive; fail-closed, never CAD fallback)
+# --------------------------------------------------------------------------
+def test_total_usd_authoritative_valid_rate(monkeypatch, tmp_path):
+    # Prior carries a CAD ibkr_equity (preserved via read-through) so we can
+    # prove the authoritative USD total is NOT the CAD sum the tier_manager /
+    # equity_history publishers currently compute.
+    prior = {
+        "ibkr_equity": 190000.0,  # CAD (canonical collector value, preserved)
+        "ibkr_equity_currency": "CAD",
+        "ibkr_equity_currency_ok": True,
+        "kraken_equity": 12345.0,  # overwritten this cycle
+    }
+    rc, data = _patch_main(
+        monkeypatch, tmp_path,
+        usdcad=1.4, ibkr_usd=136000.0, kraken_usd=200.0, prior=prior,
+    )
+    assert rc == 0
+    assert data["usd_ok"] is True
+    assert data["usdcad_rate_used"] == 1.4
+    # kraken CAD this cycle = 200.0 * 1.4 = 280.0; converted back = 200.0 USD.
+    # coinbase is 0.0 -> total == ibkr_usd + kraken_usd exactly (coinbase handled).
+    assert data["coinbase_equity"] == 0.0
+    assert abs(data["total_equity_usd_authoritative"] - (136000.0 + 200.0)) < 1e-6
+    assert abs(data["total_equity_usd_authoritative"] - 136200.0) < 1e-6
+    # MUST NOT equal the CAD sum (ibkr_equity + kraken_equity + coinbase, all CAD)
+    cad_sum = data["ibkr_equity"] + data["kraken_equity"] + data["coinbase_equity"]
+    assert abs(cad_sum - 190280.0) < 1e-6  # sanity on the CAD sum itself
+    assert data["total_equity_usd_authoritative"] != cad_sum
+    assert data["total_equity_usd_authoritative"] < cad_sum  # USD < CAD at >1.0 rate
+
+
+def test_total_usd_authoritative_fail_closed_when_rate_none(monkeypatch, tmp_path):
+    # FX unavailable (e.g. weekend): authoritative USD total fails closed to
+    # None — it must NEVER fall back to the CAD figure.
+    prior = {
+        "ibkr_equity": 190000.0,  # CAD
+        "ibkr_equity_currency": "CAD",
+        "ibkr_equity_currency_ok": True,
+        "kraken_equity": 280.0,
+    }
+    rc, data = _patch_main(
+        monkeypatch, tmp_path,
+        usdcad=None, ibkr_usd=None, kraken_usd=200.0, prior=prior,
+    )
+    assert rc == 0
+    assert data["total_equity_usd_authoritative"] is None
+    assert data["usd_ok"] is False
+    assert data["usdcad_rate_used"] is None
+    # explicitly NOT the preserved CAD figure
+    assert data["total_equity_usd_authoritative"] != data["ibkr_equity"]
+
+
+def test_total_usd_authoritative_fail_closed_when_ibkr_component_none(monkeypatch, tmp_path):
+    # Rate is live (so kraken converts) but the IBKR USD component is missing:
+    # "every component converts" is violated -> total None, usd_ok False, yet
+    # usdcad_rate_used still records the rate that WAS applied to kraken.
+    rc, data = _patch_main(
+        monkeypatch, tmp_path,
+        usdcad=1.4, ibkr_usd=None, kraken_usd=200.0,
+    )
+    assert rc == 0
+    assert data["total_equity_usd_authoritative"] is None
+    assert data["usd_ok"] is False
+    assert data["usdcad_rate_used"] == 1.4
+    assert data["kraken_equity_currency_ok"] is True  # kraken still converted

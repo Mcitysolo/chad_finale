@@ -244,6 +244,35 @@ def main() -> int:
             payload.get("kraken_equity"),
         )
 
+    # --- Authoritative USD equity (additive; display/observability only — no
+    # risk/sizing/tier/drawdown consumer reads it). Built ONLY from USD
+    # components converted via the SAME validated live USDCAD rate used above:
+    #   total = ibkr_equity_usd_display
+    #         + (kraken_equity CAD / usdcad)        # CAD per USD -> USD
+    #         + coinbase (USD)
+    # FAIL-CLOSED: if the live rate is unavailable/invalid, or any component
+    # failed to convert (e.g. IBKR NetLiquidation unread -> ibkr display None,
+    # or kraken not freshly converted), total_equity_usd_authoritative is None
+    # and usd_ok is False. It NEVER falls back to the CAD figure.
+    coinbase_usd = float(payload.get("coinbase_equity", 0.0) or 0.0)  # 0.0 (unused)
+    kraken_cad_now = payload.get("kraken_equity")
+    components_ok = (
+        usdcad is not None
+        and ibkr_equity_usd is not None
+        and payload.get("kraken_equity_currency_ok") is True
+        and isinstance(kraken_cad_now, (int, float))
+    )
+    if components_ok:
+        kraken_usd = float(kraken_cad_now) / usdcad  # CAD / (CAD per USD) = USD
+        payload["total_equity_usd_authoritative"] = (
+            float(ibkr_equity_usd) + kraken_usd + coinbase_usd
+        )
+        payload["usd_ok"] = True
+    else:
+        payload["total_equity_usd_authoritative"] = None
+        payload["usd_ok"] = False
+    payload["usdcad_rate_used"] = float(usdcad) if usdcad is not None else None
+
     payload["ts_utc"] = _utc_now_iso()
     payload["ttl_seconds"] = TTL_SECONDS
 
@@ -253,11 +282,15 @@ def main() -> int:
     tmp.replace(OUT_PATH)
 
     kraken_out = payload.get("kraken_equity")
+    total_usd_out = payload.get("total_equity_usd_authoritative")
     LOG.info(
-        "portfolio_snapshot_published ibkr_usd_display=%s kraken_cad=%s usdcad=%s",
+        "portfolio_snapshot_published ibkr_usd_display=%s kraken_cad=%s usdcad=%s "
+        "total_usd_authoritative=%s usd_ok=%s",
         ("%.2f" % ibkr_equity_usd) if ibkr_equity_usd is not None else "None",
         ("%.2f" % kraken_out) if isinstance(kraken_out, (int, float)) else kraken_out,
         ("%.4f" % usdcad) if usdcad is not None else "None",
+        ("%.2f" % total_usd_out) if isinstance(total_usd_out, (int, float)) else total_usd_out,
+        payload.get("usd_ok"),
     )
     return 0
 
