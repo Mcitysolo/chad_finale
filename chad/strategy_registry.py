@@ -56,6 +56,7 @@ This module does NOT duplicate the enum — every entry references a
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -65,6 +66,7 @@ from chad.types import StrategyName
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_PATH = REPO_ROOT / "config" / "strategy_weights.json"
+TIERS_PATH = REPO_ROOT / "config" / "tiers.json"
 
 
 class Track(str, Enum):
@@ -207,7 +209,42 @@ def _load_weight_keys(weights_path: Optional[Path]) -> set:
     return set(weights.keys())
 
 
-def assert_registry_consistency(*, weights_path: Optional[Path] = None) -> None:
+def _load_tier_enabled_lists(tiers_path: Optional[Path]) -> dict:
+    """Return ``{tier_name: enabled_strategies_list}`` from config/tiers.json.
+
+    Read-only. Raises :class:`RegistryConsistencyError` if the file is
+    missing or structurally unusable — mirrors the fail-loud contract of
+    :func:`_load_weight_keys`. The wildcard sentinel ``"*"`` is preserved
+    verbatim in the returned lists; expansion/exemption is the caller's
+    concern.
+    """
+    path = tiers_path if tiers_path is not None else TIERS_PATH
+    if not Path(path).is_file():
+        raise RegistryConsistencyError(
+            f"strategy registry consistency: tiers file missing at {path}"
+        )
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - corrupt file is an error path
+        raise RegistryConsistencyError(
+            f"strategy registry consistency: tiers file unreadable at {path}: {exc}"
+        ) from exc
+    tiers = doc.get("tiers")
+    if not isinstance(tiers, dict) or not tiers:
+        raise RegistryConsistencyError(
+            f"strategy registry consistency: tiers file {path} has no "
+            "non-empty 'tiers' object"
+        )
+    out: dict = {}
+    for tier_name, spec in tiers.items():
+        raw = spec.get("enabled_strategies") if isinstance(spec, dict) else None
+        out[tier_name] = [x for x in raw if isinstance(x, str)] if isinstance(raw, list) else []
+    return out
+
+
+def assert_registry_consistency(
+    *, weights_path: Optional[Path] = None, tiers_path: Optional[Path] = None
+) -> None:
     """Fail LOUD if any consumer has drifted from the canonical registry.
 
     Validates, raising :class:`RegistryConsistencyError` with a precise
@@ -221,9 +258,19 @@ def assert_registry_consistency(*, weights_path: Optional[Path] = None) -> None:
       5. Track axis agrees with the handler-registration SSOT:
          main-track == ``chad.strategies.active_strategy_names()`` and
          side-engine == ``chad.strategies.DEFERRED_STRATEGIES``.
+      6. Every name in every explicit (non-wildcard) per-tier
+         ``enabled_strategies`` list in ``config/tiers.json`` is a declared
+         ``StrategyName`` (fail LOUD on a typo / stale removed name).
+         A wildcard list (``["*"]``) expands to registry ACTIVE and is
+         exempt from this membership check. A tier enabling a DORMANT
+         strategy is allowed but emits a non-fatal warning (visible, not
+         silent) — it is enabled-but-not-trading until a weight is assigned.
 
     This is intended to run at service/app init so registry drift can never
     again be silent. It performs only read-only checks and never mutates state.
+
+    Invariants 1–5 fail LOUD via :class:`RegistryConsistencyError`; the
+    dormant-in-tier case in invariant 6 surfaces as a :class:`UserWarning`.
     """
     # 1. exactly-once declaration; no orphans -------------------------------
     declared = [e.name for e in _REGISTRY]
@@ -304,3 +351,28 @@ def assert_registry_consistency(*, weights_path: Optional[Path] = None) -> None:
             f"STRATEGIES; only_side={sorted(side_vals - deferred_vals)} "
             f"only_deferred={sorted(deferred_vals - side_vals)}."
         )
+
+    # 6. per-tier explicit enabled lists ⊆ declared enum; dormant-in-tier warns
+    enum_vals = {s.value for s in StrategyName}
+    dormant_vals = {e.name.value for e in _REGISTRY if e.status is Status.DORMANT}
+    for tier_name, enabled in _load_tier_enabled_lists(tiers_path).items():
+        # Wildcard tiers (["*"]) expand to registry ACTIVE downstream and so
+        # can never name an undeclared strategy — exempt from the check.
+        if any(x.strip() == "*" for x in enabled):
+            continue
+        undeclared = sorted(s for s in enabled if s not in enum_vals)
+        if undeclared:
+            raise RegistryConsistencyError(
+                f"strategy registry: tier {tier_name!r} enables undeclared "
+                f"strategies {undeclared} — every name in a per-tier "
+                "enabled_strategies list must be a declared StrategyName "
+                "(fix the typo or remove the stale name from config/tiers.json)."
+            )
+        for s in enabled:
+            if s in dormant_vals:
+                warnings.warn(
+                    f"strategy registry: tier {tier_name!r} enables dormant "
+                    f"strategy {s!r} — enabled but will not trade (no weight) "
+                    "until activated.",
+                    stacklevel=2,
+                )

@@ -13,6 +13,7 @@ three-way drift (enum 18 / tier 17 / weights 16):
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import pytest
@@ -168,3 +169,91 @@ def test_assert_fails_on_missing_weights_file(tmp_path: Path) -> None:
     missing = tmp_path / "does_not_exist.json"
     with pytest.raises(RegistryConsistencyError):
         assert_registry_consistency(weights_path=missing)
+
+
+# ---------------------------------------------------------------------------
+# Per-tier enabled_strategies validation (invariant 6 — the P1-1 blind spot)
+#
+# Three tiers (MICRO/STARTER/PRO_GROWTH) explicitly enable the DORMANT
+# strategy alpha_intraday_micro. That was previously silent; the guard now
+# (a) FAILS LOUD on an undeclared name in any explicit list, and
+# (b) emits a visible WARNING (not a failure) for a dormant-in-tier name.
+# Wildcard tiers (["*"]) expand to ACTIVE and are exempt from the check.
+# ---------------------------------------------------------------------------
+
+TIERS_PATH = REPO_ROOT / "config" / "tiers.json"
+
+
+def _write_tiers(path: Path, enabled_by_tier: dict) -> None:
+    """Write a minimal tiers.json carrying only the enabled_strategies lists
+    (the only field the registry guard reads)."""
+    doc = {
+        "schema_version": "tiers.test",
+        "tiers": {
+            name: {"enabled_strategies": lst}
+            for name, lst in enabled_by_tier.items()
+        },
+    }
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_per_tier_warns_on_dormant_micro_in_live_config() -> None:
+    """The live committed config enables dormant alpha_intraday_micro in
+    MICRO, STARTER and PRO_GROWTH — each must surface a visible UserWarning
+    (and the wildcard SCALE tier must NOT warn)."""
+    with pytest.warns(UserWarning) as record:
+        assert_registry_consistency()
+    dormant = [
+        str(w.message)
+        for w in record
+        if "dormant strategy 'alpha_intraday_micro'" in str(w.message)
+    ]
+    assert len(dormant) == 3, f"expected 3 dormant-in-tier warnings, got {dormant}"
+    tiers_warned = {
+        t for t in ("MICRO", "STARTER", "PRO_GROWTH")
+        if any(f"tier '{t}'" in m for m in dormant)
+    }
+    assert tiers_warned == {"MICRO", "STARTER", "PRO_GROWTH"}
+    assert all(
+        "enabled but will not trade (no weight) until activated" in m
+        for m in dormant
+    )
+    # SCALE is wildcard-expanded → exempt → never named in a dormant warning.
+    assert not any("tier 'SCALE'" in m for m in dormant)
+
+
+def test_per_tier_fails_loud_on_undeclared_name(tmp_path: Path) -> None:
+    """An undeclared (typo'd / removed) strategy in an explicit per-tier list
+    must trip the guard with a precise RegistryConsistencyError."""
+    bad = tmp_path / "tiers.json"
+    _write_tiers(bad, {"STARTER": ["alpha", "ghost_strategy"]})
+    with pytest.raises(RegistryConsistencyError) as exc:
+        assert_registry_consistency(tiers_path=bad)
+    msg = str(exc.value)
+    assert "tier" in msg.lower() and "undeclared" in msg.lower()
+    assert "ghost_strategy" in msg
+    assert "STARTER" in msg
+
+
+def test_per_tier_wildcard_is_exempt(tmp_path: Path) -> None:
+    """A wildcard tier (["*"]) must NOT trip the undeclared-name guard even
+    though "*" is not a declared StrategyName — it expands to ACTIVE."""
+    ok = tmp_path / "tiers.json"
+    _write_tiers(ok, {"SCALE": ["*"]})
+    # Would raise "undeclared strategies ['*']" if the exemption were missing.
+    assert_registry_consistency(tiers_path=ok)
+
+
+def test_per_tier_active_only_list_emits_no_warning(tmp_path: Path) -> None:
+    """An explicit list naming only ACTIVE strategies must NOT warn."""
+    ok = tmp_path / "tiers.json"
+    _write_tiers(ok, {"PRO": ["alpha", "beta", "delta"]})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning would become an exception
+        assert_registry_consistency(tiers_path=ok)
+
+
+def test_per_tier_missing_tiers_file_fails_loud(tmp_path: Path) -> None:
+    missing = tmp_path / "does_not_exist_tiers.json"
+    with pytest.raises(RegistryConsistencyError):
+        assert_registry_consistency(tiers_path=missing)
