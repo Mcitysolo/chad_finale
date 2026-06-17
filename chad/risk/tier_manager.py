@@ -55,6 +55,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from chad.strategy_registry import active_strategy_values
 from chad.utils.market_hours import market_is_open
 
 LOG = logging.getLogger("chad.risk.tier_manager")
@@ -88,26 +89,15 @@ _LEGACY_TIER_ALIASES: Dict[str, str] = {
 # (`enabled_strategies: ["*"]`) at publish time.  Downstream consumers
 # (e.g. dynamic_risk_allocator.load_tier_filter) match names against this
 # set, so emitting the literal "*" would filter out every strategy.
-# Kept in alphabetical order; matches the v9.1 16-strategy registry.
-_CANONICAL_STRATEGY_NAMES: List[str] = [
-    "alpha",
-    "alpha_crypto",
-    "alpha_futures",
-    "alpha_intraday",
-    "alpha_intraday_micro",
-    "alpha_options",
-    "beta",
-    "beta_trend",
-    "delta",
-    "delta_pairs",
-    "gamma",
-    "gamma_futures",
-    "gamma_reversion",
-    "omega",
-    "omega_macro",
-    "omega_momentum_options",
-    "omega_vol",
-]
+#
+# DERIVED (not hand-maintained) from the single canonical strategy registry
+# (chad.strategy_registry, status == active) so it can never again drift from
+# the weighted trading set.  This is the 16-strategy ACTIVE set, alphabetical.
+# alpha_intraday_micro is declared DORMANT in the registry (main track,
+# registered handler, 0 fills, NO weight) and is therefore intentionally NOT
+# tier-eligible — it carries no weight, so the allocator gives it cap=0 either
+# way and excluding it from the SCALE wildcard changes no fills.
+_CANONICAL_STRATEGY_NAMES: List[str] = list(active_strategy_values())
 
 
 def _expand_enabled_strategies(raw: Any) -> List[str]:

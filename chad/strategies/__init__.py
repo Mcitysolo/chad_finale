@@ -315,9 +315,22 @@ def register_core_strategies(engine: StrategyEngine) -> None:
     - Ignores StrategyName values that do not have a corresponding
       StrategyRegistration (future-proofing).
 
-    This function performs no I/O and has no side effects beyond calling
+    Before registering, this calls the canonical-registry startup guard
+    (`chad.strategy_registry.assert_registry_consistency`) so any drift
+    between the enum, the tier active set, and the weights config fails LOUD
+    at service init rather than silently mis-sizing allocations.
+
+    This function performs only read-only validation I/O (reading the
+    weights config) and otherwise has no side effects beyond calling
     `engine.register` with deterministic arguments.
     """
+    # Startup drift guard (single canonical strategy registry). Raises
+    # RegistryConsistencyError if any consumer has drifted; we want a hard,
+    # loud failure at init rather than a silently inconsistent trading set.
+    from chad.strategy_registry import assert_registry_consistency
+
+    assert_registry_consistency()
+
     for reg in iter_strategy_registrations():
         config = reg.build_config()
         engine.register(config, reg.handler)

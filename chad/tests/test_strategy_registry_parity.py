@@ -52,6 +52,7 @@ from chad.strategies import (
     active_strategy_names,
     deferred_strategy_names,
 )
+from chad.strategy_registry import active_strategy_values, dormant_strategy_values
 from chad.types import StrategyName
 
 
@@ -95,17 +96,35 @@ def test_enum_orphans_none() -> None:
     )
 
 
-def test_active_registry_matches_tier_canonical() -> None:
-    """The tier_manager wildcard-expansion list MUST equal the active registry."""
-    active = {s.value for s in active_strategy_names()}
+def test_tier_canonical_matches_registry_active() -> None:
+    """The tier_manager wildcard-expansion list MUST equal the canonical
+    registry's ACTIVE (status=active, weighted) set — the 16-strategy
+    trading set.
+
+    NOTE: this is the *trading* axis (16), not the handler-registration axis
+    (17). ``alpha_intraday_micro`` is a registered main-track handler but is
+    declared DORMANT in chad.strategy_registry (no weight, 0 fills), so it is
+    intentionally absent from the tier-eligible set. Since the tier list is
+    now DERIVED from the registry, this can never drift.
+    """
+    registry_active = set(active_strategy_values())
     tier = set(_CANONICAL_STRATEGY_NAMES)
-    only_in_active = active - tier
-    only_in_tier = tier - active
+    only_in_active = registry_active - tier
+    only_in_tier = tier - registry_active
     assert only_in_active == set() and only_in_tier == set(), (
-        "tier_manager._CANONICAL_STRATEGY_NAMES out of sync with active "
-        f"registry; only_in_active={sorted(only_in_active)} "
+        "tier_manager._CANONICAL_STRATEGY_NAMES out of sync with canonical "
+        f"registry ACTIVE set; only_in_active={sorted(only_in_active)} "
         f"only_in_tier={sorted(only_in_tier)}"
     )
+
+
+def test_registry_active_excludes_dormant_micro() -> None:
+    """alpha_intraday_micro is registered (17) but DORMANT — it must be in the
+    handler registry yet absent from both the weighted set and the tier set."""
+    assert "alpha_intraday_micro" in {s.value for s in active_strategy_names()}
+    assert "alpha_intraday_micro" not in set(active_strategy_values())
+    assert "alpha_intraday_micro" not in set(_CANONICAL_STRATEGY_NAMES)
+    assert "alpha_intraday_micro" in set(dormant_strategy_values())
 
 
 def test_weights_are_subset_of_active_registry() -> None:
