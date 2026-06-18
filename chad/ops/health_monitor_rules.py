@@ -4,6 +4,7 @@ Fast mechanical checks. No API call. Runs every cycle.
 """
 from __future__ import annotations
 import json
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,8 @@ from typing import List, Optional
 REPO_ROOT = Path("/home/ubuntu/chad_finale")
 RUNTIME = REPO_ROOT / "runtime"
 DATA = REPO_ROOT / "data"
+
+logger = logging.getLogger("chad.health_monitor_rules")
 
 
 def is_weekday() -> bool:
@@ -1148,5 +1151,25 @@ def run_all_rules() -> List[Finding]:
         try:
             fn(findings)
         except Exception as e:
-            pass  # rule failure never crashes the monitor
+            # A rule that raises must NOT be silently dropped — that is
+            # indistinguishable from a passing rule and leaves the monitor
+            # blind to whatever that rule checks. Catch it (one broken rule
+            # can't crash the engine), but surface it as a finding so the
+            # alert pipeline sees it. remedy_action="notify" routes through
+            # the safe no-op remedy (health_monitor_remediation.notify).
+            rule_name = getattr(fn, "__name__", repr(fn))
+            logger.error("HEALTH_RULE_ERROR rule=%s err=%s", rule_name, repr(e))
+            findings.append(Finding(
+                rule_id=f"RULE_ERROR:{rule_name}",
+                severity="ERROR",
+                title=f"Health rule raised: {rule_name}",
+                description=(
+                    f"Rule callable {rule_name}() raised an exception during "
+                    f"run_all_rules(). The check it performs did NOT run, so the "
+                    f"monitor is blind to that condition until the rule is fixed."
+                ),
+                remedy_type="NOTIFY_ONLY",
+                remedy_action="notify",
+                evidence=f"{rule_name} raised {repr(e)}",
+            ))
     return findings

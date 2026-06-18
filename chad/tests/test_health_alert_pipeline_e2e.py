@@ -220,3 +220,45 @@ def test_telegram_notify_dedupe_ttl_default_is_900s(monkeypatch):
 
     cfg = telegram_notify.load_config()
     assert cfg.dedupe_ttl_s == 900
+
+
+# ── Test 7 — a raising rule surfaces as a finding, not a silent drop ───────────
+
+def test_raising_rule_surfaces_as_error_finding(monkeypatch):
+    """Regression: run_all_rules() used to swallow a raising rule with a bare
+    `pass`, making a broken rule indistinguishable from a passing one. The fix
+    records the failure as an ERROR-severity Finding so it reaches the alert
+    pipeline. Patch one real rule in the iteration list to raise and prove the
+    engine (a) does not crash and (b) emits a finding naming that rule."""
+    import chad.ops.health_monitor_rules as rules
+
+    boom_msg = "synthetic rule explosion"
+
+    def _boom(findings):
+        raise RuntimeError(boom_msg)
+
+    # Carry the real rule's name so the surfaced finding reflects the rule that
+    # broke (the engine derives rule_id from fn.__name__).
+    _boom.__name__ = "rule_critical_services"
+
+    # The run_all_rules() list resolves bare rule names against the module
+    # globals at call time, so patching the attribute is picked up.
+    monkeypatch.setattr(rules, "rule_critical_services", _boom)
+
+    findings = rules.run_all_rules()
+
+    # Engine stayed resilient (returned a list) AND the broken rule was not
+    # silently dropped — it surfaces as an ERROR finding naming the rule.
+    err = [
+        f for f in findings
+        if f.severity == "ERROR" and f.rule_id == "RULE_ERROR:rule_critical_services"
+    ]
+    assert len(err) == 1, "raising rule must surface as a finding, not a silent drop"
+    f = err[0]
+    assert "rule_critical_services" in f.title
+    # repr(exc) is carried in evidence so the failure is diagnosable downstream.
+    assert "RuntimeError" in f.evidence
+    assert boom_msg in f.evidence
+    # Must route through the safe no-op remedy + pure-notification message shape.
+    assert f.remedy_action == "notify"
+    assert f.remedy_type == "NOTIFY_ONLY"
