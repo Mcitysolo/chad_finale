@@ -16,6 +16,8 @@
 **Lock type:** Full SSOT cut (the first full rewrite since v9.6). Tag: `SSOT_v9_7_2026-06-04`.
 **Live order posture:** No new live execution authorization granted by this document. `ready_for_live` = false.
 
+> Defense-board reconciliation (P0–P3) completed 2026-06-17 — see docs/DEFENSE_BOARD_RECONCILIATION_2026-06-17.md. All tiers reconciled; no active live exposure; ready_for_live remains FALSE.
+
 > **LOCK STATUS:** Drafted 2026-06-04 for operator review; **LOCKED 2026-06-04 by explicit operator GO**
 > (single-file commit + annotated tag `SSOT_v9_7_2026-06-04`). This file at
 > `docs/CHAD_UNIFIED_SSOT_v9.7_2026-06-04.md` is now the SSOT of record, superseding
