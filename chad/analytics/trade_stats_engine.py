@@ -54,6 +54,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from chad.analytics.futures_classifier import is_futures_row
+
 
 # -----------------------------
 # Repo root resolution (call-time)
@@ -649,6 +651,7 @@ def load_and_compute(
     excluded_manual = 0
     excluded_untrusted = 0
     excluded_validate_only = 0
+    excluded_futures = 0
 
     # Effective sample selection
     effective: List[ParsedTrade] = []
@@ -672,6 +675,14 @@ def load_and_compute(
             continue
         if _is_untrusted(tags, extra):
             excluded_untrusted += 1
+            continue
+        # item 5b: drop futures rows from the performance sample. Bug-B futures
+        # contamination otherwise inflates effective_trades and degrades the
+        # win_rate / sharpe_like / max_drawdown the SCR band is computed from.
+        # Dropped at the same point as pnl_untrusted; secType (when present) or
+        # symbol root both classify (chad.analytics.futures_classifier).
+        if is_futures_row(t.symbol, (extra or {}).get("secType")):
+            excluded_futures += 1
             continue
         if _is_unfilled_ibkr_paper(t):
             # Count as untrusted for performance purposes? keep separate? treat as untrusted-equivalent
@@ -716,6 +727,7 @@ def load_and_compute(
         # operator forensics.
         "excluded_untrusted": int(excluded_untrusted + excluded_quarantined),
         "excluded_validate_only": int(excluded_validate_only),
+        "excluded_futures": int(excluded_futures),
         "excluded_quarantined": int(excluded_quarantined),
         "excluded_pre_epoch": int(excluded_pre_epoch),
         "excluded_nonfinite": int(excluded_nonfinite),

@@ -75,13 +75,16 @@ def _untrusted_non_validate_only_payload(seq: int = 1):
 
 
 def _trusted_closed_payload(seq: int = 1, pnl: float = 12.5):
+    # Equity control row (a generic trusted closed trade). Uses an equity symbol
+    # so it survives the item-5b futures exclusion — the symbol is incidental to
+    # these validate-only tests.
     return {
-        "strategy": "alpha_futures",
-        "symbol": "MES",
+        "strategy": "alpha",
+        "symbol": "AAPL",
         "side": "SELL",
         "quantity": 1.0,
-        "fill_price": 5000.0,
-        "notional": 25000.0,
+        "fill_price": 250.0,
+        "notional": 250.0,
         "pnl": pnl,
         "entry_time_utc": "2099-01-01T00:00:00+00:00",
         "exit_time_utc": "2099-01-01T00:00:00+00:00",

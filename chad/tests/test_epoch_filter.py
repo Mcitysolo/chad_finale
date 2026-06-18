@@ -40,7 +40,7 @@ def _trade_record(
     pnl: float,
     exit_time_utc: str,
     strategy: str = "delta",
-    symbol: str = "MES",
+    symbol: str = "AAPL",
     extra_payload: dict | None = None,
 ) -> dict:
     payload = {

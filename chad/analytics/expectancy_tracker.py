@@ -13,6 +13,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
+from chad.analytics.futures_classifier import is_futures_row
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 TRADES_GLOB = os.path.join(REPO_ROOT, "data", "trades", "trade_history_*.ndjson")
 PNL_STATE = os.path.join(REPO_ROOT, "runtime", "pnl_state.json")
@@ -80,6 +82,14 @@ def _iter_trades():
                     if isinstance(tags, list) and (
                         "pnl_untrusted" in tags or "historical_pre_rebuild" in tags
                     ):
+                        continue
+                    # item 5b: drop futures rows so expectancy_state.json agrees
+                    # with the SCR effective sample (same classifier). Bug-B
+                    # futures contamination must not feed winner_scaling /
+                    # strategy_health via per-strategy expectancy.
+                    _extra = payload.get("extra") or {}
+                    _sec_type = _extra.get("secType") if isinstance(_extra, dict) else None
+                    if is_futures_row(payload.get("symbol"), _sec_type):
                         continue
                     yield payload
         except FileNotFoundError:
