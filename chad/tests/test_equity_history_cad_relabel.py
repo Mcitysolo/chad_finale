@@ -7,12 +7,13 @@ Pins the (b) equity relabel:
   ``*_cad`` keys, and ADDS forward-only authoritative ``*_usd`` fields sourced
   from the snapshot's (a) fields. The USD fields are fail-closed: null when
   ``usd_ok`` is false, NEVER a CAD fallback.
-* The drawdown chain (chad.risk.drawdown_guard) and the withdrawal chain
-  (chad.risk.withdrawal_manager) read the CONTINUOUS CAD series — preferring
-  ``total_equity_cad`` and falling back to the legacy ``total_equity_usd``
-  (which historically held the same CAD figure). Relabeling therefore does NOT
-  introduce a phantom drawdown discontinuity, and the new true-USD
-  ``total_equity_usd`` value never feeds the currency-agnostic drawdown math.
+* The drawdown chain (chad.risk.drawdown_guard) reads the CONTINUOUS CAD series
+  — preferring ``total_equity_cad`` and falling back to the legacy
+  ``total_equity_usd`` (which historically held the same CAD figure) — so the
+  relabel does NOT introduce a phantom drawdown discontinuity there.
+* The withdrawal chain (chad.risk.withdrawal_manager) now reads the true-USD v2
+  ``total_equity_usd`` column (``usd_ok`` rows only); CAD / pre-v2 rows are
+  skipped fail-closed, so the salary HWM is genuine USD, never a CAD peak.
 
 Report-only surface — no execution path is exercised here.
 """
@@ -222,25 +223,27 @@ def test_drawdown_v2_usd_ok_false_unaffected(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_withdrawal_hwm_uses_cad_series_not_true_usd():
-    """compute_authorization HWM must come from the CAD series, not the new
-    true-USD total_equity_usd value on v2 rows."""
+def test_withdrawal_hwm_uses_true_usd_v2_series():
+    """compute_authorization HWM must come from the v2 true-USD
+    ``total_equity_usd`` column (usd_ok rows only), NOT the CAD peak."""
     pol = dict(DEFAULT_POLICY)
     history = [
         {"ts_utc": "2026-04-01T00:00:00Z", "total_equity_cad": 200000.0, "total_equity_usd": 140000.0, "usd_ok": True},
         {"ts_utc": "2026-04-02T00:00:00Z", "total_equity_cad": 190000.0, "total_equity_usd": 133000.0, "usd_ok": True},
     ]
     out = compute_authorization(
-        current_equity=190000.0, history=history, scr_state="CONFIDENT", policy=pol
+        current_equity=140000.0, history=history, scr_state="CONFIDENT", policy=pol
     )
-    # HWM from CAD peak (200k), not the true-USD peak (140k).
-    assert out.high_water_mark_usd == pytest.approx(200000.0)
+    # HWM from the true-USD peak (140k), not the CAD peak (200k).
+    assert out.high_water_mark_usd == pytest.approx(140000.0)
+    assert out.high_water_mark_currency == "USD"
+    assert out.high_water_mark_currency_ok is True
 
 
 def test_withdrawal_no_crash_on_v2_null_usd_rows():
-    """v2 rows with usd_ok false carry total_equity_usd=None. The legacy direct
-    float(r['total_equity_usd']) would have raised; the CAD-preferring accessor
-    must read total_equity_cad and not crash."""
+    """v2 rows with usd_ok false carry total_equity_usd=None and are SKIPPED
+    (fail-closed). With no usable USD row, HWM falls back to current_equity —
+    no crash, and never a CAD value mislabeled as USD."""
     pol = dict(DEFAULT_POLICY)
     history = [
         {"ts_utc": "2026-04-01T00:00:00Z", "total_equity_cad": 200000.0, "total_equity_usd": None, "usd_ok": False},
@@ -249,12 +252,13 @@ def test_withdrawal_no_crash_on_v2_null_usd_rows():
     out = compute_authorization(
         current_equity=195000.0, history=history, scr_state="CONFIDENT", policy=pol
     )
-    assert out.high_water_mark_usd == pytest.approx(200000.0)
+    assert out.high_water_mark_usd == pytest.approx(195000.0)
 
 
-def test_withdrawal_legacy_rows_still_work():
-    """Legacy v1 rows (total_equity_usd holding CAD) keep working unchanged via
-    the fallback path."""
+def test_withdrawal_legacy_v1_rows_skipped_no_crash():
+    """Legacy v1 rows (total_equity_usd holding CAD, no usd_ok marker) are now
+    SKIPPED for the USD HWM — never treated as USD. With no v2 USD rows the HWM
+    fails closed to current_equity; no crash, no CAD-as-USD leak."""
     pol = dict(DEFAULT_POLICY)
     history = [
         {"ts_utc": "2026-04-01T00:00:00Z", "total_equity_usd": 200000.0},
@@ -263,4 +267,4 @@ def test_withdrawal_legacy_rows_still_work():
     out = compute_authorization(
         current_equity=190000.0, history=history, scr_state="CONFIDENT", policy=pol
     )
-    assert out.high_water_mark_usd == pytest.approx(200000.0)
+    assert out.high_water_mark_usd == pytest.approx(190000.0)

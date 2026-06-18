@@ -21,8 +21,12 @@ OUTPUT:
   - runtime/withdrawal_authorization.json
     {
       "phase": "BUILD" | "GROW" | "PAY",
-      "current_equity_usd": float,
-      "high_water_mark_usd": float,
+      "current_equity_usd": float,        # genuine USD (total_equity_usd_authoritative)
+      "current_equity_currency": "USD",
+      "current_equity_currency_ok": bool,
+      "high_water_mark_usd": float,       # genuine USD (v2 total_equity_usd peak)
+      "high_water_mark_currency": "USD",
+      "high_water_mark_currency_ok": bool,
       "drawdown_from_hwm_pct": float,
       "spendable_surplus_usd": float,
       "authorized_withdrawal_usd": float,
@@ -109,26 +113,27 @@ def _read_equity_history() -> List[Dict[str, Any]]:
     return out
 
 
-def _row_equity_cad(row: Dict[str, Any]) -> float:
-    """Continuity-safe per-row equity read for the HWM / drawdown math.
+def _row_equity_usd(row: Dict[str, Any]) -> Optional[float]:
+    """True-USD per-row equity for the HWM / drawdown math (equity_history.v2).
 
-    Prefers the honest ``total_equity_cad`` key (equity_history.v2); falls back
-    to the legacy ``total_equity_usd`` key, which historically carried the same
-    broker-native CAD figure. Both are the same CAD basis, so the series stays
-    continuous across the v1->v2 relabel (no phantom drawdown discontinuity).
-    The new v2 ``total_equity_usd`` (true USD / null) is never reached here
-    because v2 rows always carry ``total_equity_cad``. Missing/non-numeric -> 0.0
-    (matches the prior ``r.get(..., 0.0)`` behaviour).
+    Returns the genuine-USD ``total_equity_usd`` value ONLY when the row carries
+    ``usd_ok: true`` and a numeric value (v2 rows). Pre-v2 rows — whose
+    ``total_equity_usd`` historically held the broker-native CAD figure and which
+    lack the ``usd_ok`` marker — and v2 rows with ``usd_ok: false`` (where
+    ``total_equity_usd`` is null) are SKIPPED -> ``None``. FAIL-CLOSED: the HWM is
+    never contaminated by a CAD value mislabeled as USD; callers must drop
+    ``None`` rows. NOTE: this fixes the CURRENCY of the HWM, not the historical
+    futures-runaway contamination of the equity series itself (a separate step).
     """
-    for k in ("total_equity_cad", "total_equity_usd"):
-        v = row.get(k)
-        if v is None:
-            continue
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            continue
-    return 0.0
+    if row.get("usd_ok") is not True:
+        return None
+    v = row.get("total_equity_usd")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _load_policy() -> Dict[str, Any]:
@@ -153,6 +158,12 @@ class WithdrawalAuthorization:
     history_days: int
     reason: str
     ts_utc: str
+    # Currency provenance tags (mirror portfolio_snapshot / dynamic_caps pattern).
+    # These fields are now genuine USD (driven by total_equity_usd_authoritative).
+    current_equity_currency: str = "USD"
+    current_equity_currency_ok: bool = True
+    high_water_mark_currency: str = "USD"
+    high_water_mark_currency_ok: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -174,21 +185,26 @@ def compute_authorization(
     require_confident = bool(policy["require_scr_confident"])
     min_history = int(policy["minimum_history_days"])
 
-    # Compute high water mark from history (continuous CAD series)
+    # Compute high water mark from history (true-USD v2 series; CAD/pre-v2 rows
+    # are skipped — see _row_equity_usd). ``current_equity`` is the authoritative
+    # USD figure from main(), so HWM and drawdown are USD-vs-USD throughout. If no
+    # usable USD rows exist, fail closed to current_equity (never a CAD peak).
     if history:
-        equities = [_row_equity_cad(r) for r in history]
-        hwm = max(equities)
+        equities = [e for e in (_row_equity_usd(r) for r in history) if e is not None]
+        hwm = max(equities) if equities else current_equity
     else:
         hwm = current_equity
 
-    # Compute drawdown over lookback window
+    # Compute drawdown over lookback window (true-USD rows only)
     cutoff = datetime.now(timezone.utc) - timedelta(days=dd_lookback)
     recent = []
     for r in history:
         try:
             ts = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
             if ts > cutoff:
-                recent.append(_row_equity_cad(r))
+                e = _row_equity_usd(r)
+                if e is not None:
+                    recent.append(e)
         except Exception:
             continue
     recent.append(current_equity)
@@ -278,6 +294,10 @@ def compute_authorization(
         history_days=len(history),
         reason=" | ".join(reasons),
         ts_utc=_utc_now_iso(),
+        current_equity_currency="USD",
+        current_equity_currency_ok=True,
+        high_water_mark_currency="USD",
+        high_water_mark_currency_ok=True,
     )
 
 
@@ -291,11 +311,22 @@ def main() -> int:
     if not snap:
         LOG.error("portfolio_snapshot_missing — withdrawal manager cannot run")
         return 1
-    current_equity = (
-        float(snap.get("ibkr_equity", 0.0))
-        + float(snap.get("kraken_equity", 0.0))
-        + float(snap.get("coinbase_equity", 0.0))
-    )
+    # The salary/withdrawal view is denominated in USD (seed, HWM, salary cap).
+    # Drive it EXCLUSIVELY by the authoritative USD equity
+    # (portfolio_snapshot_publisher: total_equity_usd_authoritative + usd_ok),
+    # mirroring chad/risk/tier_manager.py. FAIL-CLOSED: if usd_ok is false — or
+    # the field is absent / not numeric — HOLD the last published authorization
+    # and do NOT republish. We must NEVER fall back to the CAD component sum.
+    usd_ok = bool(snap.get("usd_ok", False))
+    total_usd = snap.get("total_equity_usd_authoritative")
+    if not (usd_ok and isinstance(total_usd, (int, float))):
+        LOG.warning(
+            "WITHDRAWAL_HELD_NO_USD_RATE usd_ok=%s total_usd=%s "
+            "(no authoritative USD equity; holding prior authorization, CAD never used)",
+            usd_ok, total_usd,
+        )
+        return 0
+    current_equity = float(total_usd)
 
     history = _read_equity_history()
 

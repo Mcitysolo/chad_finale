@@ -225,20 +225,29 @@ def _compound_metrics(
     }
 
 
-def build_payload() -> Dict[str, Any]:
+def build_payload() -> Optional[Dict[str, Any]]:
     withdrawal = _read_json(WITHDRAWAL_PATH)
     snap = _read_json(SNAPSHOT_PATH)
     scr = _read_json(SCR_PATH)
     history = _read_history()
 
-    if snap:
-        current_equity = (
-            float(snap.get("ibkr_equity", 0.0))
-            + float(snap.get("kraken_equity", 0.0))
-            + float(snap.get("coinbase_equity", 0.0))
+    # The business view is denominated in USD (seed, salary, and HWM are all
+    # USD). It is driven EXCLUSIVELY by the authoritative USD equity
+    # (portfolio_snapshot_publisher: total_equity_usd_authoritative + usd_ok),
+    # mirroring chad/risk/tier_manager.py. FAIL-CLOSED: if usd_ok is false — or
+    # the field is absent / not numeric (FX unavailable, stale snapshot) — HOLD
+    # the last published business_phase.json (return None; main() does NOT
+    # republish). We must NEVER fall back to the CAD component sum or a null USD.
+    usd_ok = bool(snap.get("usd_ok", False))
+    total_usd = snap.get("total_equity_usd_authoritative")
+    if not (usd_ok and isinstance(total_usd, (int, float))):
+        LOG.warning(
+            "BUSINESS_PHASE_HELD_NO_USD_RATE usd_ok=%s total_usd=%s "
+            "(no authoritative USD equity; holding prior business_phase, CAD never used)",
+            usd_ok, total_usd,
         )
-    else:
-        current_equity = float(withdrawal.get("current_equity_usd", 0.0))
+        return None
+    current_equity = float(total_usd)
 
     seed = float(withdrawal.get("seed_capital_usd", 50000.0))
     hwm = float(withdrawal.get("high_water_mark_usd", current_equity))
@@ -269,6 +278,8 @@ def build_payload() -> Dict[str, Any]:
         "phase": phase,
         "phase_description": description,
         "current_equity_usd": round(current_equity, 2),
+        "current_equity_currency": "USD",
+        "current_equity_currency_ok": True,
         "seed_capital_usd": round(seed, 2),
         "growth_pct_from_seed": round(growth_pct, 2),
         "days_in_phase": days_in_phase,
@@ -284,6 +295,11 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     payload = build_payload()
+    if payload is None:
+        # FAIL-CLOSED / HOLD-PRIOR (mirror tier_manager): no authoritative USD
+        # equity available — leave the last published business_phase.json intact.
+        LOG.warning("business_phase_held — no authoritative USD equity; prior file kept")
+        return 0
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     tmp = OUT_PATH.with_suffix(".json.tmp")

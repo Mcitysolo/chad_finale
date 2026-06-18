@@ -76,7 +76,11 @@ def _policy(**overrides: Any) -> Dict[str, Any]:
 
 
 def _history(days: int, equity: float) -> List[Dict[str, Any]]:
-    """Build a synthetic equity history of N days at flat equity."""
+    """Build a synthetic equity history of N days at flat equity.
+
+    Rows are tagged ``usd_ok: True`` so the figures are genuine-USD v2 rows —
+    the only form the withdrawal HWM accessor (_row_equity_usd) accepts.
+    """
     from datetime import datetime, timedelta, timezone
 
     base = datetime.now(timezone.utc) - timedelta(days=max(days - 1, 0))
@@ -84,6 +88,7 @@ def _history(days: int, equity: float) -> List[Dict[str, Any]]:
         {
             "ts_utc": (base + timedelta(days=i)).isoformat().replace("+00:00", "Z"),
             "total_equity_usd": float(equity),
+            "usd_ok": True,
         }
         for i in range(days)
     ]
@@ -243,7 +248,7 @@ def test_salary_withdrawal_requires_pay_phase():
 
     # Below HWM → GROW override, $0.
     below_hwm_history = _history(20, 90_000.0) + [
-        {"ts_utc": "2099-01-01T00:00:00Z", "total_equity_usd": 200_000.0}
+        {"ts_utc": "2099-01-01T00:00:00Z", "total_equity_usd": 200_000.0, "usd_ok": True}
     ]
     below_hwm = compute_authorization(
         current_equity=100_000.0,
@@ -257,7 +262,7 @@ def test_salary_withdrawal_requires_pay_phase():
     # Drawdown > 5% within lookback → GROW override, $0.
     dd_history = (
         _history(15, 100_000.0)
-        + [{"ts_utc": "2099-01-01T00:00:00Z", "total_equity_usd": 110_000.0}]
+        + [{"ts_utc": "2099-01-01T00:00:00Z", "total_equity_usd": 110_000.0, "usd_ok": True}]
     )
     drawdown = compute_authorization(
         current_equity=100_000.0,  # 9.09% off recent peak of 110k
@@ -418,19 +423,23 @@ def test_salary_withdrawal_writes_proposal_not_transfer(tmp_path, monkeypatch):
         "ibkr_equity": 100_000.0,
         "kraken_equity": 0.0,
         "coinbase_equity": 0.0,
+        # New contract: main() reads the authoritative USD figure (fail-closed on
+        # usd_ok), never the broker-native CAD component sum.
+        "total_equity_usd_authoritative": 100_000.0,
+        "usd_ok": True,
         "ts_utc": "2026-05-04T00:00:00Z",
     }
     (runtime_dir / "portfolio_snapshot.json").write_text(json.dumps(snap))
     (runtime_dir / "scr_state.json").write_text(json.dumps({"state": "WARMUP"}))
 
-    # Synthesize a 14-day history.
+    # Synthesize a 14-day history (true-USD v2 rows).
     from datetime import datetime, timedelta, timezone
 
     base = datetime.now(timezone.utc) - timedelta(days=14)
     lines = []
     for i in range(15):
         ts = (base + timedelta(days=i)).isoformat().replace("+00:00", "Z")
-        lines.append(json.dumps({"ts_utc": ts, "total_equity_usd": 100_000.0}))
+        lines.append(json.dumps({"ts_utc": ts, "total_equity_usd": 100_000.0, "usd_ok": True}))
     (runtime_dir / "equity_history.ndjson").write_text("\n".join(lines))
 
     out_path = runtime_dir / "withdrawal_authorization.json"
