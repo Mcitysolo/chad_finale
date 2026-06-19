@@ -18,6 +18,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -169,7 +170,7 @@ class ExecStateStore:
         now = _utc_now_iso()
         qty = float(quantity)
 
-        with self._connect() as con:
+        with contextlib.closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE;")
             con.execute(
                 """
@@ -238,7 +239,7 @@ class ExecStateStore:
 
     def bump_submit_attempt(self, *, idempotency_key: str) -> int:
         now = _utc_now_iso()
-        with self._connect() as con:
+        with contextlib.closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE;")
             con.execute(
                 "UPDATE exec_state SET submit_attempts = submit_attempts + 1, updated_at_utc=? WHERE idempotency_key=?",
@@ -253,7 +254,7 @@ class ExecStateStore:
 
     def mark_submitted(self, *, idempotency_key: str, broker_order_id: str) -> None:
         now = _utc_now_iso()
-        with self._connect() as con:
+        with contextlib.closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE;")
             con.execute(
                 """
@@ -267,7 +268,7 @@ class ExecStateStore:
 
     def mark_error(self, *, idempotency_key: str, err: str) -> None:
         now = _utc_now_iso()
-        with self._connect() as con:
+        with contextlib.closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE;")
             con.execute(
                 "UPDATE exec_state SET status=?, last_error=?, updated_at_utc=? WHERE idempotency_key=?",
