@@ -1,5 +1,17 @@
 # Pending Action — Bug A (L1): root-fix the per-call event-loop/fd leak in ibkr_adapter
-Date: 2026-06-04  •  Author: TEAM CHAD (issued) / SOLO (executes)  •  Status: PENDING operator GO  •  Priority: HIGH (the leak's only current mask is the Bug B env gate — see §5)
+Date: 2026-06-04  •  Author: TEAM CHAD (issued) / SOLO (executes)  •  Status: IMPLEMENTED / LANDED (2026-06-19)  •  Priority: HIGH (the leak's only current mask is the Bug B env gate — see §5)
+
+## 0. Implementation status (2026-06-19) — LANDED
+The original scope of this PA was L-01/L-02 only (the executor / event-loop leak in ibkr_adapter._call_with_timeout). On GO the scope was extended to the **full leak class** surfaced by the 2026-06-09 fd-leak audit (L-03/L-04/L-05), and all four items have landed; two are also live (services restarted):
+
+| Item | Leak site | Commit | State |
+|------|-----------|--------|-------|
+| L-01/L-02 | executor / event-loop (ibkr_adapter._call_with_timeout, shared bounded broker executor) | 275acff | **LANDED + LIVE** — live-loop + orchestrator restarted; epoll fds 19 → 1 |
+| L-03 | `_SQLiteIdempotencyStore` per-call SQLite connection (fd leak on order-submit hot path) | ce9fad7 | **LANDED** |
+| L-04 | kraken_executor `ExecStateStore` per-call SQLite connection (twin of L-03) | 710e262 | **LANDED** |
+| L-05 | backend ai_surface `GPTClient` per-request Session/socket leak (now a process singleton) | 87c002f | **LANDED + LIVE** — backend restarted |
+
+The `CHAD_DISABLE_FUTURES_EXECUTION` env-gate (the Bug B mask, §5) **REMAINS ON** as defense-in-depth. This fix removes the leak's load-bearing role but does NOT unlock futures re-enable: removing the env-gate is a separate future decision (Bug B disposition), explicitly NOT granted by this PA. This PA does not mark `ready_for_live` and removes no gate.
 
 ## 1. Objective
 Root-fix the event-loop / file-descriptor leak behind the 2026-05-30 fd-exhaustion (Errno 24) silent freeze. Replace per-broker-call thread+loop minting in ibkr_adapter._call_with_timeout with one bounded module-level executor, so loop/fd count stays constant regardless of broker-call volume. Retires the LimitNOFILE band-aid's load-bearing role.
@@ -41,3 +53,4 @@ Mechanical loop-count assertion: count `anon_inode:[eventpoll]` entries under /p
 ## 10. Status log
 - 2026-06-04: authored from L1/Bug A read-first (leak DORMANT not fixed; root cause = per-call thread+loop mint in ibkr_adapter._call_with_timeout; mask = Bug B env gate). PENDING operator GO.
 - 2026-06-07: refined with audit deltas — router-twin shared-module extraction (§3/§4), retry-amplification note (§3), executor size pinned + lifecycle (§4), pool-saturation log marker (§4), mechanical epoll-fd assertion (§8). Status unchanged: PENDING operator GO.
+- 2026-06-19: **IMPLEMENTED / LANDED.** Scope extended from L-01/L-02 to the full 2026-06-09 leak class (L-01/L-02 executor → 275acff, LIVE [live-loop + orchestrator restarted, epoll 19→1]; L-03 _SQLiteIdempotencyStore → ce9fad7; L-04 kraken ExecStateStore → 710e262; L-05 backend GPTClient session → 87c002f, LIVE [backend restarted]). CHAD_DISABLE_FUTURES_EXECUTION env-gate REMAINS ON as defense-in-depth (removal is a separate future decision, not unlocked here). No `ready_for_live` flip; no gate removed. See §0.
