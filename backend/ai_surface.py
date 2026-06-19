@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import time
@@ -101,8 +102,14 @@ class ResearchResponse(BaseModel):
 # ------------------------------------------------------------
 router = APIRouter(prefix="/ai", tags=["ai"])
 
+@functools.lru_cache(maxsize=1)
 def _client() -> GPTClient:
     # Loads /etc/chad/openai.env internally (best-effort) and enforces rate limits.
+    # L-05 fix: return ONE process-lifetime GPTClient so a single requests.Session
+    # (gpt_client.py:238) is reused across requests, instead of leaking a fresh,
+    # never-closed keep-alive Session per call (open sockets on the long-lived
+    # backend). lru_cache does NOT cache exceptions, so a failed construction
+    # (e.g. missing OPENAI_API_KEY) is retried on the next call.
     return GPTClient()
 
 @router.get("", include_in_schema=False)
