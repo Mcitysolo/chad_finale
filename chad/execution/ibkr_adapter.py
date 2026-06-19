@@ -29,6 +29,7 @@ Key properties
     - IbkrAdapter.submit_routed_signals(...)
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -829,7 +830,7 @@ class _SQLiteIdempotencyStore:
         return conn
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        with contextlib.closing(self._connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ibkr_exec_state (
@@ -845,7 +846,7 @@ class _SQLiteIdempotencyStore:
             )
 
     def claim(self, key: str, payload: Mapping[str, Any], now: datetime) -> bool:
-        with self._lock, self._connect() as conn:
+        with self._lock, contextlib.closing(self._connect()) as conn:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO ibkr_exec_state (
@@ -866,7 +867,7 @@ class _SQLiteIdempotencyStore:
             return cur.rowcount == 1
 
     def mark(self, key: str, *, status: str, broker_order_id: Optional[int], result: Mapping[str, Any], now: datetime) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, contextlib.closing(self._connect()) as conn:
             conn.execute(
                 """
                 UPDATE ibkr_exec_state
@@ -883,7 +884,7 @@ class _SQLiteIdempotencyStore:
             )
 
     def get(self, key: str) -> Optional[Mapping[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, contextlib.closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT idempotency_key, status, created_at_utc, updated_at_utc,
@@ -945,7 +946,7 @@ class _SQLiteIdempotencyStore:
              defensively as STILL_ACTIVE (return False) — the caller must
              have wired the probe in production.
         """
-        with self._lock, self._connect() as conn:
+        with self._lock, contextlib.closing(self._connect()) as conn:
             # Step 1 — fresh row.
             cur = conn.execute(
                 """
