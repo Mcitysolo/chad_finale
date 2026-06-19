@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
-import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 import os
 
+from chad.execution.broker_executor import BrokerCallTimeout, call_with_timeout
 from chad.execution.futures_gate import futures_execution_disabled, is_futures_sec_type
 
 LOGGER = logging.getLogger("chad.execution.ibkr_trade_router")
@@ -17,33 +17,27 @@ _BROKER_TIMEOUT_S = 10.0
 
 
 def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout_s: float = _BROKER_TIMEOUT_S, label: str = "broker_call") -> Any:
-    """Run *fn(*args)* in a daemon thread with a hard wall-clock timeout."""
-    result_box: list = []
-    error_box: list = []
+    """Run *fn(*args)* on the shared bounded broker executor with a hard
+    wall-clock timeout (Bug A L-02 root fix — twin of ibkr_adapter; see
+    chad/execution/broker_executor.py).
 
-    def _target() -> None:
-        try:
-            result_box.append(fn(*args))
-        except BaseException as exc:
-            error_box.append(exc)
+    Each executor worker holds ONE persistent event loop, so ib_async's sync
+    util.run() reuses it instead of minting (and, on timeout, leaking) a fresh
+    loop per call.
 
-    worker = threading.Thread(target=_target, daemon=True)
-    worker.start()
-    worker.join(timeout=timeout_s)
-
-    if worker.is_alive():
+    On timeout: logs TIMEOUT classification and raises TimeoutError.
+    On inner exception: re-raises as-is so the caller can classify.
+    """
+    try:
+        return call_with_timeout(fn, *args, timeout_s=timeout_s, label=label)
+    except BrokerCallTimeout as exc:
         LOGGER.error(
             "ibkr.broker_call_timeout",
             extra={"label": label, "timeout_s": timeout_s, "failure_class": "TIMEOUT"},
         )
         raise TimeoutError(
             f"Broker call {label!r} exceeded {timeout_s}s liveness deadline — failure_class=TIMEOUT"
-        )
-
-    if error_box:
-        raise error_box[0]
-
-    return result_box[0] if result_box else None
+        ) from exc
 
 
 @dataclass(frozen=True)
