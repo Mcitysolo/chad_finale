@@ -2322,6 +2322,32 @@ def run_once(logger: logging.Logger) -> None:
                 )
                 mark_position_open(intent)
 
+            # Soak ENTRY-intent audit (PA SOAK_STATUS_HISTORY_WRITER 2026-06-20,
+            # companion #3). Best-effort + isolated observer placed just before
+            # the broker submit: classify the intent exactly as the branch tree
+            # above did, then append one soak_entry_intent.v1 row (admitted=True
+            # — it reached submission). Writes only under data/soak/; the writer
+            # never raises into the host and this try/except is redundant cover
+            # so a failure can never block the submit.
+            try:
+                from chad.ops.soak.evidence_writers import (
+                    classify_intent_type as _soak_classify_intent_type,
+                    emit_entry_intent_audit as _soak_emit_entry_intent,
+                )
+                _soak_emit_entry_intent(
+                    intent_type=_soak_classify_intent_type(
+                        is_exit=_intent_is_exit,
+                        is_flip=is_flip_signal(intent),
+                        side=_side_str,
+                    ),
+                    symbol=getattr(intent, "symbol", None),
+                    side=getattr(intent, "side", None),
+                    strategy=getattr(intent, "strategy", None),
+                    admitted=True,
+                )
+            except Exception:
+                pass
+
             # --- Submit to IBKR adapter and record paper evidence ---
             try:
                 _ensure_thread_event_loop()

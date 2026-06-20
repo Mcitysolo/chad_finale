@@ -722,6 +722,24 @@ def publish_once(*, repo_root: Path, runtime_dir: Path, data_dir: Path) -> None:
     LOG.info("published trade_lifecycle_state=%s ttl=%ss", lifecycle_path, ttl_lifecycle)
     LOG.info("published positions_truth=%s ttl=%ss truth_ok=%s", truth_path, ttl_truth, truth_payload.get("truth_ok"))
 
+    # Soak status-history writer (PA SOAK_STATUS_HISTORY_WRITER_2026-06-20, Option C).
+    # Best-effort + isolated observer: runs LAST, only AFTER both authority
+    # artifacts are durably written above (:719-720), and reads the just-written
+    # positions_truth.json. The writer itself never raises into the host; this
+    # second try/except is defense-in-depth (mirrors reconciliation_publisher.py)
+    # so a history-write failure can never corrupt, delay, or alter the 60s
+    # publisher's primary job. Pure observer — writes only under data/soak/.
+    try:
+        from chad.ops.soak.evidence_writers import emit_status_history as _soak_emit_status_history
+        _soak_emit_status_history(
+            repo_root=repo_root,
+            runtime_dir=runtime_dir,
+            data_dir=data_dir,
+            truth_path=truth_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("soak status_history emit failed (best-effort, ignored): %s", exc)
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Publish SSOT v5.0 trade_lifecycle_state + positions_truth (bootstrap).")

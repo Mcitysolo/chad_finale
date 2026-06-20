@@ -208,6 +208,18 @@ class SignalRouter:
 
         # Stable ordering: symbol then side
         routed.sort(key=lambda rs: (rs.symbol, rs.side.value))
+
+        # Soak signal-router emission audit (PA SOAK_STATUS_HISTORY_WRITER
+        # 2026-06-20, companion #2). Best-effort + isolated observer: one
+        # soak_signal_router.v1 row per RoutedSignal, written only under
+        # data/soak/. The writer never raises into the host; this try/except is
+        # belt-and-suspenders so routing output is never perturbed.
+        try:
+            from chad.ops.soak.evidence_writers import emit_signal_router_emissions as _soak_emit_router
+            _soak_emit_router(routed)
+        except Exception:
+            pass
+
         return routed
 # -----------------------------
 # Backwards-compatible functional entrypoint
