@@ -184,6 +184,55 @@ def test_dry_run_default_mutates_nothing(tmp_path, capsys):
     assert not (runtime / ERB.MARKER_FILENAME).exists()
 
 
+def test_dry_run_reports_truthful_would_archive_bytes(tmp_path, capsys):
+    """Regression for the 'bytes to archive: 0' display artifact: dry-run never
+    ran execute_plan, so every actionable a.bytes was None and the summed total
+    rendered as 0 despite real content. The preview must now stat each target and
+    report a truthful, non-zero would-preserve total — split copy vs fence — and
+    that total must equal exactly what APPLY archives on the same fixture."""
+    runtime, data_trades = make_dirty(tmp_path)
+
+    rc = ERB.main(_base_args(runtime, data_trades) + ["--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+
+    # --- parse the dry-run JSON block (printed after the rendered plan) ---
+    jstart = out.index("\n{", out.index("DRY-RUN")) if "DRY-RUN" in out else out.index("\n{")
+    payload = json.loads(out[jstart:])
+    pv = payload["would_preserve_bytes"]
+
+    # headline regression: both legs are non-zero (the bug rendered 0)
+    assert pv["to_archive_dir"] > 0
+    assert pv["fenced_in_place"] > 0
+    assert pv["total"] == pv["to_archive_dir"] + pv["fenced_in_place"]
+
+    # the rendered human summary must echo the same non-zero total, not 0
+    assert f"bytes preserved total   : {pv['total']:,}" in out
+    assert "bytes to archive : 0" not in out
+
+    # --- independent ground truth from a freshly built plan over the fixture ---
+    ctx = ERB.resolve_context(ERB.build_arg_parser().parse_args(
+        _base_args(runtime, data_trades)))
+    plan = ERB.build_plan(ctx, CURRENT_EPOCH, EXPECTED_TARGET)
+    assert all(a.bytes is None for a in plan)  # dry-run plan never stats (root cause)
+    exp_copy = sum(a.src.stat().st_size for a in plan
+                   if a.archive_mode == "copy" and a.status in ("PLANNED", "DONE"))
+    exp_fence = sum(a.src.stat().st_size for a in plan
+                    if a.archive_mode == "rename_in_place" and a.status in ("PLANNED", "DONE"))
+    assert (pv["to_archive_dir"], pv["fenced_in_place"]) == (exp_copy, exp_fence)
+    assert ERB.plan_preserved_bytes(plan) == (exp_copy, exp_fence)
+
+    # --- preview must equal what APPLY actually preserves on the same fixture ---
+    assert ERB.main(_base_args(runtime, data_trades) +
+                    ["--apply", "--confirm", ERB.CONFIRM_TOKEN]) == 0
+    arch = next((runtime / "archive").glob("epoch_2_pre_*"))
+    manifest = json.loads((arch / "archive_manifest.json").read_text())
+    archived_copy = sum(f["bytes"] for f in manifest["files_archived"])
+    fenced_bytes = sum(f["bytes"] for f in manifest["day_files_fenced"])
+    assert pv["to_archive_dir"] == archived_copy
+    assert pv["fenced_in_place"] == fenced_bytes
+
+
 def test_apply_without_token_stays_dry_run(tmp_path, capsys):
     runtime, data_trades = make_dirty(tmp_path)
     before = _snapshot(list(runtime.iterdir()) + list(data_trades.iterdir()))

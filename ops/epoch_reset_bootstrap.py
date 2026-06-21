@@ -772,6 +772,35 @@ def _fmt_bytes(n: Optional[int]) -> str:
     return f"{n:,}"
 
 
+def _action_bytes(a: PlannedAction) -> int:
+    """Bytes this action would preserve, resolved for display (no mutation).
+
+    APPLY stats each source at archive time (a.bytes set in execute_plan Phase
+    A), so the rendered figure matches exactly what was archived. DRY-RUN never
+    mutates, so a.bytes is None and we stat the still-present live source here —
+    this is what makes the preview total truthful. Non-actionable actions
+    (SKIP_ABSENT/SKIP_DONE/ERROR) and sources that have gone missing contribute
+    0, so the reported total is zero only when nothing is genuinely preserved.
+    """
+    if a.status not in ("PLANNED", "DONE"):
+        return 0
+    if a.bytes is not None:
+        return a.bytes
+    try:
+        return a.src.stat().st_size
+    except OSError:
+        return 0
+
+
+def plan_preserved_bytes(plan: List[PlannedAction]) -> tuple:
+    """(copy_bytes, fence_bytes) the plan would preserve. copy_bytes are moved
+    into the archive dir (the sole rollback source); fence_bytes are renamed to
+    `.scr_reset_bak` and stay on disk in place. Display-only — never mutates."""
+    copy_b = sum(_action_bytes(a) for a in plan if a.archive_mode == "copy")
+    fence_b = sum(_action_bytes(a) for a in plan if a.archive_mode == "rename_in_place")
+    return copy_b, fence_b
+
+
 def render_plan(ctx: ResetContext, plan: List[PlannedAction], gates: GateResult,
                 current_label: str, target_label: str, mode: str) -> str:
     lines: List[str] = []
@@ -805,7 +834,7 @@ def render_plan(ctx: ResetContext, plan: List[PlannedAction], gates: GateResult,
 
     act = sum(1 for a in plan if a.status == "PLANNED" or a.status == "DONE")
     skip = sum(1 for a in plan if a.status.startswith("SKIP"))
-    arch_bytes = sum((a.bytes or 0) for a in plan if a.archive_mode == "copy" and a.status in ("PLANNED", "DONE"))
+    copy_bytes, fence_bytes = plan_preserved_bytes(plan)
     fence_n = sum(1 for a in plan if a.live_action == "rename_fence" and a.status in ("PLANNED", "DONE"))
 
     lines.append("PLAN / BLAST RADIUS:")
@@ -817,16 +846,21 @@ def render_plan(ctx: ResetContext, plan: List[PlannedAction], gates: GateResult,
                 "DONE": "DONE ", "SKIP_ABSENT": "skip ", "SKIP_DONE": "skip ",
                 "ERROR": "ERROR",
             }.get(a.status, a.status)
-            sz = _fmt_bytes(a.bytes) if a.bytes is not None else ""
-            lines.append(f"    {flag:5s} {a.live_action:13s} {a.label}")
+            nb = _action_bytes(a)
+            szs = f"  ({_fmt_bytes(nb)} B)" if nb else ""
+            lines.append(f"    {flag:5s} {a.live_action:13s} {a.label}{szs}")
             if a.detail:
                 lines.append(f"          - {a.detail}")
     lines.append("")
     lines.append("SUMMARY:")
-    lines.append(f"  actionable ops   : {act}")
-    lines.append(f"  skipped (no-op)  : {skip}")
-    lines.append(f"  day-files fenced : {fence_n}")
-    lines.append(f"  bytes to archive : {_fmt_bytes(arch_bytes)}")
+    lines.append(f"  actionable ops          : {act}")
+    lines.append(f"  skipped (no-op)         : {skip}")
+    lines.append(f"  day-files fenced        : {fence_n}")
+    lines.append(f"  bytes -> archive dir    : {_fmt_bytes(copy_bytes)}"
+                 "  (copied; sole rollback source)")
+    lines.append(f"  bytes fenced in place   : {_fmt_bytes(fence_bytes)}"
+                 "  (.scr_reset_bak renames; data stays on disk)")
+    lines.append(f"  bytes preserved total   : {_fmt_bytes(copy_bytes + fence_bytes)}")
     lines.append("=" * 78)
     return "\n".join(lines)
 
@@ -923,10 +957,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("\nDRY-RUN: nothing was mutated. Re-run with "
                   f"--apply --confirm {CONFIRM_TOKEN} to execute.")
         if args.json:
+            copy_b, fence_b = plan_preserved_bytes(plan)
             print(json.dumps({
                 "status": "dry-run", "mode": mode,
                 "from_epoch": current_label, "to_epoch": target_label,
                 "gates": {"ok": gates.ok, "refusals": gates.refusals},
+                "would_preserve_bytes": {
+                    "to_archive_dir": copy_b,
+                    "fenced_in_place": fence_b,
+                    "total": copy_b + fence_b,
+                },
                 "plan": [a.to_dict() for a in plan],
             }, indent=2, default=str))
         return 0
