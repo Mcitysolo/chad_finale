@@ -96,7 +96,7 @@ def test_portfolio_var_empty_portfolio_returns_zero_report(tmp_path: Path) -> No
     assert report.var_99_1day_usd == 0.0
     assert report.symbol_count == 0
     assert report.symbols_used == []
-    assert report.portfolio_equity_usd == 100000.0
+    assert report.portfolio_equity_cad == 100000.0
 
 
 def test_portfolio_var_non_empty_portfolio_returns_positive_var(tmp_path: Path) -> None:
@@ -127,7 +127,7 @@ def test_portfolio_var_non_empty_portfolio_returns_positive_var(tmp_path: Path) 
     assert "AAA" in report.symbols_used
     assert report.var_95_1day_usd > 0.0
     assert report.var_99_1day_usd > report.var_95_1day_usd
-    assert report.portfolio_equity_usd == 100000.0
+    assert report.portfolio_equity_cad == 100000.0
     assert math.isfinite(report.var_pct_of_equity)
 
 
@@ -202,7 +202,7 @@ def test_var_publisher_writes_schema(tmp_path: Path, monkeypatch: pytest.MonkeyP
     required_keys = {
         "schema_version", "ts_utc", "ttl_seconds", "status", "method",
         "confidence_levels", "var_95_1day_usd", "var_99_1day_usd",
-        "portfolio_equity_usd", "var_pct_of_equity",
+        "portfolio_equity_cad", "var_pct_of_equity",
         "symbol_count", "symbols_used", "symbols_missing_data",
         "enforcement_active", "notes",
     }
@@ -243,8 +243,8 @@ def test_drawdown_guard_identifies_hwm_from_history(tmp_path: Path) -> None:
     )
 
     assert report.status == "ok"
-    assert report.hwm_usd == 110000.0
-    assert report.current_equity_usd == 102000.0
+    assert report.hwm_cad == 110000.0
+    assert report.current_equity_cad == 102000.0
     assert report.drawdown_pct == pytest.approx((102000.0 - 110000.0) / 110000.0 * 100.0, abs=1e-6)
     assert report.enforcement_active is False
 
@@ -318,7 +318,7 @@ def test_drawdown_publisher_writes_schema(tmp_path: Path) -> None:
 
     required_keys = {
         "schema_version", "ts_utc", "ttl_seconds", "status",
-        "current_equity_usd", "hwm_usd", "drawdown_pct",
+        "current_equity_cad", "hwm_cad", "drawdown_pct",
         "halt_threshold_pct", "halt", "enforcement_active",
         "sample_count", "lookback_days", "notes",
     }
@@ -326,8 +326,8 @@ def test_drawdown_publisher_writes_schema(tmp_path: Path) -> None:
     assert state["schema_version"] == "drawdown_state.v1"
     assert state["ttl_seconds"] == 300
     assert state["enforcement_active"] is False
-    assert state["hwm_usd"] == 100000.0
-    assert state["current_equity_usd"] == 95000.0
+    assert state["hwm_cad"] == 100000.0
+    assert state["current_equity_cad"] == 95000.0
 
 
 # ---------------------------------------------------------------------------

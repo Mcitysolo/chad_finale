@@ -50,8 +50,13 @@ HALT_PCT_ENV = "CHAD_DRAWDOWN_HALT_PCT"
 @dataclass(frozen=True)
 class DrawdownReport:
     status: str
-    current_equity_usd: float
-    hwm_usd: float
+    # CAD-denominated, report-only. ``_current_equity`` sums the CAD snapshot
+    # legs and ``_row_equity`` prefers ``total_equity_cad``; these figures have
+    # always carried CAD, so the field names now say so. Renamed from the
+    # historical ``current_equity_usd`` / ``hwm_usd`` (label fix only — values,
+    # drawdown_pct math, and enforcement_active=False are all unchanged).
+    current_equity_cad: float
+    hwm_cad: float
     drawdown_pct: float
     halt_threshold_pct: float
     halt: bool
@@ -220,8 +225,8 @@ def compute_drawdown(
     if not equities:
         return DrawdownReport(
             status="insufficient_data",
-            current_equity_usd=current_eq,
-            hwm_usd=0.0,
+            current_equity_cad=current_eq,
+            hwm_cad=0.0,
             drawdown_pct=0.0,
             halt_threshold_pct=threshold,
             halt=False,
@@ -245,8 +250,8 @@ def compute_drawdown(
 
     return DrawdownReport(
         status=status,
-        current_equity_usd=current_eq,
-        hwm_usd=hwm,
+        current_equity_cad=current_eq,
+        hwm_cad=hwm,
         drawdown_pct=dd_pct,
         halt_threshold_pct=threshold,
         halt=halt_flag,
@@ -264,8 +269,8 @@ def report_to_state_dict(report: DrawdownReport, ts_utc: str, ttl_seconds: int =
         "ts_utc": ts_utc,
         "ttl_seconds": int(ttl_seconds),
         "status": report.status,
-        "current_equity_usd": round(float(report.current_equity_usd), 2),
-        "hwm_usd": round(float(report.hwm_usd), 2),
+        "current_equity_cad": round(float(report.current_equity_cad), 2),
+        "hwm_cad": round(float(report.hwm_cad), 2),
         "drawdown_pct": round(float(report.drawdown_pct), 4),
         "halt_threshold_pct": round(float(report.halt_threshold_pct), 4),
         "halt": bool(report.halt),

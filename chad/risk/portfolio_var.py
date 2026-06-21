@@ -100,7 +100,13 @@ class SymbolExposure:
 class VarReport:
     status: str
     method: str
-    portfolio_equity_usd: float
+    # Account equity is CAD-sourced (``_load_portfolio_equity`` sums the CAD
+    # snapshot legs / pnl_state.account_equity, which is CAD). Renamed from the
+    # historical ``portfolio_equity_usd`` — label fix only; the value and
+    # ``var_pct_of_equity`` math are unchanged. NOTE: the ``*_usd`` VaR/exposure
+    # fields below are deliberately left as-is — they price USD-denominated
+    # exposures off price_cache and are a separate (Bucket B) question.
+    portfolio_equity_cad: float
     var_95_1day_usd: float
     var_99_1day_usd: float
     symbols_used: List[str]
@@ -281,7 +287,7 @@ def compute_portfolio_var(
         return VarReport(
             status="insufficient_data",
             method="parametric",
-            portfolio_equity_usd=equity_usd,
+            portfolio_equity_cad=equity_usd,
             var_95_1day_usd=0.0,
             var_99_1day_usd=0.0,
             symbols_used=[],
@@ -343,7 +349,7 @@ def compute_portfolio_var(
         return VarReport(
             status="insufficient_data",
             method="parametric",
-            portfolio_equity_usd=equity_usd,
+            portfolio_equity_cad=equity_usd,
             var_95_1day_usd=0.0,
             var_99_1day_usd=0.0,
             symbols_used=[],
@@ -364,7 +370,7 @@ def compute_portfolio_var(
     return VarReport(
         status="ok",
         method="parametric",
-        portfolio_equity_usd=equity_usd,
+        portfolio_equity_cad=equity_usd,
         var_95_1day_usd=var_95,
         var_99_1day_usd=var_99,
         symbols_used=[e.symbol for e in exposures],
@@ -387,7 +393,7 @@ def report_to_state_dict(report: VarReport, ts_utc: str, ttl_seconds: int = 3600
         "confidence_levels": list(report.confidence_levels),
         "var_95_1day_usd": round(float(report.var_95_1day_usd), 2),
         "var_99_1day_usd": round(float(report.var_99_1day_usd), 2),
-        "portfolio_equity_usd": round(float(report.portfolio_equity_usd), 2),
+        "portfolio_equity_cad": round(float(report.portfolio_equity_cad), 2),
         "var_pct_of_equity": round(float(report.var_pct_of_equity), 4),
         "symbol_count": int(report.symbol_count),
         "symbols_used": list(report.symbols_used),

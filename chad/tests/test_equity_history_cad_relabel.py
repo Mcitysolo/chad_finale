@@ -186,14 +186,14 @@ def test_drawdown_continuity_cad_relabel_no_phantom_drop(tmp_path):
     )
 
     # Identical HWM and drawdown across the relabel -> no phantom discontinuity.
-    assert dd_v2.hwm_usd == dd_legacy.hwm_usd == pytest.approx(200000.0)
-    assert dd_v2.current_equity_usd == dd_legacy.current_equity_usd == pytest.approx(180000.0)
+    assert dd_v2.hwm_cad == dd_legacy.hwm_cad == pytest.approx(200000.0)
+    assert dd_v2.current_equity_cad == dd_legacy.current_equity_cad == pytest.approx(180000.0)
     assert dd_v2.drawdown_pct == pytest.approx(dd_legacy.drawdown_pct)
     assert dd_v2.drawdown_pct == pytest.approx((180000.0 - 200000.0) / 200000.0 * 100.0)
 
     # Explicitly: the chain did NOT read the true-USD field (would have put HWM at
     # ~140k and drawdown near 0%).
-    assert dd_v2.hwm_usd != pytest.approx(140000.0)
+    assert dd_v2.hwm_cad != pytest.approx(140000.0)
     assert dd_v2.drawdown_pct < -5.0
 
 
@@ -213,8 +213,8 @@ def test_drawdown_v2_usd_ok_false_unaffected(tmp_path):
 
     dd = drawdown_guard.compute_drawdown(equity_history_path=hist, portfolio_snapshot_path=snap)
     assert dd.status == "ok"
-    assert dd.hwm_usd == pytest.approx(200000.0)
-    assert dd.current_equity_usd == pytest.approx(150000.0)
+    assert dd.hwm_cad == pytest.approx(200000.0)
+    assert dd.current_equity_cad == pytest.approx(150000.0)
     assert dd.drawdown_pct == pytest.approx((150000.0 - 200000.0) / 200000.0 * 100.0)
 
 

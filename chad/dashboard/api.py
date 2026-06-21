@@ -119,7 +119,15 @@ def _load_json_with_mtime(path: Path) -> tuple:
         return {}, None
 
 
-def _fmt_money(x: float | int | None) -> str:
+def _ccy_suffix(currency: str | None) -> str:
+    """Return a display suffix like ' CAD' for a non-empty currency tag, else ''.
+    Opt-in: existing callers pass nothing and get byte-identical output."""
+    if not currency:
+        return ""
+    return f" {currency}"
+
+
+def _fmt_money(x: float | int | None, currency: str | None = None) -> str:
     if x is None:
         return "—"
     try:
@@ -127,21 +135,22 @@ def _fmt_money(x: float | int | None) -> str:
     except (TypeError, ValueError):
         return "—"
     sign = "-" if x < 0 else ""
-    return f"{sign}${abs(x):,.0f}"
+    return f"{sign}${abs(x):,.0f}{_ccy_suffix(currency)}"
 
 
-def _fmt_money_signed(x: float | int | None) -> str:
+def _fmt_money_signed(x: float | int | None, currency: str | None = None) -> str:
     if x is None:
         return "—"
     try:
         x = float(x)
     except (TypeError, ValueError):
         return "—"
+    suf = _ccy_suffix(currency)
     if x > 0:
-        return f"+${x:,.0f}" if abs(x) >= 10 else f"+${x:,.2f}"
+        return (f"+${x:,.0f}{suf}" if abs(x) >= 10 else f"+${x:,.2f}{suf}")
     if x < 0:
-        return f"-${abs(x):,.0f}" if abs(x) >= 10 else f"-${abs(x):,.2f}"
-    return "$0"
+        return (f"-${abs(x):,.0f}{suf}" if abs(x) >= 10 else f"-${abs(x):,.2f}{suf}")
+    return f"$0{suf}"
 
 
 def _sharpe_to_score(sharpe: float | None) -> int:
@@ -313,6 +322,19 @@ class StateBuilder:
 
         equity = pnl.get("account_equity")
 
+        # Bucket A currency-honesty: account_equity is CAD-denominated. Surface the
+        # self-reported currency tag faithfully. When account_equity_currency_ok is
+        # not True the tag is unverified, so we render "CAD*" (asterisk = unverified)
+        # rather than asserting a clean "CAD". Display-only — no value is converted.
+        equity_ccy = pnl.get("account_equity_currency")
+        equity_ccy_ok = pnl.get("account_equity_currency_ok")
+        if equity_ccy:
+            account_value_currency_label = (
+                str(equity_ccy) if equity_ccy_ok is True else f"{equity_ccy}*"
+            )
+        else:
+            account_value_currency_label = None
+
         today_raw = pnl.get("realized_pnl")
         try:
             today_realized = float(today_raw) if today_raw is not None else None
@@ -361,7 +383,16 @@ class StateBuilder:
 
         out = {
             "account_value": equity,
-            "account_value_label": _fmt_money(equity),
+            "account_value_label": _fmt_money(equity, currency=account_value_currency_label),
+            "account_value_currency": equity_ccy,
+            "account_value_currency_ok": (bool(equity_ccy_ok) if equity_ccy_ok is not None else None),
+            "account_value_currency_label": account_value_currency_label,
+            "account_value_currency_note": (
+                None if not equity_ccy
+                else f"{equity_ccy}"
+                if equity_ccy_ok is True
+                else f"{equity_ccy} (unverified)"
+            ),
             "realized_pnl": (round(today_realized, 2) if today_realized is not None else None),
             "realized_pnl_label": realized_label,
             "today_realized_pnl": (round(today_realized, 2) if today_realized is not None else None),

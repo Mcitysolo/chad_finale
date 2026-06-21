@@ -453,7 +453,10 @@ function fmtMoney(n, opts){
   const sign = n < 0 ? '-' : (opts.signed && n > 0 ? '+' : '');
   const abs = Math.abs(n);
   const digits = (opts.cents && abs < 10) ? 2 : 0;
-  return sign + '$' + abs.toLocaleString('en-US', {minimumFractionDigits:digits, maximumFractionDigits:digits});
+  // Opt-in currency suffix (e.g. "CAD*"). Callers that omit opts.currency get
+  // byte-identical output — used only for the CAD-denominated account value.
+  const ccy = opts.currency ? (' ' + opts.currency) : '';
+  return sign + '$' + abs.toLocaleString('en-US', {minimumFractionDigits:digits, maximumFractionDigits:digits}) + ccy;
 }
 function fmtPct(n, digits){
   digits = digits == null ? 1 : digits;
@@ -488,7 +491,7 @@ function animateNumber(el, target, opts){
     const p = Math.min(1, (t - t0)/dur);
     const eased = 1 - Math.pow(1 - p, 3);
     const val = start + (target - start) * eased;
-    el.textContent = opts.money ? fmtMoney(val, {signed:opts.signed, cents: Math.abs(val) < 10}) : val.toFixed(opts.decimals || 0);
+    el.textContent = opts.money ? fmtMoney(val, {signed:opts.signed, cents: Math.abs(val) < 10, currency: opts.currency}) : val.toFixed(opts.decimals || 0);
     if (p < 1) requestAnimationFrame(step);
   }
   requestAnimationFrame(step);
@@ -545,7 +548,7 @@ function renderState(s){
 
   const equityEl = document.getElementById('equityVal');
   if (p && p.account_value != null){
-    animateNumber(equityEl, Number(p.account_value), {money:true});
+    animateNumber(equityEl, Number(p.account_value), {money:true, currency: (p && p.account_value_currency_label) || null});
   } else {
     equityEl.textContent = (p && p.account_value_label) || '—';
   }
