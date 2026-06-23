@@ -1,0 +1,90 @@
+name: phase4-ci
+
+on:
+  pull_request:
+    branches:
+      - phase4_exec_and_risk_spec
+      - main
+    paths:
+      - 'chad/**'
+      - '.github/workflows/**'
+  push:
+    branches:
+      - phase4_exec_and_risk_spec
+      - 'phase4_*'
+    paths:
+      - 'chad/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase4-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-phase4:
+    name: Phase-4 Smoke (lint+types+tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      # Ensure Python can import the 'chad' package from the repo root in CI
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies (lenient)
+        run: |
+          set -e
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # Minimal deps to run lint/types/tests
+            pip install pytest ruff mypy types-requests
+          fi
+
+      - name: Ruff (if configured)
+        run: |
+          set -e
+          if [ -f ruff.toml ] || [ -f pyproject.toml ] || [ -f ruff.legacy.toml ]; then
+            python -m ruff --version
+            # Lint only phase4 paths to keep fast
+            python -m ruff check chad/phase4 || exit 1
+          else
+            echo "Ruff config not found — skipping lint."
+          fi
+
+      - name: Mypy (if config present)
+        run: |
+          set -e
+          if [ -f mypy.ini ] || grep -q "\[tool.mypy\]" pyproject.toml 2>/dev/null; then
+            python -m mypy --version
+            # Type-check only phase4 to keep fast
+            python -m mypy chad/phase4 || exit 1
+          else
+            echo "Mypy config not found — skipping type checks."
+          fi
+
+      - name: Run Phase-4 smoke tests
+        run: |
+          set -e
+          pytest -q chad/phase4/tests
