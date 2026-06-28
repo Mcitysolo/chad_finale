@@ -507,7 +507,8 @@ def _build_stop_bus_snapshot(
         if status_path.is_file():
             status = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(status, dict):
-                lat = status.get("latency_ms") or status.get("avg_latency_ms")
+                # Prefer api_ms (true API round-trip); latency_ms includes connect_ms (SSOT: connect_ms != api_ms).
+                lat = status.get("api_ms") or status.get("latency_ms") or status.get("avg_latency_ms")
                 if lat is not None:
                     snap["avg_latency_ms"] = float(lat)
                 if "consecutive_cycles_above_stop_threshold" in status:

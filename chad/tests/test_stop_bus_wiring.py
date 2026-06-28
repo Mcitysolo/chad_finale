@@ -190,3 +190,33 @@ def test_live_loop_snapshot_old_format_artifact_falls_back_to_legacy(tmp_path: P
     assert snap["avg_latency_ms"] == 3000.0
     assert "consecutive_cycles_above_stop_threshold" not in snap
     assert "breach_streak_started_at" not in snap
+
+
+def test_live_loop_snapshot_prefers_api_ms_over_connect_polluted_latency(tmp_path: Path):
+    import logging
+    from chad.core.live_loop import _build_stop_bus_snapshot
+
+    # SSOT: connect_ms != api_ms. latency_ms includes the one-shot connect cost
+    # (connect_ms + api_ms) so it false-trips the broker_latency STOP_BUS on a
+    # fresh-connect cycle. The snapshot must select api_ms (true round-trip).
+    status = tmp_path / "ibkr_status.json"
+    status.write_text(json.dumps({
+        "api_ms": 0.3,
+        "connect_ms": 8259.7,
+        "latency_ms": 8260.0,
+    }), encoding="utf-8")
+    snap = _build_stop_bus_snapshot(logging.getLogger("test"), ibkr_status_path=status)
+    assert snap["avg_latency_ms"] == 0.3
+
+
+def test_live_loop_snapshot_falls_back_to_latency_ms_when_api_ms_absent(tmp_path: Path):
+    import logging
+    from chad.core.live_loop import _build_stop_bus_snapshot
+
+    # api_ms is None only on connect failure (latency_ms == connect attempt);
+    # the fallback chain must degrade to latency_ms so the trigger still sees a
+    # value rather than dropping the field entirely.
+    status = tmp_path / "ibkr_status.json"
+    status.write_text(json.dumps({"latency_ms": 8260.0}), encoding="utf-8")
+    snap = _build_stop_bus_snapshot(logging.getLogger("test"), ibkr_status_path=status)
+    assert snap["avg_latency_ms"] == 8260.0
