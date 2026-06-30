@@ -569,14 +569,27 @@ def build_positions_truth(
 
     reconciliation_green = reconciliation_status == "GREEN"
 
-    truth_ok = bool(
+    # A legitimately flat, broker-confirmed account is a valid truth state:
+    # broker reconciled GREEN, zero positions in both the snapshot and the
+    # ledger, and cash/equity is present (proves the broker actually answered,
+    # not a silent/empty read). This does NOT relax the non-empty path below —
+    # when positions exist, the count-match gate is unchanged.
+    flat_proven = (
         upstream_green
-        and bool(ledger_state)
-        and snapshot_positions_count > 0
-        and ledger_state_positions_count == snapshot_positions_count
+        and snapshot_positions_count == 0
+        and ledger_state_positions_count == 0
+        and isinstance(cash, dict) and len(cash) > 0
+    )
+    truth_ok = bool(
+        (upstream_green and bool(ledger_state)
+         and snapshot_positions_count > 0
+         and ledger_state_positions_count == snapshot_positions_count)
+        or flat_proven
     )
 
-    if truth_ok and scope_mismatch:
+    if flat_proven:
+        truth_source = "BROKER_AUTHORITY_FLAT_PROVEN"
+    elif truth_ok and scope_mismatch:
         truth_source = "BROKER_SNAPSHOT_RECONCILED_WITH_LEDGER_SCOPE_MISMATCH_REPLAY_DIAGNOSTIC_ONLY"
     elif truth_ok:
         truth_source = "BROKER_SNAPSHOT_RECONCILED_WITH_LEDGER"
@@ -590,7 +603,11 @@ def build_positions_truth(
     # — useful evidence but never authoritative when truth_source selects the
     # broker-authority path. replay_diagnostic_blocks_truth=false in that case.
     broker_authority_status = "GREEN" if truth_ok else "RED"
-    if truth_ok:
+    if flat_proven:
+        broker_authority_reason = (
+            "BROKER_AUTHORITY_GREEN: flat_proven cash_confirmed snapshot=0 ledger=0"
+        )
+    elif truth_ok:
         broker_authority_reason = (
             f"BROKER_AUTHORITY_GREEN: upstream={reconciliation_status_upstream or 'GREEN'} "
             f"snapshot={snapshot_positions_count} ledger={ledger_state_positions_count}"
@@ -617,6 +634,7 @@ def build_positions_truth(
     replay_diagnostic_reason = reconciliation_status_reason
     replay_diagnostic_blocks_truth = not bool(
         truth_source.startswith("BROKER_SNAPSHOT_RECONCILED_WITH_LEDGER")
+        or truth_source.startswith("BROKER_AUTHORITY_FLAT_PROVEN")
     )
 
     payload_nohash: Dict[str, Any] = {

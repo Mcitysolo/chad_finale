@@ -334,9 +334,35 @@ class IBKRPortfolioCollector:
                     "currency": str(c.currency),
                 })
 
+            # Cash/equity passthrough (broker-authority). Surfaces broker cash
+            # alongside positions so positions_truth can prove a legitimately
+            # flat account (snapshot=0 + ledger=0 + cash_confirmed). Sourced
+            # from the same accountSummary tags the collector already reads for
+            # NetLiquidation (TotalCashValue/NetLiquidation/AvailableFunds),
+            # grouped by the row's currency tag. Reuses the open connection; on
+            # any failure we write cash={} — never crash, never omit the key.
+            cash: Dict[str, Dict[str, float]] = {}
+            try:
+                _CASH_TAGS = ("TotalCashValue", "NetLiquidation", "AvailableFunds")
+                for r in ib.accountSummary():
+                    tag = str(getattr(r, "tag", "")).strip()
+                    if tag not in _CASH_TAGS:
+                        continue
+                    ccy = str(getattr(r, "currency", "") or "").strip().upper()
+                    if not ccy:
+                        continue
+                    try:
+                        val = float(getattr(r, "value", "0") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    cash.setdefault(ccy, {})[tag] = val
+            except Exception:
+                cash = {}
+
             payload: Dict[str, Any] = {
                 "positions": pos_list,
                 "positions_count": len(pos_list),
+                "cash": cash,
                 "ts_utc": _utc_now_iso(),
                 "ttl_seconds": int(POSITIONS_SNAPSHOT_TTL_SECONDS),
                 "source": "ibkr_portfolio_collector_v2",
