@@ -21,11 +21,11 @@ OUTPUT:
   - runtime/withdrawal_authorization.json
     {
       "phase": "BUILD" | "GROW" | "PAY",
-      "current_equity_usd": float,        # genuine USD (total_equity_usd_authoritative)
-      "current_equity_currency": "USD",
+      "current_equity_cad": float,        # broker-native CAD (ibkr_equity)
+      "current_equity_currency": "CAD",
       "current_equity_currency_ok": bool,
-      "high_water_mark_usd": float,       # genuine USD (v2 total_equity_usd peak)
-      "high_water_mark_currency": "USD",
+      "high_water_mark_cad": float,       # CAD (v2 total_equity_cad peak)
+      "high_water_mark_currency": "CAD",
       "high_water_mark_currency_ok": bool,
       "drawdown_from_hwm_pct": float,
       "spendable_surplus_usd": float,
@@ -113,27 +113,27 @@ def _read_equity_history() -> List[Dict[str, Any]]:
     return out
 
 
-def _row_equity_usd(row: Dict[str, Any]) -> Optional[float]:
-    """True-USD per-row equity for the HWM / drawdown math (equity_history.v2).
+def _row_equity_cad(row: Dict[str, Any]) -> Optional[float]:
+    """CAD per-row equity for the HWM / drawdown math (C-ii).
 
-    Returns the genuine-USD ``total_equity_usd`` value ONLY when the row carries
-    ``usd_ok: true`` and a numeric value (v2 rows). Pre-v2 rows — whose
-    ``total_equity_usd`` historically held the broker-native CAD figure and which
-    lack the ``usd_ok`` marker — and v2 rows with ``usd_ok: false`` (where
-    ``total_equity_usd`` is null) are SKIPPED -> ``None``. FAIL-CLOSED: the HWM is
-    never contaminated by a CAD value mislabeled as USD; callers must drop
-    ``None`` rows. NOTE: this fixes the CURRENCY of the HWM, not the historical
-    futures-runaway contamination of the equity series itself (a separate step).
+    Continuity-safe key priority (mirrors drawdown_guard._row_equity):
+    ``total_equity_cad`` is the honest CAD series written by equity_history.v2;
+    the legacy ``total_equity_usd`` key carried the SAME CAD figure in v1 rows, so
+    it is the fallback. ``total_equity_cad`` MUST be tried first — in v2 rows
+    ``total_equity_usd`` holds the true-USD figure (or null), which must never feed
+    the CAD HWM. Returns None when no usable value exists; callers drop None rows.
     """
-    if row.get("usd_ok") is not True:
-        return None
-    v = row.get("total_equity_usd")
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
+    for k in ("total_equity_cad", "total_equity_usd"):
+        v = row.get(k)
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f == f:  # not NaN
+            return f
+    return None
 
 
 def _load_policy() -> Dict[str, Any]:
@@ -148,9 +148,9 @@ def _load_policy() -> Dict[str, Any]:
 @dataclass
 class WithdrawalAuthorization:
     phase: str
-    current_equity_usd: float
-    seed_capital_usd: float
-    high_water_mark_usd: float
+    current_equity_cad: float
+    seed_capital_cad: float
+    high_water_mark_cad: float
     drawdown_from_hwm_pct: float
     spendable_surplus_usd: float
     authorized_withdrawal_usd: float
@@ -159,10 +159,12 @@ class WithdrawalAuthorization:
     reason: str
     ts_utc: str
     # Currency provenance tags (mirror portfolio_snapshot / dynamic_caps pattern).
-    # These fields are now genuine USD (driven by total_equity_usd_authoritative).
-    current_equity_currency: str = "USD"
+    # C-ii: these fields are now broker-native CAD (driven by ibkr_equity and the
+    # equity_history total_equity_cad series). spendable_surplus_usd /
+    # authorized_withdrawal_usd retain their names (value re-prices to CAD).
+    current_equity_currency: str = "CAD"
     current_equity_currency_ok: bool = True
-    high_water_mark_currency: str = "USD"
+    high_water_mark_currency: str = "CAD"
     high_water_mark_currency_ok: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
@@ -176,33 +178,39 @@ def compute_authorization(
     policy: Dict[str, Any],
 ) -> WithdrawalAuthorization:
     """Pure function: given inputs, return the authorization decision."""
-    seed = float(policy["seed_capital_usd"])
+    # C-ii dual-key: prefer the CAD-native policy key, fall back to the legacy USD
+    # key so this code is correct against both the current USD config and the
+    # CAD-repriced config staged in PA C-ii.
+    seed = float(policy["seed_capital_cad"] if "seed_capital_cad" in policy
+                 else policy["seed_capital_usd"])
     build_mult = float(policy["build_phase_threshold_multiplier"])
     payout_rate = float(policy["payout_rate_above_hwm"])
-    max_salary = float(policy["max_monthly_salary_usd"])
+    max_salary = float(policy["max_monthly_salary_cad"] if "max_monthly_salary_cad" in policy
+                       else policy["max_monthly_salary_usd"])
     dd_veto = float(policy["drawdown_veto_pct"])
     dd_lookback = int(policy["drawdown_lookback_days"])
     require_confident = bool(policy["require_scr_confident"])
     min_history = int(policy["minimum_history_days"])
 
-    # Compute high water mark from history (true-USD v2 series; CAD/pre-v2 rows
-    # are skipped — see _row_equity_usd). ``current_equity`` is the authoritative
-    # USD figure from main(), so HWM and drawdown are USD-vs-USD throughout. If no
-    # usable USD rows exist, fail closed to current_equity (never a CAD peak).
+    # C-ii: compute high water mark from the CAD series (total_equity_cad, with a
+    # legacy total_equity_usd-as-CAD fallback — see _row_equity_cad).
+    # ``current_equity`` is the broker-native CAD figure (ibkr_equity) from main(),
+    # so HWM and drawdown are CAD-vs-CAD throughout. If no usable row exists, fail
+    # closed to current_equity.
     if history:
-        equities = [e for e in (_row_equity_usd(r) for r in history) if e is not None]
+        equities = [e for e in (_row_equity_cad(r) for r in history) if e is not None]
         hwm = max(equities) if equities else current_equity
     else:
         hwm = current_equity
 
-    # Compute drawdown over lookback window (true-USD rows only)
+    # Compute drawdown over lookback window (CAD rows; see _row_equity_cad)
     cutoff = datetime.now(timezone.utc) - timedelta(days=dd_lookback)
     recent = []
     for r in history:
         try:
             ts = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
             if ts > cutoff:
-                e = _row_equity_usd(r)
+                e = _row_equity_cad(r)
                 if e is not None:
                     recent.append(e)
         except Exception:
@@ -284,9 +292,9 @@ def compute_authorization(
 
     return WithdrawalAuthorization(
         phase=phase,
-        current_equity_usd=current_equity,
-        seed_capital_usd=seed,
-        high_water_mark_usd=hwm,
+        current_equity_cad=current_equity,
+        seed_capital_cad=seed,
+        high_water_mark_cad=hwm,
         drawdown_from_hwm_pct=drawdown_from_hwm,
         spendable_surplus_usd=max(0.0, current_equity - hwm),
         authorized_withdrawal_usd=authorized,
@@ -294,9 +302,9 @@ def compute_authorization(
         history_days=len(history),
         reason=" | ".join(reasons),
         ts_utc=_utc_now_iso(),
-        current_equity_currency="USD",
+        current_equity_currency="CAD",
         current_equity_currency_ok=True,
-        high_water_mark_currency="USD",
+        high_water_mark_currency="CAD",
         high_water_mark_currency_ok=True,
     )
 
@@ -311,22 +319,22 @@ def main() -> int:
     if not snap:
         LOG.error("portfolio_snapshot_missing — withdrawal manager cannot run")
         return 1
-    # The salary/withdrawal view is denominated in USD (seed, HWM, salary cap).
-    # Drive it EXCLUSIVELY by the authoritative USD equity
-    # (portfolio_snapshot_publisher: total_equity_usd_authoritative + usd_ok),
-    # mirroring chad/risk/tier_manager.py. FAIL-CLOSED: if usd_ok is false — or
-    # the field is absent / not numeric — HOLD the last published authorization
-    # and do NOT republish. We must NEVER fall back to the CAD component sum.
-    usd_ok = bool(snap.get("usd_ok", False))
-    total_usd = snap.get("total_equity_usd_authoritative")
-    if not (usd_ok and isinstance(total_usd, (int, float))):
+    # C-ii (CAD-native): the salary/withdrawal view is denominated in CAD (seed,
+    # HWM, salary cap are CAD-repriced in PA C-ii). Drive it by the broker-native
+    # CAD equity (portfolio_snapshot_publisher: ibkr_equity + ibkr_equity_currency_ok),
+    # mirroring chad/risk/tier_manager.py. FAIL-CLOSED: if ibkr_equity_currency_ok is
+    # false — or ibkr_equity is absent / not numeric — HOLD the last published
+    # authorization and do NOT republish.
+    cad_ok = bool(snap.get("ibkr_equity_currency_ok", False))
+    ibkr_cad = snap.get("ibkr_equity")
+    if not (cad_ok and isinstance(ibkr_cad, (int, float))):
         LOG.warning(
-            "WITHDRAWAL_HELD_NO_USD_RATE usd_ok=%s total_usd=%s "
-            "(no authoritative USD equity; holding prior authorization, CAD never used)",
-            usd_ok, total_usd,
+            "WITHDRAWAL_HELD_NO_CAD_EQUITY ibkr_equity_currency_ok=%s ibkr_equity=%s "
+            "(no broker-native CAD equity; holding prior authorization)",
+            cad_ok, ibkr_cad,
         )
         return 0
-    current_equity = float(total_usd)
+    current_equity = float(ibkr_cad)
 
     history = _read_equity_history()
 
@@ -344,8 +352,8 @@ def main() -> int:
 
     LOG.info(
         "withdrawal_authorization phase=%s authorized=$%.2f hwm=$%.2f current=$%.2f reason=%s",
-        auth.phase, auth.authorized_withdrawal_usd, auth.high_water_mark_usd,
-        auth.current_equity_usd, auth.reason,
+        auth.phase, auth.authorized_withdrawal_usd, auth.high_water_mark_cad,
+        auth.current_equity_cad, auth.reason,
     )
     return 0
 

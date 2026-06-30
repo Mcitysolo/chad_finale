@@ -223,27 +223,26 @@ def test_drawdown_v2_usd_ok_false_unaffected(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_withdrawal_hwm_uses_true_usd_v2_series():
-    """compute_authorization HWM must come from the v2 true-USD
-    ``total_equity_usd`` column (usd_ok rows only), NOT the CAD peak."""
+def test_withdrawal_hwm_uses_cad_series():
+    """C-ii: compute_authorization HWM must come from the CAD
+    ``total_equity_cad`` column, NOT the true-USD peak."""
     pol = dict(DEFAULT_POLICY)
     history = [
         {"ts_utc": "2026-04-01T00:00:00Z", "total_equity_cad": 200000.0, "total_equity_usd": 140000.0, "usd_ok": True},
         {"ts_utc": "2026-04-02T00:00:00Z", "total_equity_cad": 190000.0, "total_equity_usd": 133000.0, "usd_ok": True},
     ]
     out = compute_authorization(
-        current_equity=140000.0, history=history, scr_state="CONFIDENT", policy=pol
+        current_equity=190000.0, history=history, scr_state="CONFIDENT", policy=pol
     )
-    # HWM from the true-USD peak (140k), not the CAD peak (200k).
-    assert out.high_water_mark_usd == pytest.approx(140000.0)
-    assert out.high_water_mark_currency == "USD"
+    # HWM from the CAD peak (200k), not the true-USD peak (140k).
+    assert out.high_water_mark_cad == pytest.approx(200000.0)
+    assert out.high_water_mark_currency == "CAD"
     assert out.high_water_mark_currency_ok is True
 
 
-def test_withdrawal_no_crash_on_v2_null_usd_rows():
-    """v2 rows with usd_ok false carry total_equity_usd=None and are SKIPPED
-    (fail-closed). With no usable USD row, HWM falls back to current_equity —
-    no crash, and never a CAD value mislabeled as USD."""
+def test_withdrawal_no_crash_on_null_usd_rows():
+    """C-ii: rows with total_equity_usd=None still carry a CAD value; the CAD
+    HWM reads total_equity_cad. No crash, never a None-driven fallback."""
     pol = dict(DEFAULT_POLICY)
     history = [
         {"ts_utc": "2026-04-01T00:00:00Z", "total_equity_cad": 200000.0, "total_equity_usd": None, "usd_ok": False},
@@ -252,13 +251,12 @@ def test_withdrawal_no_crash_on_v2_null_usd_rows():
     out = compute_authorization(
         current_equity=195000.0, history=history, scr_state="CONFIDENT", policy=pol
     )
-    assert out.high_water_mark_usd == pytest.approx(195000.0)
+    assert out.high_water_mark_cad == pytest.approx(200000.0)
 
 
-def test_withdrawal_legacy_v1_rows_skipped_no_crash():
-    """Legacy v1 rows (total_equity_usd holding CAD, no usd_ok marker) are now
-    SKIPPED for the USD HWM — never treated as USD. With no v2 USD rows the HWM
-    fails closed to current_equity; no crash, no CAD-as-USD leak."""
+def test_withdrawal_legacy_v1_rows_read_as_cad():
+    """C-ii: legacy v1 rows (total_equity_usd holding CAD, no total_equity_cad)
+    are read via the CAD fallback — they WERE CAD. HWM = CAD peak."""
     pol = dict(DEFAULT_POLICY)
     history = [
         {"ts_utc": "2026-04-01T00:00:00Z", "total_equity_usd": 200000.0},
@@ -267,4 +265,4 @@ def test_withdrawal_legacy_v1_rows_skipped_no_crash():
     out = compute_authorization(
         current_equity=190000.0, history=history, scr_state="CONFIDENT", policy=pol
     )
-    assert out.high_water_mark_usd == pytest.approx(190000.0)
+    assert out.high_water_mark_cad == pytest.approx(200000.0)

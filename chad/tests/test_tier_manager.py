@@ -209,16 +209,32 @@ def test_legacy_pro_alias_migrates_to_scale(tiers_config):
 
 
 # ---------------------------------------------------------------------------
-# main() — tier band sourced from authoritative USD equity (fail-closed).
+# main() — tier band sourced from broker-native CAD equity (C-ii, fail-closed).
 #
-# The CLI reads runtime/portfolio_snapshot.json and must select the tier from
-# `total_equity_usd_authoritative` / `usd_ok` ONLY — never the CAD component
-# sum (ibkr_equity + kraken_equity + coinbase_equity).  When usd_ok is false
-# (or the USD figure is absent / null) it HOLDS the last persisted tier and
-# does not recompute.  Snapshots below deliberately set the CAD components to
-# values whose CAD sum would resolve to a *different* tier, proving CAD is
-# never consulted.
+# The CLI reads runtime/portfolio_snapshot.json and selects the tier from
+# `ibkr_equity` / `ibkr_equity_currency_ok` (broker-native CAD, no FX call).
+# When ibkr_equity_currency_ok is false (or ibkr_equity is absent / null) it
+# HOLDS the last persisted tier and does not recompute.  The config below is the
+# CAD-repriced tiers config (PA C-ii); the band readers are dual-key, so these
+# tests validate the end-state (CAD intake vs CAD bands).
 # ---------------------------------------------------------------------------
+
+_USDCAD = 1.4160
+
+
+def _cad_tiers_config() -> dict:
+    """Build the C-ii CAD-repriced tiers config from the live USD config:
+    rename ``*_equity_usd`` -> ``*_equity_cad`` and re-price ×1.4160 (whole CAD);
+    ``risk_profile.*`` caps are left untouched.  Mirrors PA C-ii."""
+    cfg = json.loads(TIERS_CONFIG_PATH.read_text(encoding="utf-8"))
+    for spec in cfg.get("tiers", {}).values():
+        for base in ("min_equity", "max_equity", "demotion_equity"):
+            usd_key = base + "_usd"
+            if usd_key in spec:
+                v = spec.pop(usd_key)
+                spec[base + "_cad"] = None if v is None else round(v * _USDCAD)
+    return cfg
+
 
 def _run_main(monkeypatch, tmp_path, *, snapshot, prior_state=None):
     snap_path = tmp_path / "portfolio_snapshot.json"
@@ -227,8 +243,8 @@ def _run_main(monkeypatch, tmp_path, *, snapshot, prior_state=None):
     snap_path.write_text(json.dumps(snapshot), encoding="utf-8")
     if prior_state is not None:
         out_path.write_text(json.dumps(prior_state), encoding="utf-8")
-    # use the real production tier bands
-    cfg_path.write_text(TIERS_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    # CAD-repriced tier bands (PA C-ii); read dual-key by the publisher.
+    cfg_path.write_text(json.dumps(_cad_tiers_config()), encoding="utf-8")
     monkeypatch.setattr(tmmod, "RUNTIME_DIR", tmp_path)
     monkeypatch.setattr(tmmod, "SNAPSHOT_PATH", snap_path)
     monkeypatch.setattr(tmmod, "OUT_PATH", out_path)
@@ -238,57 +254,52 @@ def _run_main(monkeypatch, tmp_path, *, snapshot, prior_state=None):
     return rc, data
 
 
-def test_main_usd_ok_137k_selects_pro_growth(monkeypatch, tmp_path):
-    # USD 137k -> PRO_GROWTH band [25k, 160k).  The CAD sum (~198k) would be
-    # SCALE; prove the CAD sum is NOT used.
+def test_main_cad_ok_137k_selects_pro_growth(monkeypatch, tmp_path):
+    # CAD 137k -> PRO_GROWTH band [35.4k, 226.56k) under the CAD-repriced bands.
     snapshot = {
-        "ibkr_equity": 197_935.4,        # CAD — must be ignored
-        "kraken_equity": 258.5,          # CAD — must be ignored
+        "ibkr_equity": 137_000.0,        # CAD — the broker-native tier driver
+        "ibkr_equity_currency": "CAD",
+        "ibkr_equity_currency_ok": True,
+        "kraken_equity": 258.5,
         "coinbase_equity": 0.0,
-        "total_equity_usd_authoritative": 137_000.0,
-        "usd_ok": True,
     }
     rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot)
     assert rc == 0
     assert data["tier_name"] == "PRO_GROWTH"
-    assert data["current_equity_usd"] == 137_000.0   # USD figure, not CAD sum
-    cad_sum = 197_935.4 + 258.5 + 0.0                 # ~198k -> would be SCALE
-    assert data["current_equity_usd"] != cad_sum
+    assert data["current_equity_cad"] == 137_000.0   # ibkr_equity drives the band
     assert data["tier_name"] != "SCALE"
 
 
-def test_main_usd_ok_above_160k_selects_scale(monkeypatch, tmp_path):
-    # USD >160k -> SCALE.  The tiny CAD sum (100) would be MICRO; prove USD
-    # drives the band, not CAD.
+def test_main_cad_ok_above_226k_selects_scale(monkeypatch, tmp_path):
+    # CAD >= 226.56k -> SCALE under the CAD-repriced bands.
     snapshot = {
-        "ibkr_equity": 100.0,            # CAD — would be MICRO if used
+        "ibkr_equity": 230_000.0,        # CAD
+        "ibkr_equity_currency": "CAD",
+        "ibkr_equity_currency_ok": True,
         "kraken_equity": 0.0,
         "coinbase_equity": 0.0,
-        "total_equity_usd_authoritative": 165_000.0,
-        "usd_ok": True,
     }
     rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot)
     assert rc == 0
     assert data["tier_name"] == "SCALE"
-    assert data["current_equity_usd"] == 165_000.0
-    assert data["tier_name"] != "MICRO"
+    assert data["current_equity_cad"] == 230_000.0
+    assert data["tier_name"] != "PRO_GROWTH"
 
 
-def test_main_usd_not_ok_holds_prior_tier_no_cad_fallback(monkeypatch, tmp_path, caplog):
-    # usd_ok false (FX unavailable) -> HOLD the last persisted tier; do NOT
-    # recompute and NEVER fall back to the CAD sum.  The CAD sum here (~600k)
-    # would resolve to SCALE — proving CAD is never consulted.
+def test_main_cad_not_ok_holds_prior_tier(monkeypatch, tmp_path, caplog):
+    # ibkr_equity_currency_ok false -> HOLD the last persisted tier; do NOT
+    # recompute.  The ibkr_equity value is present but untrusted.
     snapshot = {
-        "ibkr_equity": 500_000.0,        # CAD — must NEVER be used
-        "kraken_equity": 100_000.0,      # CAD — must NEVER be used
+        "ibkr_equity": 500_000.0,        # CAD — present but currency not ok
+        "ibkr_equity_currency": "CAD",
+        "ibkr_equity_currency_ok": False,
+        "kraken_equity": 100_000.0,
         "coinbase_equity": 0.0,
-        "total_equity_usd_authoritative": None,
-        "usd_ok": False,
     }
     prior = {
-        "schema_version": "tier_state.v2",
+        "schema_version": "tier_state.v3",
         "tier_name": "PRO_GROWTH",
-        "current_equity_usd": 137_000.0,
+        "current_equity_cad": 137_000.0,
     }
     with caplog.at_level(logging.WARNING, logger=tmmod.LOG.name):
         rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot, prior_state=prior)
@@ -296,28 +307,25 @@ def test_main_usd_not_ok_holds_prior_tier_no_cad_fallback(monkeypatch, tmp_path,
     # tier_state.json is left untouched (held) — no recompute occurred.
     assert data == prior
     assert data["tier_name"] == "PRO_GROWTH"
-    assert data["current_equity_usd"] == 137_000.0   # untouched; NOT the CAD sum
-    cad_sum = 500_000.0 + 100_000.0 + 0.0             # ~600k -> would be SCALE
-    assert data["current_equity_usd"] != cad_sum
-    assert data["tier_name"] != "SCALE"
-    assert any("TIER_HELD_NO_USD_RATE" in r.getMessage() for r in caplog.records)
+    assert data["current_equity_cad"] == 137_000.0   # untouched
+    assert any("TIER_HELD_NO_CAD_EQUITY" in r.getMessage() for r in caplog.records)
 
 
-def test_main_usd_field_absent_treated_as_not_ok(monkeypatch, tmp_path, caplog):
-    # An old snapshot lacking the authoritative-USD fields entirely must be
-    # treated as fail-closed (hold), never CAD-summed.
+def test_main_cad_field_absent_treated_as_not_ok(monkeypatch, tmp_path, caplog):
+    # A snapshot lacking the CAD currency-ok marker entirely must be treated as
+    # fail-closed (hold).
     snapshot = {
-        "ibkr_equity": 500_000.0,        # CAD
-        "kraken_equity": 100_000.0,      # CAD
+        "ibkr_equity": 500_000.0,        # CAD, but no currency_ok marker
+        "kraken_equity": 100_000.0,
         "coinbase_equity": 0.0,
     }
-    prior = {"schema_version": "tier_state.v2", "tier_name": "STARTER",
-             "current_equity_usd": 10_000.0}
+    prior = {"schema_version": "tier_state.v3", "tier_name": "STARTER",
+             "current_equity_cad": 10_000.0}
     with caplog.at_level(logging.WARNING, logger=tmmod.LOG.name):
         rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot, prior_state=prior)
     assert rc == 0
     assert data == prior                              # held, no recompute
-    assert any("TIER_HELD_NO_USD_RATE" in r.getMessage() for r in caplog.records)
+    assert any("TIER_HELD_NO_CAD_EQUITY" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +409,12 @@ def test_market_is_open_weekend_is_closed():
 # ---------------------------------------------------------------------------
 
 _DEMOTE_SNAPSHOT = {
-    "total_equity_usd_authoritative": 140_000.0,
-    "usd_ok": True,
+    "ibkr_equity": 200_000.0,            # CAD: below SCALE demotion gate (203 904),
+    "ibkr_equity_currency": "CAD",       # naive PRO_GROWTH (< 226 560)
+    "ibkr_equity_currency_ok": True,
 }
-_PRIOR_SCALE = {"schema_version": "tier_state.v2", "tier_name": "SCALE",
-                "current_equity_usd": 165_000.0}
+_PRIOR_SCALE = {"schema_version": "tier_state.v3", "tier_name": "SCALE",
+                "current_equity_cad": 240_000.0}
 
 
 def test_main_demotion_defers_when_market_open(monkeypatch, tmp_path):
@@ -436,12 +445,13 @@ def test_main_demotion_applies_when_market_closed(monkeypatch, tmp_path):
 
 def test_main_promotion_unaffected_by_market_open(monkeypatch, tmp_path):
     # A promotion applies regardless of market_open — confirms only the
-    # *demotion* deferral path consults the helper.  Prior PRO_GROWTH, USD 165k
+    # *demotion* deferral path consults the helper.  Prior PRO_GROWTH, CAD 230k
     # promotes to SCALE even with the market reported OPEN.
     monkeypatch.setattr(tmmod, "market_is_open", lambda _now: True)
-    snapshot = {"total_equity_usd_authoritative": 165_000.0, "usd_ok": True}
-    prior = {"schema_version": "tier_state.v2", "tier_name": "PRO_GROWTH",
-             "current_equity_usd": 140_000.0}
+    snapshot = {"ibkr_equity": 230_000.0, "ibkr_equity_currency": "CAD",
+                "ibkr_equity_currency_ok": True}
+    prior = {"schema_version": "tier_state.v3", "tier_name": "PRO_GROWTH",
+             "current_equity_cad": 200_000.0}
     rc, data = _run_main(monkeypatch, tmp_path, snapshot=snapshot, prior_state=prior)
     assert rc == 0
     assert data["tier_name"] == "SCALE"                       # promotion applied

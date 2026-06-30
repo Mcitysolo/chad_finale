@@ -1616,10 +1616,14 @@ class MorningBrief:
                 lines.append("═══ BUSINESS STATUS ═══")
                 phase = str(biz.get("phase") or wd.get("phase") or "?").upper()
                 cur_eq = _safe_float(
-                    biz.get("current_equity_usd")
+                    biz.get("current_equity_cad")
+                    or biz.get("current_equity_usd")
+                    or wd.get("current_equity_cad")
                     or wd.get("current_equity_usd", 0.0)
                 )
-                seed = _safe_float(biz.get("seed_capital_usd", 50000.0))
+                seed = _safe_float(
+                    biz.get("seed_capital_cad", biz.get("seed_capital_usd", 70800.0))
+                )
                 growth_dollars = cur_eq - seed
                 tier_name = str(tier_doc.get("tier_name", "?"))
                 n_strategies = len(tier_doc.get("enabled_strategies") or [])
@@ -1967,9 +1971,9 @@ class WeeklySummary:
                 days_in_phase = int(biz.get("days_in_phase", 0))
                 next_req = biz.get("next_phase_requirement", "")
                 metrics = biz.get("compound_metrics", {}) or {}
-                hwm = float(metrics.get("high_water_mark_usd", 0.0))
-                cur_eq_w = _safe_float(biz.get("current_equity_usd", 0.0))
-                seed_w = _safe_float(biz.get("seed_capital_usd", 50000.0))
+                hwm = float(metrics.get("high_water_mark_cad", metrics.get("high_water_mark_usd", 0.0)))
+                cur_eq_w = _safe_float(biz.get("current_equity_cad", biz.get("current_equity_usd", 0.0)))
+                seed_w = _safe_float(biz.get("seed_capital_cad", biz.get("seed_capital_usd", 70800.0)))
                 growth_dollars_w = cur_eq_w - seed_w
 
                 if phase == "GROW":

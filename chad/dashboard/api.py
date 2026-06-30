@@ -663,7 +663,7 @@ class StateBuilder:
             authorized = 0.0
 
         try:
-            hwm = float(wd.get("high_water_mark_usd", 0.0) or 0.0)
+            hwm = float(wd.get("high_water_mark_cad", wd.get("high_water_mark_usd", 0.0)) or 0.0)
         except (TypeError, ValueError):
             hwm = 0.0
 

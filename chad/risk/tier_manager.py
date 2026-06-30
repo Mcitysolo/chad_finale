@@ -26,12 +26,12 @@ INPUTS:
 
 OUTPUT (runtime/tier_state.json):
   {
-    "schema_version":             "tier_state.v2",
+    "schema_version":             "tier_state.v3",
     "tier_name":                  "SCALE",
     "tier_description":           ...,
-    "current_equity_usd":         float,
-    "tier_min_equity":            float,
-    "tier_max_equity":            float | null,
+    "current_equity_cad":         float,
+    "tier_min_equity_cad":        float,
+    "tier_max_equity_cad":        float | null,
     "enabled_strategies":         [...],
     "allowed_instruments":        [...],
     "risk_profile":               {...},
@@ -179,11 +179,25 @@ def _normalize_tiers_input(tiers: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _band_value(spec: Dict[str, Any], base: str) -> Any:
+    """Read a tier band threshold, preferring the CAD-native key
+    (``<base>_cad``) and falling back to the legacy USD key (``<base>_usd``).
+
+    Continuity-safe (mirrors drawdown_guard._row_equity's key priority): the
+    publisher reads correctly against BOTH the current USD config and the
+    CAD-repriced config staged in PA C-ii.  A present ``_cad`` key wins even
+    when its value is null (e.g. MICRO demotion), so the null-demotion
+    fallback in _demotion_threshold is preserved."""
+    if (base + "_cad") in spec:
+        return spec.get(base + "_cad")
+    return spec.get(base + "_usd")
+
+
 def _ordered_tier_names(tiers: Dict[str, Dict[str, Any]]) -> List[str]:
     """Return tier names sorted from lowest to highest band."""
     def _key(name: str) -> Tuple[int, float]:
         rank = TIER_RANK.get(name, 99)
-        floor = float(tiers[name].get("min_equity_usd", 0) or 0)
+        floor = float(_band_value(tiers[name], "min_equity") or 0)
         return (rank, floor)
     return sorted(tiers.keys(), key=_key)
 
@@ -198,8 +212,8 @@ def _naive_tier_for_equity(
         return None
     for name in ordered:
         spec = tiers[name]
-        lo = float(spec.get("min_equity_usd", 0) or 0)
-        hi_raw = spec.get("max_equity_usd")
+        lo = float(_band_value(spec, "min_equity") or 0)
+        hi_raw = _band_value(spec, "max_equity")
         hi = float(hi_raw) if hi_raw is not None else float("inf")
         if lo <= equity < hi:
             return name
@@ -209,9 +223,9 @@ def _naive_tier_for_equity(
 def _demotion_threshold(spec: Dict[str, Any]) -> float:
     """Read demotion_equity_usd from a tier spec; fall back to 90 % of
     min_equity_usd if the field is missing/null."""
-    raw = spec.get("demotion_equity_usd")
+    raw = _band_value(spec, "demotion_equity")
     if raw is None:
-        return float(spec.get("min_equity_usd", 0) or 0) * 0.90
+        return float(_band_value(spec, "min_equity") or 0) * 0.90
     return float(raw)
 
 
@@ -464,14 +478,14 @@ class TierManager:
         spec = self._tiers.get(self._tier_name, {})
 
         return {
-            "schema_version": "tier_state.v2",
+            "schema_version": "tier_state.v3",
             "tier_name": self._tier_name,
             "tier_description": spec.get("description", ""),
-            "current_equity_usd": self._equity,
-            "tier_min_equity": float(spec.get("min_equity_usd", 0) or 0),
-            "tier_max_equity": (
-                float(spec["max_equity_usd"])
-                if spec.get("max_equity_usd") is not None
+            "current_equity_cad": self._equity,
+            "tier_min_equity_cad": float(_band_value(spec, "min_equity") or 0),
+            "tier_max_equity_cad": (
+                float(_band_value(spec, "max_equity"))
+                if _band_value(spec, "max_equity") is not None
                 else None
             ),
             "enabled_strategies": _expand_enabled_strategies(
@@ -529,11 +543,11 @@ def _select_tier(
     # naive below previous → consult demotion threshold (with hysteresis
     # fallback when demotion_equity_usd is absent).
     prev_spec = tier_map[prev]
-    raw_demotion = prev_spec.get("demotion_equity_usd")
+    raw_demotion = _band_value(prev_spec, "demotion_equity")
     if raw_demotion is not None:
         threshold = float(raw_demotion)
     else:
-        prev_min = float(prev_spec.get("min_equity_usd", 0) or 0)
+        prev_min = float(_band_value(prev_spec, "min_equity") or 0)
         threshold = prev_min * (1.0 - float(hysteresis_pct) / 100.0)
 
     if equity >= threshold:
@@ -563,23 +577,24 @@ def main() -> int:
     previous_state = _read_json(OUT_PATH)
     previous_tier = previous_state.get("tier_name")
 
-    # The tier band is driven EXCLUSIVELY by the authoritative USD equity
-    # (portfolio_snapshot_publisher: total_equity_usd_authoritative + usd_ok),
-    # never by the CAD component sum.  FAIL-CLOSED: if usd_ok is false — or the
-    # field is absent / not numeric (e.g. FX unavailable on a weekend, or an
-    # old snapshot) — HOLD the last persisted tier and do NOT recompute.  We
-    # must NEVER fall back to the CAD figure or to a null USD figure.
-    usd_ok = bool(snap.get("usd_ok", False))
-    total_usd = snap.get("total_equity_usd_authoritative")
-    if not (usd_ok and isinstance(total_usd, (int, float))):
+    # C-ii (CAD-native): the tier band is driven by the broker-native CAD equity
+    # (portfolio_snapshot_publisher: ibkr_equity + ibkr_equity_currency_ok), which
+    # the v2 collector writes with NO FX call.  Bands are CAD-repriced (PA C-ii;
+    # the band readers are dual-key, so this code is correct against both the
+    # current USD config and the CAD config).  FAIL-CLOSED: if
+    # ibkr_equity_currency_ok is false — or ibkr_equity is absent / not numeric —
+    # HOLD the last persisted tier and do NOT recompute.
+    cad_ok = bool(snap.get("ibkr_equity_currency_ok", False))
+    ibkr_cad = snap.get("ibkr_equity")
+    if not (cad_ok and isinstance(ibkr_cad, (int, float))):
         LOG.warning(
-            "TIER_HELD_NO_USD_RATE held_tier=%s usd_ok=%s total_usd=%s "
-            "(no authoritative USD equity; tier held, CAD never used)",
-            previous_tier, usd_ok, total_usd,
+            "TIER_HELD_NO_CAD_EQUITY held_tier=%s ibkr_equity_currency_ok=%s "
+            "ibkr_equity=%s (no broker-native CAD equity; tier held)",
+            previous_tier, cad_ok, ibkr_cad,
         )
         return 0
 
-    equity = float(total_usd)
+    equity = float(ibkr_cad)
 
     config = _read_json(TIERS_CONFIG_PATH)
     if not config or "tiers" not in config:

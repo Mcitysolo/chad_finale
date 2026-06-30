@@ -421,12 +421,12 @@ def test_salary_withdrawal_writes_proposal_not_transfer(tmp_path, monkeypatch):
 
     snap = {
         "ibkr_equity": 100_000.0,
+        "ibkr_equity_currency": "CAD",
+        "ibkr_equity_currency_ok": True,
         "kraken_equity": 0.0,
         "coinbase_equity": 0.0,
-        # New contract: main() reads the authoritative USD figure (fail-closed on
-        # usd_ok), never the broker-native CAD component sum.
-        "total_equity_usd_authoritative": 100_000.0,
-        "usd_ok": True,
+        # C-ii: main() reads broker-native CAD ibkr_equity (fail-closed on
+        # ibkr_equity_currency_ok).
         "ts_utc": "2026-05-04T00:00:00Z",
     }
     (runtime_dir / "portfolio_snapshot.json").write_text(json.dumps(snap))

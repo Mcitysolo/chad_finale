@@ -17,11 +17,11 @@ INPUTS:
 OUTPUT:
   - runtime/business_phase.json
     {
-      "schema_version": "business_phase.v1",
+      "schema_version": "business_phase.v2",
       "phase": "BUILD" | "GROW" | "PAY",
       "phase_description": str,
-      "current_equity_usd": float,
-      "seed_capital_usd": float,
+      "current_equity_cad": float,
+      "seed_capital_cad": float,
       "growth_pct_from_seed": float,
       "days_in_phase": int,
       "next_phase_requirement": str,
@@ -29,7 +29,7 @@ OUTPUT:
           "total_return_pct": float,
           "annualized_return_pct": float,
           "days_active": int,
-          "high_water_mark_usd": float
+          "high_water_mark_cad": float
       },
       "ts_utc": ISO-8601
     }
@@ -221,7 +221,7 @@ def _compound_metrics(
         "total_return_pct": round(total_return_pct, 2),
         "annualized_return_pct": round(annualized, 2),
         "days_active": days_active,
-        "high_water_mark_usd": round(hwm, 2),
+        "high_water_mark_cad": round(hwm, 2),
     }
 
 
@@ -231,26 +231,33 @@ def build_payload() -> Optional[Dict[str, Any]]:
     scr = _read_json(SCR_PATH)
     history = _read_history()
 
-    # The business view is denominated in USD (seed, salary, and HWM are all
-    # USD). It is driven EXCLUSIVELY by the authoritative USD equity
-    # (portfolio_snapshot_publisher: total_equity_usd_authoritative + usd_ok),
-    # mirroring chad/risk/tier_manager.py. FAIL-CLOSED: if usd_ok is false — or
-    # the field is absent / not numeric (FX unavailable, stale snapshot) — HOLD
-    # the last published business_phase.json (return None; main() does NOT
-    # republish). We must NEVER fall back to the CAD component sum or a null USD.
-    usd_ok = bool(snap.get("usd_ok", False))
-    total_usd = snap.get("total_equity_usd_authoritative")
-    if not (usd_ok and isinstance(total_usd, (int, float))):
+    # C-ii (CAD-native): the business view is denominated in CAD (seed, salary, and
+    # HWM are CAD-repriced in PA C-ii). It is driven by the broker-native CAD equity
+    # (portfolio_snapshot_publisher: ibkr_equity + ibkr_equity_currency_ok),
+    # mirroring chad/risk/tier_manager.py. FAIL-CLOSED: if ibkr_equity_currency_ok is
+    # false — or ibkr_equity is absent / not numeric (stale snapshot) — HOLD the last
+    # published business_phase.json (return None; main() does NOT republish).
+    cad_ok = bool(snap.get("ibkr_equity_currency_ok", False))
+    ibkr_cad = snap.get("ibkr_equity")
+    if not (cad_ok and isinstance(ibkr_cad, (int, float))):
         LOG.warning(
-            "BUSINESS_PHASE_HELD_NO_USD_RATE usd_ok=%s total_usd=%s "
-            "(no authoritative USD equity; holding prior business_phase, CAD never used)",
-            usd_ok, total_usd,
+            "BUSINESS_PHASE_HELD_NO_CAD_EQUITY ibkr_equity_currency_ok=%s ibkr_equity=%s "
+            "(no broker-native CAD equity; holding prior business_phase)",
+            cad_ok, ibkr_cad,
         )
         return None
-    current_equity = float(total_usd)
+    current_equity = float(ibkr_cad)
 
-    seed = float(withdrawal.get("seed_capital_usd", 50000.0))
-    hwm = float(withdrawal.get("high_water_mark_usd", current_equity))
+    # C-ii dual-key: withdrawal_authorization now emits *_cad; fall back to the
+    # legacy *_usd key (and the CAD-repriced seed default) during the transition.
+    seed = float(
+        withdrawal.get("seed_capital_cad",
+                       withdrawal.get("seed_capital_usd", 70800.0))
+    )
+    hwm = float(
+        withdrawal.get("high_water_mark_cad",
+                       withdrawal.get("high_water_mark_usd", current_equity))
+    )
     phase = str(withdrawal.get("phase", "BUILD")).upper()
     authorized_salary = float(withdrawal.get("authorized_withdrawal_usd", 0.0))
     scr_state = str(scr.get("state", withdrawal.get("scr_state", "UNKNOWN")))
@@ -274,13 +281,13 @@ def build_payload() -> Optional[Dict[str, Any]]:
     metrics = _compound_metrics(history, seed, current_equity, hwm)
 
     return {
-        "schema_version": "business_phase.v1",
+        "schema_version": "business_phase.v2",
         "phase": phase,
         "phase_description": description,
-        "current_equity_usd": round(current_equity, 2),
-        "current_equity_currency": "USD",
+        "current_equity_cad": round(current_equity, 2),
+        "current_equity_currency": "CAD",
         "current_equity_currency_ok": True,
-        "seed_capital_usd": round(seed, 2),
+        "seed_capital_cad": round(seed, 2),
         "growth_pct_from_seed": round(growth_pct, 2),
         "days_in_phase": days_in_phase,
         "next_phase_requirement": next_req,
@@ -308,7 +315,7 @@ def main() -> int:
 
     LOG.info(
         "business_phase_published phase=%s equity=$%.2f growth=%.2f%% next=%s",
-        payload["phase"], payload["current_equity_usd"],
+        payload["phase"], payload["current_equity_cad"],
         payload["growth_pct_from_seed"], payload["next_phase_requirement"],
     )
     return 0
