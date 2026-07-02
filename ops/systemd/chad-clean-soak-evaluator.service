@@ -1,0 +1,17 @@
+[Unit]
+Description=CHAD Clean-Soak Evaluator (GAP-039, oneshot)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.ops.clean_soak_evaluator
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-clean-soak-evaluator
+
+[Install]
+WantedBy=multi-user.target
