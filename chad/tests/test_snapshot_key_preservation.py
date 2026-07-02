@@ -249,7 +249,9 @@ def test_publisher_preserves_unowned_keys(
     monkeypatch.setattr(pub, "OUT_PATH", snap, raising=True)
     monkeypatch.setattr(pub, "_get_live_usdcad_rate", lambda *a, **k: USDCAD_RATE, raising=True)
     monkeypatch.setattr(pub, "_ibkr_equity_usd", lambda usdcad: 156000.0, raising=True)
-    monkeypatch.setattr(pub, "_read_kraken_usd_equity", lambda: 0.0, raising=True)
+    # C-ii: the Kraken leg is now native CAD (no USD round-trip); inject the
+    # native CAD value directly (0.0 here) via the new reader.
+    monkeypatch.setattr(pub, "_read_kraken_cad_equity", lambda *a, **k: 0.0, raising=True)
 
     rc = pub.main()
     assert rc == 0

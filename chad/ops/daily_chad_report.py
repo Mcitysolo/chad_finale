@@ -1219,9 +1219,17 @@ class DailyCHADReport:
         if isinstance(kraken_snap, dict) and kraken_snap.get("ok"):
             sections.append("═══ YOUR REAL KRAKEN ACCOUNT ═══")
             sections.append("(This is real money on Kraken — read-only snapshot)")
-            usd_eq = float(kraken_snap.get("usd_equivalent") or 0.0)
-            if usd_eq > 0:
-                sections.append(f"  Total value (USD eq): {_format_money(usd_eq)}")
+            # Prefer the native-CAD rollup (the Kraken account is natively CAD);
+            # fall back to the legacy USD-equivalent only if cad_equivalent is
+            # absent (clearly labeled so the currency is never ambiguous).
+            cad_eq_raw = kraken_snap.get("cad_equivalent")
+            cad_eq = float(cad_eq_raw) if isinstance(cad_eq_raw, (int, float)) else 0.0
+            if cad_eq > 0:
+                sections.append(f"  Total value (CAD): {_format_money(cad_eq)}")
+            else:
+                usd_eq = float(kraken_snap.get("usd_equivalent") or 0.0)
+                if usd_eq > 0:
+                    sections.append(f"  Total value (USD eq, legacy): {_format_money(usd_eq)}")
             balances = kraken_snap.get("balances") or {}
             if isinstance(balances, dict):
                 for asset, qty in sorted(balances.items()):

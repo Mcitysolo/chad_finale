@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+from chad.constants.fx import USDCAD_CONVERSION_CONSTANT
 from chad.exchanges.kraken_client import KrakenClient, KrakenClientConfig
 
 LOGGER = logging.getLogger("chad.market_data.kraken_balance_provider")
@@ -119,6 +120,7 @@ class KrakenBalanceSnapshot:
     balances: Dict[str, float] = field(default_factory=dict)
     raw: Dict[str, str] = field(default_factory=dict)
     usd_equivalent: float = 0.0
+    cad_equivalent: float = 0.0
     error: Optional[str] = None
 
     def to_json(self) -> Dict[str, Any]:
@@ -128,6 +130,7 @@ class KrakenBalanceSnapshot:
             "balances": dict(self.balances),
             "raw": dict(self.raw),
             "usd_equivalent": float(self.usd_equivalent),
+            "cad_equivalent": float(self.cad_equivalent),
             "error": self.error,
         }
 
@@ -146,6 +149,7 @@ class KrakenBalanceProvider:
         provider = KrakenBalanceProvider()
         balances = provider.get_balance()                 # {'BTC': 0.0012, 'CAD': 252.85}
         usd_eq   = provider.get_usd_equivalent(prices)    # converts using prices + FX fallback
+        cad_eq   = provider.get_cad_equivalent(prices)    # native CAD (crypto via C-ii constant)
         provider.maybe_refresh_snapshot(prices)           # writes runtime/kraken_balances.json
     """
 
@@ -270,6 +274,68 @@ class KrakenBalanceProvider:
 
         return float(total)
 
+    def get_cad_equivalent(self, prices: Mapping[str, float]) -> float:
+        """
+        Compute total CAD-equivalent of all balances (the base currency of the
+        Kraken account, which is natively CAD).
+
+        Native CAD cash is valued 1:1 with NO FX round-trip. The crypto sliver
+        (BTC/ETH/SOL/...) is valued at its <ASSET>-USD price converted into CAD
+        via the sanctioned USDCAD_CONVERSION_CONSTANT (the live USD.CAD feed is
+        dark on the paper account; CHAD does not trade forex). This is the
+        currency-honest rollup for the CAD base — it never values CAD in USD and
+        never depends on the dead live FX feed.
+        """
+        balances = self.get_balance()
+        return self._value_balances_in_cad(balances, prices)
+
+    def _value_balances_in_cad(
+        self,
+        balances: Mapping[str, float],
+        prices: Mapping[str, float],
+    ) -> float:
+        total = 0.0
+        for asset, qty in balances.items():
+            try:
+                qty_f = float(qty)
+            except (TypeError, ValueError):
+                continue
+            if qty_f == 0.0:
+                continue
+
+            # Native CAD cash: valued 1:1, NO FX.
+            if asset == "CAD":
+                total += qty_f * 1.0
+                continue
+
+            # Crypto asset: '<ASSET>-USD' price * USDCAD constant -> CAD.
+            crypto_key = _PRICE_LOOKUP_SYMBOL.get(asset)
+            if crypto_key is not None:
+                p = prices.get(crypto_key)
+                if p is not None:
+                    try:
+                        total += qty_f * float(p) * USDCAD_CONVERSION_CONSTANT
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+
+            # Other fiat (USD/EUR/...): USD-per-fiat * USDCAD constant -> CAD.
+            # (These legs are ~never present; handled for completeness.)
+            fx_key = f"{asset}-USD"
+            fx = prices.get(fx_key)
+            if fx is None:
+                fx = _FIAT_USD_FALLBACK.get(asset)
+            if fx is not None:
+                try:
+                    total += qty_f * float(fx) * USDCAD_CONVERSION_CONSTANT
+                    continue
+                except (TypeError, ValueError):
+                    pass
+
+            LOGGER.debug("kraken_balance_unvalued_cad asset=%s qty=%s", asset, qty_f)
+
+        return float(total)
+
     # -- snapshot writer ----------------------------------------------------
 
     def maybe_refresh_snapshot(
@@ -319,14 +385,17 @@ class KrakenBalanceProvider:
                     continue
                 balances[asset] = balances.get(asset, 0.0) + amount
             usd_eq = self._value_balances_in_usd(balances, prices)
+            cad_eq = self._value_balances_in_cad(balances, prices)
             ok = bool(raw)
             err = None if ok else "empty_balance_response"
             return KrakenBalanceSnapshot(
-                ts_utc=ts, ok=ok, balances=balances, raw=raw, usd_equivalent=usd_eq, error=err
+                ts_utc=ts, ok=ok, balances=balances, raw=raw,
+                usd_equivalent=usd_eq, cad_equivalent=cad_eq, error=err
             )
         except Exception as exc:
             return KrakenBalanceSnapshot(
-                ts_utc=ts, ok=False, balances={}, raw={}, usd_equivalent=0.0,
+                ts_utc=ts, ok=False, balances={}, raw={},
+                usd_equivalent=0.0, cad_equivalent=0.0,
                 error=f"{type(exc).__name__}: {exc}",
             )
 

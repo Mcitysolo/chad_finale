@@ -22,7 +22,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 LOG = logging.getLogger("chad.ops.portfolio_snapshot_publisher")
 
@@ -51,7 +51,12 @@ def _utc_now_iso() -> str:
 
 
 def _read_kraken_usd_equity() -> float:
-    """Read existing kraken_balances.json for USD-equivalent."""
+    """Read existing kraken_balances.json for USD-equivalent.
+
+    Legacy helper retained for back-compat (the Kraken *equity leg* no longer
+    reads it — see _read_kraken_cad_equity). Still exposed because downstream
+    observability may reference the USD-equivalent figure.
+    """
     try:
         d = json.loads(KRAKEN_BAL_PATH.read_text(encoding="utf-8"))
         usd_eq = d.get("usd_equivalent") or d.get("usd_eq") or 0.0
@@ -59,6 +64,84 @@ def _read_kraken_usd_equity() -> float:
     except Exception as exc:
         LOG.warning("kraken_balance_read_failed: %s", exc)
         return 0.0
+
+
+def _read_kraken_cad_equity(path: Path = KRAKEN_BAL_PATH) -> Optional[float]:
+    """Read the NATIVE CAD value of the Kraken account from its snapshot.
+
+    The Kraken account is natively CAD. Prefer the provider-written
+    ``cad_equivalent`` (crypto sliver valued via the sanctioned USDCAD constant
+    at snapshot time). If that field is absent, reconstruct from ``balances``:
+    CAD cash 1:1 (native), crypto skipped (the balance snapshot carries no
+    price — the provider's cad_equivalent is the priced path).
+
+    Returns the native CAD float (possibly 0.0 when cad_equivalent is present
+    and zero), or None when NEITHER a cad_equivalent NOR any reconstructable
+    balance is available -> the caller fails closed. This path NEVER performs a
+    USD round-trip and NEVER touches the dark live USDCAD feed.
+    """
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOG.warning("kraken_cad_read_failed: %s", exc)
+        return None
+    if not isinstance(d, dict):
+        return None
+
+    cad_eq = d.get("cad_equivalent")
+    if isinstance(cad_eq, (int, float)) and not isinstance(cad_eq, bool):
+        return float(cad_eq)
+
+    # Fallback: reconstruct native CAD from balances (no USD round-trip).
+    balances = d.get("balances")
+    if not isinstance(balances, dict) or not balances:
+        return None
+    total = 0.0
+    valued_any = False
+    for asset, qty in balances.items():
+        try:
+            qty_f = float(qty)
+        except (TypeError, ValueError):
+            continue
+        if qty_f == 0.0:
+            continue
+        if str(asset).upper() == "CAD":
+            total += qty_f  # native CAD, 1:1
+            valued_any = True
+        else:
+            # Crypto legs carry no price in the balance snapshot; the provider's
+            # cad_equivalent is the priced path. Skip (debug) rather than guess.
+            LOG.debug("kraken_cad_fallback_skip_unpriced asset=%s qty=%s", asset, qty_f)
+    if not valued_any:
+        return None
+    return float(total)
+
+
+def _apply_kraken_cad_leg(payload: Dict[str, Any], *, path: Path = KRAKEN_BAL_PATH) -> None:
+    """Set the Kraken equity leg to its NATIVE CAD value on ``payload``.
+
+    Honest currency semantics: the value IS CAD, so kraken_equity_currency_ok is
+    True whenever a native value is readable — with NO usdcad multiply and NO
+    dead-feed dependency. Fail-closed (preserve prior kraken_equity, currency_ok
+    False, loud log) only when neither cad_equivalent nor a reconstructable
+    balance is available.
+    """
+    cad = _read_kraken_cad_equity(path)
+    if cad is not None:
+        payload["kraken_equity"] = float(cad)
+        payload["kraken_equity_currency"] = "CAD"
+        payload["kraken_equity_currency_ok"] = True
+    else:
+        # FAIL-CLOSED: preserve the prior kraken_equity (already copied via
+        # read-through), flag it untrusted, log loudly. The next cycle with a
+        # readable native value self-heals.
+        payload["kraken_equity_currency_ok"] = False
+        LOG.error(
+            "KRAKEN_CAD_UNAVAILABLE: no cad_equivalent and no reconstructable "
+            "balance; preserving prior kraken_equity=%s, "
+            "kraken_equity_currency_ok=false",
+            payload.get("kraken_equity"),
+        )
 
 
 def _validate_usdcad(mid: Optional[float]) -> Optional[float]:
@@ -196,7 +279,6 @@ def main() -> int:
     # double FX call). None == no usable live rate -> fail-closed downstream.
     usdcad = _get_live_usdcad_rate()
     ibkr_equity_usd = _ibkr_equity_usd(usdcad)
-    kraken_usd = _read_kraken_usd_equity()
 
     # BOX-034A §3 (single-writer): the v2 collector
     # (chad/portfolio/ibkr_portfolio_collector_v2.py, chad-ibkr-collector.timer)
@@ -225,24 +307,13 @@ def main() -> int:
         float(ibkr_equity_usd) if ibkr_equity_usd is not None else None
     )
 
-    # BOX-034A Inc 3 Step 0b: Kraken balances are read as a USD-equivalent;
-    # convert to the CAD base so the snapshot is currency-consistent (ibkr_equity
-    # is already CAD via the v2 collector).
-    if usdcad is not None:
-        kraken_cad = float(kraken_usd) * usdcad  # USD * (CAD per USD) = CAD
-        payload["kraken_equity"] = kraken_cad
-        payload["kraken_equity_currency"] = "CAD"
-        payload["kraken_equity_currency_ok"] = True
-    else:
-        # FAIL-CLOSED: never tag a USD figure as CAD. Preserve the prior
-        # kraken_equity (already copied via read-through), flag it untrusted,
-        # and log loudly. The next cycle with a live rate self-heals.
-        payload["kraken_equity_currency_ok"] = False
-        LOG.error(
-            "KRAKEN_FX_UNAVAILABLE: no live USDCAD rate at write time; preserving "
-            "prior kraken_equity=%s unconverted, kraken_equity_currency_ok=false",
-            payload.get("kraken_equity"),
-        )
+    # C-ii native-CAD Kraken leg: the Kraken account is natively CAD. Value it
+    # in CAD DIRECTLY from the snapshot's cad_equivalent (crypto sliver priced
+    # via the sanctioned USDCAD constant at snapshot time) — NO usdcad multiply,
+    # NO dead-feed dependency, NO USD round-trip. This retires the former
+    # USD-equivalent -> CAD conversion (BOX-034A Inc 3 Step 0b) for this leg;
+    # the IBKR USD display block below is unchanged and still uses the live rate.
+    _apply_kraken_cad_leg(payload)
 
     # --- Authoritative USD equity (additive; display/observability only — no
     # risk/sizing/tier/drawdown consumer reads it). Built ONLY from USD

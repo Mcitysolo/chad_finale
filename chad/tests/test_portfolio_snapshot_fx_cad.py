@@ -6,10 +6,11 @@ Covers:
 - _validate_usdcad / _get_live_usdcad_rate band logic (no fallback leaks):
   in-band -> live mid; unavailable -> None; out-of-band (inverted ~0.73 /
   garbage) -> None.
-- main(): Kraken USD->CAD conversion uses the live rate in the correct
-  direction (184.58 * ~1.37 -> ~252.85) and tags currency_ok=true.
-- main(): FX unavailable -> fail-closed (prior kraken_equity preserved,
-  currency_ok=false, KRAKEN_FX_UNAVAILABLE logged, ibkr_equity_usd_display None).
+- main(): Kraken leg is NATIVE CAD (C-ii) — no USD round-trip, no usdcad
+  multiply; currency_ok=true whenever a native CAD value is readable.
+- main(): Kraken CAD unreadable -> fail-closed (prior kraken_equity preserved,
+  currency_ok=false, KRAKEN_CAD_UNAVAILABLE logged). FX unavailable now only
+  affects ibkr_equity_usd_display (None), NOT the native Kraken CAD leg.
 
 No real IBKR connection: all IO is patched. Safe under CHAD_SKIP_IB_CONNECT=1.
 """
@@ -55,7 +56,7 @@ def test_get_live_usdcad_rate_via_injected_fetcher():
 # --------------------------------------------------------------------------
 # main() write behaviour
 # --------------------------------------------------------------------------
-def _patch_main(monkeypatch, tmp_path, *, usdcad, ibkr_usd, kraken_usd, prior=None):
+def _patch_main(monkeypatch, tmp_path, *, usdcad, ibkr_usd, kraken_cad, prior=None):
     out = tmp_path / "portfolio_snapshot.json"
     if prior is not None:
         out.write_text(json.dumps(prior), encoding="utf-8")
@@ -63,28 +64,32 @@ def _patch_main(monkeypatch, tmp_path, *, usdcad, ibkr_usd, kraken_usd, prior=No
     monkeypatch.setattr(pub, "OUT_PATH", out)
     monkeypatch.setattr(pub, "_get_live_usdcad_rate", lambda *a, **k: usdcad)
     monkeypatch.setattr(pub, "_ibkr_equity_usd", lambda _u: ibkr_usd)
-    monkeypatch.setattr(pub, "_read_kraken_usd_equity", lambda: kraken_usd)
+    # C-ii: the Kraken leg is now NATIVE CAD (no USD round-trip). Inject the
+    # native CAD value directly; kraken_cad=None triggers the fail-closed branch.
+    monkeypatch.setattr(pub, "_read_kraken_cad_equity", lambda *a, **k: kraken_cad)
     rc = pub.main()
     data = json.loads(out.read_text(encoding="utf-8"))
     return rc, data
 
 
-def test_kraken_converted_to_cad_correct_direction(monkeypatch, tmp_path):
-    # live rate from the real Kraken file: 252.8538 CAD / 184.583274 USD ~= 1.3698
+def test_kraken_leg_is_native_cad_passthrough(monkeypatch, tmp_path):
+    # C-ii: the Kraken account is natively CAD. The leg passes the native CAD
+    # value through verbatim — no usdcad multiply, no USD round-trip.
     rc, data = _patch_main(
         monkeypatch, tmp_path,
-        usdcad=1.3698, ibkr_usd=200000.0, kraken_usd=184.583274,
+        usdcad=1.3698, ibkr_usd=200000.0, kraken_cad=252.85,
     )
     assert rc == 0
     assert data["kraken_equity_currency"] == "CAD"
     assert data["kraken_equity_currency_ok"] is True
-    # 184.583274 * 1.3698 ~= 252.86 — correct direction (NOT the ~135 inversion)
-    assert 252.0 < data["kraken_equity"] < 253.7
-    assert data["kraken_equity"] > 200.0  # proves direction is USD->CAD, not CAD->USD
+    assert data["kraken_equity"] == 252.85  # native CAD verbatim, no conversion
     assert data["ibkr_equity_usd_display"] == 200000.0
 
 
-def test_kraken_fail_closed_when_fx_unavailable(monkeypatch, tmp_path, caplog):
+def test_kraken_fail_closed_when_cad_unreadable(monkeypatch, tmp_path, caplog):
+    # C-ii: the Kraken leg fails closed ONLY when the native CAD value is
+    # unreadable (no cad_equivalent, no reconstructable balance) — NOT because
+    # the USDCAD feed is dark. Prior kraken_equity is preserved, never mis-tagged.
     prior = {
         "ibkr_equity": 295687.28,
         "ibkr_equity_currency": "CAD",
@@ -94,7 +99,7 @@ def test_kraken_fail_closed_when_fx_unavailable(monkeypatch, tmp_path, caplog):
     with caplog.at_level(logging.ERROR, logger=pub.LOG.name):
         rc, data = _patch_main(
             monkeypatch, tmp_path,
-            usdcad=None, ibkr_usd=None, kraken_usd=184.583274, prior=prior,
+            usdcad=None, ibkr_usd=None, kraken_cad=None, prior=prior,
         )
     assert rc == 0
     # prior kraken_equity preserved (NOT overwritten, NOT mis-tagged as CAD)
@@ -105,19 +110,20 @@ def test_kraken_fail_closed_when_fx_unavailable(monkeypatch, tmp_path, caplog):
     # canonical collector value preserved via read-through
     assert data["ibkr_equity"] == 295687.28
     # loud, greppable warning emitted
-    assert any("KRAKEN_FX_UNAVAILABLE" in r.getMessage() for r in caplog.records)
+    assert any("KRAKEN_CAD_UNAVAILABLE" in r.getMessage() for r in caplog.records)
 
 
 def test_ibkr_usd_display_none_does_not_block_kraken_cad(monkeypatch, tmp_path):
-    # IBKR equity unavailable but FX is live: kraken still converts, display None
+    # IBKR equity unavailable: the native-CAD Kraken leg is unaffected; only the
+    # ibkr_equity_usd_display goes None.
     rc, data = _patch_main(
         monkeypatch, tmp_path,
-        usdcad=1.3698, ibkr_usd=None, kraken_usd=184.583274,
+        usdcad=1.3698, ibkr_usd=None, kraken_cad=252.85,
     )
     assert rc == 0
     assert data["ibkr_equity_usd_display"] is None
     assert data["kraken_equity_currency_ok"] is True
-    assert 252.0 < data["kraken_equity"] < 253.7
+    assert data["kraken_equity"] == 252.85
 
 
 # --------------------------------------------------------------------------
@@ -135,12 +141,12 @@ def test_total_usd_authoritative_valid_rate(monkeypatch, tmp_path):
     }
     rc, data = _patch_main(
         monkeypatch, tmp_path,
-        usdcad=1.4, ibkr_usd=136000.0, kraken_usd=200.0, prior=prior,
+        usdcad=1.4, ibkr_usd=136000.0, kraken_cad=280.0, prior=prior,
     )
     assert rc == 0
     assert data["usd_ok"] is True
     assert data["usdcad_rate_used"] == 1.4
-    # kraken CAD this cycle = 200.0 * 1.4 = 280.0; converted back = 200.0 USD.
+    # kraken native CAD this cycle = 280.0; converted back = 280.0 / 1.4 = 200.0 USD.
     # coinbase is 0.0 -> total == ibkr_usd + kraken_usd exactly (coinbase handled).
     assert data["coinbase_equity"] == 0.0
     assert abs(data["total_equity_usd_authoritative"] - (136000.0 + 200.0)) < 1e-6
@@ -163,7 +169,7 @@ def test_total_usd_authoritative_fail_closed_when_rate_none(monkeypatch, tmp_pat
     }
     rc, data = _patch_main(
         monkeypatch, tmp_path,
-        usdcad=None, ibkr_usd=None, kraken_usd=200.0, prior=prior,
+        usdcad=None, ibkr_usd=None, kraken_cad=280.0, prior=prior,
     )
     assert rc == 0
     assert data["total_equity_usd_authoritative"] is None
@@ -179,10 +185,10 @@ def test_total_usd_authoritative_fail_closed_when_ibkr_component_none(monkeypatc
     # usdcad_rate_used still records the rate that WAS applied to kraken.
     rc, data = _patch_main(
         monkeypatch, tmp_path,
-        usdcad=1.4, ibkr_usd=None, kraken_usd=200.0,
+        usdcad=1.4, ibkr_usd=None, kraken_cad=280.0,
     )
     assert rc == 0
     assert data["total_equity_usd_authoritative"] is None
     assert data["usd_ok"] is False
     assert data["usdcad_rate_used"] == 1.4
-    assert data["kraken_equity_currency_ok"] is True  # kraken still converted
+    assert data["kraken_equity_currency_ok"] is True  # kraken leg still native CAD
