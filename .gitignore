@@ -27,3 +27,10 @@ runtime/pnl_state.json
 
 # Forensic-archive directory (P3-1 telegram dedupe + P3-2 dynamic_caps backups)
 _archive/
+
+# Claude Code: ignore local settings/caches, keep intentional skill+hook config
+.claude/*
+!.claude/hooks/
+!.claude/hooks/**
+!.claude/skills/
+!.claude/skills/**

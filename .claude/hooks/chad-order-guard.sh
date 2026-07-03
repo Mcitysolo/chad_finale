@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# chad-order-guard.sh — blocks live-order entrypoints, even under bypassPermissions.
+input=$(cat)
+cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // ""')
+if printf '%s' "$cmd" | grep -qiE 'flatten_futures_oneshot|micro_eod_flatten|kraken_roundtrip_runner|reqGlobalCancel'; then
+  printf 'BLOCKED by chad-order-guard: live-order/flatten entrypoint. Run this manually in the terminal (Channel 1).\n' >&2
+  exit 2
+fi
+exit 0
