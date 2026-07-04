@@ -19,12 +19,12 @@ For each symbol with 1d bar data:
         Percentile rank of the most recent 20-day realized volatility
         against the last ``lookback_days`` (default 252) of 20-day vols.
 
-    adx_proxy               : float, ~0-100
-        Average True Range as percent of price, smoothed over 14 bars.
-        Not a true Wilder ADX; a simple proxy with the same ordering
-        property (bigger = more "directional movement"). Scaled to the
-        25-ish range the classifier expects (see DEFAULT_ADX_THRESHOLD
-        = 25 in regime_classifier.py).
+    adx                     : float, ~0-100
+        Wilder's Average Directional Index over 14 bars — a measure of
+        *directional trend strength*, not volatility. Reads LOW (<20) in
+        flat or choppy markets where +DI and -DI roughly cancel, and
+        HIGH (>25) in a sustained trend. Compares against
+        DEFAULT_ADX_THRESHOLD = 25 in regime_classifier.py.
 
     trend_slope             : float
         Slope of a linear regression on the last 20 daily closes,
@@ -164,17 +164,56 @@ def compute_realized_vol_percentile(
     return below_or_equal / len(history)
 
 
-def compute_adx_proxy(bars: List[dict], period: int = DEFAULT_ADX_PERIOD) -> float:
-    """Approximate ADX from bar OHLC — positive-valued "directionality".
+def _wilder_smoothed_series(values: List[float], period: int) -> List[float]:
+    """Wilder's smoothing of ``values`` over ``period``.
 
-    Simple formulation: average true range as a percent of close, scaled
-    up by a factor that puts normal markets around 15-35 (matching the
-    classifier's threshold of 25). Not a true Wilder ADX but preserves
-    its ordering property (bigger = stronger directional movement).
+    The first smoothed value is the *sum* of the first ``period`` inputs;
+    each subsequent value is ``prior - prior / period + current``. Because
+    the directional indicators divide one smoothed series by another
+    (+DM/TR, -DM/TR), the sum-vs-average scaling cancels — only the
+    consistent recursion matters. Returns a list of length
+    ``len(values) - period + 1``; an empty list if there is too little
+    data to seed the first smoothed value.
     """
     period = max(2, int(period))
-    if len(bars) < period + 1:
+    if len(values) < period:
+        return []
+    run = math.fsum(values[:period])
+    smoothed: List[float] = [run]
+    for i in range(period, len(values)):
+        run = run - run / period + values[i]
+        smoothed.append(run)
+    return smoothed
+
+
+def compute_adx_proxy(bars: List[dict], period: int = DEFAULT_ADX_PERIOD) -> float:
+    """Wilder's Average Directional Index (ADX) from bar OHLC.
+
+    Measures *directional trend strength*, not volatility. In a flat or
+    choppy market +DI and -DI roughly cancel, so DX — and hence the ADX —
+    reads LOW (<20); a strong sustained trend (up or down) drives them
+    apart and the ADX reads HIGH (>25). The result is naturally bounded
+    to roughly 0-100.
+
+    Standard Wilder construction (period=14): per bar compute directional
+    movement (+DM, -DM) and True Range (TR), Wilder-smooth each over
+    ``period``, form +DI/-DI, then DX, then Wilder-smooth DX into the ADX.
+
+    The name ``compute_adx_proxy`` is kept for drop-in compatibility with
+    the publisher call site and the ``adx`` JSON key; only the internals
+    changed. The earlier volatility proxy (``atr_pct * 1600``) was
+    calibrated for ~1.5% index ATR and mis-read individual stocks (2-7%
+    ATR) as "strongly trending" even in a flat market.
+
+    Needs at least ``2 * period + 1`` bars for a stable ADX; with fewer it
+    returns 0.0 — the same graceful-degrade contract as the prior proxy.
+    """
+    period = max(2, int(period))
+    if len(bars) < 2 * period + 1:
         return 0.0
+
+    plus_dm: List[float] = []
+    minus_dm: List[float] = []
     trs: List[float] = []
     for i in range(1, len(bars)):
         cur = bars[i]
@@ -183,23 +222,54 @@ def compute_adx_proxy(bars: List[dict], period: int = DEFAULT_ADX_PERIOD) -> flo
             continue
         hi = _safe_float(cur.get("high"))
         lo = _safe_float(cur.get("low"))
+        prev_hi = _safe_float(prev.get("high"))
+        prev_lo = _safe_float(prev.get("low"))
         prev_close = _safe_float(prev.get("close"))
-        if hi <= 0.0 or lo <= 0.0 or prev_close <= 0.0:
+        if hi <= 0.0 or lo <= 0.0 or prev_hi <= 0.0 or prev_lo <= 0.0 or prev_close <= 0.0:
             continue
-        tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
-        trs.append(tr)
-    if len(trs) < period:
+        up_move = hi - prev_hi
+        down_move = prev_lo - lo
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0.0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0.0) else 0.0)
+        trs.append(max(hi - lo, abs(hi - prev_close), abs(lo - prev_close)))
+
+    # Two Wilder passes are needed: one to seed +DI/-DI/DX, one to seed the
+    # ADX average. Require 2*period directional samples so both are stable.
+    if len(trs) < 2 * period:
         return 0.0
-    recent_tr_mean = statistics.fmean(trs[-period:])
-    last_close = _safe_float(
-        bars[-1].get("close") if isinstance(bars[-1], dict) else 0.0
-    )
-    if last_close <= 0.0:
+
+    sm_plus = _wilder_smoothed_series(plus_dm, period)
+    sm_minus = _wilder_smoothed_series(minus_dm, period)
+    sm_tr = _wilder_smoothed_series(trs, period)
+
+    dxs: List[float] = []
+    for sp, sm, st in zip(sm_plus, sm_minus, sm_tr):
+        if st <= 0.0:
+            dxs.append(0.0)
+            continue
+        plus_di = 100.0 * sp / st
+        minus_di = 100.0 * sm / st
+        di_sum = plus_di + minus_di
+        if di_sum <= 0.0:  # guard divide-by-zero (both DI == 0)
+            dxs.append(0.0)
+            continue
+        dxs.append(100.0 * abs(plus_di - minus_di) / di_sum)
+
+    if len(dxs) < period:
         return 0.0
-    atr_pct = recent_tr_mean / last_close  # e.g. 0.015 = 1.5% ATR
-    # Scale so typical-market ~25. 0.015 * 1600 = 24 — lines up with the
-    # classifier's default adx_threshold of 25.
-    return atr_pct * 1600.0
+
+    # ADX seed = simple mean of the first `period` DX values, then Wilder's
+    # running average: adx = (prior * (period - 1) + current) / period.
+    adx = statistics.fmean(dxs[:period])
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+
+    # Defensive clamp: DX/ADX are mathematically in [0, 100].
+    if adx < 0.0:
+        return 0.0
+    if adx > 100.0:
+        return 100.0
+    return adx
 
 
 def compute_trend_slope(closes: List[float], period: int = DEFAULT_TREND_WINDOW) -> float:
