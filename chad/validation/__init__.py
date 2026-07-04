@@ -23,6 +23,25 @@ from chad.validation.bar_audit import (
     render_corpus_summary,
     render_symbol_audit,
 )
+from chad.validation.cost_model import (
+    CostBreakdown,
+    CostConfig,
+    DEFAULT_COST_CONFIG,
+    InstrumentClass,
+    IntrabarResolution,
+    LiquidityTier,
+    Trade,
+    apply_costs,
+    resolve_intrabar,
+)
+from chad.validation.regime_labeler import (
+    DEFAULT_REGIME_CONFIG,
+    Regime,
+    RegimeConfig,
+    RegimeLabel,
+    RegimeSeries,
+    label_series,
+)
 from chad.validation.scoring_spine import (
     DEFAULT_PERIODS_PER_YEAR,
     ScoreResult,
@@ -30,6 +49,12 @@ from chad.validation.scoring_spine import (
     score_equity,
     score_returns,
     score_trades,
+)
+from chad.validation.splits import (
+    Partition,
+    WalkForwardWindow,
+    generate_walk_forward,
+    partition,
 )
 
 __all__ = [
@@ -50,4 +75,26 @@ __all__ = [
     "score_equity",
     "score_returns",
     "score_trades",
+    # Phase 2 — cost model + pessimistic execution (SSOT §3.5).
+    "CostBreakdown",
+    "CostConfig",
+    "DEFAULT_COST_CONFIG",
+    "InstrumentClass",
+    "IntrabarResolution",
+    "LiquidityTier",
+    "Trade",
+    "apply_costs",
+    "resolve_intrabar",
+    # Phase 2 — splits + purged/embargoed walk-forward (SSOT §3.7).
+    "Partition",
+    "WalkForwardWindow",
+    "generate_walk_forward",
+    "partition",
+    # Phase 2 — independent regime labeler (SSOT §3.4).
+    "DEFAULT_REGIME_CONFIG",
+    "Regime",
+    "RegimeConfig",
+    "RegimeLabel",
+    "RegimeSeries",
+    "label_series",
 ]
