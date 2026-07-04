@@ -149,11 +149,15 @@ docs/EDGE_HARNESS_DESIGN_v1.1.md   # this doc, committed as build SSOT
 
 ### 4.3 Pre-registered minimums (F2 — set NOW, not after results)
 A verdict stricter than `INSUFFICIENT_DATA` requires at least:
-- **≥ [N_min] OOS trades** per head being judged,
-- **≥ [W_min] walk-forward windows**,
-- **≥ [R_min] distinct regimes** represented in OOS,
+- **≥ 30 OOS trades** per head being judged (**N_min = 30**),
+- **≥ 6 walk-forward windows** (**W_min = 6**),
+- **≥ 3 distinct regimes** represented in OOS (**R_min = 3**),
 - data-quality audit (Phase 0) **PASS** for every symbol involved.
-(Exact N_min/W_min/R_min fixed at Phase 3, committed to this doc before any sealed run. Placeholders now to force the discipline of pre-registration.)
+
+**Committed values + justification (pre-registered at Phase 3, 2026-07-04, before any sealed run — these are now FIXED; changing them post-FAIL is a config change that invalidates the seal and increments the deflation trial count per §3.2):**
+- **N_min = 30 OOS trades/head.** Below ≈30 trades the per-head Sharpe and — critically — its skewness and kurtosis (which the Deflated Sharpe Ratio consumes, §3.3) are dominated by sampling noise, so the DSR denominator is unreliable. 30 is the conventional central-limit floor and is consistent with the borderline sample sizes (n ≈ 24–29) of the published PSR/DSR worked examples this phase encodes as known-answer anchors. With 52 daily-bar symbols and limited history this will frequently NOT be met → honest `INSUFFICIENT_DATA` (the intended default, Part 0).
+- **W_min = 6 walk-forward windows.** ≥6 non-overlapping purged/embargoed OOS folds give ≥5 degrees of freedom for a cross-window consistency check — the floor below which "the edge is stable through time" cannot be distinguished from a lucky single stretch. Achievable from a few years of daily bars under the §3.7 splitter; fewer windows is not enough time-diversity to judge stability strictly.
+- **R_min = 3 distinct regimes in OOS.** The independent labeler (§3.4) defines 5 regimes {bull_calm, bull_vol, bear_calm, bear_vol, flat}. The pass condition (§4.2) already requires edge in **≥2** regimes, so the *representation* minimum must exceed the pass bar: requiring ≥3 distinct regimes present ensures the ≥2-regime test is assessed against a non-degenerate regime sample rather than fabricated from a market that only exhibited one or two moods over the OOS span.
 
 Starting threshold values (frozen before sealed run, all logged): deflated Sharpe > 0 at 95%, cost-adjusted CAGR > 0, worst-quantile ruin < 1%, edge in ≥ 2 regimes or regime-scoped sizing, IS→OOS degradation within a sane band.
 
