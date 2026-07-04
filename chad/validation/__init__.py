@@ -23,6 +23,14 @@ from chad.validation.bar_audit import (
     render_corpus_summary,
     render_symbol_audit,
 )
+from chad.validation.scoring_spine import (
+    DEFAULT_PERIODS_PER_YEAR,
+    ScoreResult,
+    equity_to_returns,
+    score_equity,
+    score_returns,
+    score_trades,
+)
 
 __all__ = [
     "AuditConfig",
@@ -35,4 +43,11 @@ __all__ = [
     "audit_symbol",
     "render_corpus_summary",
     "render_symbol_audit",
+    # Phase 1 — shared scoring spine (SSOT §1.3).
+    "DEFAULT_PERIODS_PER_YEAR",
+    "ScoreResult",
+    "equity_to_returns",
+    "score_equity",
+    "score_returns",
+    "score_trades",
 ]
