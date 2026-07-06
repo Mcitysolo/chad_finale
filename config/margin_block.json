@@ -1,0 +1,38 @@
+{
+  "_comment": "CHAD Margin/Buying-Power BLOCK — pre-registered config per design SSOT v2.2. Committed BEFORE the consuming gate exists (pre-registration). THRESHOLDS ARE FROZEN: changing any threshold/rate is a deliberate logged event, and a post-FAIL change counts as a new trial. The SOLE field expected to change post-freeze is `mode` (the Part 7 shadow->enforce ladder); each mode change is a separate authorization commit, so git history is the enforcement-authorization log. No env overrides; invalid/missing config => refuse to start (fail-closed at startup).",
+  "schema_version": "1.0.0",
+  "design_ref": "docs/CHAD_MARGIN_BLOCK_DESIGN_v2.2.md",
+  "frozen_utc": "2026-07-06",
+  "mode": "shadow",
+  "_mode_note": "shadow = evaluate + log only, blocks nothing (design Part 7 step 2). enforce_paper / enforce_live require a separate deliberate authorization commit; never auto-flip. This is the only field permitted to change after freeze.",
+  "account_size_basis": "NetLiquidation",
+  "_basis_note": "ALL percentage/multiple thresholds are denominated in NetLiquidation (the canonical account-size field the buying_power_provider fetches). The design's word 'equity' maps to NetLiquidation here; EquityWithLoanValue is NOT collected and is not a basis. One base, no ambiguity.",
+  "thresholds": {
+    "aggregate_gross_exposure_max_mult_netliq": 2.0,
+    "excess_liquidity_floor_pct_netliq": 25.0,
+    "init_margin_ceiling_pct_netliq": 50.0,
+    "single_order_notional_max_pct_netliq": 10.0,
+    "whatif_vs_independent_log_gap_tolerance_pct": 20.0
+  },
+  "margin_rates_by_asset_class": {
+    "_note": "Independent margin estimate = notional * rate, then CAD-converted. Conservative (overstates margin => biases toward BLOCK). The MORE CONSERVATIVE of {whatIf, independent} governs.",
+    "equity_regt": 0.50,
+    "crypto_unlevered": 1.00,
+    "futures_blanket_conservative": 0.25,
+    "_futures_note": "Single conservative blanket rate. Futures are gated OFF (CHAD_DISABLE_FUTURES_EXECUTION=1). 0.25 deliberately overstates typical SPAN (~5-12%) to bias toward BLOCK. MUST be refined to per-symbol SPAN rates before futures execution is ever enabled."
+  },
+  "freshness": {
+    "account_data_ttl_seconds": 30.0,
+    "fx_conservative_bias_mult": 1.05,
+    "_fx_note": "USD->CAD via canonical USDCAD_CONVERSION_CONSTANT * this bias, overstating USD exposure in CAD (FX fails-closed). Applies to exposure, NOT to capacity figures (design section 2.1)."
+  },
+  "whatif_pacing": {
+    "max_calls_per_second": 2,
+    "_note": "Respect IBKR pacing. On pacing/timeout the independent estimate governs; an increasing order is still fail-closed if neither is computable."
+  },
+  "safety": {
+    "no_env_overrides": true,
+    "refuse_start_on_invalid": true,
+    "_note": "Loader contract (implemented by the design-Phase-B gate that consumes this file): STRICT validation. Unknown non-underscore key => refuse to start; missing required key => refuse; wrong type => refuse. A typo'd threshold name must NOT validate as a harmless extra key while the real threshold silently falls to a code default — that silent drift is exactly what this file exists to prevent. A risk threshold must not be silently overridable by env/drop-in (loss-guard drift lesson)."
+  }
+}
