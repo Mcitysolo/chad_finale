@@ -34,3 +34,13 @@ _archive/
 !.claude/hooks/**
 !.claude/skills/
 !.claude/skills/**
+
+# planning-with-files skill: universal install dir + per-project plan artifacts
+.agents/
+.planning/
+task_plan.md
+findings.md
+progress.md
+# Local-only skill symlink (target lives in ignored .agents/) + installer lockfile
+.claude/skills/planning-with-files
+skills-lock.json
