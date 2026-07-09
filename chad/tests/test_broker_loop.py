@@ -10,14 +10,28 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 import pytest
 
 from chad.execution.broker_loop import (
+    BROKER_READER_STALLED,
     BrokerLoop,
     BrokerLoopDown,
     BrokerLoopTimeout,
 )
+
+
+class _Clock:
+    """Manually-advanced monotonic clock injected as the watchdog's now_fn so
+    reader-idle time is controlled deterministically (independent of the real
+    check cadence)."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
 
 
 @pytest.fixture()
@@ -177,3 +191,119 @@ def test_stop_is_idempotent() -> None:
     bl.stop(timeout_s=2.0)
     bl.stop(timeout_s=2.0)  # must not raise
     assert not bl.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# U2 — reader-progress watchdog + forced reconnect + BROKER_READER_STALLED
+# ---------------------------------------------------------------------------
+
+def test_watchdog_reconnects_on_reader_stall(loop: BrokerLoop) -> None:
+    clock = _Clock()
+    reconnected = threading.Event()
+
+    async def _reconnect():
+        reconnected.set()
+
+    loop.attach_watchdog(
+        reconnect=_reconnect,
+        stall_timeout_s=0.5,
+        interval_s=0.02,
+        pending_provider=lambda: 1,  # a call is in flight
+        now_fn=clock,
+    )
+    # A call is pending and the reader makes no progress -> stall.
+    clock.t = 5.0
+    assert reconnected.wait(3.0), "watchdog did not force a reconnect on stall"
+
+
+def test_watchdog_no_reconnect_when_reader_progresses(loop: BrokerLoop) -> None:
+    clock = _Clock()
+    reconnected = threading.Event()
+
+    async def _reconnect():
+        reconnected.set()
+
+    loop.attach_watchdog(
+        reconnect=_reconnect,
+        stall_timeout_s=0.5,
+        interval_s=0.02,
+        pending_provider=lambda: 1,
+        now_fn=clock,
+    )
+    # A call is pending, but the reader keeps advancing (mark_reader_progress
+    # in lockstep with the clock) -> never a stall.
+    for _ in range(30):
+        clock.t += 0.1
+        loop.mark_reader_progress()
+        time.sleep(0.02)
+    assert not reconnected.is_set(), "healthy reader must not trigger reconnect"
+
+
+def test_watchdog_no_reconnect_when_no_calls_pending(loop: BrokerLoop) -> None:
+    clock = _Clock()
+    reconnected = threading.Event()
+
+    async def _reconnect():
+        reconnected.set()
+
+    loop.attach_watchdog(
+        reconnect=_reconnect,
+        stall_timeout_s=0.5,
+        interval_s=0.02,
+        pending_provider=lambda: 0,  # nothing in flight
+        now_fn=clock,
+    )
+    clock.t = 100.0  # reader long-idle, but no pending call
+    time.sleep(0.3)
+    assert not reconnected.is_set(), "idle reader with no pending call is normal"
+
+
+def test_watchdog_marker_logged(loop: BrokerLoop, caplog) -> None:
+    import logging
+
+    clock = _Clock()
+    reconnected = threading.Event()
+
+    async def _reconnect():
+        reconnected.set()
+
+    with caplog.at_level(logging.ERROR, logger="chad.execution.broker_loop"):
+        loop.attach_watchdog(
+            reconnect=_reconnect,
+            stall_timeout_s=0.3,
+            interval_s=0.02,
+            pending_provider=lambda: 1,
+            now_fn=clock,
+        )
+        clock.t = 9.0
+        assert reconnected.wait(3.0)
+    assert any(BROKER_READER_STALLED in r.getMessage() for r in caplog.records)
+
+
+def test_watchdog_does_not_storm_reconnects(loop: BrokerLoop) -> None:
+    clock = _Clock()
+    count = {"n": 0}
+    lock = threading.Lock()
+
+    async def _reconnect():
+        with lock:
+            count["n"] += 1
+
+    loop.attach_watchdog(
+        reconnect=_reconnect,
+        stall_timeout_s=0.5,
+        interval_s=0.02,
+        pending_provider=lambda: 1,
+        now_fn=clock,
+    )
+    # One stall episode -> exactly one reconnect; the clock reset after the
+    # reconnect keeps it from firing every tick.
+    clock.t = 5.0
+    time.sleep(0.5)
+    with lock:
+        assert count["n"] == 1
+    # A fresh stall window elapses -> a second, separate reconnect.
+    clock.t = 10.0
+    time.sleep(0.3)
+    with lock:
+        assert count["n"] == 2

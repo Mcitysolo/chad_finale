@@ -45,12 +45,20 @@ import asyncio
 import concurrent.futures
 import logging
 import threading
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 LOGGER = logging.getLogger("chad.execution.broker_loop")
 
 # journald-observable markers.
 BROKER_LOOP_DOWN = "BROKER_LOOP_DOWN"
+# Reader made no progress while calls were pending -> connection declared DEAD,
+# forced disconnect+reconnect on the owner loop (U2 watchdog).
+BROKER_READER_STALLED = "BROKER_READER_STALLED"
+
+# Watchdog defaults.
+_DEFAULT_STALL_TIMEOUT_S = 20.0
+_DEFAULT_WATCHDOG_INTERVAL_S = 1.0
 
 # Default wall-clock cap for a single owner-loop submission.
 _DEFAULT_SUBMIT_TIMEOUT_S = 10.0
@@ -118,6 +126,16 @@ class BrokerLoop:
         # a stall only matters while at least one call is in flight).
         self._pending_lock = threading.Lock()
         self._pending_calls = 0
+        # Reader-progress watchdog state (U2). Configured via attach_watchdog().
+        self._wd_enabled = False
+        self._wd_reconnect: Optional[Callable[[], Awaitable[Any]]] = None
+        self._wd_stall_timeout_s = _DEFAULT_STALL_TIMEOUT_S
+        self._wd_interval_s = _DEFAULT_WATCHDOG_INTERVAL_S
+        self._wd_now: Callable[[], float] = time.monotonic
+        self._wd_pending_provider: Callable[[], int] = self.pending_calls
+        self._wd_last_read = 0.0
+        self._wd_reconnecting = False
+        self._wd_future: Optional["concurrent.futures.Future[Any]"] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -183,8 +201,15 @@ class BrokerLoop:
             if not self._started:
                 return
             self._started = False
+            self._wd_enabled = False
+            wd_future = self._wd_future
             loop = self._loop
             thread = self._thread
+        if wd_future is not None:
+            try:
+                wd_future.cancel()
+            except BaseException:  # noqa: BLE001
+                pass
         if loop is not None and not loop.is_closed():
             try:
                 loop.call_soon_threadsafe(loop.stop)
@@ -301,3 +326,97 @@ class BrokerLoop:
         with self._pending_lock:
             if self._pending_calls > 0:
                 self._pending_calls -= 1
+
+    # ------------------------------------------------------------------
+    # Reader-progress watchdog (U2)
+    # ------------------------------------------------------------------
+
+    def attach_watchdog(
+        self,
+        *,
+        reconnect: Callable[[], Awaitable[Any]],
+        stall_timeout_s: float = _DEFAULT_STALL_TIMEOUT_S,
+        interval_s: float = _DEFAULT_WATCHDOG_INTERVAL_S,
+        pending_provider: Optional[Callable[[], int]] = None,
+        now_fn: Optional[Callable[[], float]] = None,
+    ) -> None:
+        """Arm the reader-progress watchdog on the owner loop.
+
+        ``reconnect`` is an async callable executed ON the owner loop that
+        force-disconnects and reconnects the IB connection. The watchdog fires
+        it iff, while at least one call is pending, the reader has made no
+        progress (:meth:`mark_reader_progress`) for ``stall_timeout_s``. This is
+        the deadlock signature — a call awaiting a response the reader never
+        delivers. ``isConnected()`` is never consulted.
+
+        ``pending_provider`` / ``now_fn`` are injectable for testing; they
+        default to this loop's pending count and ``time.monotonic``.
+        """
+        if not self.is_alive():
+            raise BrokerLoopDown("cannot attach watchdog to a loop that is not alive")
+        self._wd_reconnect = reconnect
+        self._wd_stall_timeout_s = float(stall_timeout_s)
+        self._wd_interval_s = float(interval_s)
+        self._wd_pending_provider = pending_provider or self.pending_calls
+        self._wd_now = now_fn or time.monotonic
+        self._wd_last_read = self._wd_now()
+        self._wd_reconnecting = False
+        self._wd_enabled = True
+        # Launch the checker task on the owner loop; keep the handle to cancel
+        # on stop().
+        self._wd_future = asyncio.run_coroutine_threadsafe(
+            self._watchdog_loop(), self._loop  # type: ignore[arg-type]
+        )
+
+    def mark_reader_progress(self) -> None:
+        """Record that the socket reader made progress (called from the reader
+        event path on the owner loop). A plain float store — atomic in CPython,
+        no lock needed."""
+        self._wd_last_read = self._wd_now()
+
+    def reader_idle_seconds(self) -> float:
+        """Seconds since the last observed reader progress (diagnostic)."""
+        return self._wd_now() - self._wd_last_read
+
+    async def _watchdog_loop(self) -> None:
+        while self._wd_enabled:
+            try:
+                await asyncio.sleep(self._wd_interval_s)
+            except asyncio.CancelledError:
+                break
+            if not self._wd_enabled:
+                break
+            try:
+                pending = int(self._wd_pending_provider())
+            except BaseException:  # noqa: BLE001
+                pending = 0
+            if pending <= 0:
+                # No call in flight -> an idle reader is normal, never a stall.
+                continue
+            idle = self._wd_now() - self._wd_last_read
+            if idle < self._wd_stall_timeout_s:
+                continue
+            if self._wd_reconnecting or self._wd_reconnect is None:
+                continue
+            # Reader stalled while calls pending => connection is DEAD.
+            self._wd_reconnecting = True
+            _log_marker(
+                BROKER_READER_STALLED,
+                self._name,
+                f"idle={idle:.3f}s stall_timeout={self._wd_stall_timeout_s}s "
+                f"pending={pending}",
+            )
+            try:
+                await self._wd_reconnect()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                LOGGER.error(
+                    "broker_loop.watchdog_reconnect_failed",
+                    extra={"name": self._name, "error": str(exc)},
+                )
+            finally:
+                # Reset the clock after the reconnect attempt so a fresh stall
+                # window must elapse before firing again (no reconnect storm).
+                self._wd_last_read = self._wd_now()
+                self._wd_reconnecting = False
