@@ -184,19 +184,30 @@ exactly (async-twin present + already-connected → legacy path).
 
 ## 5. Rollback plan
 
-All units are additive or self-contained. To revert the entire change set:
+All units are additive or self-contained. The landed L1-CLD commit range
+(oldest→newest) is:
 
 ```
-git revert --no-edit <U6_sha>..<U0_sha>^     # revert the L1-CLD commit range
-# or hard reset to the baseline tag/commit:
-git checkout 3c80d40 -- chad/execution/ibkr_adapter.py chad/execution/broker_executor.py
-git rm chad/execution/broker_loop.py
+8472862  U0  PA doc
+725ed71  U1  broker_loop.py (owner loop + submit_coro)
+06b30f7  U2  reader-progress watchdog
+f7b1a3f  U3  ibkr_adapter owner-loop migration
+2f431a3  U4  broker_executor semaphore admission gate
+a28e237  U5  cross-loop deadlock recovery integration test
 ```
 
-`broker_loop.py` is a new module with no importers until U3; deleting it plus
-reverting the adapter/executor edits restores the `3c80d40` baseline. No runtime
-state, no config, no systemd unit is touched, so rollback is code-only and needs
-no restart (the code was never activated).
+To revert the entire change set:
+
+```
+git revert --no-edit 8472862^..a28e237        # revert the whole L1-CLD range
+# or hard-reset to the pre-L1-CLD baseline:
+git reset --hard 3c80d40
+```
+
+`broker_loop.py` is a new module; reverting the adapter/executor edits plus
+deleting it restores the `3c80d40` baseline. No runtime state, no config, no
+systemd unit is touched, so rollback is code-only and needs no restart (the code
+was never activated).
 
 ---
 
