@@ -29,6 +29,7 @@ Key properties
     - IbkrAdapter.submit_routed_signals(...)
 """
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -46,6 +47,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
 
 from chad.options.spread_spec import OptionsSpreadSpec
 from chad.execution.broker_executor import BrokerCallTimeout, call_with_timeout
+from chad.execution.broker_loop import (
+    BrokerLoop,
+    BrokerLoopDown,
+    BrokerLoopTimeout,
+)
 from chad.execution.futures_gate import futures_execution_disabled, is_futures_sec_type
 from chad.types import AssetClass, RoutedSignal, SignalSide
 
@@ -91,6 +97,19 @@ class BrokerTimeoutError(SubmissionError):
 FAILURE_CLASSES = ("TIMEOUT", "BLOCKED", "REJECTED", "FAILED", "UNKNOWN")
 
 _BROKER_TIMEOUT_S = 10.0
+
+# L1-CLD: reader-progress watchdog cadence for the connection-owner loop.
+_READER_STALL_TIMEOUT_S = 20.0
+_READER_WATCHDOG_INTERVAL_S = 2.0
+
+
+def _is_real_ib(ib: Any) -> bool:
+    """True for a genuine ib_async ``IB`` (exposes the async twins), False for a
+    sync-only ``IBLike`` test fake. Gates the connection-owner-loop routing
+    (L1-CLD) so the existing sync-fake test surface is untouched."""
+    return callable(getattr(ib, "connectAsync", None)) and callable(
+        getattr(ib, "qualifyContractsAsync", None)
+    )
 
 
 def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout_s: float = _BROKER_TIMEOUT_S, label: str = "broker_call") -> Any:
@@ -1180,10 +1199,27 @@ def _lazy_import_option_class() -> Any:
 
 
 class _ContractResolver:
-    def __init__(self, config: IbkrConfig, now_fn: NowFn) -> None:
+    def __init__(
+        self,
+        config: IbkrConfig,
+        now_fn: NowFn,
+        *,
+        broker_call: Optional[Callable[..., Any]] = None,
+    ) -> None:
         self._config = config
         self._now_fn = now_fn
         self._cache: MutableMapping[str, _ResolvedContract] = {}
+        # L1-CLD: when the adapter homed the connection on the owner loop it
+        # passes its _broker_call so qualify round-trips are marshalled onto
+        # that loop. Absent (direct construction / dry-run) -> legacy path.
+        self._broker_call = broker_call
+
+    def _qualify(self, ib: IBLike, *contracts: Any, label: str) -> Any:
+        """Qualify one or more contracts, routing through the connection-owner
+        loop when available (L1-CLD), else the legacy bounded sync executor."""
+        if self._broker_call is not None:
+            return self._broker_call(ib, "qualifyContracts", *contracts, label=label)
+        return _call_with_timeout(ib.qualifyContracts, *contracts, label=label)
 
     def resolve(self, ib: Optional[IBLike], intent: NormalizedIntent) -> _ResolvedContract:
         cache_key = _hash_payload(
@@ -1387,7 +1423,7 @@ class _ContractResolver:
         # Qualify contract if IB session available (non-hot-path)
         if ib is not None:
             try:
-                qualified = ib.qualifyContracts(contract)
+                qualified = self._qualify(ib, contract, label="qualifyContracts.option")
                 if qualified:
                     contract = qualified[0]
             except Exception as exc:
@@ -1543,8 +1579,8 @@ class _ContractResolver:
             qualify_exc: Optional[BaseException] = None
             qualified: Sequence[Any] = ()
             try:
-                qualified = _call_with_timeout(
-                    ib.qualifyContracts,
+                qualified = self._qualify(
+                    ib,
                     long_opt,
                     short_opt,
                     label="qualifyContracts.combo_legs",
@@ -1982,7 +2018,17 @@ class IbkrAdapter:
         self._now_fn = now_fn or _utc_now
         self._ib: Optional[IBLike] = None
         self._lock = threading.RLock()
-        self._resolver = _ContractResolver(self._config, self._now_fn)
+        # L1-CLD: dedicated connection-owner event-loop thread. Created lazily
+        # on first real connect. `_owner_loop_homed` is True only once THIS
+        # adapter established the connection on that loop — an externally
+        # pre-connected IB (legacy live_loop injection) is never re-homed.
+        self._broker_loop: Optional[BrokerLoop] = None
+        self._owner_loop_homed = False
+        self._reader_stall_timeout_s = _READER_STALL_TIMEOUT_S
+        self._reader_watchdog_interval_s = _READER_WATCHDOG_INTERVAL_S
+        self._resolver = _ContractResolver(
+            self._config, self._now_fn, broker_call=self._broker_call
+        )
         self._order_factory = _OrderFactory(self._config)
         self._qualify_cache = _QualifyCache(
             ttl_seconds=_resolve_qualify_cache_ttl_seconds(),
@@ -2015,8 +2061,39 @@ class IbkrAdapter:
         with self._lock:
             if self._ib is None:
                 self._ib = self._ib_factory()
+            ib = self._ib
 
-            if self._ib.isConnected():
+            # ---- Connection-owner-loop path (L1-CLD) for a real ib_async IB --
+            if _is_real_ib(ib):
+                already = False
+                try:
+                    already = bool(ib.isConnected())
+                except BaseException:  # noqa: BLE001
+                    already = False
+                if already and not self._owner_loop_homed:
+                    # An externally pre-connected IB was injected (its socket +
+                    # reader are bound to the caller's loop, e.g. live_loop's
+                    # MainThread). Re-homing it onto the owner loop would strand
+                    # the socket on a foreign loop; instead we adopt it as-is and
+                    # leave owner-loop routing OFF, preserving today's behavior.
+                    # (Activation homes the adapter's OWN execution connection —
+                    # see PA L1_CLD_cross_loop_deadlock_fix_2026-07-08 §4.)
+                    LOGGER.info(
+                        "ibkr.connection_adopted_external",
+                        extra={"owner_loop_homed": False},
+                    )
+                    return
+                if self._owner_loop_homed and already:
+                    return
+                # Establish (or re-establish) the connection ON the owner loop.
+                self._ensure_broker_loop()
+                self._connect_on_owner_loop(ib)
+                self._owner_loop_homed = True
+                self._wire_reader_watchdog(ib)
+                return
+
+            # ---- Legacy sync path (sync-only IBLike / test fakes) ------------
+            if ib.isConnected():
                 return
 
             last_error: Optional[BaseException] = None
@@ -2031,16 +2108,16 @@ class IbkrAdapter:
                             "attempt": attempt,
                         },
                     )
-                    self._ib.connect(
+                    ib.connect(
                         self._config.host,
                         self._config.port,
                         clientId=self._config.client_id,
                         timeout=float(self._config.connect_timeout_s),
                     )
-                    if self._ib.isConnected():
+                    if ib.isConnected():
                         LOGGER.info(
                             "ibkr.connected",
-                            extra={"accounts": list(self._ib.managedAccounts() or [])},
+                            extra={"accounts": list(ib.managedAccounts() or [])},
                         )
                         return
                 except BaseException as exc:  # noqa: BLE001
@@ -2056,14 +2133,241 @@ class IbkrAdapter:
                 f"Failed to connect to IBKR at {self._config.host}:{self._config.port}"
             ) from last_error
 
+    # ------------------------------------------------------------------
+    # Connection-owner loop (L1-CLD) — helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_broker_loop(self) -> BrokerLoop:
+        """Lazily create + start the dedicated connection-owner loop thread."""
+        if self._broker_loop is None:
+            self._broker_loop = BrokerLoop(name="chad-broker-loop")
+        if not self._broker_loop.is_alive():
+            self._broker_loop.start()
+        return self._broker_loop
+
+    def _owner_loop_active(self, ib: Any) -> bool:
+        return bool(
+            self._owner_loop_homed
+            and self._broker_loop is not None
+            and self._broker_loop.is_alive()
+            and _is_real_ib(ib)
+        )
+
+    def _broker_call(
+        self,
+        ib: Any,
+        name: str,
+        *args: Any,
+        timeout_s: float = _BROKER_TIMEOUT_S,
+        label: Optional[str] = None,
+    ) -> Any:
+        """Single routing chokepoint for adapter broker calls.
+
+        When the connection is homed on the owner loop, the call runs there —
+        the async twin (``<name>Async``) via ``submit_coro``, or a sync-only
+        ib_async method (e.g. ``openTrades``) via ``submit_call`` so it touches
+        the IB object on its owning loop. Both are bounded + cancellable, so no
+        call can hang uninterruptibly. Otherwise (sync fake / externally-adopted
+        IB) the pre-existing bounded sync executor path is preserved exactly.
+
+        Owner-loop timeouts / loop-down are translated to ``BrokerTimeoutError``
+        so every caller's exception handling is unchanged.
+        """
+        label = label or name
+        if self._owner_loop_active(ib):
+            bl = self._broker_loop
+            assert bl is not None
+            try:
+                async_meth = getattr(ib, name + "Async", None)
+                if callable(async_meth):
+                    return bl.submit_coro(
+                        async_meth(*args), timeout_s=timeout_s, label=label
+                    )
+                sync_meth = getattr(ib, name)
+                return bl.submit_call(
+                    sync_meth, *args, timeout_s=timeout_s, label=label
+                )
+            except BrokerLoopTimeout as exc:
+                LOGGER.error(
+                    "ibkr.broker_call_timeout",
+                    extra={"label": label, "timeout_s": timeout_s, "failure_class": "TIMEOUT"},
+                )
+                raise BrokerTimeoutError(
+                    f"Broker call {label!r} exceeded {timeout_s}s liveness "
+                    f"deadline — failure_class=TIMEOUT"
+                ) from exc
+            except BrokerLoopDown as exc:
+                LOGGER.error(
+                    "ibkr.broker_loop_down",
+                    extra={"label": label, "failure_class": "BLOCKED"},
+                )
+                raise BrokerTimeoutError(
+                    f"Broker owner loop down for {label!r} — failure_class=BLOCKED"
+                ) from exc
+        # Fallback (unchanged legacy behavior).
+        return _call_with_timeout(getattr(ib, name), *args, timeout_s=timeout_s, label=label)
+
+    def _connect_on_owner_loop(self, ib: Any) -> None:
+        """Run ``connectAsync`` ON the owner loop, with bounded retries. The sync
+        MainThread connect path is never used for an owner-loop-homed IB."""
+        bl = self._ensure_broker_loop()
+        connect_timeout = float(self._config.connect_timeout_s)
+        submit_timeout = connect_timeout + _BROKER_TIMEOUT_S
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, self._config.max_connect_retries + 1):
+            try:
+                LOGGER.info(
+                    "ibkr.connecting",
+                    extra={
+                        "host": self._config.host,
+                        "port": self._config.port,
+                        "client_id": self._config.client_id,
+                        "attempt": attempt,
+                        "via": "owner_loop",
+                    },
+                )
+                bl.submit_coro(
+                    ib.connectAsync(
+                        self._config.host,
+                        self._config.port,
+                        self._config.client_id,
+                        connect_timeout,
+                    ),
+                    timeout_s=submit_timeout,
+                    label="connectAsync",
+                )
+                if bool(bl.submit_call(ib.isConnected, timeout_s=_BROKER_TIMEOUT_S, label="isConnected")):
+                    LOGGER.info(
+                        "ibkr.connected",
+                        extra={"via": "owner_loop"},
+                    )
+                    return
+            except BaseException as exc:  # noqa: BLE001
+                last_error = exc
+                LOGGER.warning(
+                    "ibkr.connection_attempt_failed",
+                    extra={"attempt": attempt, "error": str(exc), "via": "owner_loop"},
+                )
+                if attempt < self._config.max_connect_retries:
+                    time.sleep(self._config.retry_backoff_s * attempt)
+        raise ConnectionError(
+            f"Failed to connect to IBKR at {self._config.host}:{self._config.port} "
+            f"via connection-owner loop"
+        ) from last_error
+
+    def _wire_reader_watchdog(self, ib: Any) -> None:
+        """Hook the socket-reader event to feed the owner loop's reader-progress
+        watchdog, then arm the watchdog (forced reconnect on a stall)."""
+        bl = self._broker_loop
+        if bl is None:
+            return
+
+        def _on_read(*_a: Any, **_k: Any) -> None:
+            try:
+                bl.mark_reader_progress()
+            except BaseException:  # noqa: BLE001
+                pass
+
+        try:
+            # `ib.client.conn` is created once (persists across reconnects), and
+            # `conn.hasData` fires on every raw socket read — the most reliable
+            # reader-progress signal. Fall back to `ib.updateEvent`.
+            conn = getattr(getattr(ib, "client", None), "conn", None)
+            has_data = getattr(conn, "hasData", None)
+            if has_data is not None:
+                has_data += _on_read
+            else:
+                upd = getattr(ib, "updateEvent", None)
+                if upd is not None:
+                    upd += _on_read
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning("ibkr.reader_hook_wire_failed", extra={"error": str(exc)})
+
+        async def _reconnect() -> None:
+            # Runs ON the owner loop: force disconnect + reconnect so the socket
+            # is re-bound to the owner loop.
+            LOGGER.warning("ibkr.reader_stalled_reconnect", extra={"via": "owner_loop"})
+            try:
+                ib.disconnect()
+            except BaseException:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.1)
+            await ib.connectAsync(
+                self._config.host,
+                self._config.port,
+                self._config.client_id,
+                float(self._config.connect_timeout_s),
+            )
+
+        try:
+            bl.attach_watchdog(
+                reconnect=_reconnect,
+                stall_timeout_s=float(self._reader_stall_timeout_s),
+                interval_s=float(self._reader_watchdog_interval_s),
+            )
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning("ibkr.reader_watchdog_attach_failed", extra={"error": str(exc)})
+
+    async def _place_and_wait_async(
+        self, ib: Any, qualified_contract: Any, prepared: "_PreparedOrder", idempotency_key: str
+    ) -> Any:
+        """Owner-loop coroutine mirror of the sync ``_place_and_wait``: place the
+        order, pump the reader via ``asyncio.sleep`` (never ``ib.sleep`` on a
+        foreign loop), install the status handler, and bounded-wait for a
+        terminal status."""
+        t = ib.placeOrder(qualified_contract, prepared.order)
+        initial_wait = float(self._config.initial_status_wait_s)
+        if initial_wait > 0.0:
+            await asyncio.sleep(initial_wait)
+        self._install_trade_status_handler(t, idempotency_key)
+        await self._await_terminal_status_async(
+            ib, t, timeout_s=float(self._config.terminal_wait_s)
+        )
+        return t
+
+    async def _await_terminal_status_async(
+        self, ib: Any, trade: Any, *, timeout_s: float
+    ) -> None:
+        """Async twin of ``_await_terminal_status`` — runs on the owner loop so
+        the reader keeps advancing while it waits."""
+        if timeout_s <= 0.0:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_s)
+        step = 0.1
+        while loop.time() < deadline:
+            status_str = ""
+            try:
+                order_status = getattr(trade, "orderStatus", None)
+                status_str = _safe_str(getattr(order_status, "status", ""), "")
+            except BaseException:  # noqa: BLE001
+                status_str = ""
+            klass = _classify_idempotency_status(status_str)
+            if klass in ("terminal_positive", "terminal_negative"):
+                return
+            await asyncio.sleep(step)
+
     def shutdown(self) -> None:
         """Disconnect cleanly; safe to call multiple times."""
         with self._lock:
-            if self._ib is not None and self._ib.isConnected():
+            ib = self._ib
+            bl = self._broker_loop
+            if ib is not None:
                 try:
-                    self._ib.disconnect()
+                    if self._owner_loop_homed and bl is not None and bl.is_alive():
+                        # Disconnect ON the owner loop that owns the socket.
+                        bl.submit_call(ib.disconnect, timeout_s=_BROKER_TIMEOUT_S, label="disconnect")
+                    elif ib.isConnected():
+                        ib.disconnect()
                 except BaseException as exc:  # noqa: BLE001
                     LOGGER.warning("ibkr.disconnect_error", extra={"error": str(exc)})
+            if bl is not None:
+                try:
+                    bl.stop()
+                except BaseException as exc:  # noqa: BLE001
+                    LOGGER.warning("ibkr.broker_loop_stop_error", extra={"error": str(exc)})
+            self._broker_loop = None
+            self._owner_loop_homed = False
             self._ib = None
 
     # ------------------------------------------------------------------
@@ -2450,7 +2754,7 @@ class IbkrAdapter:
             try:
                 qualified_contract = self._qualify_if_possible(ib, resolved_contract.contract)
                 if prepared.what_if:
-                    what_if_order = _call_with_timeout(ib.whatIfOrder, qualified_contract, prepared.order, label="whatIfOrder")
+                    what_if_order = self._broker_call(ib, "whatIfOrder", qualified_contract, prepared.order, label="whatIfOrder")
                     raw = {"what_if_order": _jsonable(what_if_order)}
                     LOGGER.info(
                         "EXECUTION_RESULT",
@@ -2529,7 +2833,34 @@ class IbkrAdapter:
                         timeout_s=float(self._config.terminal_wait_s),
                     )
                     return t
-                trade = _call_with_timeout(_place_and_wait, label="placeOrder")
+                if self._owner_loop_active(ib):
+                    # Owner-loop path: place + wait as a coroutine on the loop
+                    # that owns the socket. Bounded liveness deadline > the
+                    # internal initial+terminal waits so it never pre-empts them.
+                    place_timeout = (
+                        float(self._config.initial_status_wait_s)
+                        + float(self._config.terminal_wait_s)
+                        + _BROKER_TIMEOUT_S
+                    )
+                    try:
+                        trade = self._broker_loop.submit_coro(  # type: ignore[union-attr]
+                            self._place_and_wait_async(
+                                ib, qualified_contract, prepared, idempotency_key
+                            ),
+                            timeout_s=place_timeout,
+                            label="placeOrder",
+                        )
+                    except (BrokerLoopTimeout, BrokerLoopDown) as exc:
+                        LOGGER.error(
+                            "ibkr.broker_call_timeout",
+                            extra={"label": "placeOrder", "failure_class": "TIMEOUT"},
+                        )
+                        raise BrokerTimeoutError(
+                            "Broker call 'placeOrder' exceeded liveness deadline "
+                            "— failure_class=TIMEOUT"
+                        ) from exc
+                else:
+                    trade = _call_with_timeout(_place_and_wait, label="placeOrder")
 
                 order = getattr(trade, "order", None)
                 order_status = getattr(trade, "orderStatus", None)
@@ -2845,7 +3176,7 @@ class IbkrAdapter:
         if not callable(fn):
             return []
         try:
-            result = _call_with_timeout(fn, label="openTrades")
+            result = self._broker_call(ib, "openTrades", label="openTrades")
         except BaseException as exc:  # noqa: BLE001
             LOGGER.warning(
                 "ibkr.open_trades_snapshot_failed",
@@ -3003,7 +3334,7 @@ class IbkrAdapter:
             )
             return cached
         try:
-            qualified = list(_call_with_timeout(ib.qualifyContracts, contract, label="qualifyContracts") or [])
+            qualified = list(self._broker_call(ib, "qualifyContracts", contract, label="qualifyContracts") or [])
         except BaseException as exc:  # noqa: BLE001
             LOGGER.warning("ibkr.qualify_contract_failed", extra={"error": str(exc)})
             return contract
