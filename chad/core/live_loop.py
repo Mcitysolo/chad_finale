@@ -77,7 +77,10 @@ from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
 from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig, resolve_asset_class
 from chad.execution.futures_gate import is_futures_sec_type
-from chad.execution.ibkr_client_ids import LIVE_LOOP as _IBKR_LIVE_LOOP_CLIENT_ID
+from chad.execution.ibkr_client_ids import (
+    LIVE_LOOP as _IBKR_LIVE_LOOP_CLIENT_ID,
+    EXECUTION as _IBKR_EXECUTION_CLIENT_ID,
+)
 from chad.execution.paper_exec_evidence_writer import (
     PaperExecEvidence,
     StrategyAttributionError,
@@ -134,12 +137,125 @@ from chad.execution.execution_config import (
     ExecutionMode as _ExecMode,
     get_execution_mode as _get_exec_mode,
 )
-_paper_adapter = IbkrAdapter(
-    config=IbkrConfig(
-        dry_run=(_get_exec_mode() != _ExecMode.IBKR_PAPER),
-    ),
-    ib_factory=lambda: ib,
-)
+
+# ---------------------------------------------------------------------------
+# L1-CLD U7 activation — execution-connection ownership.
+#
+# The cross-loop-deadlock fix (PA L1_CLD_cross_loop_deadlock_fix_2026-07-08)
+# roots the deadlock: the shared `ib` above is connected on MainThread and its
+# reader is never pumped, so broker request/response calls dispatched onto other
+# loops hang uninterruptibly. The fix homes the EXECUTION connection on a
+# dedicated broker-owner event loop (chad/execution/broker_loop.py) whose reader
+# runs continuously.
+#
+# To activate it in production the execution adapter must own its OWN connection
+# (params-mode) instead of adopting the pre-connected MainThread `ib`. The shared
+# `ib` stays exactly as-is for position_sync + market-data; only the execution
+# adapter migrates. params-mode is the production default; set
+# CHAD_EXECUTION_OWN_CONNECTION=0 for an instant rollback to legacy adoption
+# WITHOUT a code revert. Fail-closed: if boot homing fails, live_loop starts in
+# a NO-EXECUTION state (BROKER_LOOP_DOWN) and never falls back to a MainThread
+# connect (see _home_execution_connection + the submit gate in run_once).
+# ---------------------------------------------------------------------------
+
+# Set True by _home_execution_connection() when boot homing fails; the submit
+# path in run_once() reads it to stay fail-closed (no orders, no fallback).
+_EXECUTION_DISABLED: bool = False
+
+
+def _execution_owns_connection() -> bool:
+    """True (default) when the execution adapter owns a DEDICATED IB connection
+    homed on the broker owner loop. CHAD_EXECUTION_OWN_CONNECTION=0/false/no/off
+    forces legacy shared-`ib` adoption (the pre-U7 dormant behavior)."""
+    return (
+        os.environ.get("CHAD_EXECUTION_OWN_CONNECTION", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+
+
+def _execution_client_id() -> int:
+    """Dedicated execution clientId. Env CHAD_EXECUTION_CLIENT_ID overrides the
+    canonical registry default (ibkr_client_ids.EXECUTION); a non-int value
+    falls back to the safe default. Never LIVE_LOOP's shared-connection id."""
+    raw = os.environ.get("CHAD_EXECUTION_CLIENT_ID", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logging.getLogger("chad.live_loop").warning(
+                "CHAD_EXECUTION_CLIENT_ID=%r is not an int; using registry "
+                "default clientId=%s",
+                raw,
+                _IBKR_EXECUTION_CLIENT_ID,
+            )
+    return _IBKR_EXECUTION_CLIENT_ID
+
+
+if _execution_owns_connection():
+    # params-mode (L1-CLD activation, production default): the adapter creates
+    # an UNCONNECTED IB and connectAsync's it on the broker owner loop with the
+    # dedicated execution clientId. No pre-connected MainThread `ib` is injected.
+    _paper_adapter = IbkrAdapter(
+        config=IbkrConfig(
+            dry_run=(_get_exec_mode() != _ExecMode.IBKR_PAPER),
+            client_id=_execution_client_id(),
+        ),
+        ib_factory=lambda: IB(),
+    )
+else:
+    # Legacy adoption (rollback): reuse the shared MainThread-connected `ib`.
+    # The L1-CLD owner-loop routing stays OFF (dormant) on this path.
+    _paper_adapter = IbkrAdapter(
+        config=IbkrConfig(
+            dry_run=(_get_exec_mode() != _ExecMode.IBKR_PAPER),
+        ),
+        ib_factory=lambda: ib,
+    )
+
+
+def _home_execution_connection(logger: logging.Logger) -> bool:
+    """Boot-time homing of the dedicated execution connection on the broker
+    owner loop (L1-CLD U7). FAIL-CLOSED: on any failure mark execution disabled,
+    emit the BROKER_LOOP_DOWN marker, and start in a NO-EXECUTION state — never
+    silently fall back to a MainThread connection. Returns True iff homed.
+
+    No-ops (returns False) in legacy-adoption mode and when CHAD_SKIP_IB_CONNECT
+    is set (import/test parity with the shared-`ib` connect guard above)."""
+    global _EXECUTION_DISABLED
+    if not _execution_owns_connection():
+        return False
+    if os.environ.get("CHAD_SKIP_IB_CONNECT", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    try:
+        _paper_adapter.ensure_connected(force=True)
+        _EXECUTION_DISABLED = False
+        logger.info(
+            "EXECUTION_OWNER_LOOP_ENGAGED clientId=%s — dedicated execution "
+            "connection homed on the broker owner loop (L1-CLD U7 active)",
+            _execution_client_id(),
+        )
+        return True
+    except BaseException as exc:  # noqa: BLE001 - fail-closed on ANY boot error
+        _EXECUTION_DISABLED = True
+        logger.error(
+            "BROKER_LOOP_DOWN — execution owner-loop homing FAILED at boot; "
+            "starting in NO-EXECUTION state (fail-closed, no MainThread "
+            "fallback): %s",
+            exc,
+            extra={"marker": "BROKER_LOOP_DOWN"},
+        )
+        try:
+            from chad.utils.telegram_notify import notify
+            notify(
+                "🚨 CHAD LIVE LOOP — execution owner-loop homing FAILED at boot. "
+                "Starting in NO-EXECUTION state (BROKER_LOOP_DOWN); no orders "
+                "will be placed until the execution connection is restored.",
+                severity="critical",
+                dedupe_key="exec_broker_loop_down",
+            )
+        except Exception:
+            pass
+        return False
 LOOP_INTERVAL_SECONDS = 60
 _ROUTE_DECISION_PATH = Path("/home/ubuntu/chad_finale/runtime/last_route_decision.json")
 
@@ -2352,7 +2468,20 @@ def run_once(logger: logging.Logger) -> None:
             # --- Submit to IBKR adapter and record paper evidence ---
             try:
                 _ensure_thread_event_loop()
-                submitted = _paper_adapter.submit_strategy_trade_intents([intent])
+                if _EXECUTION_DISABLED:
+                    # L1-CLD U7 fail-closed: boot homing failed (BROKER_LOOP_DOWN).
+                    # Skip the submit entirely rather than risk a fallback path;
+                    # no orders are placed until the execution connection is
+                    # restored (operator action).
+                    logger.warning(
+                        "SUBMIT_SKIPPED_NO_EXECUTION %s %s — execution disabled "
+                        "(BROKER_LOOP_DOWN at boot)",
+                        getattr(intent, "symbol", ""),
+                        getattr(intent, "side", ""),
+                    )
+                    submitted = []
+                else:
+                    submitted = _paper_adapter.submit_strategy_trade_intents([intent])
                 for order in submitted:
                     if str(order.status or "").strip().lower() in {"error", "failed", "rejected"}:
                         logger.warning(
@@ -2694,6 +2823,12 @@ def run_loop() -> None:
     _init_redis_dynamic_caps_subscriber(logger)
     # Subscribe to Redis live_gate for observability
     _init_redis_live_gate_subscriber(logger)
+
+    # L1-CLD U7: home the dedicated execution connection on the broker owner
+    # loop BEFORE the first cycle. Fail-closed — a failure here disables the
+    # execution path (BROKER_LOOP_DOWN) rather than letting a later lazy connect
+    # fall through to a MainThread path.
+    _home_execution_connection(logger)
 
     while True:
         if _SHUTDOWN_REQUESTED:

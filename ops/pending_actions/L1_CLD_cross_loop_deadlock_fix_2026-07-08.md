@@ -168,17 +168,50 @@ Repo-only now (this PA). Activation is a **separate, gated** operator step.
    call succeeds. Commit.
 7. **U6** — full suite; fix fallout; final commit + push `origin/main`.
 
-### Activation (post-GO, NOT part of these units)
+### Activation — WIRED AT U7 (2026-07-09)
 
-The migration is **dormant in production** until the execution connection is
-homed on the owner loop. That requires wiring `live_loop.py` to let the adapter
-own its execution connection on the owner loop (rather than injecting a
-pre-connected-on-MainThread `ib`). Because `live_loop`'s shared `ib` is also used
-by `position_sync` and market-data reads on MainThread, the execution adapter
-must take a **dedicated execution connection** (its own clientId) — a config
-Pending Action, not applied here (governance rule 3). Until that wiring + PA
-land at a gated `chad-live-loop` restart, the adapter keeps today's behavior
-exactly (async-twin present + already-connected → legacy path).
+**Status flip:** the migration is **no longer dormant** — U7 wired the
+activation as the **production default** (repo-only; see the caveat below). U0–U6
+built the owner-loop machinery; U7 lets `live_loop.py` hand the execution
+adapter its OWN connection so the machinery actually engages.
+
+What U7 changed (all repo-only — **no deploy, no restart**):
+
+1. **Dedicated execution clientId — from config.** New registry constant
+   `chad/execution/ibkr_client_ids.py::EXECUTION = 9007` (the **config key**),
+   overridable at runtime via env **`CHAD_EXECUTION_CLIENT_ID`** (safe default =
+   the registry constant). `9007` is collision-free by construction:
+   `assert_no_collisions()` covers it, it differs from `LIVE_LOOP` (99, the
+   shared MainThread `ib`), and it was absent from the 2026-07-08 IB Gateway
+   client census (observed 80, 99, 9001, 9003, 9021, 9035). It is a NEW slot, so
+   the shared `ib` (position_sync + market-data) is untouched.
+
+2. **params-mode wiring in `live_loop.py`.** `_paper_adapter` is now built with
+   `ib_factory=lambda: IB()` (an UNCONNECTED IB) and `IbkrConfig(client_id=
+   _execution_client_id())`. The adapter's `ensure_connected()` then homes it on
+   the broker owner loop via `connectAsync` (the U3 machinery) — the MainThread
+   sync `connect()` is never used for the execution path. Legacy adoption remains
+   available for instant rollback via **`CHAD_EXECUTION_OWN_CONNECTION=0`** (no
+   code revert needed); sync-fake tests keep the adoption path unchanged.
+
+3. **Boot fail-closed (`_home_execution_connection`).** `run_loop()` homes the
+   execution connection before the first cycle. On ANY failure it sets
+   `_EXECUTION_DISABLED=True`, emits the **`BROKER_LOOP_DOWN`** marker, and the
+   `run_once` submit path skips execution (`SUBMIT_SKIPPED_NO_EXECUTION`) — it
+   never falls back to a MainThread connect.
+
+4. **Reconnect parity.** The reader-progress watchdog's forced reconnect
+   (`ibkr_adapter.py::_wire_reader_watchdog._reconnect`) reconnects with
+   `self._config.client_id` = the SAME dedicated `9007`, via `connectAsync` on
+   the owner loop. No path re-introduces `util.getLoop()` / a sync connect on a
+   foreign thread.
+
+**CAVEAT — activation trigger:** the wiring is committed but **NOT deployed**.
+It takes effect only at the **next `chad-live-loop` restart** (operator GO).
+Treat that restart as the gated activation. Until then production runs the
+already-loaded (pre-U7) code and behavior is unchanged. Post-restart proof
+markers: `EXECUTION_OWNER_LOOP_ENGAGED clientId=9007`, a `chad-broker-loop`
+thread, and IB Gateway showing a client `9007` connection.
 
 ---
 
@@ -194,20 +227,30 @@ All units are additive or self-contained. The landed L1-CLD commit range
 f7b1a3f  U3  ibkr_adapter owner-loop migration
 2f431a3  U4  broker_executor semaphore admission gate
 a28e237  U5  cross-loop deadlock recovery integration test
+36ed7bc  U6  full-suite verification record + rollback range
+<U7>     U7  activation — live_loop params-mode + EXECUTION clientId (this commit)
 ```
 
-To revert the entire change set:
+**Instant rollback without a code revert (preferred, since U7 is repo-only):**
+because U7's activation is gated behind an env switch, an operator who has not
+yet restarted `chad-live-loop` needs to do nothing; one who wants to keep the
+code but run legacy behavior sets `CHAD_EXECUTION_OWN_CONNECTION=0` (the adapter
+reverts to adopting the shared MainThread `ib`, owner-loop routing OFF).
+
+To revert the entire change set in git:
 
 ```
-git revert --no-edit 8472862^..a28e237        # revert the whole L1-CLD range
+git revert --no-edit 8472862^..HEAD           # revert the whole L1-CLD range incl. U7
 # or hard-reset to the pre-L1-CLD baseline:
 git reset --hard 3c80d40
 ```
 
-`broker_loop.py` is a new module; reverting the adapter/executor edits plus
-deleting it restores the `3c80d40` baseline. No runtime state, no config, no
-systemd unit is touched, so rollback is code-only and needs no restart (the code
-was never activated).
+`broker_loop.py` is a new module; reverting the adapter/executor/live_loop edits
+plus deleting it restores the `3c80d40` baseline. No runtime state, no
+`config/` file, no systemd unit is touched, so rollback is code-only and needs
+no restart. **Until the next `chad-live-loop` restart the U7 wiring is inert in
+production** (the running process holds the pre-U7 code), so this remains a
+NOT_DEPLOYED change awaiting operator GO.
 
 ---
 

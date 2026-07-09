@@ -47,6 +47,19 @@ from typing import Dict, List
 # value mirrors LIVE_LOOP rather than introducing a separate connection.
 LIVE_LOOP: int = 99
 
+# Dedicated EXECUTION connection for the live-loop order path (L1-CLD U7
+# activation). The cross-loop-deadlock fix homes the execution IB on a
+# broker-owner event loop (chad/execution/broker_loop.py); it therefore needs
+# its OWN connection, distinct from LIVE_LOOP's shared MainThread `ib` (which
+# stays bound to position_sync + market-data reads). This is a NEW connection
+# slot, not a re-assignment of an existing one: 9007 is unclaimed by every
+# registered service above and was absent from the 2026-07-08 IB Gateway
+# client census (observed: 80, 99, 9001, 9003, 9021, 9035). Overridable at
+# runtime via env CHAD_EXECUTION_CLIENT_ID (chad/core/live_loop.py); this
+# constant is the documented safe default. assert_no_collisions() (below)
+# fails import if this ever clashes with another registered id.
+EXECUTION: int = 9007
+
 # ---------------------------------------------------------------------------
 # Market data providers
 # ---------------------------------------------------------------------------
@@ -155,6 +168,7 @@ def client_id_map() -> Dict[str, int]:
     """Return name -> client id for every registered constant."""
     return {
         "LIVE_LOOP": LIVE_LOOP,
+        "EXECUTION": EXECUTION,
         "PRICE_PROVIDER": PRICE_PROVIDER,
         "HISTORICAL_PROVIDER": HISTORICAL_PROVIDER,
         "PRICE_CACHE_REFRESH": PRICE_CACHE_REFRESH,
