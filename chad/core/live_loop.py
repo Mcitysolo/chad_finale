@@ -76,6 +76,7 @@ from chad.core.ibkr_execution_runner import _build_plan_and_intents
 from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
 from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig, resolve_asset_class
+from chad.execution.margin_shadow_gate import build_default_shadow_gate
 from chad.execution.futures_gate import is_futures_sec_type
 from chad.execution.ibkr_client_ids import (
     LIVE_LOOP as _IBKR_LIVE_LOOP_CLIENT_ID,
@@ -191,6 +192,16 @@ def _execution_client_id() -> int:
     return _IBKR_EXECUTION_CLIENT_ID
 
 
+# G3C Phase C: build the margin/BP shadow gate ONCE at boot and wire it into the paper
+# adapter. build_default_shadow_gate is FAIL-OPEN (returns None on any config problem → no
+# gate → byte-identical order flow), reads config/margin_block.json (mode=shadow), and issues
+# NO broker I/O. In shadow it only evaluates + logs + records evidence; it blocks nothing.
+# Activates at the next chad-live-loop restart.
+_MARGIN_SHADOW_GATE = build_default_shadow_gate(
+    repo_root=Path("/home/ubuntu/chad_finale"),
+    logger=logging.getLogger("chad.live_loop"),
+)
+
 if _execution_owns_connection():
     # params-mode (L1-CLD activation, production default): the adapter creates
     # an UNCONNECTED IB and connectAsync's it on the broker owner loop with the
@@ -201,6 +212,7 @@ if _execution_owns_connection():
             client_id=_execution_client_id(),
         ),
         ib_factory=lambda: IB(),
+        margin_gate=_MARGIN_SHADOW_GATE,
     )
 else:
     # Legacy adoption (rollback): reuse the shared MainThread-connected `ib`.
@@ -210,6 +222,7 @@ else:
             dry_run=(_get_exec_mode() != _ExecMode.IBKR_PAPER),
         ),
         ib_factory=lambda: ib,
+        margin_gate=_MARGIN_SHADOW_GATE,
     )
 
 

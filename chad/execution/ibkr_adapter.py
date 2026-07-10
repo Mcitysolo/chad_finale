@@ -53,6 +53,7 @@ from chad.execution.broker_loop import (
     BrokerLoopTimeout,
 )
 from chad.execution.futures_gate import futures_execution_disabled, is_futures_sec_type
+from chad.execution.margin_shadow_gate import MarginShadowGate, order_view_from_intent
 from chad.types import AssetClass, RoutedSignal, SignalSide
 
 LOGGER = logging.getLogger("chad.execution.ibkr")
@@ -2012,10 +2013,15 @@ class IbkrAdapter:
         *,
         ib_factory: Optional[IBFactory] = None,
         now_fn: Optional[NowFn] = None,
+        margin_gate: Optional[MarginShadowGate] = None,
     ) -> None:
         self._config = config or IbkrConfig()
         self._ib_factory = ib_factory or _lazy_import_ib_factory()
         self._now_fn = now_fn or _utc_now
+        # G3C Phase C: optional margin/BP gate wired at the pre-claim chokepoint. Default None
+        # → byte-identical existing behavior. Production wires the shadow gate (see live_loop);
+        # tests inject a gate (shadow or an injected-enforce config) to exercise both paths.
+        self._margin_gate = margin_gate
         self._ib: Optional[IBLike] = None
         self._lock = threading.RLock()
         # L1-CLD: dedicated connection-owner event-loop thread. Created lazily
@@ -2535,6 +2541,84 @@ class IbkrAdapter:
     # Submission
     # ------------------------------------------------------------------
 
+    def _evaluate_margin_gate(
+        self, intent: NormalizedIntent, idempotency_key: str, now: datetime
+    ) -> Optional[SubmittedOrder]:
+        """Evaluate the margin/BP gate for ``intent`` at the pre-claim chokepoint.
+
+        Returns ``None`` to proceed (ALWAYS, in shadow) or, only in ENFORCE mode on a real
+        BLOCK, a ``SubmittedOrder(status="margin_blocked")`` — returned BEFORE the idempotency
+        claim so a blocked order writes no idempotency row. The gate's own ``evaluate`` never
+        raises; this wrapper additionally fails OPEN in shadow (proceed) and CLOSED in enforce
+        on the extreme edge that view-building/should_block itself raises (task constraint 1)."""
+        gate = self._margin_gate
+        if gate is None:
+            return None
+        try:
+            order_view = order_view_from_intent(intent, order_id=idempotency_key)
+            verdict = gate.evaluate(order_view, now_epoch=now.timestamp())
+            if not gate.should_block(verdict):
+                return None
+            LOGGER.warning(
+                "ibkr.margin_gate_blocked",
+                extra={
+                    "symbol": intent.symbol,
+                    "reason": verdict.reason,
+                    "detail": verdict.detail,
+                    "mode": verdict.mode,
+                    "idempotency_key": idempotency_key,
+                },
+            )
+            return SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=intent.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=self._config.dry_run,
+                submitted_at=now,
+                ib_order_id=None,
+                status="margin_blocked",
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                raw={"margin_shadow": verdict.to_dict()},
+            )
+        except Exception as exc:  # noqa: BLE001 - gate wiring must never break the order path
+            enforce = False
+            try:
+                enforce = bool(gate.config.is_enforce)
+            except Exception:  # noqa: BLE001
+                enforce = False
+            LOGGER.error(
+                "ibkr.margin_gate_error",
+                extra={"symbol": intent.symbol, "error": str(exc), "enforce": enforce},
+            )
+            if not enforce:
+                return None  # SHADOW fail-open: never stop trading
+            # ENFORCE fail-closed on an internal wiring error.
+            return SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=intent.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=self._config.dry_run,
+                submitted_at=now,
+                ib_order_id=None,
+                status="margin_blocked",
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                raw={"margin_gate_error": f"{type(exc).__name__}: {exc}"},
+            )
+
     def _submit_intent(self, intent: NormalizedIntent) -> Optional[SubmittedOrder]:
         if intent.quantity <= 0.0:
             LOGGER.info(
@@ -2545,6 +2629,16 @@ class IbkrAdapter:
 
         now = self._now_fn()
         idempotency_key = self._compute_idempotency_key(intent)
+
+        # G3C Phase C: margin/BP gate at the pre-claim chokepoint (design v2.2 Part 7/8). In
+        # SHADOW this only evaluates + logs a MARGIN_SHADOW marker + records evidence, and
+        # ALWAYS returns None (proceed) — provably side-effect-free on the submission outcome.
+        # In ENFORCE a real BLOCK returns here, BEFORE the idempotency claim below, so a
+        # blocked order writes NO idempotency row.
+        margin_blocked = self._evaluate_margin_gate(intent, idempotency_key, now)
+        if margin_blocked is not None:
+            return margin_blocked
+
         if self._idempotency:
             # GAP-036 (Phase-53): state-machine-aware claim. The ib_probe
             # callable is bound to the currently-connected IB instance (if
