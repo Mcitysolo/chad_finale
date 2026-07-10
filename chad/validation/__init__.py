@@ -152,6 +152,17 @@ from chad.validation.report_writer import (
     verify_signature,
     write_report,
 )
+from chad.validation.trade_log_adapter import (
+    AdapterManifest,
+    AdapterResult,
+    AdmittedTrade,
+    adapt_records,
+    classify_instrument,
+    is_placeholder_fill,
+    iter_ledger_files,
+    run_adapter,
+    trust_exclusion,
+)
 
 __all__ = [
     "AuditConfig",
@@ -282,4 +293,14 @@ __all__ = [
     "sign_report",
     "verify_signature",
     "write_report",
+    # Phase 6 — Stage-2 real-trade ingest adapter (SSOT §1.3 / Part 6): trust gate + manifest.
+    "AdapterManifest",
+    "AdapterResult",
+    "AdmittedTrade",
+    "adapt_records",
+    "classify_instrument",
+    "is_placeholder_fill",
+    "iter_ledger_files",
+    "run_adapter",
+    "trust_exclusion",
 ]
