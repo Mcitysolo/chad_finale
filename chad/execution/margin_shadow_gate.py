@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +68,7 @@ __all__ = [
     "MarginShadowGate",
     "order_view_from_intent",
     "build_default_shadow_gate",
+    "default_evidence_dir",
     "MARKER_SHADOW",
     "MARKER_ERROR",
 ]
@@ -492,6 +494,24 @@ def _default_ibkr_snapshot_source(
     return _source
 
 
+def default_evidence_dir(repo_root: Path) -> Path:
+    """THE single place the real production evidence directory (``<repo>/data/margin_shadow``)
+    is composed. Production callers that want the real path (e.g. ``chad.core.live_loop``) must
+    pass it explicitly via this helper; :func:`build_default_shadow_gate` uses it as the
+    fallback ONLY outside a running test (see the pytest guard below)."""
+    return repo_root.joinpath(*_DEFAULT_EVIDENCE_SUBDIR)
+
+
+def _under_active_pytest() -> bool:
+    """True only while a pytest test is actually executing (setup/call/teardown).
+
+    ``PYTEST_CURRENT_TEST`` is set by pytest per running test and is UNSET during collection
+    / module import — so import-time factory calls (``chad.core.live_loop`` at module load,
+    collected before any test body runs) are never affected; only a test that constructs the
+    default gate *inside its body* without an explicit ``evidence_dir`` trips the guard."""
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
 def build_default_shadow_gate(
     *,
     repo_root: Path,
@@ -503,7 +523,14 @@ def build_default_shadow_gate(
     """Build the production shadow gate from ``config/margin_block.json``. FAIL-OPEN: on any
     config problem it logs ``MARGIN_GATE_ERROR`` and returns ``None`` (no gate wired → order
     flow byte-identical) — a broken margin config must NEVER stop trading in shadow. When the
-    config is enforce-mode, the same could block; that flip is the deliberate G3b step."""
+    config is enforce-mode, the same could block; that flip is the deliberate G3b step.
+
+    G3C-HF leak guard: ``evidence_dir`` is REQUIRED-explicit under pytest. If a test calls this
+    without one, it would otherwise compose the real ``<repo>/data/margin_shadow`` path and
+    ``evaluate()`` would write a row into the working tree (the ``margin_shadow_20270115.ndjson``
+    incident, 2026-07-10). Under a running test the omission now raises loudly; outside pytest
+    (production / import-time wiring) the real path is composed as before via
+    :func:`default_evidence_dir`."""
     log = logger or LOGGER
     cfg_path = config_path or (repo_root / "config" / "margin_block.json")
     try:
@@ -515,7 +542,16 @@ def build_default_shadow_gate(
         )
         return None
     rt = runtime_dir or (repo_root / "runtime")
-    ev = evidence_dir or repo_root.joinpath(*_DEFAULT_EVIDENCE_SUBDIR)
+    if evidence_dir is not None:
+        ev: Path = evidence_dir
+    else:
+        if _under_active_pytest():
+            raise RuntimeError(
+                f"{MARKER_ERROR} build_default_shadow_gate: evidence_dir is REQUIRED-explicit "
+                f"under pytest — pass evidence_dir=tmp_path (never the real "
+                f"{default_evidence_dir(repo_root)} path). [G3C-HF test-write leak guard]"
+            )
+        ev = default_evidence_dir(repo_root)
     return MarginShadowGate(
         config,
         snapshot_source=_default_ibkr_snapshot_source(rt, config),

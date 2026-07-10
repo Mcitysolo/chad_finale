@@ -151,10 +151,12 @@ def hermetic_sinks(tmp_path: Path, monkeypatch):
     """Redirect every disk sink the writer touches to tmp, and point the
     slippage tracker + signal-decay recorder at tmp ledgers so we can read
     back the intent_id the real propagation code wrote."""
-    # Fill / fee / metric output dirs.
+    # Fill / fee / metric output dirs + the hash-chain LOCK dir (else _append_hash_chained_record
+    # locks the real runtime/locks/FILLS_*.lock — a working-tree leak the write depends on).
     monkeypatch.setattr(wmod, "FILLS_DIR", tmp_path / "fills", raising=True)
     monkeypatch.setattr(wmod, "FEES_DIR", tmp_path / "fees", raising=True)
     monkeypatch.setattr(wmod, "EXEC_METRICS_DIR", tmp_path / "metrics", raising=True)
+    monkeypatch.setattr(wmod, "LOCKS_DIR", tmp_path / "locks", raising=True)
 
     # Price cache so normalize_paper_fill_evidence keeps a clean SPY fill.
     cache = tmp_path / "price_cache.json"

@@ -321,12 +321,16 @@ def test_untrusted_placeholder_fill_is_not_fifo_matched(
     fills_dir = tmp_path / "fills"
     fees_dir = tmp_path / "fees"
     metrics_dir = tmp_path / "execution_metrics"
+    locks_dir = tmp_path / "locks"
     fills_dir.mkdir(parents=True, exist_ok=True)
     fees_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(pew, "FILLS_DIR", fills_dir)
     monkeypatch.setattr(pew, "FEES_DIR", fees_dir)
     monkeypatch.setattr(pew, "EXEC_METRICS_DIR", metrics_dir)
+    # Redirect the hash-chain LOCK dir too (else _append_hash_chained_record locks the real
+    # runtime/locks/FILLS_*.lock — a working-tree leak the write depends on).
+    monkeypatch.setattr(pew, "LOCKS_DIR", locks_dir)
 
     # 1) Build placeholder fill, normalize, write through the real writer.
     bad = PaperExecEvidence(

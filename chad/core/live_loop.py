@@ -76,7 +76,7 @@ from chad.core.ibkr_execution_runner import _build_plan_and_intents
 from chad.core.suppression import SuppressionReason
 from chad.core.broker_position_sync import BrokerPositionSync
 from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig, resolve_asset_class
-from chad.execution.margin_shadow_gate import build_default_shadow_gate
+from chad.execution.margin_shadow_gate import build_default_shadow_gate, default_evidence_dir
 from chad.execution.futures_gate import is_futures_sec_type
 from chad.execution.ibkr_client_ids import (
     LIVE_LOOP as _IBKR_LIVE_LOOP_CLIENT_ID,
@@ -197,8 +197,12 @@ def _execution_client_id() -> int:
 # gate → byte-identical order flow), reads config/margin_block.json (mode=shadow), and issues
 # NO broker I/O. In shadow it only evaluates + logs + records evidence; it blocks nothing.
 # Activates at the next chad-live-loop restart.
+# evidence_dir is passed EXPLICITLY (the real data/margin_shadow path) so this import-time
+# construction is immune to the G3C-HF pytest guard in build_default_shadow_gate regardless of
+# when live_loop is first imported (module-top at collection, or lazily inside a test body).
 _MARGIN_SHADOW_GATE = build_default_shadow_gate(
     repo_root=Path("/home/ubuntu/chad_finale"),
+    evidence_dir=default_evidence_dir(Path("/home/ubuntu/chad_finale")),
     logger=logging.getLogger("chad.live_loop"),
 )
 

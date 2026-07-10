@@ -217,22 +217,30 @@ def test_evidence_write_failure_never_raises(tmp_path):
 # --------------------------------------------------------------------------- #
 # 6. Default factory — fail-open + honest stale default source.
 # --------------------------------------------------------------------------- #
-def test_build_default_gate_loads_shadow_config():
-    g = build_default_shadow_gate(repo_root=REPO)
+def test_build_default_gate_loads_shadow_config(tmp_path):
+    # evidence_dir is REQUIRED-explicit under pytest (G3C-HF leak guard) — inject tmp_path
+    # so this never composes/writes the real data/margin_shadow path.
+    g = build_default_shadow_gate(repo_root=REPO, evidence_dir=tmp_path / "ev")
     assert g is not None and g.mode == "shadow"
 
 
 def test_build_default_gate_failopen_on_bad_config(tmp_path, caplog):
     bad = tmp_path / "nope.json"
     with caplog.at_level("ERROR"):
-        g = build_default_shadow_gate(repo_root=REPO, config_path=bad)
+        # bad config → fail-open returns None before the evidence_dir guard; inject anyway.
+        g = build_default_shadow_gate(repo_root=REPO, config_path=bad, evidence_dir=tmp_path / "ev")
     assert g is None
     assert any(MARKER_ERROR in r.getMessage() for r in caplog.records)
 
 
 def test_default_source_returns_failclosed_snapshot(tmp_path):
-    """The real runtime source honestly reports margin fields are not published → stale block."""
-    g = build_default_shadow_gate(repo_root=REPO)
+    """The real runtime source honestly reports margin fields are not published → stale block.
+
+    G3C-HF: this was the offending test — it built the gate with the production DEFAULT
+    evidence_dir and then evaluate()'d, leaking margin_shadow_20270115.ndjson into the real
+    data/margin_shadow tree (NOW=1_800_000_000 → ts_utc 2027-01-15). evidence_dir is now
+    injected at tmp_path so the evaluation's evidence append lands in tmp, never the repo."""
+    g = build_default_shadow_gate(repo_root=REPO, evidence_dir=tmp_path / "ev")
     assert g is not None
     v = g.evaluate(_view(), now_epoch=NOW)
     assert v.reason == "STALE_OR_MISSING_MARGIN_DATA" and v.staleness is True
