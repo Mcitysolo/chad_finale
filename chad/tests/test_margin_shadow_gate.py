@@ -296,3 +296,75 @@ def test_adapter_enforce_gate_allows_good_order_through(tmp_path):
     adapter = IbkrAdapter(config=cfg, margin_gate=gate)
     out = adapter.submit_strategy_trade_intents([_intent(qty=1.0, price=100.0)])
     assert out[0].status == "dry_run"       # small order passes the enforce gate
+
+
+# --------------------------------------------------------------------------- #
+# 8. CI-invariant: placeOrder is only reachable via the gate (design §2.3 / Part 8).
+# --------------------------------------------------------------------------- #
+class _SpyGate:
+    """A stand-in that records every evaluate() call and never blocks (shadow semantics)."""
+    def __init__(self):
+        self.calls = []
+
+    def evaluate(self, order_view, *, now_epoch):
+        self.calls.append(dict(order_view))
+        return None  # sentinel; should_block ignores it
+
+    def should_block(self, _verdict):
+        return False
+
+
+def test_ci_invariant_every_submit_path_flows_through_the_gate(tmp_path):
+    """Both public submit entry points must route through the gate for EVERY order — nothing
+    reaches the claim/placeOrder path without a gate evaluation (design §2.3 chokepoint)."""
+    spy = _SpyGate()
+    cfg = IbkrConfig(dry_run=True, state_db_path=tmp_path / "s.db")
+    adapter = IbkrAdapter(config=cfg, margin_gate=spy)  # type: ignore[arg-type]
+
+    adapter.submit_strategy_trade_intents([_intent("AAPL"), _intent("MSFT")])
+    from chad.types import AssetClass, RoutedSignal, SignalSide
+    routed = RoutedSignal(symbol="SPY", side=SignalSide.BUY, net_size=3.0,
+                          source_strategies=("beta",), confidence=0.5, asset_class=AssetClass.ETF)
+    adapter.submit_routed_signals([routed])
+
+    assert len(spy.calls) == 3          # 2 intents + 1 routed → all evaluated
+    assert {c["symbol"] for c in spy.calls} == {"AAPL", "MSFT", "SPY"}
+
+
+def test_ci_invariant_place_order_only_downstream_of_the_gate():
+    """Structural lock: _submit_via_ib (the sole placeOrder caller) is reachable only from
+    inside _submit_intent, which calls _evaluate_margin_gate BEFORE the idempotency claim."""
+    import inspect
+    from chad.execution import ibkr_adapter as mod
+
+    src = inspect.getsource(mod)
+    # placeOrder/whatIfOrder appear only inside _submit_via_ib / _place_and_wait_async.
+    submit_intent_src = inspect.getsource(mod.IbkrAdapter._submit_intent)
+    assert "_evaluate_margin_gate(" in submit_intent_src
+    # the gate call precedes the idempotency claim + the broker submit within _submit_intent.
+    gate_pos = submit_intent_src.index("_evaluate_margin_gate(")
+    claim_pos = submit_intent_src.index("claim_or_reclaim(")
+    via_ib_pos = submit_intent_src.index("_submit_via_ib(")
+    assert gate_pos < claim_pos < via_ib_pos
+    # _submit_via_ib is the single placeOrder chokepoint; _submit_intent is its only caller.
+    assert src.count("self._submit_via_ib(") == 1
+
+
+# --------------------------------------------------------------------------- #
+# 9. Latency budget: shadow adds no broker call and stays within a small budget
+#    (design Part 8: "SHADOW ... provably adds no submit latency (tested)").
+# --------------------------------------------------------------------------- #
+def test_shadow_eval_is_within_latency_budget(tmp_path):
+    """A full shadow evaluation (incl. the synchronous best-effort evidence append) must be
+    fast — a coarse budget that trips on an accidental broker call / sleep / network I/O."""
+    import time as _t
+    g = _gate(_shadow_cfg(), _usable_snap(), evidence_path=tmp_path / "ev")
+    # warm up path creation, then time steady-state evaluations.
+    g.evaluate(_view(), now_epoch=NOW)
+    t0 = _t.perf_counter()
+    for i in range(50):
+        g.evaluate(_view(order_id=f"k{i}"), now_epoch=NOW)
+    elapsed = _t.perf_counter() - t0
+    # 50 evals incl. 50 evidence appends: generous 2s budget (≈40ms/order) — a broker call
+    # or network round-trip would blow this by orders of magnitude.
+    assert elapsed < 2.0, f"shadow eval too slow: {elapsed:.3f}s for 50 evaluations"

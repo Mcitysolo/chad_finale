@@ -3,13 +3,17 @@
 The built-but-inert margin BLOCK gate (Phases A+B: buying_power_provider, kraken_bp_provider,
 pending_exposure_ledger, margin_block.decide) is wired here into the IBKR order-submission
 chokepoint in **SHADOW mode** (design SSOT ``docs/CHAD_MARGIN_BLOCK_DESIGN_v2.2.md`` Part 7
-step 2 / Part 8 Phase C). Shadow contract, verbatim from the design:
+step 2 / Part 8 Phase C). Shadow contract, summarized from the design:
 
   * evaluates **every** order using **cached data only** — no synchronous broker calls in
     the submit path (P3);
-  * runs the decision pipeline (including the ledger reserve/reconcile), **only the
-    ALLOW/BLOCK outcome suppressed** — so a would-block surfaces in the logs, never as a
-    real block;
+  * runs the decision pipeline (the ledger *reserve* is exercised each call; the
+    *reconcile*-from-broker path runs only when an ``open_orders_source`` is wired — in the
+    default production wiring it is not yet, so the ledger is flagged stale rather than
+    reconciled), **only the ALLOW/BLOCK outcome suppressed** — so a would-block surfaces in
+    the logs, never as a real block. Cross-call reserve→*release* lifecycle (the design's
+    "leaked-reservation surfaces in shadow" goal) needs the persistent maintained ledger and
+    is the G3b companion (see the per-evaluation-ledger note on ``_evaluate_inner``);
   * logs a grep-able marker per evaluation and appends the verdict to a dedicated evidence
     ndjson (NOT ``runtime/``) so the enforce-flip (G3b) can be judged on a corpus;
   * **blocks nothing** while ``mode == "shadow"`` and is **provably side-effect-free on the
@@ -154,18 +158,14 @@ def _fmt(x: Optional[float]) -> str:
 
 
 def _iso_utc(epoch: float) -> str:
-    """UTC ISO-8601 from an epoch (pure function of the injected epoch; no wall-clock)."""
+    """UTC ISO-8601 from an epoch (pure function of the injected epoch; no wall-clock).
+
+    The evidence date-partition is derived from ``ShadowVerdict.ts_utc`` (itself this value),
+    so the whole evidence artifact is deterministic in the injected ``now_epoch``."""
     try:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(epoch)))
     except (ValueError, OverflowError, OSError):
         return "1970-01-01T00:00:00Z"
-
-
-def _day_str(epoch: float) -> str:
-    try:
-        return time.strftime("%Y%m%d", time.gmtime(float(epoch)))
-    except (ValueError, OverflowError, OSError):
-        return "19700101"
 
 
 # --------------------------------------------------------------------------- #
