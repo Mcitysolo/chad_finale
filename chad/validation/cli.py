@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import math
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +58,8 @@ from chad.validation.cost_model import (
     CostConfig,
     InstrumentClass,
     LiquidityTier,
+    Trade,
+    apply_costs,
 )
 from chad.validation.feature_parity import (
     ParityStatus,
@@ -72,6 +76,7 @@ from chad.validation.report_writer import (
     write_report,
 )
 from chad.validation.scoring_spine import score_returns
+from chad.validation.trade_log_adapter import AdmittedTrade, run_adapter
 from chad.validation.significance import (
     DEFAULT_TRIAL_MULTIPLE,
     RuinConfig,
@@ -93,6 +98,7 @@ __all__ = [
     "HeadSpec",
     "DEFAULT_CATALOG",
     "run_stage_historical",
+    "run_stage2_trade_log",
     "current_code_commit",
     "main",
 ]
@@ -736,6 +742,266 @@ def _worst_status(audits: Sequence[Optional[SymbolAudit]]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Stage 2 — real trade-log validation (SSOT §1.3 / Part 6, Phase 6).
+# --------------------------------------------------------------------------- #
+def _finite_or_none(value: Any) -> Any:
+    """A real, finite number passes through; NaN/±inf/None collapse to ``None``.
+
+    Keeps every metric embedded in the (allow_nan=False) signed report finitely
+    representable — an undefined metric is honestly ``None``, which the strict verdict
+    treats as *not confirmed* (fails that check), never a fabricated pass.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None if not isinstance(value, (int, float)) else value
+    f = float(value)
+    return f if math.isfinite(f) else None
+
+
+def _stage2_net_returns(
+    admitted: Sequence[AdmittedTrade], cost_config: CostConfig
+) -> tuple[list[float], dict[str, Any]]:
+    """Net per-trade returns for admitted real fills, via the IDENTICAL cost path (S4).
+
+    Each admitted trade is mapped onto :meth:`Trade.from_fill` and charged by
+    :func:`apply_costs` — the same commission + half-spread + slippage haircut synthetic
+    Stage-1 trades get — then ``return_i = (gross_pnl_i - total_cost_i) / notional_i``. No
+    scoring logic is duplicated here (the spine consumes the returns). A trade whose notional
+    is non-positive or whose net return is non-finite is skipped and counted (never crashes).
+    """
+    returns: list[float] = []
+    gross_sum = net_sum = cost_sum = 0.0
+    skipped = 0
+    for t in admitted:
+        try:
+            breakdown = apply_costs(Trade.from_fill(t.to_fill_mapping()), cost_config)
+        except (ValueError, KeyError):
+            skipped += 1
+            continue
+        net = breakdown.net_pnl if breakdown.net_pnl is not None else (t.gross_pnl - breakdown.total_cost)
+        if not (t.notional > 0.0) or not math.isfinite(net) or not math.isfinite(net / t.notional):
+            skipped += 1
+            continue
+        returns.append(net / t.notional)
+        gross_sum += t.gross_pnl
+        net_sum += net
+        cost_sum += breakdown.total_cost
+    summary = {
+        "n_trades": len(returns),
+        "n_skipped_uncostable": skipped,
+        "gross_pnl": gross_sum,
+        "net_pnl": net_sum,
+        "total_cost": cost_sum,
+    }
+    return returns, summary
+
+
+def _stage2_head_metrics(
+    head: str,
+    returns: Sequence[float],
+    *,
+    n_effective_trials: int,
+    final_run: bool,
+) -> tuple[HeadMetrics, dict[str, Any]]:
+    """Build a head's :class:`HeadMetrics` from a real-fill net-return series (DRY-reuse).
+
+    Reuses the Phase-1/3 :func:`_oos_metrics` spine so a live-trade-log head is scored by the
+    IDENTICAL machinery as a Stage-1 head. Walk-forward windowing over a live log is a future
+    extension (Phase 6 delivers the ingest seam), so ``n_walk_forward_windows = 0`` — which,
+    with ``W_min = 6``, honestly yields ``INSUFFICIENT_DATA`` until the soak matures, never a
+    fabricated pass (SSOT Part 0). ``oos_source`` is ``"live_trade_log"``; there is no sealed
+    OOS box for a live log, so ``oos_access_count = 0`` (never CONTAMINATED by construction).
+    """
+    om = _oos_metrics(returns, periods_per_year=252.0, n_effective_trials=n_effective_trials)
+    om = {
+        **om,
+        "cost_adj_cagr": _finite_or_none(om["cost_adj_cagr"]),
+        "deflated_sharpe_worst": _finite_or_none(om["deflated_sharpe_worst"]),
+        "worst_quantile_ruin": _finite_or_none(om["worst_quantile_ruin"]),
+    }
+    metrics = HeadMetrics(
+        head=head,
+        parity_status="LIVE_TRADE_LOG",
+        replayable=True,          # these ARE real executed trades — scored, not skipped
+        data_quality_status="CLEAN",  # Phase-0 audits BAR data, not live fills (noted in report)
+        oos_access_count=0,
+        n_oos_trades=int(om["n_oos_trades"]),
+        n_walk_forward_windows=0,
+        n_regimes_in_oos=int(om["n_regimes_in_oos"]),
+        deflated_sharpe_worst=om["deflated_sharpe_worst"],
+        cost_adj_cagr=om["cost_adj_cagr"],
+        worst_quantile_ruin=om["worst_quantile_ruin"],
+        regimes_with_edge=int(om["regimes_with_edge"]),
+        regime_scoped_sizing=False,
+        final_run=final_run,
+        oos_source="live_trade_log",
+    )
+    return metrics, om
+
+
+def run_stage2_trade_log(
+    *,
+    repo_root: Path,
+    out_dir: Path,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    trades_dir: Optional[Path] = None,
+    final_run: bool = False,
+    thresholds: VerdictThresholds = DEFAULT_THRESHOLDS,
+    cost_config: CostConfig = DEFAULT_COST_CONFIG,
+    generated_at: Optional[str] = None,
+    code_commit: Optional[str] = None,
+    trial_multiple: float = DEFAULT_TRIAL_MULTIPLE,
+) -> dict[str, Any]:
+    """Run the Stage-2 real-trade-log validation end-to-end and return the SIGNED report.
+
+    Pipeline: :func:`chad.validation.trade_log_adapter.run_adapter` (fail-closed trust gate) →
+    per-strategy net returns via the IDENTICAL cost path (S4) → :func:`_oos_metrics` (Phases
+    1/3 spine) → :func:`decide_verdict` per head → :func:`decide_portfolio_verdict` on the
+    pooled series → signed report (Phase 5 report writer). It NEVER seals/opens an OOS box
+    (there is no sealed OOS for a live log — the lockbox/config-freeze machinery of Phases 0-5
+    is untouched), and NEVER writes ``runtime/`` or ``ready_for_live`` (SSOT §1.2 / Part 0).
+    The adapter's ndjson + manifest are written under ``out_dir/stage2``.
+    """
+    if trades_dir is None:
+        trades_dir = repo_root / "data" / "trades"
+    if generated_at is None:
+        generated_at = _now_iso()
+    if code_commit is None:
+        code_commit = current_code_commit(repo_root)
+
+    result = run_adapter(
+        trades_dir=trades_dir,
+        since=since,
+        until=until,
+        out_dir=out_dir / "stage2",
+        generated_at=generated_at,
+    )
+
+    # Group admitted trusted fills by strategy attribution → one head each.
+    by_strategy: dict[str, list[AdmittedTrade]] = {}
+    for t in result.admitted:
+        by_strategy.setdefault(t.strategy, []).append(t)
+
+    n_heads = max(1, len(by_strategy))
+    n_effective_trials = punitive_trial_count(n_heads, multiple=trial_multiple)
+
+    heads_section: list[dict[str, Any]] = []
+    head_verdicts: list[VerdictResult] = []
+    counts: dict[str, int] = {v.value: 0 for v in Verdict}
+    for strategy in sorted(by_strategy):
+        admitted = by_strategy[strategy]
+        returns, trade_summary = _stage2_net_returns(admitted, cost_config)
+        metrics, om = _stage2_head_metrics(
+            strategy, returns, n_effective_trials=n_effective_trials, final_run=final_run
+        )
+        verdict = decide_verdict(metrics, thresholds)
+        head_verdicts.append(verdict)
+        counts[verdict.verdict.value] += 1
+        heads_section.append(
+            {
+                "head": strategy,
+                "symbol": "(live fills)",
+                "metrics": metrics.to_dict(),
+                "verdict": verdict.to_dict(),
+                "trade_summary": {
+                    **trade_summary,
+                    "n_admitted": len(admitted),
+                    "oos_metrics": {"source": "live_trade_log", **om},
+                },
+            }
+        )
+
+    # Portfolio track: pooled net returns across every admitted head (equal-weight).
+    pooled: list[float] = []
+    for strategy in sorted(by_strategy):
+        pooled.extend(_stage2_net_returns(by_strategy[strategy], cost_config)[0])
+    surviving = sum(1 for v in head_verdicts if v.verdict is Verdict.PASS)
+    total_heads = len(head_verdicts)
+    capital_fraction = (surviving / total_heads) if total_heads else 0.0
+    portfolio_metrics, _pom = _stage2_head_metrics(
+        "portfolio", pooled, n_effective_trials=n_effective_trials, final_run=final_run
+    )
+    pm = PortfolioMetrics(
+        portfolio=portfolio_metrics,
+        surviving_heads=surviving,
+        total_heads=total_heads,
+        capital_fraction_in_surviving_heads=capital_fraction,
+    )
+    portfolio_verdict = decide_portfolio_verdict(pm, thresholds)
+    portfolio_block = {
+        "verdict": portfolio_verdict.to_dict(),
+        "metrics": portfolio_metrics.to_dict(),
+        "surviving_heads": surviving,
+        "total_heads": total_heads,
+        "capital_fraction_in_surviving_heads": capital_fraction,
+        "allocator_note": (
+            "Stage-2 portfolio track is an equal-weight pool of every admitted head's real "
+            "net-return stream (no live allocator imported under §1.2 isolation)."
+        ),
+    }
+
+    oos_section = {
+        "access_count": 0,
+        "total_access_events": 0,
+        "per_head_access_counts": {},
+        "source": "live_trade_log",
+        "final_run": final_run,
+        "sealed": False,
+        "seal": None,
+        "log_integrity_ok": True,
+        "contaminated": False,
+        "note": (
+            "No sealed OOS partition exists for a live trade log; the OOS lockbox is not used "
+            "in Stage 2 (SSOT §3.1 applies to the historical backtest). Admission is governed "
+            "by the fail-closed trust gate instead — see data_quality.stage2_adapter_manifest."
+        ),
+    }
+
+    report = build_report(
+        generated_at=generated_at,
+        stage="stage2_trade_log",
+        final_run=final_run,
+        code_commit=code_commit,
+        data_quality={
+            "worst_status": "N/A (Stage-2 live fills; Phase-0 audits BAR data, not fills)",
+            "symbols": [],
+            "involved_symbols": [],
+            "stage2_adapter_manifest": result.manifest.to_dict(),
+        },
+        parity_map=[],
+        parity_table=(
+            "n/a — Stage-2 heads are REAL executed trades (not replayed historical logic); "
+            "feature parity is a Stage-1 concept."
+        ),
+        heads=heads_section,
+        portfolio=portfolio_block,
+        frozen_config={
+            "note": (
+                "Stage 2 echoes the frozen thresholds + cost config for transparency; it does "
+                "NOT seal an OOS box or touch the Phase-5 config-freeze ledger."
+            ),
+            "thresholds": thresholds.to_dict(),
+            "cost_config": cost_config.to_dict(),
+        },
+        oos=oos_section,
+        thresholds=thresholds.to_dict(),
+        verdict_summary={
+            "counts": counts,
+            "portfolio_verdict": portfolio_verdict.label,
+        },
+        extra_notes=[
+            "Stage 2 (real trade-log validation, SSOT §1.3 / Part 6). Real paper fills pass "
+            "the fail-closed trust gate, get the IDENTICAL S4 cost haircut, and are scored by "
+            "the SAME spine + verdict as Stage 1 — only the input adapter differs.",
+            "n_walk_forward_windows = 0 for every head: walk-forward windowing over a live log "
+            "is a future extension, so heads honestly read INSUFFICIENT_DATA until it matures "
+            "(never a fabricated pass). The machine never flips ready_for_live (Part 0).",
+        ],
+    )
+    return sign_report(report)
+
+
+# --------------------------------------------------------------------------- #
 # CLI entry point + summary printing.
 # --------------------------------------------------------------------------- #
 def _print_summary(signed: dict[str, Any], json_path: Path) -> None:
@@ -747,8 +1013,14 @@ def _print_summary(signed: dict[str, Any], json_path: Path) -> None:
     oos = signed.get("oos", {})
     fc = signed.get("config_frozen", {})
     frozen = fc.get("frozen", {}) if isinstance(fc, dict) else {}
-    print(f"stage: {signed.get('stage')} | final_run: {fr} "
-          + ("" if fr else "(decoy OOS — real OOS SEALED, not opened)"))
+    stage = str(signed.get("stage") or "")
+    if stage == "stage2_trade_log":
+        note = "(real trade-log; no sealed OOS — admission via fail-closed trust gate)"
+    elif fr:
+        note = ""
+    else:
+        note = "(decoy OOS — real OOS SEALED, not opened)"
+    print(f"stage: {stage} | final_run: {fr} " + note)
     print(f"code_commit: {signed.get('code_commit')}")
     print(f"frozen config hash: {str(frozen.get('config_hash', '?'))[:16]}  "
           f"trial_count(deflation add-on): {fc.get('trial_count')}")
@@ -797,35 +1069,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=["historical"],
-        help="validation stage to run (only 'historical' is implemented in Phase 5)",
+        choices=["historical", "stage2"],
+        help="validation stage: 'historical' (Stage-1 backtest) or 'stage2' (real trade-log)",
     )
     parser.add_argument(
         "--final-run",
         action="store_true",
         help="OPEN and score the sealed OOS partition (one logged access). Default: "
-             "run against train/val + a synthetic decoy OOS; the real OOS stays sealed.",
+             "run against train/val + a synthetic decoy OOS; the real OOS stays sealed. "
+             "(Stage-1 only; Stage-2 has no sealed OOS.)",
     )
     parser.add_argument("--repo-root", default=None, help="repo root (default: inferred)")
     parser.add_argument("--bars-dir", default=None, help="daily-bar corpus dir (default: <repo>/data/bars/1d)")
     parser.add_argument("--out-dir", default=None, help="artifact output dir (default: <repo>/edge_reports)")
     parser.add_argument("--now", default=None, help="override the report timestamp (ISO 8601)")
     parser.add_argument("--code-commit", default=None, help="override the recorded code commit")
+    # Stage-2 (real trade-log) inputs.
+    parser.add_argument("--since", default=None, help="[stage2] earliest UTC date to admit (YYYY-MM-DD)")
+    parser.add_argument("--until", default=None, help="[stage2] latest UTC date to admit (YYYY-MM-DD)")
+    parser.add_argument("--trades-dir", default=None, help="[stage2] ledger dir (default: <repo>/data/trades)")
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(__file__).resolve().parents[2]
     out_dir = Path(args.out_dir).resolve() if args.out_dir else repo_root / "edge_reports"
     bars_dir = Path(args.bars_dir).resolve() if args.bars_dir else None
 
+    for name in ("since", "until"):
+        val = getattr(args, name)
+        if val is not None and not re.match(r"^\d{4}-\d{2}-\d{2}$", val):
+            print(f"error: --{name} must be YYYY-MM-DD, got {val!r}")
+            return 2
+    if args.since and args.until and args.since > args.until:
+        print(f"error: --since ({args.since}) is after --until ({args.until})")
+        return 2
+
     try:
-        signed = run_stage_historical(
-            repo_root=repo_root,
-            out_dir=out_dir,
-            final_run=bool(args.final_run),
-            bars_dir=bars_dir,
-            generated_at=args.now,
-            code_commit=args.code_commit,
-        )
+        if args.stage == "stage2":
+            trades_dir = Path(args.trades_dir).resolve() if args.trades_dir else None
+            signed = run_stage2_trade_log(
+                repo_root=repo_root,
+                out_dir=out_dir,
+                since=args.since,
+                until=args.until,
+                trades_dir=trades_dir,
+                final_run=bool(args.final_run),
+                generated_at=args.now,
+                code_commit=args.code_commit,
+            )
+        else:
+            signed = run_stage_historical(
+                repo_root=repo_root,
+                out_dir=out_dir,
+                final_run=bool(args.final_run),
+                bars_dir=bars_dir,
+                generated_at=args.now,
+                code_commit=args.code_commit,
+            )
     except (ValueError, OSError) as exc:
         print(f"error: {type(exc).__name__}: {exc}")
         return 2
