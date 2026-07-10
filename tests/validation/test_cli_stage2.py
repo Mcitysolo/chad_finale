@@ -186,6 +186,27 @@ def test_cli_stage2_rejects_bad_since(tmp_path):
                  "--trades-dir", str(tmp_path)]) == 2
 
 
+def test_stage2_provenance_makes_no_false_seal_or_replay_claim(tmp_path):
+    """The signed artifact must NOT carry the Stage-1 hash-seal / replay-reconstruction
+    provenance (a live trade log has neither) — else it would contradict its own oos/parity
+    sections. Verify the Stage-2 overrides are honest."""
+    records = [_fill(seq=i, hashv=f"h{i}") for i in range(3)]
+    src = _write_ledger(tmp_path, records)
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-10T00:00:00Z", code_commit="x",
+    )
+    prov = signed["provenance"]
+    assert "hash-seal" not in prov["oos_discipline"].lower()
+    assert "CONTAMINATED" not in prov["oos_discipline"]
+    assert prov["oos_discipline"].startswith("N/A for Stage 2")
+    assert "replayed" not in prov["replay_reconstruction"].lower() or \
+        prov["replay_reconstruction"].startswith("N/A for Stage 2")
+    assert prov["replay_reconstruction"].startswith("N/A for Stage 2")
+    # And the universe-bias note (a genuine, stage-agnostic caveat) is retained.
+    assert "universe_bias" in prov
+
+
 def test_cli_historical_still_works(tmp_path):
     """Regression: adding stage2 must not break the default historical stage dispatch."""
     rc = main(["--stage", "historical", "--repo-root", str(tmp_path),

@@ -401,3 +401,59 @@ def test_cli_rejects_bad_date(tmp_path):
 def test_cli_rejects_inverted_window(tmp_path):
     assert main(["--since", "2026-07-10", "--until", "2026-07-01",
                  "--trades-dir", str(tmp_path)]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# 12. Row-level idempotency — a duplicate record_hash is scored once.
+# --------------------------------------------------------------------------- #
+def test_duplicate_record_hash_deduped():
+    a = _rec(_hash="dup", _seq=1)
+    b = _rec(_hash="dup", _seq=2)  # same content hash → duplicate
+    c = _rec(_hash="uniq", _seq=3)
+    admitted, counters = adapt_records(_stream([a, b, c]))
+    assert counters["admitted"] == 2
+    assert counters["duplicate"] == 1
+
+
+def test_missing_record_hash_not_deduped():
+    """Rows without a record_hash cannot be de-duplicated — both admitted (honest)."""
+    a = _rec(_hash=None, _seq=1)
+    a["record_hash"] = None
+    b = _rec(_hash=None, _seq=2)
+    b["record_hash"] = None
+    admitted, counters = adapt_records(_stream([a, b]))
+    assert counters["admitted"] == 2
+    assert counters["duplicate"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 13. Fixed-schema manifest — every exclusion reason key is always present.
+# --------------------------------------------------------------------------- #
+def test_manifest_excluded_by_reason_is_fixed_schema(tmp_path):
+    src = tmp_path / "trades"
+    src.mkdir()
+    (src / "trade_history_20260703.ndjson").write_text(json.dumps(_rec()) + "\n")
+    m = run_adapter(trades_dir=src, generated_at="2026-07-10T00:00:00Z").manifest
+    assert set(m.excluded_by_reason) == set(EXCLUSION_REASONS)
+    assert all(v == 0 for v in m.excluded_by_reason.values())
+    assert m.to_dict()["duplicate"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 14. Constant parity with the live write-path defenses (pins the documented copy).
+# --------------------------------------------------------------------------- #
+def test_trust_constants_match_live_write_path():
+    """The adapter's trust constants are cited copies of the live evidence-writer defenses
+    (isolation forbids importing that module inside chad.validation). Tests are NOT
+    isolation-bound, so import both here and pin them — catches a future writer-side edit."""
+    from chad.execution.paper_exec_evidence_writer import (  # noqa: PLC0415 (lazy by design)
+        _PAPER_REJECTED_STATUSES,
+        _PLACEHOLDER_FILL_PRICE,
+        _STATUS_CANON,
+    )
+    from chad.validation.trade_log_adapter import REJECTED_STATUSES, TRUSTED_FILL_STATUSES
+
+    assert REJECTED_STATUSES == _PAPER_REJECTED_STATUSES
+    assert PLACEHOLDER_FILL_PRICE == _PLACEHOLDER_FILL_PRICE
+    # Every canonical genuine-fill target must be an admissible trusted status.
+    assert set(_STATUS_CANON.values()) <= TRUSTED_FILL_STATUSES

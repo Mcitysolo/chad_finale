@@ -93,15 +93,17 @@ REJECTED_STATUSES: frozenset[str] = frozenset({"error", "failed", "rejected", "c
 # The paper-mode "no live price" placeholder fallback fingerprint
 # (paper_exec_evidence_writer.py:195 _PLACEHOLDER_FILL_PRICE).
 PLACEHOLDER_FILL_PRICE: float = 100.0
-_PLACEHOLDER_EQUITY_ASSET_CLASSES: frozenset[str] = frozenset(
-    {"equity", "etf", "stock", "stk"}
-)
 
-# Futures roots present in CHAD's tradable universe → InstrumentClass.FUT. Anything
-# unmatched below falls through to the crypto/equity heuristics. A ledger symbol may carry
-# a contract month+year suffix (e.g. "MESU6" = MES + U[Sep] + 6[2026]) — stripped below.
+# Futures roots present in CHAD's tradable universe → InstrumentClass.FUT. Reconciled with
+# the canonical futures universe (chad/market_data/dynamic_universe_scanner.py:60 = {MES,
+# MNQ, MCL, MGC, ZN, ZB, M6E, SIL, MYM, M2K}); ZN/ZB (Treasuries) are included so a Treasury
+# fill without an explicit asset_class is not misclassified STK. §1.2 isolation forbids
+# importing market_data, so this is a cited local copy (a symbol whose asset_class IS present
+# is classified from that first — this set is only the last-resort symbol heuristic). M6A/M6B
+# (micro AUD/GBP FX futures) are retained. A ledger symbol may carry a contract month+year
+# suffix (e.g. "MESU6" = MES + U[Sep] + 6[2026]) — stripped below.
 _FUTURES_ROOTS: frozenset[str] = frozenset(
-    {"M6E", "M6A", "M6B", "MES", "MNQ", "MYM", "M2K", "MGC", "MCL", "SIL"}
+    {"MES", "MNQ", "MYM", "M2K", "M6E", "M6A", "M6B", "MGC", "MCL", "SIL", "ZN", "ZB"}
 )
 # Futures month codes (F G H J K M N Q U V X Z) + a 1-2 digit year suffix.
 _FUT_SUFFIX_RE = re.compile(r"[FGHJKMNQUVXZ]\d{1,2}$")
@@ -431,8 +433,9 @@ class AdapterManifest:
     rows_in_window: int
     out_of_window: int
     malformed: int
+    duplicate: int
     admitted: int
-    excluded_by_reason: dict[str, int]
+    excluded_by_reason: dict[str, int]         # FIXED schema: every EXCLUSION_REASONS key, 0+
     date_range_admitted: Optional[str]         # "min..max" over admitted rows, or None
     strategies_admitted: dict[str, int]
     notes: list[str]
@@ -448,6 +451,7 @@ class AdapterManifest:
             "rows_in_window": self.rows_in_window,
             "out_of_window": self.out_of_window,
             "malformed": self.malformed,
+            "duplicate": self.duplicate,
             "admitted": self.admitted,
             "excluded_by_reason": dict(self.excluded_by_reason),
             "date_range_admitted": self.date_range_admitted,
@@ -494,21 +498,28 @@ def adapt_records(
     A ``None`` record is a line that failed to parse (counted as ``malformed``). Date window
     ``[since, until]`` (inclusive ``YYYY-MM-DD`` strings; either may be ``None`` for open-ended)
     is applied first — out-of-window rows are neither admitted nor trust-counted. Trust
-    exclusions (fail-closed) and malformed-but-in-window rows are tallied. Returns the
+    exclusions (fail-closed) and malformed-but-in-window rows are tallied. An admitted row
+    whose ``record_hash`` was already admitted is dropped as a ``duplicate`` (row-level
+    idempotency: the same content hash must not be scored twice, e.g. if it appeared in two
+    matched files); rows lacking a hash cannot be de-duplicated and are admitted. Returns the
     stable-sorted admitted list and a counters dict. Never raises on bad data.
 
     Structural guarantee: a row reaches ``admitted`` ONLY on the ``trust_exclusion(...) is
-    None`` branch. As a fail-closed tripwire, the exact original record of every admitted row
-    is re-run through :func:`trust_exclusion` after the loop; if any now excludes, that is a
-    non-deterministic-gate bug and raises ``AssertionError`` rather than handing the row
-    downstream — so the adapter is *unable* to feed an untrusted row into the scorer.
+    None`` branch (the sole append site) — THIS is what makes the adapter unable to feed an
+    untrusted row into the scorer. The post-loop re-run of :func:`trust_exclusion` on each
+    admitted record is a secondary tripwire that catches a *non-deterministic gate* (a future
+    edit making the gate stateful/random so it admits then excludes the same input); it raises
+    rather than shipping such a row. It is an ``assert`` (advisory under ``python -O``); the
+    append-gate above is the non-advisory guarantee.
     """
     admitted_pairs: list[tuple[AdmittedTrade, Mapping[str, Any]]] = []
+    seen_hashes: set[str] = set()
     counters: dict[str, int] = {
         "rows_read": 0,
         "rows_in_window": 0,
         "out_of_window": 0,
         "malformed": 0,
+        "duplicate": 0,
         "admitted": 0,
     }
     for reason in EXCLUSION_REASONS:
@@ -539,14 +550,22 @@ def adapt_records(
         except _MalformedRow:
             counters["malformed"] += 1
             continue
+
+        rh = record.get("record_hash")
+        if isinstance(rh, str) and rh:
+            if rh in seen_hashes:
+                counters["duplicate"] += 1
+                continue
+            seen_hashes.add(rh)
         admitted_pairs.append((trade, record))
 
     admitted_pairs.sort(key=lambda pair: _sort_key(pair[0]))
     admitted = [t for t, _ in admitted_pairs]
     counters["admitted"] = len(admitted)
 
-    # Fail-closed tripwire: re-verify the trust gate on the EXACT original record of every
-    # admitted row. A leak here means the gate is non-deterministic — refuse, don't ship it.
+    # Secondary tripwire (see docstring): a deterministic pure gate re-runs identically, so
+    # this only fires if the gate became non-deterministic. The real guarantee is the append
+    # gate above (a row is only ever added when trust_exclusion(...) returned None).
     leaked = [rec for _, rec in admitted_pairs if trust_exclusion(rec) is not None]
     assert not leaked, f"trust-filter leak: {len(leaked)} admitted rows are excludable"
 
@@ -635,10 +654,10 @@ def run_adapter(
             {"path": str(fp), "sha256": _sha256_file(fp), "rows": per_file_rows.get(fp.name, 0)}
         )
 
+    # FIXED schema: emit every EXCLUSION_REASONS key (0 when none), so a downstream consumer
+    # can rely on the full key set always being present.
     excluded_by_reason = {
-        reason: counters[f"excluded:{reason}"]
-        for reason in EXCLUSION_REASONS
-        if counters[f"excluded:{reason}"] > 0
+        reason: counters[f"excluded:{reason}"] for reason in EXCLUSION_REASONS
     }
     strategies: dict[str, int] = {}
     for t in admitted:
@@ -665,6 +684,7 @@ def run_adapter(
         rows_in_window=counters["rows_in_window"],
         out_of_window=counters["out_of_window"],
         malformed=counters["malformed"],
+        duplicate=counters["duplicate"],
         admitted=counters["admitted"],
         excluded_by_reason=excluded_by_reason,
         date_range_admitted=_date_range(admitted),
@@ -710,7 +730,8 @@ def _print_manifest(manifest: AdapterManifest) -> None:
     print(f"input files: {len(manifest.input_files)}")
     print(
         f"rows_read={manifest.rows_read}  in_window={manifest.rows_in_window}  "
-        f"out_of_window={manifest.out_of_window}  malformed={manifest.malformed}"
+        f"out_of_window={manifest.out_of_window}  malformed={manifest.malformed}  "
+        f"duplicate={manifest.duplicate}"
     )
     print(f"ADMITTED (trusted, scorer-ready): {manifest.admitted}")
     if manifest.excluded_by_reason:

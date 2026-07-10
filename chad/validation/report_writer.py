@@ -98,12 +98,18 @@ def build_report(
     thresholds: Mapping[str, Any],
     verdict_summary: Mapping[str, Any],
     extra_notes: Optional[Sequence[str]] = None,
+    provenance_overrides: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Assemble the full (unsigned) report dict from already-serialised sections.
 
     Every argument is a plain, JSON-serialisable section dict/list produced by the
     upstream phases — this function only arranges them and stamps provenance. Pass
     :func:`sign_report` over the result to seal it. Deterministic in its inputs.
+
+    ``provenance_overrides`` (default ``None`` → Stage-1 output unchanged) replaces specific
+    keys in the provenance block. A stage that has no sealed OOS or no replayed heads (e.g.
+    Stage 2, real trade log) passes overrides so the SIGNED artifact does not carry a
+    hash-seal / replay-reconstruction claim that is false for that run.
     """
     if not isinstance(generated_at, str) or not generated_at:
         raise ValueError("generated_at must be a non-empty str")
@@ -112,27 +118,31 @@ def build_report(
     if not isinstance(final_run, bool):
         raise ValueError(f"final_run must be a bool, got {final_run!r}")
 
+    provenance: dict[str, Any] = {
+        "universe_bias": UNIVERSE_PROVENANCE_NOTE,
+        "oos_discipline": (
+            "OOS is hash-sealed; scored only on an explicit --final-run and logged "
+            "immutably (SSOT §3.1). This artifact records the access count; > 1 ⇒ "
+            "CONTAMINATED."
+        ),
+        "replay_reconstruction": (
+            "REPLAYABLE heads are replayed by a harness-side decision function over "
+            "reconstructable (daily-bar) inputs; the live strategy module is never "
+            "imported (SSOT §1.2 isolation). Reconstruction fidelity is a separate, "
+            "flagged concern, not asserted here."
+        ),
+        "notes": list(extra_notes) if extra_notes else [],
+    }
+    if provenance_overrides:
+        provenance.update(provenance_overrides)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at,
         "stage": stage,
         "final_run": final_run,
         "code_commit": code_commit,
-        "provenance": {
-            "universe_bias": UNIVERSE_PROVENANCE_NOTE,
-            "oos_discipline": (
-                "OOS is hash-sealed; scored only on an explicit --final-run and logged "
-                "immutably (SSOT §3.1). This artifact records the access count; > 1 ⇒ "
-                "CONTAMINATED."
-            ),
-            "replay_reconstruction": (
-                "REPLAYABLE heads are replayed by a harness-side decision function over "
-                "reconstructable (daily-bar) inputs; the live strategy module is never "
-                "imported (SSOT §1.2 isolation). Reconstruction fidelity is a separate, "
-                "flagged concern, not asserted here."
-            ),
-            "notes": list(extra_notes) if extra_notes else [],
-        },
+        "provenance": provenance,
         "thresholds": dict(thresholds),
         "config_frozen": dict(frozen_config),
         "oos": dict(oos),

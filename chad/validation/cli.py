@@ -745,16 +745,32 @@ def _worst_status(audits: Sequence[Optional[SymbolAudit]]) -> str:
 # Stage 2 — real trade-log validation (SSOT §1.3 / Part 6, Phase 6).
 # --------------------------------------------------------------------------- #
 def _finite_or_none(value: Any) -> Any:
-    """A real, finite number passes through; NaN/±inf/None collapse to ``None``.
+    """A real, finite number passes through; NaN/±inf/bool/None collapse to ``None``.
 
     Keeps every metric embedded in the (allow_nan=False) signed report finitely
     representable — an undefined metric is honestly ``None``, which the strict verdict
     treats as *not confirmed* (fails that check), never a fabricated pass.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None if not isinstance(value, (int, float)) else value
+        return None
     f = float(value)
     return f if math.isfinite(f) else None
+
+
+def _finitize(obj: Any) -> Any:
+    """Recursively replace every non-finite float (NaN/±inf) in a JSON-ish structure with
+    ``None`` so the whole embedded metrics block is safe for ``allow_nan=False`` signing.
+
+    Covers NESTED dicts (e.g. the ``seed_sweep`` sub-dict), lists, and scalars — not just the
+    top-level metric keys — so a future upstream NaN cannot slip into the signed report via a
+    nested value. Bools and ints pass through unchanged (only float NaN/inf collapse)."""
+    if isinstance(obj, dict):
+        return {k: _finitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finitize(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
 
 
 def _stage2_net_returns(
@@ -777,6 +793,8 @@ def _stage2_net_returns(
         except (ValueError, KeyError):
             skipped += 1
             continue
+        # apply_costs always sets net_pnl when a gross_pnl is supplied (AdmittedTrade always
+        # carries one); the fallback is belt-and-suspenders for a None net.
         net = breakdown.net_pnl if breakdown.net_pnl is not None else (t.gross_pnl - breakdown.total_cost)
         if not (t.notional > 0.0) or not math.isfinite(net) or not math.isfinite(net / t.notional):
             skipped += 1
@@ -811,13 +829,9 @@ def _stage2_head_metrics(
     fabricated pass (SSOT Part 0). ``oos_source`` is ``"live_trade_log"``; there is no sealed
     OOS box for a live log, so ``oos_access_count = 0`` (never CONTAMINATED by construction).
     """
-    om = _oos_metrics(returns, periods_per_year=252.0, n_effective_trials=n_effective_trials)
-    om = {
-        **om,
-        "cost_adj_cagr": _finite_or_none(om["cost_adj_cagr"]),
-        "deflated_sharpe_worst": _finite_or_none(om["deflated_sharpe_worst"]),
-        "worst_quantile_ruin": _finite_or_none(om["worst_quantile_ruin"]),
-    }
+    # Finitize the WHOLE metrics block (incl. the nested seed_sweep sub-dict) so no non-finite
+    # float can reach the allow_nan=False report signing via any nested value.
+    om = _finitize(_oos_metrics(returns, periods_per_year=252.0, n_effective_trials=n_effective_trials))
     metrics = HeadMetrics(
         head=head,
         parity_status="LIVE_TRADE_LOG",
@@ -888,9 +902,11 @@ def run_stage2_trade_log(
     heads_section: list[dict[str, Any]] = []
     head_verdicts: list[VerdictResult] = []
     counts: dict[str, int] = {v.value: 0 for v in Verdict}
+    pooled: list[float] = []  # portfolio track: pooled net returns (equal-weight), reused below
     for strategy in sorted(by_strategy):
         admitted = by_strategy[strategy]
         returns, trade_summary = _stage2_net_returns(admitted, cost_config)
+        pooled.extend(returns)  # reuse the per-head series — no second cost pass
         metrics, om = _stage2_head_metrics(
             strategy, returns, n_effective_trials=n_effective_trials, final_run=final_run
         )
@@ -911,10 +927,6 @@ def run_stage2_trade_log(
             }
         )
 
-    # Portfolio track: pooled net returns across every admitted head (equal-weight).
-    pooled: list[float] = []
-    for strategy in sorted(by_strategy):
-        pooled.extend(_stage2_net_returns(by_strategy[strategy], cost_config)[0])
     surviving = sum(1 for v in head_verdicts if v.verdict is Verdict.PASS)
     total_heads = len(head_verdicts)
     capital_fraction = (surviving / total_heads) if total_heads else 0.0
@@ -997,6 +1009,20 @@ def run_stage2_trade_log(
             "is a future extension, so heads honestly read INSUFFICIENT_DATA until it matures "
             "(never a fabricated pass). The machine never flips ready_for_live (Part 0).",
         ],
+        # Stage 2 has neither a sealed OOS nor replayed heads — override the Stage-1 provenance
+        # so the SIGNED artifact does not carry a hash-seal / replay claim that is false here.
+        provenance_overrides={
+            "oos_discipline": (
+                "N/A for Stage 2: a live trade log has no sealed OOS partition (SSOT §3.1 "
+                "applies to the Stage-1 backtest). Admission is governed by the fail-closed "
+                "trust gate — see data_quality.stage2_adapter_manifest; oos.contaminated is "
+                "false by construction (access_count = 0)."
+            ),
+            "replay_reconstruction": (
+                "N/A for Stage 2: heads are REAL executed paper fills, not replayed historical "
+                "logic; no strategy module is imported and no reconstruction is asserted."
+            ),
+        },
     )
     return sign_report(report)
 
