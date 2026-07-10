@@ -152,17 +152,12 @@ from chad.validation.report_writer import (
     verify_signature,
     write_report,
 )
-from chad.validation.trade_log_adapter import (
-    AdapterManifest,
-    AdapterResult,
-    AdmittedTrade,
-    adapt_records,
-    classify_instrument,
-    is_placeholder_fill,
-    iter_ledger_files,
-    run_adapter,
-    trust_exclusion,
-)
+
+# NOTE: chad.validation.trade_log_adapter (Phase 6, Stage-2 seam) and chad.validation.cli
+# both carry a ``__main__`` entry point and are therefore deliberately NOT re-exported here
+# — eagerly importing a ``python -m``-executable submodule from the package __init__ trips a
+# runpy "found in sys.modules ... prior to execution" RuntimeWarning. Import their API
+# directly (``from chad.validation.trade_log_adapter import run_adapter``), as cli.py does.
 
 __all__ = [
     "AuditConfig",
@@ -293,14 +288,4 @@ __all__ = [
     "sign_report",
     "verify_signature",
     "write_report",
-    # Phase 6 — Stage-2 real-trade ingest adapter (SSOT §1.3 / Part 6): trust gate + manifest.
-    "AdapterManifest",
-    "AdapterResult",
-    "AdmittedTrade",
-    "adapt_records",
-    "classify_instrument",
-    "is_placeholder_fill",
-    "iter_ledger_files",
-    "run_adapter",
-    "trust_exclusion",
 ]
