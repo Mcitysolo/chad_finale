@@ -424,8 +424,10 @@ def test_rebuilder_consults_exclusion_policy_when_strict_mode(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 def test_reconciliation_publisher_emits_position_guard_drift_json(tmp_path, monkeypatch):
-    """GAP-028 §5.1: _emit_position_guard_drift writes the v1 advisory file
-    with a non-empty `drifts` array when guard state contains a side mismatch."""
+    """GAP-028 §5.1 + WKF U3: _emit_position_guard_drift writes the v2 advisory
+    file with a non-empty `drifts` array. The synthetic state (guard delta|AAPL
+    BUY 31 vs broker_sync|AAPL SELL 2) is now a like-with-like signed
+    qty_mismatch under the v2 semantics (a side flip shows as a sign delta)."""
     from chad.ops import reconciliation_publisher as pub
     from chad.core import position_guard
 
@@ -446,16 +448,18 @@ def test_reconciliation_publisher_emits_position_guard_drift_json(tmp_path, monk
     assert drift_path.is_file(), "drift advisory file must be written"
 
     payload = _load_json(drift_path)
-    assert payload["schema_version"] == "position_guard_drift.v1"
+    assert payload["schema_version"] == "position_guard_drift.v2"
     assert payload["drift_count"] == 1
     assert payload["ttl_seconds"] == pub.TTL_SECONDS
     assert "ts_utc" in payload
+    assert payload["counts_by_kind"]["qty_mismatch"] == 1
     assert isinstance(payload["drifts"], list) and len(payload["drifts"]) == 1
     rec = payload["drifts"][0]
-    assert rec["key"] == "delta|AAPL"
-    assert rec["drift_kind"] == "side_mismatch"
-    assert rec["guard_side"] == "BUY"
-    assert rec["broker_side"] == "SELL"
+    assert rec["symbol"] == "AAPL"
+    assert rec["drift_kind"] == "qty_mismatch"
+    assert rec["guard_qty"] == 31.0        # BUY 31 → +31
+    assert rec["broker_qty"] == -2.0       # SELL 2 → -2
+    assert rec["broker_present"] is True
 
     # Read-only invariant: position_guard.json mtime must not change.
     pre_mtime = guard_path.stat().st_mtime_ns

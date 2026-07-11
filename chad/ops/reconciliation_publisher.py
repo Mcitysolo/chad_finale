@@ -250,7 +250,11 @@ def _emit_position_guard_drift() -> int:
     Returns the number of drift records emitted.
     """
     try:
-        from chad.core.position_guard import detect_guard_vs_broker_truth_drift
+        # WKF U3: v2 drift semantics — like-with-like symbol totals, broker truth
+        # read from the recorded broker_sync quantity (NOT gated on `open`), and
+        # a single atomic read of position_guard.json so guard + broker truth
+        # share one `_version` generation (kills the stale-snapshot false positive).
+        from chad.core.position_guard import detect_guard_vs_broker_drift_v2
     except Exception as exc:  # noqa: BLE001
         LOG.warning("position_guard import failed for drift emit: %s", exc)
         return 0
@@ -264,12 +268,25 @@ def _emit_position_guard_drift() -> int:
     else:
         guard_state = {}
 
-    drifts = detect_guard_vs_broker_truth_drift(guard_state) if isinstance(guard_state, dict) else []
+    result = (
+        detect_guard_vs_broker_drift_v2(guard_state)
+        if isinstance(guard_state, dict)
+        else {"drift_count": 0, "drifts": [], "snapshot_generation": None,
+              "counts_by_kind": {}}
+    )
+    drifts = result.get("drifts", [])
+    drift_count = int(result.get("drift_count", len(drifts)) or 0)
     payload = {
-        "schema_version": "position_guard_drift.v1",
+        # v2: extended drift_kind vocabulary (phantom_guard_entry /
+        # broker_untracked_position / qty_mismatch). drift_count remains the
+        # authoritative live-readiness gate (GAP-041 / PR-09); the consumer
+        # ops.live_readiness_publish accepts both v1 and v2.
+        "schema_version": "position_guard_drift.v2",
         "ts_utc": _utc_now_iso(),
         "ttl_seconds": TTL_SECONDS,
-        "drift_count": len(drifts),
+        "drift_count": drift_count,
+        "snapshot_generation": result.get("snapshot_generation"),
+        "counts_by_kind": result.get("counts_by_kind", {}),
         "drifts": drifts,
     }
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -277,10 +294,10 @@ def _emit_position_guard_drift() -> int:
     tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     tmp.replace(DRIFT_OUT_PATH)
     LOG.info(
-        "position_guard_drift emitted drift_count=%d path=%s",
-        len(drifts), DRIFT_OUT_PATH,
+        "position_guard_drift emitted schema=v2 drift_count=%d by_kind=%s path=%s",
+        drift_count, payload["counts_by_kind"], DRIFT_OUT_PATH,
     )
-    return len(drifts)
+    return drift_count
 
 
 def main() -> int:

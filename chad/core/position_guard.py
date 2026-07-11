@@ -543,6 +543,146 @@ def detect_guard_vs_broker_truth_drift(
     return drift
 
 
+def _signed_qty(entry: Mapping[str, Any]) -> float:
+    """Signed share quantity of a guard/broker_sync entry (BUY=+, SELL=-)."""
+    try:
+        qty = abs(float(entry.get("quantity", 0) or 0))
+    except (TypeError, ValueError):
+        qty = 0.0
+    side = str(entry.get("side", "") or "").strip().upper()
+    return -qty if side == "SELL" else qty
+
+
+def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """WKF U3: like-with-like guard↔broker drift, read atomically from one snapshot.
+
+    Supersedes :func:`detect_guard_vs_broker_truth_drift` for the emitted
+    ``position_guard_drift`` advisory. It fixes the F3 false-positive class where
+    the v1 detector compared *per-strategy* guard keys against ``broker_sync``
+    entries GATED on ``open is True`` — but the broker-truth-rebuild writes
+    ``broker_sync`` records carrying the last-known broker ``quantity`` and marks
+    them ``open=False`` (``closed_by="strategy_ownership_assumed"``). The v1
+    detector therefore saw *zero* broker truth and flagged ``broker_truth_missing``
+    for symbols the broker plainly holds (e.g. LLY 130, TLT 420).
+
+    This v2 detector:
+
+      * Aggregates GUARD quantity **per symbol** (signed) across all OPEN
+        non-``broker_sync`` entries, tracking the contributing keys/strategies.
+      * Aggregates BROKER quantity **per symbol** from ``broker_sync|<symbol>``
+        entries using the recorded ``quantity`` (signed by side) REGARDLESS of
+        the ``open`` flag — that quantity *is* broker truth.
+      * Compares symbol-total vs symbol-total (like-with-like) and classifies
+        into the extended drift_kind vocabulary:
+
+          - ``phantom_guard_entry``       guard holds, broker holds nothing.
+          - ``broker_untracked_position`` broker holds, no guard entry — e.g.
+                                          TLT 420 / IWM 200 accumulation with no
+                                          per-strategy ledger. SURFACED, never
+                                          auto-"fixed": the broker book is truth.
+          - ``qty_mismatch``              both hold but signed totals differ
+                                          (captures side flips as a sign delta).
+
+    Atomicity: both sides come from the SAME ``state`` mapping — one atomic read
+    of position_guard.json bearing a single ``_version`` generation — so a guard
+    write and a broker_sync write can never be mixed across generations. The
+    generation is echoed as ``snapshot_generation`` on the payload and on every
+    record, killing the stale-snapshot false positive by construction. Pure: no
+    I/O, no mutation of ``state``.
+
+    Returns a payload dict::
+
+        {"snapshot_generation": <int|None>, "written_by": <str>,
+         "drift_count": <int>, "counts_by_kind": {...}, "drifts": [ {rec}, ... ]}
+    """
+    empty_counts = {
+        "phantom_guard_entry": 0,
+        "broker_untracked_position": 0,
+        "qty_mismatch": 0,
+    }
+    if not isinstance(state, Mapping):
+        return {
+            "snapshot_generation": None, "written_by": "",
+            "drift_count": 0, "counts_by_kind": dict(empty_counts), "drifts": [],
+        }
+
+    generation = state.get("_version")
+    written_by = str(state.get("_written_by", "") or "")
+
+    # --- broker truth by symbol: recorded quantity, NOT gated on `open` ---
+    broker_qty: Dict[str, float] = {}
+    broker_side: Dict[str, Optional[str]] = {}
+    for key, entry in state.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not key.startswith("broker_sync|"):
+            continue
+        symbol = str(entry.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        broker_qty[symbol] = broker_qty.get(symbol, 0.0) + _signed_qty(entry)
+        broker_side[symbol] = str(entry.get("side", "") or "").strip().upper() or None
+
+    # --- guard aggregate by symbol: OPEN, non-broker_sync entries ---
+    guard_qty: Dict[str, float] = {}
+    guard_keys: Dict[str, List[str]] = {}
+    guard_strats: Dict[str, List[str]] = {}
+    for key, entry in state.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if key.startswith("_") or key.startswith("broker_sync|"):
+            continue
+        if entry.get("open") is not True:
+            continue
+        symbol = str(entry.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        guard_qty[symbol] = guard_qty.get(symbol, 0.0) + _signed_qty(entry)
+        guard_keys.setdefault(symbol, []).append(key)
+        strat = str(entry.get("strategy", "") or "").strip()
+        strat_list = guard_strats.setdefault(symbol, [])
+        if strat and strat not in strat_list:
+            strat_list.append(strat)
+
+    _EPS = 1e-9
+    counts = dict(empty_counts)
+    drifts: List[Dict[str, Any]] = []
+    for symbol in sorted(set(guard_qty) | set(broker_qty)):
+        g = guard_qty.get(symbol, 0.0)
+        b = broker_qty.get(symbol, 0.0)
+        g_open = abs(g) > _EPS
+        b_open = abs(b) > _EPS
+        if g_open and not b_open:
+            kind = "phantom_guard_entry"
+        elif b_open and not g_open:
+            kind = "broker_untracked_position"
+        elif g_open and b_open and abs(g - b) > _EPS:
+            kind = "qty_mismatch"
+        else:
+            continue  # equal totals (incl. both-flat) → no drift
+        counts[kind] += 1
+        drifts.append({
+            "symbol": symbol,
+            "drift_kind": kind,
+            "guard_qty": g,
+            "broker_qty": b,
+            "qty_delta": g - b,
+            "guard_keys": list(guard_keys.get(symbol, [])),
+            "guard_strategies": list(guard_strats.get(symbol, [])),
+            "broker_side": broker_side.get(symbol),
+            "broker_present": b_open,
+            "snapshot_generation": generation,
+        })
+
+    return {
+        "snapshot_generation": generation,
+        "written_by": written_by,
+        "drift_count": len(drifts),
+        "counts_by_kind": counts,
+        "drifts": drifts,
+    }
+
+
 def close_stale_position_from_broker_truth(
     strategy: str,
     symbol: str,

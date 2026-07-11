@@ -186,7 +186,12 @@ def _resolved_reconciliation_status(
     except Exception as exc:
         return "UNKNOWN", f"position_guard_drift_unreadable:{type(exc).__name__}"
 
-    if str(g.get("schema_version") or "") != "position_guard_drift.v1":
+    # WKF U3: accept both the legacy v1 and the v2 (like-with-like symbol-total)
+    # drift schemas. Both carry the authoritative numeric `drift_count`; the gate
+    # semantics below are identical for either version.
+    if str(g.get("schema_version") or "") not in (
+        "position_guard_drift.v1", "position_guard_drift.v2",
+    ):
         return "UNKNOWN", "position_guard_drift_schema_invalid"
 
     try:
