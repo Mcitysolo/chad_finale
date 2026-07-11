@@ -865,6 +865,97 @@ def _rebuild_guard_from_paper_ledger(logger: logging.Logger) -> None:
     )
 
 
+# WKF U1: one-time-per-process boot reconcile guard. Set True after the first
+# _reconcile_boot_phantoms() call so the sweep runs exactly once at startup.
+_BOOT_PHANTOM_RECONCILE_DONE = False
+
+
+def _reconcile_boot_phantoms(logger: logging.Logger) -> None:
+    """WKF U1: one-time boot sweep that closes submission-time guard phantoms.
+
+    Runs once per process (before the first cycle). Closes OPEN, non-broker_sync
+    guard entries that the broker does NOT hold AND that no confirmed fill backs
+    — the residue of the retired pre-submit ``mark_position_open`` path. Broker
+    truth is the set of symbols with an OPEN ``broker_sync|<symbol>`` entry
+    (qty != 0); confirmed-fill backing is a non-empty trade_closer FIFO queue.
+    Each cleared key is logged ``GUARD_PHANTOM_RECONCILED key=...``.
+
+    Non-fatal and idempotent: any failure is swallowed so a reconcile problem
+    can never block startup, and the run-once flag is set up-front so a partial
+    failure does not re-sweep on a later call.
+    """
+    global _BOOT_PHANTOM_RECONCILE_DONE
+    if _BOOT_PHANTOM_RECONCILE_DONE:
+        return
+    _BOOT_PHANTOM_RECONCILE_DONE = True
+    try:
+        from chad.core.position_guard import (
+            _load_state,
+            save_state,
+            reconcile_boot_phantoms,
+        )
+
+        state = _load_state()
+        if not isinstance(state, dict) or not state:
+            logger.info("BOOT_PHANTOM_RECONCILE cleared=0 (empty guard state)")
+            return
+
+        # Broker truth: symbols with an OPEN broker_sync|<symbol> entry, qty != 0.
+        broker_symbols: set = set()
+        for key, entry in state.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            if not key.startswith("broker_sync|"):
+                continue
+            if entry.get("open") is not True:
+                continue
+            sym = str(entry.get("symbol", "") or "").strip().upper()
+            if sym and abs(float(entry.get("quantity", 0) or 0)) > 0.0:
+                broker_symbols.add(sym)
+
+        # Confirmed-fill backing: non-empty trade_closer FIFO queues.
+        fill_backed_keys: set = set()
+        if _TRADE_CLOSER_STATE_PATH.is_file():
+            try:
+                data = json.loads(_TRADE_CLOSER_STATE_PATH.read_text(encoding="utf-8"))
+                for entry in data.get("queues", []) or []:
+                    strat = str(entry.get("strategy", "")).strip()
+                    sym = str(entry.get("symbol", "")).strip().upper()
+                    lots = [
+                        lot for lot in (entry.get("lots") or [])
+                        if float(lot.get("quantity", 0) or 0) > 0
+                    ]
+                    if strat and sym and lots:
+                        fill_backed_keys.add(f"{strat}|{sym}")
+            except Exception as _tc_err:
+                # Fail-closed: if the FIFO is unreadable we cannot prove a fill
+                # backing, so skip the sweep rather than risk clearing real
+                # positions.
+                logger.warning(
+                    "BOOT_PHANTOM_RECONCILE skipped — trade_closer_state unreadable: %s",
+                    _tc_err,
+                )
+                return
+
+        new_state, cleared = reconcile_boot_phantoms(
+            state, broker_symbols, fill_backed_keys
+        )
+        if cleared:
+            save_state(new_state)
+            for k in cleared:
+                logger.warning(
+                    "GUARD_PHANTOM_RECONCILED key=%s reason=no_broker_position_no_confirmed_fill",
+                    k,
+                )
+            logger.info(
+                "BOOT_PHANTOM_RECONCILE cleared=%d keys=%s", len(cleared), cleared
+            )
+        else:
+            logger.info("BOOT_PHANTOM_RECONCILE cleared=0 (no phantoms)")
+    except Exception as exc:  # noqa: BLE001 — never block startup
+        logger.warning("boot phantom reconcile failed (non-fatal): %s", exc)
+
+
 # Roots used to collapse contract-month tickers (e.g. "MESM6", "MESZ6",
 # "MESH7") down to a stable root key for broker_sync guard entries. Without
 # this, a contract roll silently changes the guard key and the prior month's
@@ -2124,6 +2215,7 @@ def run_once(logger: logging.Logger) -> None:
     from chad.core.position_guard import (
         is_same_side_open,
         is_flip_signal,
+        is_fill_confirmed,
         mark_position_closed,
         mark_position_open,
         replace_position,
@@ -2429,6 +2521,13 @@ def run_once(logger: logging.Logger) -> None:
                 )
                 continue
 
+            # WKF U1: the guard is NO LONGER booked on submission. Classify
+            # the intent here (flip vs open) but DEFER the guard mutation
+            # (replace_position / mark_position_open) until AFTER a confirmed
+            # fill below — symmetric to the exit-close path (ISSUE-29). This
+            # kills the phantom "open on submission" entry that persisted when
+            # the order came back PreSubmitted / duplicate_open_order / rejected.
+            _intent_is_flip = is_flip_signal(intent)
             if _intent_is_exit:
                 logger.info(
                     "EXIT intent → %s %s %s qty=%s — guard close deferred to fill confirmation",
@@ -2437,24 +2536,22 @@ def run_once(logger: logging.Logger) -> None:
                     getattr(intent, "side", None),
                     getattr(intent, "quantity", None),
                 )
-            elif is_flip_signal(intent):
+            elif _intent_is_flip:
                 logger.info(
-                    "FLIP intent → %s %s %s qty=%s",
+                    "FLIP intent → %s %s %s qty=%s — guard flip deferred to fill confirmation",
                     getattr(intent, "symbol", None),
                     getattr(intent, "sec_type", None),
                     getattr(intent, "side", None),
                     getattr(intent, "quantity", None),
                 )
-                replace_position(intent)
             else:
                 logger.info(
-                    "INTENT → %s %s %s qty=%s",
+                    "INTENT → %s %s %s qty=%s — guard open deferred to fill confirmation",
                     getattr(intent, "symbol", None),
                     getattr(intent, "sec_type", None),
                     getattr(intent, "side", None),
                     getattr(intent, "quantity", None),
                 )
-                mark_position_open(intent)
 
             # Soak ENTRY-intent audit (PA SOAK_STATUS_HISTORY_WRITER 2026-06-20,
             # companion #3). Best-effort + isolated observer placed just before
@@ -2694,6 +2791,65 @@ def run_once(logger: logging.Logger) -> None:
                                     _close_err,
                                 )
 
+                        # WKF U1: OPEN / FLIP guard mutation — books the guard
+                        # ONLY on a confirmed fill (status=paper_fill/filled,
+                        # fill_id present, not pnl_untrusted). This block is
+                        # reached only after _should_persist_paper_evidence
+                        # passed above, so an unconfirmed / PreSubmitted /
+                        # duplicate_open_order / rejected order never reaches
+                        # here (it `continue`d) and thus never opens the guard.
+                        # Mirrors the exit-close path; is_fill_confirmed is the
+                        # single ISSUE-29 gate for both directions.
+                        elif not _intent_is_exit:
+                            try:
+                                _ev_extra_o = ev.extra if isinstance(ev.extra, dict) else {}
+                                _open_evidence = {
+                                    "fill_id": str(paths.get("fill_id", "")) if isinstance(paths, dict) else "",
+                                    "status": str(getattr(ev, "status", "") or "").strip().lower(),
+                                    "pnl_untrusted": bool(_ev_extra_o.get("pnl_untrusted")),
+                                    "reject": bool(getattr(ev, "reject", False)),
+                                    "tags": list(ev.tags) if ev.tags else [],
+                                    "extra": dict(_ev_extra_o),
+                                }
+                                if is_fill_confirmed(_open_evidence):
+                                    if _intent_is_flip:
+                                        replace_position(intent)
+                                        logger.info(
+                                            "FLIP_GUARD_OPENED strategy=%s symbol=%s side=%s "
+                                            "fill_id=%s — flip confirmed on fill",
+                                            getattr(intent, "strategy", "?"),
+                                            getattr(intent, "symbol", "?"),
+                                            getattr(intent, "side", "?"),
+                                            _open_evidence["fill_id"],
+                                        )
+                                    else:
+                                        mark_position_open(intent)
+                                        logger.info(
+                                            "ENTRY_GUARD_OPENED strategy=%s symbol=%s side=%s "
+                                            "fill_id=%s — open confirmed on fill",
+                                            getattr(intent, "strategy", "?"),
+                                            getattr(intent, "symbol", "?"),
+                                            getattr(intent, "side", "?"),
+                                            _open_evidence["fill_id"],
+                                        )
+                                else:
+                                    logger.warning(
+                                        "ENTRY_GUARD_NOT_OPENED strategy=%s symbol=%s side=%s "
+                                        "status=%s pnl_untrusted=%s reject=%s — fill not "
+                                        "confirmed; guard left closed (no phantom)",
+                                        getattr(intent, "strategy", "?"),
+                                        getattr(intent, "symbol", "?"),
+                                        getattr(intent, "side", "?"),
+                                        _open_evidence["status"],
+                                        _open_evidence["pnl_untrusted"],
+                                        _open_evidence["reject"],
+                                    )
+                            except Exception as _open_err:
+                                logger.warning(
+                                    "ENTRY_GUARD_OPEN_FAILED (non-fatal): %s",
+                                    _open_err,
+                                )
+
 #                         # Real-time Telegram trade alert — best effort only,
 #                         # must never block execution or evidence persistence.
 #                         try:
@@ -2846,6 +3002,11 @@ def run_loop() -> None:
     # execution path (BROKER_LOOP_DOWN) rather than letting a later lazy connect
     # fall through to a MainThread path.
     _home_execution_connection(logger)
+
+    # WKF U1: one-time boot sweep — clear submission-time guard phantoms (open
+    # entries with no broker position AND no confirmed fill) before the first
+    # cycle so stale pre-submit bookings do not survive a restart.
+    _reconcile_boot_phantoms(logger)
 
     while True:
         if _SHUTDOWN_REQUESTED:

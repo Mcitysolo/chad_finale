@@ -19,7 +19,7 @@ import os as _os
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 import json
 import time as _time
 
@@ -575,3 +575,68 @@ def close_stale_position_from_broker_truth(
     entry["_entry_version"] = int(_time.time() * 1000)
     write_position_guard(state)
     return True
+
+
+def reconcile_boot_phantoms(
+    state: Mapping[str, Any],
+    broker_symbols: Set[str],
+    fill_backed_keys: Set[str],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """WKF U1: one-time boot reconcile — close submission-time guard phantoms.
+
+    A phantom is an OPEN, non-``broker_sync`` guard entry that has NEITHER a
+    corresponding broker position NOR a confirmed fill backing it — i.e. it was
+    booked on order submission (PreSubmitted / duplicate_open_order) before the
+    fix that defers guard-open to fill confirmation, and the broker never held
+    it. Such an entry can only have been created by the retired pre-submit
+    ``mark_position_open`` / ``replace_position`` path.
+
+    Predicate (both must hold for a close):
+      * ``entry["symbol"]`` is NOT in ``broker_symbols`` (broker holds nothing
+        for that symbol), AND
+      * ``"<strategy>|<symbol>"`` is NOT in ``fill_backed_keys`` (no non-empty
+        trade_closer FIFO lot — the paper-mode confirmed-fill record).
+
+    ``broker_symbols`` are the symbols the broker currently holds (upper-cased);
+    ``fill_backed_keys`` are the guard keys with a confirmed-fill FIFO backing.
+    An entry that either the broker holds OR a confirmed fill backs is retained.
+
+    Pure: performs no I/O and never mutates ``state``. Returns
+    ``(new_state, cleared_keys)`` — a deep-enough copy with the phantom entries
+    flipped to ``open=False`` (``closed_by="phantom_boot_reconcile"``), and the
+    list of keys cleared so the caller can log ``GUARD_PHANTOM_RECONCILED``.
+    """
+    if not isinstance(state, Mapping):
+        return {}, []
+    new_state: Dict[str, Any] = {}
+    cleared: List[str] = []
+    now_iso = _utc_now_iso()
+    entry_ver = int(_time.time() * 1000)
+    broker_norm = {str(s).strip().upper() for s in (broker_symbols or set())}
+    fill_norm = {str(k) for k in (fill_backed_keys or set())}
+    for key, entry in state.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            new_state[key] = entry
+            continue
+        copy = dict(entry)
+        new_state[key] = copy
+        if key.startswith("_") or key.startswith("broker_sync|"):
+            continue
+        if copy.get("open") is not True:
+            continue
+        strategy = str(copy.get("strategy", "") or "").strip()
+        symbol = str(copy.get("symbol", "") or "").strip().upper()
+        if not symbol:
+            continue
+        composite = f"{strategy}|{symbol}"
+        if symbol in broker_norm or composite in fill_norm:
+            continue
+        # Phantom: broker holds nothing AND no confirmed fill backs it.
+        copy["open"] = False
+        copy["updated_at_utc"] = now_iso
+        copy["last_state"] = PositionState.CLOSED.value
+        copy["closed_by"] = "phantom_boot_reconcile"
+        copy["closed_reason"] = "no_broker_position_no_confirmed_fill"
+        copy["_entry_version"] = entry_ver
+        cleared.append(key)
+    return new_state, cleared
