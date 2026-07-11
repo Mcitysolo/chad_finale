@@ -40,6 +40,23 @@ def pytest_unconfigure(config):
 
 
 @pytest.fixture(autouse=True)
+def _rth_gate_off_by_default(monkeypatch):
+    """WKF U2: neutralise the market-hours (RTH) gate by default in tests.
+
+    In production ``CHAD_RTH_GATE`` defaults ON, which blocks any equity/ETF
+    intent submitted outside regular trading hours. Left unset, every existing
+    adapter test that submits an equity intent (open-order guard, margin gate,
+    idempotency, ...) would become wall-clock-dependent — green in-session, red
+    off-hours/weekends. Setting it to ``"0"`` here makes those tests
+    deterministic; the WKF-U2 suite (``test_wkf_u2_rth_gate.py``) re-enables the
+    gate explicitly via ``monkeypatch.delenv("CHAD_RTH_GATE")`` to exercise the
+    default-ON path. This is the "env-disable for tests" contract of the gate.
+    """
+    monkeypatch.setenv("CHAD_RTH_GATE", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _repo_write_guard():
     """Fail this test if it creates/modifies files under the repo's data/ | runtime/ tree.
 
