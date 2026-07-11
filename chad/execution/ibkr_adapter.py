@@ -2619,6 +2619,60 @@ class IbkrAdapter:
                 raw={"margin_gate_error": f"{type(exc).__name__}: {exc}"},
             )
 
+    def _evaluate_rth_gate(
+        self, intent: NormalizedIntent, idempotency_key: str, now: datetime
+    ) -> Optional[SubmittedOrder]:
+        """WKF U2: block equity/ETF intents submitted outside regular trading hours.
+
+        Returns ``None`` to proceed (gate off, non-equity/ETF asset, or market
+        open) or a ``SubmittedOrder(status="market_closed")`` BLOCK returned
+        BEFORE the idempotency claim, so a blocked order writes NO idempotency
+        row. Futures/crypto lanes are exempt (their sessions differ; crypto
+        never reaches this adapter). Fails OPEN on any internal wiring error —
+        the gate is an off-hours safety net, not a hard risk control, and must
+        never trap a legitimate in-session order.
+        """
+        try:
+            from chad.execution.rth_gate import rth_block_reason, RTH_BLOCK_STATUS
+
+            asset_class = resolve_asset_class(
+                getattr(intent, "symbol", ""), getattr(intent, "sec_type", "")
+            )
+            reason = rth_block_reason(asset_class, now, os.environ)
+            if reason is None:
+                return None
+            _strategy = "/".join(intent.source_strategies) if intent.source_strategies else ""
+            LOGGER.warning(
+                "RTH_GATE_BLOCK symbol=%s strategy=%s asset_class=%s sec_type=%s side=%s "
+                "qty=%s now_utc=%s reason=%s — equity/ETF submit outside regular trading "
+                "hours; no order placed, no idempotency row",
+                intent.symbol, _strategy, asset_class, intent.sec_type, intent.side,
+                intent.quantity,
+                now.isoformat() if hasattr(now, "isoformat") else now,
+                reason,
+            )
+            return SubmittedOrder(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=intent.quantity,
+                strategy=list(intent.source_strategies),
+                dry_run=self._config.dry_run,
+                submitted_at=now,
+                ib_order_id=None,
+                status=RTH_BLOCK_STATUS,
+                asset_class=intent.asset_class,
+                sec_type=intent.sec_type,
+                exchange=intent.exchange,
+                currency=intent.currency,
+                order_type=intent.order_type,
+                what_if=False,
+                idempotency_key=idempotency_key,
+                raw={"rth_gate": {"reason": reason, "asset_class": asset_class}},
+            )
+        except Exception as exc:  # noqa: BLE001 - gate wiring must never trap a live order
+            LOGGER.warning("ibkr.rth_gate_error (fail-open): %r", exc)
+            return None
+
     def _submit_intent(self, intent: NormalizedIntent) -> Optional[SubmittedOrder]:
         if intent.quantity <= 0.0:
             LOGGER.info(
@@ -2638,6 +2692,13 @@ class IbkrAdapter:
         margin_blocked = self._evaluate_margin_gate(intent, idempotency_key, now)
         if margin_blocked is not None:
             return margin_blocked
+
+        # WKF U2: market-hours (RTH) gate — same pre-claim chokepoint. Blocks
+        # equity/ETF intents submitted outside regular trading hours BEFORE the
+        # idempotency claim (no row for a blocked intent). Futures/crypto exempt.
+        rth_blocked = self._evaluate_rth_gate(intent, idempotency_key, now)
+        if rth_blocked is not None:
+            return rth_blocked
 
         if self._idempotency:
             # GAP-036 (Phase-53): state-machine-aware claim. The ib_probe

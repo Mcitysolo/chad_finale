@@ -1174,6 +1174,9 @@ _UNCONFIRMED_BROKER_STATUSES = frozenset({
     "inactive", "unknown", "", "error", "failed", "rejected",
     "cancelled", "duplicate_blocked",
     "duplicate_open_order", "suppressed_open_orders_cap",
+    # WKF U2: RTH-gate block — an equity/ETF intent rejected for being off-hours
+    # must never be persisted as a paper fill (nor open the guard).
+    "market_closed", "margin_blocked",
 })
 
 
