@@ -1,0 +1,142 @@
+{
+  "schema": "chad_dormant_feature_census.v1",
+  "generated_utc": "2026-07-12",
+  "head_commit": "b49e82b",
+  "ssot": "v9.8",
+  "epoch": "Epoch-3",
+  "runtime_anchors": {
+    "regime": "ranging",
+    "regime_conf": 0.623,
+    "tier": "SCALE",
+    "equity_cad": 1000521.76,
+    "execution_mode": "paper"
+  },
+  "total_rows": 46,
+  "by_state": {
+    "REGIME_GATED": 12,
+    "DISABLED_UNIT": 9,
+    "INERT_CONFIG": 6,
+    "BROKEN_SILENT": 5,
+    "UNWIRED": 4,
+    "ENV_GATED": 4,
+    "SHADOW": 3,
+    "REPORT_ONLY": 2,
+    "WEIGHTLESS": 1
+  },
+  "by_risk_class": {
+    "OFFENSE": 19,
+    "DEFENSE": 11,
+    "OBSERVABILITY": 9,
+    "DATA": 7
+  },
+  "broken_silent_found": [
+    {
+      "row": "R42",
+      "name": "var_publisher",
+      "evidence": "runtime/var_state.json mtime 2026-05-07 (66d stale), no systemd timer exists, exported as live gauges chad_var_status_ok=1.0 by chad/ops/metrics_server.py:491-505 with no staleness guard",
+      "impact": "dead 66d VaR compute scraped as fresh healthy risk metric",
+      "risk_class": "OBSERVABILITY(DEFENSE-intent)"
+    },
+    {
+      "row": "R43",
+      "name": "chad-ibkr-daily-bars-refresh",
+      "evidence": "timer enabled+active but service Active=failed exit-1 since 2026-07-12 02:46Z (~17h), no OnFailure=; ExecStart chad.market_data.nightly_bars_refresh",
+      "impact": "data/bars/1d/ writer failing silently; downstream reads stale-as-fresh",
+      "risk_class": "DATA"
+    },
+    {
+      "row": "R44",
+      "name": "chad-service-alert@chad-ibkr-bar-provider",
+      "evidence": "OnFailure alert-handler instance Active=failed exit-4, latched since 2026-06-27 (~2wk)",
+      "impact": "the alerting path itself is dead; bar-provider failures never alert",
+      "risk_class": "OBSERVABILITY"
+    },
+    {
+      "row": "R45",
+      "name": "chad-lifecycle-replay-engine",
+      "evidence": "timer active (runs every 30m) but emits matched_symbols=0 RED (ignores Epoch-3); writes fresh-but-empty runtime/lifecycle_replay_state.json",
+      "impact": "fresh-looking but functionally empty artifact read as truth",
+      "risk_class": "OBSERVABILITY"
+    },
+    {
+      "row": "R46",
+      "name": "CHAD_ALLOCATOR_MODE=V3 drop-in",
+      "evidence": "/etc/systemd/system/chad-orchestrator.service.d/40-allocator-v3.conf:2 sets CHAD_ALLOCATOR_MODE=V3; grep chad/+ops/ = ZERO readers; AllocV3Strategy never constructed (orchestrator.py:617-619 hard-returns CorrelationOverlayStrategy())",
+      "impact": "operator-facing false capability signal (config-misrepresentation subtype); V3/Kelly never runs, live overlay is correlation_overlay",
+      "risk_class": "OFFENSE(config-integrity)"
+    }
+  ],
+  "no_activation_criteria_defined": [
+    "R12 alpha_intraday_micro (BOX-033 weight policy unresolved)",
+    "R13 alpha_forex",
+    "R14 allocator_v3_kelly",
+    "R15 savage_allocator",
+    "R16 profit_router_beta_injection",
+    "R17 futures_execution_lane (blocker=cooldown patch + Bug-B disposition)",
+    "R19 legacy_shared_ib_execution_path",
+    "R20 paper_shadow_canary_arm",
+    "R21 kraken_realized_fill_lane_validate_only",
+    "R22 margin_block_gate (thresholds frozen; go-decision NONE_DEFINED)",
+    "R23 kraken_margin_lane",
+    "R25 drawdown_guard_enforcement",
+    "R26 global_kill_switch",
+    "R29 kraken_polling_collectors",
+    "R30 kraken_paper_lane",
+    "R31 polygon_lane",
+    "R32 portfolio_merge_unit",
+    "R33 ibkr_cash_collector",
+    "R34 price_cache_refresh",
+    "R35 soak_evidence_writers",
+    "R36 rotation_rules_tilt",
+    "R38 crypto_risk_off_notify_publishers",
+    "R39 stop_refresh",
+    "R40 superseded_dark_units",
+    "R41 feature_flags_stub",
+    "R42 var_publisher",
+    "R43 ibkr_daily_bars_refresh",
+    "R44 service_alert_bar_provider",
+    "R45 lifecycle_replay_engine",
+    "R46 allocator_mode_v3_dropin"
+  ],
+  "no_activation_criteria_count": 30,
+  "have_activation_criteria": [
+    "R1-R11 regime-gated heads (regime_activation_matrix flip)",
+    "R18 exit_only_lane (3-part LiveGate gate in-code)",
+    "R24 ml_xgb_veto (threshold 0.65 / >=100 samples / <=30d stale; numeric go-bar still NONE_DEFINED)",
+    "R27 signal_stacking (soft: raise to 2 when more families fire)",
+    "R28 autonomy_bounds (drift gate >=0.08 weight-drift OR >=0.20 turnover)",
+    "R37 regime_booster (conf>=0.70 + favorable regime)"
+  ],
+  "corrections_not_dormant": [
+    {
+      "name": "EP6 bar-ts fix (_bar_ts_to_utc_iso)",
+      "prior_claim": "committed-not-activated; bar-provider unrestarted; sibling ibkr_historical_provider still buggy",
+      "fresh_evidence": "bar-provider PID 1148488 started 2026-06-27 11:36Z (13d AFTER fix a0f8c06 2026-06-14); running process has the fix. Sibling fixed by ee3e5f1 (PA-EP6b, 2026-06-14) via shared helper",
+      "verdict": "ACTIVE/DEPLOYED - not dormant; both writers fixed"
+    },
+    {
+      "name": "drawdown/feed-watchdog/ibkr-watchdog/health-monitor/decision-trace-heartbeat publishers",
+      "prior_claim": "BROKEN_SILENT (disabled units)",
+      "fresh_evidence": "all five have enabled+active timers that fired <2min before sweep; disabled state is only the timer-triggered oneshot .service",
+      "verdict": "REFUTED - running on schedule, output fresh (drawdown GUARD still report-only by design, R25)"
+    },
+    {
+      "name": "dynamic_universe_scanner",
+      "prior_claim": "dead/decorative unit (possible BROKEN_SILENT)",
+      "fresh_evidence": "module explicitly never writes universe.json (dynamic_universe_scanner.py:546); timer fired today 20:44:36 Result=success; only observability consumers",
+      "verdict": "DORMANT-BY-DESIGN (REPORT_ONLY) - not a defect"
+    }
+  ],
+  "false_positives_operationally_enabled": [
+    "~30 disabled timer-driven oneshot services with enabled+firing timers",
+    "CHAD_ALWAYS_ACTIVE_ROUTING=1 (10-always-active-routing.conf)",
+    "CHAD_STRATEGY_INTELLIGENCE_ENABLED=true",
+    "CHAD_PER_STRATEGY_LOSS_LIMIT_ENFORCE=1 (loss guard ENFORCING despite config text report_only)",
+    "CHAD_KRAKEN_MODE=paper_kraken (lane ON in paper; realized fills still validate_only)",
+    "CHAD_RTH_GATE default ON",
+    "CHAD_CHASSIS_ENFORCEMENT default ON"
+  ],
+  "report_doc": "docs/CHAD_DORMANT_FEATURE_CENSUS_2026-07-12.md",
+  "commit": "",
+  "push": ""
+}
