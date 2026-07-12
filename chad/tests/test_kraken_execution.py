@@ -130,10 +130,24 @@ def test_intent_builder_btc_basic() -> None:
     assert intent.notional_estimate == pytest.approx(800.0, rel=1e-9)
 
 
-def test_intent_builder_rejects_below_min_volume() -> None:
-    # 0.000001 BTC at $80k = $0.08 notional -> volume way below 0.0001 BTC min
+def test_intent_builder_below_min_bumps_when_affordable() -> None:
+    # CRYPTO-TRUST U3: below-min no longer silently starves. 0.000001 BTC at
+    # $80k is below the 0.0001 BTC min; with no binding cap the minimum is
+    # affordable, so the intent is BUMPED to the min and tagged.
     sig = _mk_signal("BTC-USD", SignalSide.BUY, 0.000001, AssetClass.CRYPTO)
     intent = _build_kraken_intent_from_routed_signal(sig, current_price=80000.0)
+    assert intent is not None
+    assert intent.volume == pytest.approx(0.0001, rel=1e-9)
+    assert "CRYPTO_MIN_SIZE_BUMP" in getattr(intent, "markers", ())
+
+
+def test_intent_builder_below_min_skips_when_cap_cannot_afford() -> None:
+    # A tiny per-strategy risk cap ($2) cannot afford the 0.0001 BTC minimum
+    # ($8 notional at $80k) -> loud SKIP (returns None), never a sub-min order.
+    sig = _mk_signal("BTC-USD", SignalSide.BUY, 0.000001, AssetClass.CRYPTO)
+    intent = _build_kraken_intent_from_routed_signal(
+        sig, current_price=80000.0, dynamic_cap_for_crypto=2.0
+    )
     assert intent is None
 
 

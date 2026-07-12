@@ -36,6 +36,36 @@ from typing import Any, Dict, List, Optional
 
 _KRAKEN_EXECUTOR = None  # lazy singleton
 _PAPER_EVIDENCE_STORE = None  # lazy IdempotencyStore for paper-kraken dedup
+_TRUSTED_FILL_ENGINE = None  # lazy CRYPTO-TRUST U1 engine
+
+
+def _kraken_trusted_fills_enabled() -> bool:
+    """CRYPTO-TRUST U1 kill-switch. Default ON (mirrors the L1-CLD
+    CHAD_EXECUTION_OWN_CONNECTION idiom): trusted unless explicitly disabled."""
+    return (
+        os.environ.get("CHAD_KRAKEN_TRUSTED_FILLS", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+
+
+def _kraken_trusted_dedup(key: str) -> bool:
+    """At-most-once gate for trusted fills, sharing the paper idempotency store
+    (store #4, runtime/exec_state_paper.sqlite3). Returns True if newly inserted."""
+    store = _get_paper_evidence_store()
+    mark = store.mark_once(
+        trade_id=key, payload_hash=key, meta={"source": "kraken_trusted_fill"}
+    )
+    return bool(mark.inserted)
+
+
+def _get_trusted_fill_engine():
+    """Lazy-instantiate the trusted-fill engine (dedup wired to store #4)."""
+    global _TRUSTED_FILL_ENGINE
+    if _TRUSTED_FILL_ENGINE is not None:
+        return _TRUSTED_FILL_ENGINE
+    from chad.core.kraken_trusted_fill_engine import TrustedFillEngine
+    _TRUSTED_FILL_ENGINE = TrustedFillEngine(dedup=_kraken_trusted_dedup)
+    return _TRUSTED_FILL_ENGINE
 
 
 def resolve_kraken_mode() -> str:
@@ -102,7 +132,16 @@ def get_kraken_executor():
     cfg = KrakenClientConfig.from_env()
     client = KrakenClient(cfg)
     router = KrakenTradeRouter(client)
-    _KRAKEN_EXECUTOR = KrakenExecutor(router=router)
+    # CRYPTO-2 (U2): wire the Kraken margin/BP shadow gate at the executor
+    # chokepoint. Fail-open: any construction problem => margin_gate=None =>
+    # byte-identical legacy behavior (a broken margin config never stops trading).
+    margin_gate = None
+    try:
+        from chad.execution.kraken_margin_gate import build_default_kraken_shadow_gate
+        margin_gate = build_default_kraken_shadow_gate()
+    except Exception as exc:  # noqa: BLE001
+        margin_gate = None
+    _KRAKEN_EXECUTOR = KrakenExecutor(router=router, margin_gate=margin_gate)
     return _KRAKEN_EXECUTOR
 
 
@@ -462,7 +501,36 @@ def execute_kraken_intents(logger: logging.Logger, kraken_intents: List[object])
                 and not txids
             ):
                 try:
-                    _write_paper_kraken_evidence(logger, intent, risk_result, resp)
+                    # CRYPTO-TRUST U1: the trusted fill engine is the evidence
+                    # product (validate_only above remains the pre-check). It
+                    # marks against the live WS tape, applies the real taker fee,
+                    # and realizes FIFO round-trip PnL into the SAME pipeline.
+                    # Fail-closed to the legacy untrusted writer when the engine
+                    # declines (kill-switch off, stale tape, dedup error).
+                    used_trusted = False
+                    if _kraken_trusted_fills_enabled():
+                        try:
+                            result = _get_trusted_fill_engine().process_intent(intent)
+                            used_trusted = bool(result.get("trusted"))
+                            if not used_trusted:
+                                logger.info(
+                                    "KRAKEN_TRUSTED_FILL_FALLBACK pair=%s side=%s reason=%s",
+                                    getattr(intent, "pair", None),
+                                    getattr(intent, "side", None),
+                                    result.get("reason"),
+                                )
+                        except Exception as engine_exc:  # noqa: BLE001
+                            # Any engine error -> fall back to the legacy writer
+                            # so paper evidence is never silently lost.
+                            logger.warning(
+                                "KRAKEN_TRUSTED_FILL_ENGINE_ERROR pair=%s side=%s: %s",
+                                getattr(intent, "pair", None),
+                                getattr(intent, "side", None),
+                                engine_exc,
+                            )
+                            used_trusted = False
+                    if not used_trusted:
+                        _write_paper_kraken_evidence(logger, intent, risk_result, resp)
                 except Exception as exc:
                     logger.warning(
                         "KRAKEN_PAPER_EVIDENCE_WRITE_FAILED pair=%s side=%s: %s",

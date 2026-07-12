@@ -109,6 +109,12 @@ class StrategyTradeIntent:
     # that produced this signal. ISO8601 UTC or YYYY-MM-DD.
     bar_timestamp: str = ""
 
+    # CRYPTO-TRUST U3: sizing/evidence markers carried from the sizing
+    # chokepoint (execution_pipeline min-size bump/skip) into the trusted-fill
+    # evidence tags. Backward-compatible default keeps every construction site
+    # unchanged.
+    markers: Tuple[str, ...] = ()
+
 
 @dataclass(frozen=True)
 class RiskGateResult:
@@ -290,16 +296,78 @@ class KrakenExecutor:
       * If live and txids exist, logs TradeResult AND writes txid into exec_state (exactly-once)
     """
 
-    def __init__(self, router: KrakenTradeRouter, caps_path: Optional[Path] = None, exec_db_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        router: KrakenTradeRouter,
+        caps_path: Optional[Path] = None,
+        exec_db_path: Optional[Path] = None,
+        *,
+        margin_gate: Optional[Any] = None,
+    ) -> None:
         self._router = router
         self._caps_path = caps_path or default_dynamic_caps_path()
         self._store = ExecStateStore(exec_db_path or _default_exec_state_db_path())
+        # CRYPTO-2 (U2): MarginShadowGate wired at the single Kraken submit
+        # chokepoint. Default None => byte-identical legacy behavior. In shadow
+        # it evaluates + logs + writes evidence but NEVER blocks (fail-open).
+        self._margin_gate = margin_gate
+
+    def _evaluate_margin_gate(
+        self, intent: StrategyTradeIntent
+    ) -> Optional[Tuple[RiskGateResult, Optional[TradeResponse]]]:
+        """Shadow margin/BP chokepoint. Returns None to proceed (always, in
+        shadow); a blocking result only in enforce mode. Mirrors the IBKR G3C
+        template (ibkr_adapter._evaluate_margin_gate): evaluate before the risk
+        check / router.execute / store.claim; fail-OPEN in shadow."""
+        gate = self._margin_gate
+        if gate is None:
+            return None
+        from chad.execution.kraken_margin_gate import kraken_order_view_from_intent
+
+        order_id = (
+            str(getattr(intent, "idempotency_key", "") or "")
+            or "|".join([
+                str(getattr(intent, "strategy", "") or ""),
+                str(getattr(intent, "pair", "") or ""),
+                str(getattr(intent, "side", "") or ""),
+                f"{float(getattr(intent, 'volume', 0.0) or 0.0):.10f}",
+            ])
+        )
+        try:
+            order_view = kraken_order_view_from_intent(intent, order_id=order_id)
+            verdict = gate.evaluate(order_view, now_epoch=time.time())
+            if not gate.should_block(verdict):
+                return None  # SHADOW: always proceed
+            LOGGER.warning(
+                "kraken.margin_gate_blocked",
+                extra={"order_id": order_id, "pair": getattr(intent, "pair", None)},
+            )
+            return (
+                RiskGateResult(allowed=False, reason="MARGIN_BLOCKED", adjusted_notional=0.0),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-open in shadow
+            enforce = bool(getattr(getattr(gate, "config", None), "is_enforce", False))
+            LOGGER.error("kraken.margin_gate_error order_id=%s detail=%s", order_id, exc)
+            if not enforce:
+                return None  # SHADOW fail-open: never stop trading on a gate error
+            return (
+                RiskGateResult(allowed=False, reason="MARGIN_GATE_ERROR", adjusted_notional=0.0),
+                None,
+            )
 
     def execute_with_risk(
         self,
         intent: StrategyTradeIntent,
         live: bool = False,
     ) -> Tuple[RiskGateResult, Optional[TradeResponse]]:
+        # CRYPTO-2 (U2): margin/BP shadow gate runs FIRST — before the risk
+        # check, router.execute (validate) and store.claim (live) — so no
+        # Kraken submit path bypasses it. Shadow never blocks.
+        margin_blocked = self._evaluate_margin_gate(intent)
+        if margin_blocked is not None:
+            return margin_blocked
+
         caps_data = load_dynamic_caps(self._caps_path)
         rr = check_risk(caps_data=caps_data, intent=intent)
 

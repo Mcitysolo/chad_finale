@@ -1464,11 +1464,61 @@ def normalize_kraken_pair(symbol: str) -> Optional[str]:
     return _KRAKEN_SYMBOL_MAP.get(key)
 
 
+# --------------------------------------------------------------------------- #
+# CRYPTO-TRUST U3 — lunch-money sizing helpers
+# --------------------------------------------------------------------------- #
+
+def _kraken_min_volume(pair: str) -> Decimal:
+    """Per-pair Kraken min order size. config/kraken_trading.json is the source
+    of truth; falls back to the built-in table on any load problem."""
+    try:
+        from chad.execution.kraken_trading_config import get_kraken_trading_config
+        return Decimal(str(get_kraken_trading_config().min_volume(pair)))
+    except Exception:
+        return _KRAKEN_MIN_VOLUMES.get(pair, Decimal("0.0001"))
+
+
+def _read_crypto_scr_sizing_factor(path: Optional[object] = None) -> "tuple[float, bool]":
+    """(sizing_factor, paused). SCR was previously applied to the IBKR lane only
+    (live_loop.py:2244-2247); this brings honest SCR attenuation to the crypto
+    lane. Unreadable/absent => (1.0, False) (no attenuation, never an accidental
+    starve). PAUSED or factor<=0 => paused (skip the crypto lane)."""
+    import json as _json
+    from pathlib import Path as _Path
+    p = _Path(path) if path is not None else _Path("/home/ubuntu/chad_finale/runtime/scr_state.json")
+    try:
+        raw = _json.loads(p.read_text(encoding="utf-8"))
+        state = str(raw.get("state", "")).strip().upper()
+        factor = float(raw.get("sizing_factor", 1.0) or 1.0)
+    except Exception:
+        return 1.0, False
+    if state == "PAUSED" or factor <= 0.0:
+        return 0.0, True
+    return factor, False
+
+
+def _read_kraken_available_notional_usd(path: Optional[object] = None) -> Optional[float]:
+    """Paper Kraken wallet size (usd_equivalent) for min-size affordability.
+    None (unconstrained by wallet) on any read problem — the risk cap and the
+    margin shadow gate remain the binding capacity checks."""
+    import json as _json
+    from pathlib import Path as _Path
+    p = _Path(path) if path is not None else _Path("/home/ubuntu/chad_finale/runtime/kraken_balances.json")
+    try:
+        raw = _json.loads(p.read_text(encoding="utf-8"))
+        v = float(raw.get("usd_equivalent", 0.0) or 0.0)
+        return v if v > 0.0 else None
+    except Exception:
+        return None
+
+
 def _build_kraken_intent_from_routed_signal(
     signal: RoutedSignal,
     current_price: float,
     *,
     dynamic_cap_for_crypto: Optional[float] = None,
+    scr_sizing_factor: float = 1.0,
+    available_notional_usd: Optional[float] = None,
 ):
     """
     Convert a RoutedSignal (CRYPTO asset class) into a KrakenStrategyTradeIntent.
@@ -1543,9 +1593,51 @@ def _build_kraken_intent_from_routed_signal(
     volume_dec = (capped_notional / price_dec) * size_mult
     attenuated_notional = capped_notional * size_mult
 
-    min_vol = _KRAKEN_MIN_VOLUMES.get(pair, Decimal("0.0001"))
+    # CRYPTO-TRUST U3: SCR sizing_factor attenuation for the crypto lane.
+    try:
+        scr = float(scr_sizing_factor)
+    except (TypeError, ValueError):
+        scr = 1.0
+    if scr <= 0.0:
+        return None  # SCR PAUSED / zero factor -> no crypto sizing
+    if scr != 1.0:
+        scr_dec = Decimal(str(scr))
+        volume_dec = volume_dec * scr_dec
+        attenuated_notional = attenuated_notional * scr_dec
+
+    # CRYPTO-TRUST U3: lunch-money min-size handling (bump / skip; never a
+    # silent starve). Replaces the historical silent `return None`.
+    from chad.execution.kraken_min_size import decide_min_size
+    intent_markers: Tuple[str, ...] = ()
+    min_vol = _kraken_min_volume(pair)
     if volume_dec < min_vol:
-        return None
+        decision = decide_min_size(
+            pair=pair,
+            computed_volume=float(volume_dec),
+            price=float(price_dec),
+            min_volume=float(min_vol),
+            available_notional=available_notional_usd,
+            risk_cap_notional=(
+                float(dynamic_cap_for_crypto) if dynamic_cap_for_crypto is not None else None
+            ),
+        )
+        if decision.is_skip:
+            LOG.warning(
+                "CRYPTO_BELOW_MIN_SKIP pair=%s computed=%.10f min=%.10f "
+                "min_notional=%.4f available_usd=%s risk_cap=%s",
+                pair, decision.computed_volume, decision.min_volume,
+                decision.min_notional, available_notional_usd, dynamic_cap_for_crypto,
+            )
+            return None
+        # BUMP up to the pair minimum.
+        volume_dec = Decimal(str(decision.final_volume))
+        attenuated_notional = volume_dec * price_dec
+        if decision.marker:
+            intent_markers = (decision.marker,)
+        LOG.info(
+            "CRYPTO_MIN_SIZE_BUMP pair=%s from=%.10f to=%.10f notional=%.4f",
+            pair, decision.computed_volume, float(volume_dec), float(attenuated_notional),
+        )
 
     strategies = tuple(getattr(signal, "source_strategies", ()) or ())
     if strategies and isinstance(strategies[0], StrategyName):
@@ -1611,6 +1703,7 @@ def _build_kraken_intent_from_routed_signal(
         signal_family=_STRATEGY_SIGNAL_FAMILY.get(primary_strategy_name, "unknown"),
         order_urgency=signal_urgency,
         bar_timestamp=kraken_bar_ts,
+        markers=intent_markers,
     )
 
 
@@ -1631,6 +1724,14 @@ def build_kraken_intents_from_routed_signals(
         LOG.warning("STOP_BUS_ACTIVE — Kraken intent building skipped")
         return []
 
+    # CRYPTO-TRUST U3: read SCR sizing_factor + paper wallet balance ONCE per
+    # batch (kept out of the per-signal builder so it stays deterministic).
+    scr_factor, scr_paused = _read_crypto_scr_sizing_factor()
+    if scr_paused:
+        LOG.warning("CRYPTO_SCR_PAUSED — Kraken intent building skipped")
+        return []
+    available_usd = _read_kraken_available_notional_usd()
+
     out: List[object] = []
     for rs in routed_signals:
         if getattr(rs, "asset_class", None) != AssetClass.CRYPTO:
@@ -1640,7 +1741,8 @@ def build_kraken_intents_from_routed_signals(
         if price is None:
             continue
         intent = _build_kraken_intent_from_routed_signal(
-            rs, float(price), dynamic_cap_for_crypto=dynamic_cap_for_crypto
+            rs, float(price), dynamic_cap_for_crypto=dynamic_cap_for_crypto,
+            scr_sizing_factor=scr_factor, available_notional_usd=available_usd,
         )
         if intent is None:
             continue

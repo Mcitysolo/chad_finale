@@ -35,6 +35,13 @@ def isolated_evidence_paths(tmp_path, monkeypatch):
     from chad.analytics import trade_result_logger as trl
     from chad.execution import idempotency_store as ids
 
+    # CRYPTO-TRUST: these tests validate the LEGACY untrusted _write_paper_
+    # kraken_evidence path, which is the kill-switch-off / fallback behavior.
+    # Pin the kill-switch OFF so they are deterministic regardless of whether
+    # the live WS feed has a fresh runtime/kraken_prices.json touch (which would
+    # otherwise activate the trusted engine and write realized rows on close only).
+    monkeypatch.setenv("CHAD_KRAKEN_TRUSTED_FILLS", "0")
+
     fills_dir = tmp_path / "fills"
     fees_dir = tmp_path / "fees"
     metrics_dir = tmp_path / "execution_metrics"
@@ -361,3 +368,59 @@ def test_kraken_paper_fill_visible_to_strategy_lane_summary(
     assert alpha.get("zero_fill_epoch2") is False, (
         f"alpha_crypto still flagged zero_fill_epoch2 after paper evidence: {alpha}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# CRYPTO-TRUST U1 — kill-switch routing in execute_kraken_intents
+# --------------------------------------------------------------------------- #
+
+def test_paper_kraken_routes_to_trusted_engine_when_enabled(
+    isolated_evidence_paths, monkeypatch
+):
+    from chad.core import kraken_execution as ke
+
+    monkeypatch.setenv("CHAD_KRAKEN_TRUSTED_FILLS", "1")  # override fixture default
+    monkeypatch.setattr(ke, "is_kraken_gate_enabled", lambda: True)
+    monkeypatch.setattr(ke, "resolve_kraken_mode", lambda: "paper_kraken")
+    monkeypatch.setattr(ke, "get_kraken_executor",
+                        lambda: _fake_executor(allowed=True, txids=[]))
+
+    calls = {"trusted": 0, "legacy": 0}
+
+    class _FakeEngine:
+        def process_intent(self, intent):
+            calls["trusted"] += 1
+            return {"trusted": True, "reason": "filled"}
+
+    monkeypatch.setattr(ke, "_get_trusted_fill_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(ke, "_write_paper_kraken_evidence",
+                        lambda *a, **k: calls.__setitem__("legacy", calls["legacy"] + 1))
+
+    ke.execute_kraken_intents(logging.getLogger("t.trusted"), [_make_paper_intent()])
+    assert calls["trusted"] == 1
+    assert calls["legacy"] == 0  # trusted path used; legacy NOT double-written
+
+
+def test_paper_kraken_falls_back_to_legacy_when_engine_declines(
+    isolated_evidence_paths, monkeypatch
+):
+    from chad.core import kraken_execution as ke
+
+    monkeypatch.setenv("CHAD_KRAKEN_TRUSTED_FILLS", "1")
+    monkeypatch.setattr(ke, "is_kraken_gate_enabled", lambda: True)
+    monkeypatch.setattr(ke, "resolve_kraken_mode", lambda: "paper_kraken")
+    monkeypatch.setattr(ke, "get_kraken_executor",
+                        lambda: _fake_executor(allowed=True, txids=[]))
+
+    calls = {"legacy": 0}
+
+    class _FakeEngine:
+        def process_intent(self, intent):
+            return {"trusted": False, "reason": "no_fresh_touch"}  # declines
+
+    monkeypatch.setattr(ke, "_get_trusted_fill_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(ke, "_write_paper_kraken_evidence",
+                        lambda *a, **k: calls.__setitem__("legacy", calls["legacy"] + 1))
+
+    ke.execute_kraken_intents(logging.getLogger("t.fallback"), [_make_paper_intent()])
+    assert calls["legacy"] == 1  # engine declined -> legacy fallback (no silent drop)

@@ -398,6 +398,7 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
         "txid": extra.get("txid"),
         "fill_id": record.get("fill_id") or payload.get("fill_id"),
         "fee_model": extra.get("fee_model"),
+        "provenance": extra.get("provenance"),
         "slippage_bps": extra.get("slippage_bps"),
         "latency_ms": extra.get("latency_ms"),
         "sequence_id": record.get("sequence_id"),
@@ -439,6 +440,12 @@ class AdapterManifest:
     date_range_admitted: Optional[str]         # "min..max" over admitted rows, or None
     strategies_admitted: dict[str, int]
     notes: list[str]
+    # CRYPTO-TRUST U1 honesty guard: evidence-class separation so no verdict
+    # silently mixes SIMULATED_AGAINST_LIVE_TICKS crypto with broker-confirmed
+    # fills. Keyed by fill-level provenance label (unlabeled -> "unspecified")
+    # and by instrument_class. Defaults keep any other construction site valid.
+    admitted_by_provenance: dict[str, int] = field(default_factory=dict)
+    admitted_by_instrument_class: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -457,6 +464,8 @@ class AdapterManifest:
             "date_range_admitted": self.date_range_admitted,
             "strategies_admitted": dict(self.strategies_admitted),
             "notes": list(self.notes),
+            "admitted_by_provenance": dict(self.admitted_by_provenance),
+            "admitted_by_instrument_class": dict(self.admitted_by_instrument_class),
         }
 
 
@@ -660,8 +669,13 @@ def run_adapter(
         reason: counters[f"excluded:{reason}"] for reason in EXCLUSION_REASONS
     }
     strategies: dict[str, int] = {}
+    by_provenance: dict[str, int] = {}
+    by_instrument: dict[str, int] = {}
     for t in admitted:
         strategies[t.strategy] = strategies.get(t.strategy, 0) + 1
+        prov = str(t.provenance.get("provenance") or "unspecified")
+        by_provenance[prov] = by_provenance.get(prov, 0) + 1
+        by_instrument[t.instrument_class] = by_instrument.get(t.instrument_class, 0) + 1
 
     if generated_at is None:
         generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -673,6 +687,9 @@ def run_adapter(
         "broker-rejected / non-canonical-status rows cannot reach the scorer.",
         "Prices set to the realized fill (two-leg haircut on traded notional); realized PnL "
         "carried authoritatively as gross_pnl, not reconstructed.",
+        "Evidence classes are separated (admitted_by_provenance / _by_instrument_class): "
+        "SIMULATED_AGAINST_LIVE_TICKS crypto rows are counted apart from broker-confirmed "
+        "fills so no verdict silently mixes simulated and broker-confirmed evidence.",
     ]
     manifest = AdapterManifest(
         schema_version=SCHEMA_VERSION,
@@ -690,6 +707,8 @@ def run_adapter(
         date_range_admitted=_date_range(admitted),
         strategies_admitted=dict(sorted(strategies.items())),
         notes=notes,
+        admitted_by_provenance=dict(sorted(by_provenance.items())),
+        admitted_by_instrument_class=dict(sorted(by_instrument.items())),
     )
     result = AdapterResult(admitted=admitted, manifest=manifest)
 
