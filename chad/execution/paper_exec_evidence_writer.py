@@ -1642,6 +1642,14 @@ _LOG = logging.getLogger(__name__)
 
 _FEE_MODEL_TAG = "ibkr_fixed_v1"
 
+# CRYPTO-TRUST (U1): trusted Kraken paper fills carry their own fee already
+# modeled (fee_amount>0), so _apply_modeled_commission short-circuits and never
+# re-stamps the ibkr_fixed_v1 crypto branch below. These labels are the single
+# grep locus for the trust contract; the engine (chad/core/kraken_trusted_fill_
+# engine.py) sets ev.extra["fee_model"]/["provenance"] to exactly these strings.
+_KRAKEN_FEE_MODEL_TAG = "kraken_paper_v1"
+_PROVENANCE_SIMULATED_AGAINST_LIVE_TICKS = "SIMULATED_AGAINST_LIVE_TICKS"
+
 # Genuine-fill statuses that incur a commission. Deliberately EXCLUDES
 # dry_run / duplicate_* / rejected / error / PendingSubmit — those never
 # traded, so they must carry fee_amount=0 and no fee_model stamp. This set is

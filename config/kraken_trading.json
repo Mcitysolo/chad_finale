@@ -1,0 +1,35 @@
+{
+  "_comment": "CHAD Kraken trusted paper-fill + lunch-money sizing config. Backs the trusted fill engine (fees + slippage) and the min-size bump/skip sizing decision. STRICT/fail-closed loader (chad/execution/kraken_trading_config.py): unknown non-underscore key => refuse; missing required key => refuse; wrong type => refuse. Rows marked operator_verify:true carry documented public values that could NOT be verified offline against the live Kraken account/endpoint and must be confirmed by the operator before any enforce/live promotion.",
+  "schema_version": "kraken_trading.v1",
+  "frozen_utc": "2026-07-12",
+  "taker_fee": {
+    "_source": "Kraken Pro published spot TAKER fee, base 30-day-volume tier (<= $10k) = 0.26%. Matches the existing repo constant paper_exec_evidence_writer.py _CRYPTO_FEE_TAKER_PCT=0.0026. Live per-account TradeVolume tier NOT queryable offline.",
+    "operator_verify": true,
+    "default_taker_bps": 26.0,
+    "taker_bps_by_pair": {
+      "XBTUSD": 26.0,
+      "ETHUSD": 26.0,
+      "SOLUSD": 26.0,
+      "XBTCAD": 26.0,
+      "ETHCAD": 26.0
+    }
+  },
+  "slippage_model": {
+    "_note": "CHAD modeling assumption (NOT a Kraken-published value). Marketable orders cross the spread (taker) and pay a bps impact floor. buy fill = mid*(1 + half_spread_frac + impact_frac); sell fill = mid*(1 - half_spread_frac - impact_frac); impact_frac = slippage_impact_floor_bps/1e4. The floor keeps fee/impact drag visible at ~$185 size rather than modeled as zero.",
+    "operator_verify": false,
+    "slippage_impact_floor_bps": 5.0,
+    "max_tick_age_seconds": 30.0
+  },
+  "min_order_size_by_pair": {
+    "_source": "Carried forward from execution_pipeline.py _KRAKEN_MIN_VOLUMES (repo's existing documented Kraken minima, base currency, keyed on REST altname). Live AssetPairs.ordermin NOT queryable offline.",
+    "operator_verify": true,
+    "default_min_volume": 0.0001,
+    "min_volume_by_pair": {
+      "XBTUSD": 0.0001,
+      "ETHUSD": 0.001,
+      "SOLUSD": 0.05,
+      "XBTCAD": 0.0001,
+      "ETHCAD": 0.001
+    }
+  }
+}
