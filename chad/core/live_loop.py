@@ -1930,6 +1930,29 @@ def run_once(logger: logging.Logger) -> None:
         logger.warning("position_reconciler failed (non-fatal): %s", _rec_err)
 
     # ------------------------------------------------------------------
+    # Position-aware equity EXIT OVERLAY (EXIT-AUDIT Q5(b); default SHADOW).
+    # Placement: immediately after the reconciler — so it sees the same
+    # authoritative open-position snapshot (position_guard.json) the
+    # reconciler just used — and BEFORE intent planning, so in ACTIVE mode
+    # its reduce-only closes bypass the pipeline netting step exactly like
+    # the reconciler/regime closes above (same rationale as that block).
+    # SHADOW (default) closes NOTHING: it only logs EXIT_OVERLAY_* markers
+    # and appends data/exit_overlay evidence. Non-fatal — a build/run
+    # failure submits nothing (fail-open in shadow, fail-closed in active)
+    # and never stops the trading cycle.
+    # ------------------------------------------------------------------
+    try:
+        from chad.risk.position_exit_overlay import build_default_overlay
+
+        _exit_overlay = build_default_overlay(
+            repo_root=Path(__file__).resolve().parents[2]
+        )
+        if _exit_overlay is not None:
+            _exit_overlay.run_cycle(_paper_adapter)
+    except Exception as _xov_err:  # noqa: BLE001
+        logger.warning("position_exit_overlay failed (non-fatal): %s", _xov_err)
+
+    # ------------------------------------------------------------------
     # Phase-8 Session 6 (G1 feed): publish runtime/market_metrics.json from
     # current daily bars so the regime classifier sees real vol / ADX /
     # trend_slope / breadth inputs rather than defaulting to 'unknown'.
