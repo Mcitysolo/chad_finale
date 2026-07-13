@@ -1,0 +1,21 @@
+{
+  "_comment": "CHAD Position-Aware Equity Exit Overlay — pre-registered config per ops/pending_actions/EXIT_AUDIT_equity_roundtrip_close_2026-07-13.md (Q5(b)). Committed with the SHADOW-first overlay. THRESHOLDS ARE FROZEN: changing any threshold is a deliberate logged event; a post-evaluation change counts as a new trial. The SOLE field expected to change post-freeze is `mode` (off -> shadow -> active), and each mode change is its own authorization commit per the pre-registered activation criteria in the PA doc (git history is the enforcement-authorization log). The env kill-switch CHAD_POSITION_EXIT_OVERLAY (OFF|SHADOW|ACTIVE) overrides this file's `mode` for emergency inerting.",
+  "schema_version": "position_exit_overlay_config.v1",
+  "mode": "shadow",
+  "atr_period": 14,
+  "atr_trail_mult": 2.5,
+  "hard_stop_loss_pct": 0.08,
+  "min_bars_for_atr": 16,
+  "max_hold_days": {
+    "equity": 20.0,
+    "etf": 30.0,
+    "default": 20.0
+  },
+  "_threshold_notes": {
+    "atr_period": "Wilder ATR lookback (bars) from data/bars/1d cache — same period gamma uses (chad/strategies/gamma.py:79).",
+    "atr_trail_mult": "Trailing-stop distance in ATRs below the favorable extreme (peak for longs / trough for shorts). 2.5 sits between gamma's 2.4 atr_trail_mult and a looser swing stop.",
+    "hard_stop_loss_pct": "Fixed backstop: fraction of the persisted entry anchor price. 0.08 = 8% adverse move from entry force-closes regardless of ATR.",
+    "min_bars_for_atr": "Minimum valid daily bars required before the ATR-trailing condition is armed; below this only max-hold and hard-stop evaluate.",
+    "max_hold_days": "Time-based max-hold per asset class (calendar days from guard opened_at). default applies to any unlisted asset class."
+  }
+}
