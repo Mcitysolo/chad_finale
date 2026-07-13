@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -201,6 +202,60 @@ def test_run_gates(tmp_path, monkeypatch):
     rt_red = _write_runtime(tmp_path / "red", recon_status="RED")
     ok3, _ = rec.run_gates(rt_red)
     assert not ok3
+
+
+# --------------------------------------------------------------------------- #
+# F2 — SCR gate disposition: WARMUP permitted; UNKNOWN + PAUSED refused
+# --------------------------------------------------------------------------- #
+def test_scr_gate_warmup_passes_unknown_and_paused_refuse(tmp_path):
+    """F2: WARMUP is an accepted SCR state for THIS tool (zero effective/scored edge to corrupt;
+    every synthetic record is pnl_untrusted). UNKNOWN (telemetry failure) and PAUSED (operator
+    halt) stay refused. CONFIDENT/CAUTIOUS continue to pass."""
+    ok_w, why_w = rec._gate_scr(_write_runtime(tmp_path / "warmup", scr="WARMUP"))
+    assert ok_w and "WARMUP" in why_w, why_w
+    ok_u, why_u = rec._gate_scr(_write_runtime(tmp_path / "unknown", scr="UNKNOWN"))
+    assert not ok_u and "UNKNOWN" in why_u, why_u
+    ok_p, why_p = rec._gate_scr(_write_runtime(tmp_path / "paused", scr="PAUSED"))
+    assert not ok_p and "PAUSED" in why_p, why_p
+    assert rec._gate_scr(_write_runtime(tmp_path / "conf", scr="CONFIDENT"))[0]
+    assert rec._gate_scr(_write_runtime(tmp_path / "caut", scr="CAUTIOUS"))[0]
+    assert "WARMUP" in rec._SAFE_SCR_STATES
+    assert "UNKNOWN" not in rec._SAFE_SCR_STATES and "PAUSED" not in rec._SAFE_SCR_STATES
+
+
+def test_run_gates_warmup_passes_end_to_end(tmp_path, monkeypatch):
+    """F2 at the run_gates level: WARMUP + non-RED reconciliation + paper exec -> all gates pass
+    (the live posture is WARMUP, so this is the real unblocked path)."""
+    monkeypatch.setattr(rec, "_gate_exec_mode_paper", lambda: (True, "exec_mode=paper"))
+    rt = _write_runtime(tmp_path, scr="WARMUP")
+    ok, reasons = rec.run_gates(rt)
+    assert ok, reasons
+    assert "WARMUP" in reasons["scr"]
+
+
+# --------------------------------------------------------------------------- #
+# F1 — `import chad` resolves from any CWD (repo root prepended to sys.path)
+# --------------------------------------------------------------------------- #
+def test_f1_subprocess_from_non_repo_cwd_reaches_gates(tmp_path):
+    """F1: run the DOCUMENTED invocation (`python3 scripts/reconcile_ledger_to_broker.py …`) as a
+    real subprocess from a NON-repo CWD. Previously the lazy `import chad` inside the exec_mode gate
+    raised ModuleNotFoundError (scripts/ is sys.path[0], chad is not pip-installed); the gate caught
+    it and fail-closed, so the tool refused before reaching broker truth. After the fix the process
+    must reach and evaluate the gates with NO import crash. We set reconciliation=RED so a gate trips
+    deterministically (exit 2) — proving run_gates() ran, not that an import blew up."""
+    rt_root = tmp_path / "repo"
+    _write_runtime(rt_root, scr="WARMUP", recon_status="RED")
+    non_repo_cwd = tmp_path / "elsewhere"
+    non_repo_cwd.mkdir()
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "reconcile_ledger_to_broker.py"),
+         "--repo-root", str(rt_root), "--execute", "--confirm", rec.CONFIRM_TOKEN],
+        cwd=str(non_repo_cwd), capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 2, out                    # a gate tripped (RED) — not an import crash
+    assert "No module named 'chad'" not in out, out     # F1: chad importable regardless of CWD
+    assert "exec_mode check raised" not in out, out      # exec_mode gate evaluated cleanly
+    assert "reconciliation status=RED" in out, out       # proves run_gates() was actually reached
 
 
 # --------------------------------------------------------------------------- #

@@ -58,6 +58,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+# --------------------------------------------------------------------------- #
+# F1 — make `chad` importable no matter the CWD or how this script is launched.
+# `python3 scripts/reconcile_ledger_to_broker.py` puts scripts/ (this file's dir) on
+# sys.path[0], NOT the repo root, and `chad` is not pip-installed in the venv — so the
+# lazy `import chad.*` inside the gates raised ModuleNotFoundError, the exec_mode gate
+# caught it and fail-closed, and the documented invocation refused before reaching
+# broker truth. Resolve the repo root from __file__ and prepend it ONCE, at module
+# import time, before any (lazy) chad import runs. Behaviour-neutral if chad is already
+# importable (guarded by the membership check).
+_REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT_FOR_IMPORT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT_FOR_IMPORT))
+
 LOG = logging.getLogger("chad.reconcile_ledger_to_broker")
 
 CONFIRM_TOKEN = "RECONCILE-LEDGER-TO-BROKER"
@@ -73,7 +86,16 @@ DISP_ADOPT = "ADOPT"
 DISP_REBASELINE_EXCLUDED = "REBASELINE_EXCLUDED"
 DISP_REBASELINE_PHANTOM = "REBASELINE_PHANTOM"
 
-_SAFE_SCR_STATES = frozenset({"CONFIDENT", "CAUTIOUS"})
+# F2 — SCR states in which this reconciliation is permitted to run.
+# WARMUP is ACCEPTED (added 2026-07-13): in WARMUP the SCR has not graduated to trusted
+# live sizing (paper_only, sizing_factor<=0.1), and — decisively — this tool writes NOTHING
+# into data/fills or effective_trades (every synthetic record + the adoption seed lot carry
+# pnl_untrusted=true, the canonical Stage-2 exclusion). With zero scored/effective edge to
+# corrupt, blocking on WARMUP only prevents a safe, evidence-preserving book cleanup.
+# UNKNOWN and PAUSED remain REFUSED (not in this set): UNKNOWN signals SCR telemetry failure
+# (state indeterminate — the control plane is blind), and PAUSED signals an explicit operator
+# halt — reconciling under either would be acting against a broken or halted control plane.
+_SAFE_SCR_STATES = frozenset({"CONFIDENT", "CAUTIOUS", "WARMUP"})
 
 
 # --------------------------------------------------------------------------- #
@@ -515,7 +537,8 @@ def _gate_scr(runtime_dir: Path) -> Tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         return False, f"scr_state.json unreadable: {exc}"
     if state not in _SAFE_SCR_STATES:
-        return False, f"scr_state={state or 'UNKNOWN'} (not CONFIDENT/CAUTIOUS)"
+        return False, (f"scr_state={state or 'UNKNOWN'} "
+                       f"(not in permitted {sorted(_SAFE_SCR_STATES)})")
     return True, f"scr_state={state}"
 
 
@@ -613,6 +636,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     now_iso = _iso_z(now)
     stamp = _stamp(now)
 
+    # F3 — the plan is derived at RUN TIME from live inputs on every invocation; no plan is ever
+    # persisted and reloaded. Guard + FIFO are re-read from disk here (648/649), exclusions and
+    # marks are re-loaded (654/655), broker truth + queues are recomputed from those fresh reads
+    # (656/657), and compute_plan() is a pure recompute (659). So a post-close dry-run reflects
+    # THIS session's broker truth (a symbol newly broker-held this session shows up as ADOPT, or
+    # REBASELINE_EXCLUDED if it is operator-excluded per load_exclusions).
     guard_path = runtime_dir / "position_guard.json"
     fifo_path = runtime_dir / "trade_closer_state.json"
     try:

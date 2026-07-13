@@ -93,14 +93,46 @@ PnL). Unstable — verified against the rebuilder.
 
 `scripts/reconcile_ledger_to_broker.py` — **dry-run by default** (prints the full plan, mutates
 nothing). `--execute` requires the typed token `--confirm RECONCILE-LEDGER-TO-BROKER` **and** passes
-fail-closed gates (exec mode paper/dry_run · SCR ∈ {CONFIDENT,CAUTIOUS} · reconciliation status not
-RED). It backs up every touched file to `*.bak_ledger_recon_<stamp>`, emits a
+the fail-closed gates below. It backs up every touched file to `*.bak_ledger_recon_<stamp>`, emits a
 `LEDGER_RECON_APPLIED` marker per row, writes a reconciliation ledger
 `runtime/ledger_reconciliation_<stamp>.ndjson` and a signed report `reports/ledger_recon_<stamp>.json`
 (git HEAD, gate results, per-symbol plan, backup SHA256s). **Idempotent** — a symbol already carrying
 a reconciliation seed lot at broker truth is a no-op. It mutates only `runtime/trade_closer_state.json`
 (durable source) and `runtime/position_guard.json` (immediate consistency, exact rebuild shape);
 `broker_sync` is never written; no broker I/O; no orders.
+
+### 4a. Fail-closed gate table (`--execute` only; dry-run never gates)
+
+| gate | PASS condition | REFUSE (exit 2) | rationale |
+|------|----------------|-----------------|-----------|
+| `exec_mode` | execution mode ∈ {paper, dry_run} | live, or the mode check raises | never reconcile a book that could place live orders |
+| `scr` | SCR state ∈ **{CONFIDENT, CAUTIOUS, WARMUP}** | UNKNOWN, PAUSED, or any other state | see WARMUP disposition below |
+| `reconciliation` | `reconciliation_state.status` ≠ RED | status = RED (broker truth unavailable) | never mutate the book against unverifiable broker truth |
+
+**SCR = WARMUP is a PERMITTED state for this tool** (disposition 2026-07-13, code
+`_SAFE_SCR_STATES`, `scripts/reconcile_ledger_to_broker.py`). Live is currently WARMUP
+(`sizing_factor≤0.1`, `paper_only`, effective trades below the graduation floor). In WARMUP the SCR
+has **not** graduated to trusted live sizing, and — decisively — this tool writes **nothing** into
+`data/fills` or `effective_trades` (every synthetic record and the adoption seed lot carry
+`pnl_untrusted=true`, the canonical Stage-2 exclusion), so there is **no scored/effective edge for a
+reconciliation to corrupt**. Blocking on WARMUP would only prevent a safe, evidence-preserving book
+cleanup. **UNKNOWN and PAUSED remain REFUSED:** UNKNOWN signals SCR telemetry failure (state
+indeterminate — the control plane is blind) and PAUSED signals an explicit operator halt; reconciling
+under either would be acting against a broken or halted control plane.
+
+> **Invocation note (F1):** the documented `python3 scripts/reconcile_ledger_to_broker.py …` now
+> works from **any** CWD. The script prepends the repo root (resolved from `__file__`) to `sys.path`
+> at import time, so the lazy `chad.*` imports inside the gates resolve even though `chad` is not
+> pip-installed and `scripts/` (not the repo root) is `sys.path[0]` under the documented invocation.
+> Previously the `exec_mode` gate caught the resulting `ModuleNotFoundError` and fail-closed, so the
+> documented command refused before it could reach broker truth.
+
+> **Freshness note (F3):** the plan is derived at **run time** from live inputs on every invocation —
+> guard + FIFO re-read from disk, exclusions + marks re-loaded, broker truth + queues recomputed,
+> `compute_plan()` a pure recompute; no plan is persisted and reloaded. A post-close dry-run therefore
+> reflects **that session's** broker truth. NB: symbols the operator owns (`exclusion_policy` /
+> `_EFFECTIVE_NON_CHAD_SYMBOLS` — currently includes BAC and SPY) classify as `REBASELINE_EXCLUDED`
+> even when newly broker-held; they are **never** adopted (the broker position is the operator's).
 
 ## 5. Execution plan (awaiting typed operator GO — Channel 1)
 
