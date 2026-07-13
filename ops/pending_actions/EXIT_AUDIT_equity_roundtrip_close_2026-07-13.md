@@ -1,9 +1,11 @@
 # PENDING ACTION — Equity round-trips do not close: forensic finding + minimal-risk fix
 
 - **Filed:** 2026-07-13
-- **Type:** Forensic finding + Pending Action (fix proposal only — NO code change, NO deploy)
-- **Author:** EXIT-AUDIT (read-only forensic)
-- **Status:** PROPOSED. Requires typed operator GO before any code is written.
+- **Type:** Forensic finding + Pending Action. SHADOW-first fix BUILT + wired 2026-07-13 (see §6);
+  ACTIVE flip and any deploy remain PROPOSED.
+- **Author:** EXIT-AUDIT (read-only forensic) + EXIT-OVERLAY (implementation)
+- **Status:** SHADOW implementation landed repo-side (default-safe, not deployed). The ACTIVE flip
+  requires typed operator GO against the §4 pre-registered criteria.
 - **Governance:** One change at a time · no direct config mutation · default-OFF, shadow-first · no
   flip without pre-registered written activation criteria (per dormant-census governance).
 
@@ -179,4 +181,42 @@ logged, never inferred as coverage.
 - `data/fills/FILLS_*.ndjson` (Epoch-2 vs Epoch-3 confirmed/rejected SELL counts; gamma MA record)
 - reset commit `4c5cd3b`; strict placeholder rejection `29e7197`; futures-disable gate `82136d7`
 
-**No code changed. No commit. No deploy. Fix authoring awaits typed operator GO.**
+---
+
+## 6. Implementation status — Q5(b) SHADOW-first landed 2026-07-13 (repo-side; NOT deployed)
+
+The recommended overlay is **built and wired in SHADOW mode** (U0–U3). It activates in shadow
+only at the next live-loop restart; the **ACTIVE flip remains a separate future PA** gated on the
+§4 pre-registered criteria. Commits (main): U0 `268d5da` (this doc), U1 `1628211`, U2 `80ed444`.
+
+Implementation citations:
+- **Core (pure):** `chad/risk/position_exit_overlay.py` — `evaluate_positions` (:401) applies the
+  three OR'd conditions (hard-stop → ATR-trailing → max-hold; first hit) and emits reduce-only
+  close-intent dicts. Phantom-awareness via `_broker_signed_by_symbol` (:353), which aggregates
+  `broker_sync|<symbol>` truth signed by side — mirroring `chad/core/position_guard._signed_qty`
+  / `detect_guard_vs_broker_drift_v2`; a position with no same-side broker truth yields
+  `EXIT_OVERLAY_SKIP_UNCONFIRMED`. Reduce-only invariant enforced at eval (`min(guard_qty,
+  broker_held)`) and re-checked at submit by `_reduce_only_reclamp` (:728).
+- **Config (pre-registered, default shadow):** `config/position_exit_overlay.json` (frozen
+  thresholds; `mode` is the sole post-freeze flip). Kill-switch env `CHAD_POSITION_EXIT_OVERLAY`
+  (OFF|SHADOW|ACTIVE) via `resolve_mode`.
+- **Runner + factory:** `PositionExitOverlay` (:567) does markers + `data/exit_overlay/*.ndjson`
+  evidence + anchor persistence (`runtime/position_exit_overlay_state.json`) and, only in ACTIVE,
+  routes through `chad.core.position_reconciler.apply_close_intents` (reused, not forked → inherits
+  the adapter RTH gate `ibkr_adapter._evaluate_rth_gate`, idempotency, margin-shadow).
+  `build_default_overlay` (:846) fail-opens to `None` on bad config and carries the margin-gate
+  pytest evidence/state leak guard. A cycle error logs `EXIT_OVERLAY_ERROR` and submits nothing.
+- **Hot-path wiring:** `chad/core/live_loop.py:1933-1953` — inside `run_once`, immediately after
+  the reconciler block and before the market-metrics publisher / intent planning.
+- **Tests:** `chad/tests/test_position_exit_overlay.py` (23) + `..._wiring.py` (4) — every
+  condition, all skip classes, reduce-only clamp + reclamp, short mirror, anchor seed/update/prune,
+  config validation, kill-switch, SHADOW-writes-evidence-submits-nothing, OFF inert, error
+  fail-open, ACTIVE reaches the real submit path + is RTH-gate-subject, phantom dropped at submit,
+  structural wiring guard.
+
+New markers: `EXIT_OVERLAY_SHADOW`, `EXIT_OVERLAY_SKIP_UNCONFIRMED`, `EXIT_OVERLAY_ERROR`,
+`EXIT_OVERLAY_ACTIVE_CLOSE`. Evidence: `data/exit_overlay/exit_overlay_YYYYMMDD.ndjson`
+(schema `exit_overlay.v1`).
+
+**Deploy status: NOT DEPLOYED.** SHADOW activates at the next live-loop restart (operator action).
+The ACTIVE flip is its own authorization PA per §4. No service files touched; no restart performed.
