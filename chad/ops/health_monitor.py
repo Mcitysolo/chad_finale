@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -245,6 +246,34 @@ equity curve shape, fill rate patterns, anything that looks unusual."""
         return ""
 
 
+def _alert_dedupe_key(finding) -> str:
+    """Build a STABLE dedupe identity for a health finding.
+
+    The dedupe layer (telegram_notify) suppresses repeats of the *same*
+    alert within a TTL. The key must therefore encode the alert's IDENTITY
+    (which rule, about which entity) and NOT the human-facing message text.
+
+    The previous key ``f"health_{rule_id}_{title[:30]}"`` embedded the raw
+    finding title, and several rule titles carry a fluctuating value — e.g.
+    "SCR gap 214 raw vs 67 effective", "Feed STALE: ... (12345s old)",
+    "Disk 87.3% full". Each cycle the value changed, so a NEW dedupe file was
+    created and the same finding was re-delivered every run (observed on disk:
+    R13 SCR-gap produced 7 distinct dedupe files, sent ~every 5 min). This is
+    independent of the COACH-VOICE rewording — the key is built from the raw
+    Finding, before any presentation formatting.
+
+    Fix: strip numeric VALUE tokens (digit runs NOT preceded by a letter, so
+    identifiers such as M6E / alpha_crypto / chad-live-loop survive) from the
+    title before it contributes to the key. What remains — the rule id plus
+    the stable entity/template text — is the alert identity.
+    """
+    rule_id = str(getattr(finding, "rule_id", "") or "?")
+    title = str(getattr(finding, "title", "") or "")
+    identity = re.sub(r"(?<![A-Za-z])\d[\d,\.]*", "", title)
+    identity = re.sub(r"\s+", " ", identity).strip()
+    return f"health_{rule_id}_{identity[:48]}"
+
+
 def _notify(message: str, severity: str = "info",
             dedupe_key: str = "") -> None:
     """Send Telegram notification."""
@@ -347,7 +376,7 @@ def run_monitor(dry_run: bool = False) -> None:
             _notify(msg,
                     severity="critical" if finding.severity == "CRITICAL"
                     else "warning",
-                    dedupe_key=f"health_{finding.rule_id}_{finding.title[:30]}")
+                    dedupe_key=_alert_dedupe_key(finding))
 
         # Send Claude analysis if it found something new
         if claude_analysis and "SYSTEM HEALTHY" not in claude_analysis:
