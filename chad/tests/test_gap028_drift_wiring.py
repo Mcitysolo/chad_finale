@@ -424,10 +424,12 @@ def test_rebuilder_consults_exclusion_policy_when_strict_mode(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 def test_reconciliation_publisher_emits_position_guard_drift_json(tmp_path, monkeypatch):
-    """GAP-028 §5.1 + WKF U3: _emit_position_guard_drift writes the v2 advisory
-    file with a non-empty `drifts` array. The synthetic state (guard delta|AAPL
-    BUY 31 vs broker_sync|AAPL SELL 2) is now a like-with-like signed
-    qty_mismatch under the v2 semantics (a side flip shows as a sign delta)."""
+    """GAP-028 §5.1 + WKF U3 + P0A-A5: _emit_position_guard_drift writes the v3
+    advisory file with a non-empty `drifts` array. The synthetic state (guard
+    delta|AAPL BUY 31 vs broker_sync|AAPL SELL 2) WOULD be a like-with-like
+    signed qty_mismatch — but AAPL is in the operator exclusion policy, so under
+    A5 it is reported as informational mixed_ownership_info (out of drift_count,
+    never RED), not an actionable qty_mismatch."""
     from chad.ops import reconciliation_publisher as pub
     from chad.core import position_guard
 
@@ -444,19 +446,23 @@ def test_reconciliation_publisher_emits_position_guard_drift_json(tmp_path, monk
     _seed_json(guard_path, _seed_synthetic_drift_state())
 
     n = pub._emit_position_guard_drift()
-    assert n == 1, f"expected exactly one drift, got {n}"
+    # AAPL is operator-owned -> mixed_ownership_info, so actionable drift_count=0.
+    assert n == 0, f"AAPL is operator-excluded -> 0 actionable drift, got {n}"
     assert drift_path.is_file(), "drift advisory file must be written"
 
     payload = _load_json(drift_path)
-    assert payload["schema_version"] == "position_guard_drift.v2"
-    assert payload["drift_count"] == 1
+    assert payload["schema_version"] == "position_guard_drift.v3"
+    assert payload["drift_count"] == 0
+    assert payload["info_count"] == 1
     assert payload["ttl_seconds"] == pub.TTL_SECONDS
     assert "ts_utc" in payload
-    assert payload["counts_by_kind"]["qty_mismatch"] == 1
+    assert payload["counts_by_kind"]["mixed_ownership_info"] == 1
+    assert payload["counts_by_kind"]["qty_mismatch"] == 0
     assert isinstance(payload["drifts"], list) and len(payload["drifts"]) == 1
     rec = payload["drifts"][0]
     assert rec["symbol"] == "AAPL"
-    assert rec["drift_kind"] == "qty_mismatch"
+    assert rec["drift_kind"] == "mixed_ownership_info"
+    assert rec["is_excluded"] is True
     assert rec["guard_qty"] == 31.0        # BUY 31 → +31
     assert rec["broker_qty"] == -2.0       # SELL 2 → -2
     assert rec["broker_present"] is True

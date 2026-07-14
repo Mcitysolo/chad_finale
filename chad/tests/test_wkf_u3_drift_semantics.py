@@ -93,10 +93,14 @@ def test_each_drift_kind_classified_correctly():
     assert "MSFT" not in by_symbol
 
     assert out["drift_count"] == 5
+    # P0A-A5: counts_by_kind gains mixed_ownership_info. This detector call
+    # passes NO excluded_symbols, so classification is unchanged and the new
+    # bucket is 0.
     assert out["counts_by_kind"] == {
         "phantom_guard_entry": 2,
         "broker_untracked_position": 1,
         "qty_mismatch": 2,
+        "mixed_ownership_info": 0,
     }
 
 
@@ -192,11 +196,18 @@ def test_publisher_emits_v2_and_is_read_only(tmp_path, monkeypatch):
     pre_mtime = guard_path.stat().st_mtime_ns
 
     n = pub._emit_position_guard_drift()
-    assert n == 5
+    # P0A-A5: the publisher now passes the real exclusion policy. In _snapshot()
+    # BAC/SPY are operator-owned (broker holds none, guard holds a phantom) and
+    # MSFT is exact-agreement — so BAC/SPY reclassify to mixed_ownership_info
+    # (informational, out of drift_count) and MSFT stays no-drift. The
+    # actionable drift is TLT + UNH (qty_mismatch) + IWM (broker_untracked) = 3.
+    assert n == 3
     payload = json.loads(drift_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "position_guard_drift.v2"
-    assert payload["drift_count"] == 5
+    assert payload["schema_version"] == "position_guard_drift.v3"
+    assert payload["drift_count"] == 3
     assert payload["counts_by_kind"]["broker_untracked_position"] == 1
+    assert payload["counts_by_kind"]["mixed_ownership_info"] == 2  # BAC, SPY
+    assert payload["info_count"] == 2
     # read-only invariant
     assert guard_path.stat().st_mtime_ns == pre_mtime
 

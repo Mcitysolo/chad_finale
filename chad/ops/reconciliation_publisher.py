@@ -268,23 +268,48 @@ def _emit_position_guard_drift() -> int:
     else:
         guard_state = {}
 
+    # A5: operator-owned symbols (exclusion policy + broker-preexisting set).
+    # Drift on these is reported as mixed_ownership_info, never actionable
+    # qty_mismatch/broker_untracked, so the operator's pre-existing holdings
+    # (BAC/SPY/LLY/MSFT ...) do not inflate drift_count or flip live-readiness
+    # RED. operator_baselines is sourced from any signed baseline recorded in
+    # the exclusion policy (none today -> deltas reported as unattributable).
+    excluded_symbols = {
+        str(s).strip().upper()
+        for s in (set(EXCLUSION_POLICY.keys()) | set(_BROKER_PREEXISTING))
+        if s
+    }
+    operator_baselines = {
+        str(sym).strip().upper(): float(meta["operator_baseline_qty"])
+        for sym, meta in EXCLUSION_POLICY.items()
+        if isinstance(meta, dict) and meta.get("operator_baseline_qty") is not None
+    }
+
     result = (
-        detect_guard_vs_broker_drift_v2(guard_state)
+        detect_guard_vs_broker_drift_v2(
+            guard_state,
+            excluded_symbols=excluded_symbols,
+            operator_baselines=operator_baselines,
+        )
         if isinstance(guard_state, dict)
-        else {"drift_count": 0, "drifts": [], "snapshot_generation": None,
-              "counts_by_kind": {}}
+        else {"drift_count": 0, "info_count": 0, "drifts": [],
+              "snapshot_generation": None, "counts_by_kind": {}}
     )
     drifts = result.get("drifts", [])
     drift_count = int(result.get("drift_count", len(drifts)) or 0)
     payload = {
-        # v2: extended drift_kind vocabulary (phantom_guard_entry /
-        # broker_untracked_position / qty_mismatch). drift_count remains the
-        # authoritative live-readiness gate (GAP-041 / PR-09); the consumer
-        # ops.live_readiness_publish accepts both v1 and v2.
-        "schema_version": "position_guard_drift.v2",
+        # v3: adds mixed_ownership_info drift_kind (A5) for operator-owned
+        # symbols; drift_count now counts ACTIONABLE drift only (phantom /
+        # broker_untracked / qty_mismatch) and remains the authoritative
+        # live-readiness gate (GAP-041 / PR-09). info_count exposes the
+        # informational mixed-ownership records. ops.live_readiness_publish
+        # accepts v1/v2/v3.
+        "schema_version": "position_guard_drift.v3",
         "ts_utc": _utc_now_iso(),
         "ttl_seconds": TTL_SECONDS,
         "drift_count": drift_count,
+        "info_count": int(result.get("info_count", 0) or 0),
+        "excluded_symbols": sorted(excluded_symbols),
         "snapshot_generation": result.get("snapshot_generation"),
         "counts_by_kind": result.get("counts_by_kind", {}),
         "drifts": drifts,
@@ -294,8 +319,8 @@ def _emit_position_guard_drift() -> int:
     tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     tmp.replace(DRIFT_OUT_PATH)
     LOG.info(
-        "position_guard_drift emitted schema=v2 drift_count=%d by_kind=%s path=%s",
-        drift_count, payload["counts_by_kind"], DRIFT_OUT_PATH,
+        "position_guard_drift emitted schema=v3 drift_count=%d info_count=%d by_kind=%s path=%s",
+        drift_count, payload["info_count"], payload["counts_by_kind"], DRIFT_OUT_PATH,
     )
     return drift_count
 

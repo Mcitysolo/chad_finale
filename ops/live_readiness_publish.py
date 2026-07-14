@@ -186,11 +186,14 @@ def _resolved_reconciliation_status(
     except Exception as exc:
         return "UNKNOWN", f"position_guard_drift_unreadable:{type(exc).__name__}"
 
-    # WKF U3: accept both the legacy v1 and the v2 (like-with-like symbol-total)
-    # drift schemas. Both carry the authoritative numeric `drift_count`; the gate
-    # semantics below are identical for either version.
+    # WKF U3 / P0A-A5: accept legacy v1, v2 (like-with-like symbol-total), and
+    # v3 (adds mixed_ownership_info for operator-owned symbols). All three carry
+    # the authoritative numeric `drift_count`; in v3 that count is ACTIONABLE
+    # drift only (mixed_ownership_info is excluded), so the gate semantics below
+    # are identical for every version.
     if str(g.get("schema_version") or "") not in (
         "position_guard_drift.v1", "position_guard_drift.v2",
+        "position_guard_drift.v3",
     ):
         return "UNKNOWN", "position_guard_drift_schema_invalid"
 

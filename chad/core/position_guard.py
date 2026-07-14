@@ -553,8 +553,26 @@ def _signed_qty(entry: Mapping[str, Any]) -> float:
     return -qty if side == "SELL" else qty
 
 
-def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
+def detect_guard_vs_broker_drift_v2(
+    state: Mapping[str, Any],
+    *,
+    excluded_symbols: Optional[Set[str]] = None,
+    operator_baselines: Optional[Mapping[str, float]] = None,
+) -> Dict[str, Any]:
     """WKF U3: like-with-like guard↔broker drift, read atomically from one snapshot.
+
+    P0A-A5 (mixed ownership): ``excluded_symbols`` is the set of operator-owned
+    symbols (the reconciliation exclusion policy — e.g. BAC/SPY/LLY/MSFT). For
+    those symbols the broker total is a MIX of the operator's pre-existing
+    shares and any CHAD lots, so comparing CHAD-tracked lots against the
+    *combined* broker total is not like-with-like and previously produced a
+    false ``broker_untracked_position`` / ``qty_mismatch`` that inflated
+    ``drift_count`` (and could flip live-readiness RED). Such symbols are now
+    reported as ``mixed_ownership_info`` — informational, EXCLUDED from
+    ``drift_count``. If a signed ``operator_baselines[symbol]`` is supplied
+    (from the exclusion-policy snapshot), the residual ``broker - baseline`` is
+    netted and reported alongside; without one we honestly report that the
+    delta cannot be attributed.
 
     Supersedes :func:`detect_guard_vs_broker_truth_drift` for the emitted
     ``position_guard_drift`` advisory. It fixes the F3 false-positive class where
@@ -599,11 +617,13 @@ def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
         "phantom_guard_entry": 0,
         "broker_untracked_position": 0,
         "qty_mismatch": 0,
+        "mixed_ownership_info": 0,
     }
     if not isinstance(state, Mapping):
         return {
             "snapshot_generation": None, "written_by": "",
-            "drift_count": 0, "counts_by_kind": dict(empty_counts), "drifts": [],
+            "drift_count": 0, "info_count": 0,
+            "counts_by_kind": dict(empty_counts), "drifts": [],
         }
 
     generation = state.get("_version")
@@ -644,6 +664,13 @@ def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
         if strat and strat not in strat_list:
             strat_list.append(strat)
 
+    excluded = {str(s).strip().upper() for s in (excluded_symbols or ())}
+    baselines = {
+        str(k).strip().upper(): float(v)
+        for k, v in (operator_baselines or {}).items()
+        if v is not None
+    }
+
     _EPS = 1e-9
     counts = dict(empty_counts)
     drifts: List[Dict[str, Any]] = []
@@ -652,6 +679,43 @@ def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
         b = broker_qty.get(symbol, 0.0)
         g_open = abs(g) > _EPS
         b_open = abs(b) > _EPS
+
+        if symbol in excluded:
+            # A5: operator-owned symbol — broker total mixes operator + CHAD
+            # lots. Reclassify what WOULD have been actionable drift into
+            # informational mixed_ownership_info (netting an operator baseline
+            # when one is recorded), and keep it OUT of drift_count. When guard
+            # and broker totals agree (or both flat) there is nothing to report,
+            # exactly as for a non-excluded symbol.
+            would_drift = (
+                (g_open and not b_open)
+                or (b_open and not g_open)
+                or (g_open and b_open and abs(g - b) > _EPS)
+            )
+            if not would_drift:
+                continue
+            baseline = baselines.get(symbol)
+            net_b = (b - baseline) if baseline is not None else None
+            chad_vs_net = (g - net_b) if net_b is not None else None
+            counts["mixed_ownership_info"] += 1
+            drifts.append({
+                "symbol": symbol,
+                "drift_kind": "mixed_ownership_info",
+                "is_excluded": True,
+                "guard_qty": g,
+                "broker_qty": b,
+                "qty_delta": g - b,
+                "operator_baseline": baseline,
+                "net_broker_qty": net_b,
+                "chad_vs_net_broker_delta": chad_vs_net,
+                "guard_keys": list(guard_keys.get(symbol, [])),
+                "guard_strategies": list(guard_strats.get(symbol, [])),
+                "broker_side": broker_side.get(symbol),
+                "broker_present": b_open,
+                "snapshot_generation": generation,
+            })
+            continue
+
         if g_open and not b_open:
             kind = "phantom_guard_entry"
         elif b_open and not g_open:
@@ -664,6 +728,7 @@ def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
         drifts.append({
             "symbol": symbol,
             "drift_kind": kind,
+            "is_excluded": False,
             "guard_qty": g,
             "broker_qty": b,
             "qty_delta": g - b,
@@ -674,10 +739,18 @@ def detect_guard_vs_broker_drift_v2(state: Mapping[str, Any]) -> Dict[str, Any]:
             "snapshot_generation": generation,
         })
 
+    # drift_count is ACTIONABLE drift only. mixed_ownership_info is
+    # informational (operator-owned symbols) and must never flip RED.
+    actionable = (
+        counts["phantom_guard_entry"]
+        + counts["broker_untracked_position"]
+        + counts["qty_mismatch"]
+    )
     return {
         "snapshot_generation": generation,
         "written_by": written_by,
-        "drift_count": len(drifts),
+        "drift_count": actionable,
+        "info_count": counts["mixed_ownership_info"],
         "counts_by_kind": counts,
         "drifts": drifts,
     }
