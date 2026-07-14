@@ -226,6 +226,21 @@ _UNIT_FRIENDLY: Dict[str, Tuple[str, str, str]] = {
         "it refreshes end-of-day price history",
         "history-based signals may lag a day",
     ),
+    "ibkr-daily-bars-refresh": (
+        "daily-history updater",
+        "it refreshes end-of-day price history",
+        "history-based signals may lag a day",
+    ),
+    "service-alert": (
+        "alerting service",
+        "it sends you failure notifications",
+        "some alerts may be delayed",
+    ),
+    "ibgateway": (
+        "broker gateway",
+        "it connects CHAD to the broker",
+        "broker actions pause until it reconnects",
+    ),
     "metrics-server": (
         "metrics service",
         "it publishes monitoring numbers",
@@ -792,3 +807,535 @@ def facts_from_finding(finding: Any, *, remedy_result: Optional[str] = None) -> 
         "remedy_action": getattr(finding, "remedy_action", ""),
         "remedy_result": remedy_result,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COACH-VOICE-L2 — conversational answers, refusals, and mode persistence.
+#
+# CV2 adds a *question-and-answer* presentation surface on top of CV1's alert
+# formatter, reusing the SAME voice: the same mode resolution, the same emoji
+# map, the same humanizers, and the same SIMPLE-never-shows-codes scrub. There
+# is ONE voice definition — this section only adds new renderers, it does not
+# fork the tone.
+#
+# Division of labour (mirrors CV1):
+#   * FACTS come from ``chad/utils/coach_intents.py`` (the read-only intent
+#     layer that reads runtime files). This module NEVER reads a runtime
+#     artifact — it only renders the ``facts`` dict it is handed.
+#   * PRESENTATION lives here.
+#
+# The one write this module owns is :func:`set_config_mode`, which persists the
+# operator's verbosity choice to ``config/coach_voice.json`` — the coach's own
+# state, not a runtime/trading artifact.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Friendly display name per mode (for acknowledgements).
+_MODE_DISPLAY = {"SIMPLE": "simple", "STANDARD": "normal", "PRO": "pro (technical)"}
+
+
+def set_config_mode(mode: Any) -> bool:
+    """Persist the verbosity ``mode`` to ``config/coach_voice.json``.
+
+    Returns True on a successful write of a valid mode, False otherwise. Only
+    the ``mode`` field is changed; ``schema_version`` / ``_comment`` and any
+    other keys are preserved. This is the coach's *own* configuration — it is
+    not a runtime or trading artifact, and it never touches order/risk/service
+    state. Never raises.
+    """
+    m = _norm_mode(mode)
+    if not m:
+        return False
+    try:
+        try:
+            raw = json.loads(COACH_CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raw = {}
+        except Exception:
+            raw = {}
+        raw.setdefault("schema_version", "coach_voice.v1")
+        raw["mode"] = m
+        tmp = COACH_CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, COACH_CONFIG_PATH)
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOG.warning("coach_voice_set_mode_failed mode=%s err=%s", mode, exc)
+        return False
+
+
+# ── number / money humanizers (kept scrub-safe: comma grouping breaks the
+#    4+ digit run the SIMPLE scrub looks for, and no trailing 's') ────────────────
+def _fmt_money(value: Any, currency: str = "CAD") -> str:
+    """Format a money value. Pass ``currency=""`` to render WITHOUT a currency
+    label — used for values whose currency basis is not established (e.g. the
+    SCR raw paper-P&L sum, which the money-truth layer intentionally leaves
+    uncurrencied). Attaching a false 'CAD'/'USD' to such a value is a currency-
+    provenance overclaim, CHAD's #1 bug class."""
+    v = _as_float(value)
+    if v is None:
+        return "an unknown amount"
+    ccy = str(currency or "").upper()
+    neg = "-" if v < 0 else ""
+    a = abs(v)
+    if a >= 1_000_000:
+        body = f"{a / 1_000_000:.2f}M"
+    elif a >= 10_000:
+        body = f"{a / 1_000:.0f}K"
+    else:
+        body = f"{a:,.0f}"
+    suffix = f" {ccy}" if ccy else ""
+    return f"{neg}${body}{suffix}"
+
+
+def _fmt_pct(value: Any, digits: int = 1) -> str:
+    v = _as_float(value)
+    if v is None:
+        return "n/a"
+    return f"{v * 100:.{digits}f}%"
+
+
+def _fmt_signed(value: Any, digits: int = 2) -> str:
+    v = _as_float(value)
+    if v is None:
+        return "n/a"
+    return f"{v:+.{digits}f}"
+
+
+def _fmt_qty(value: Any) -> str:
+    v = _as_float(value)
+    if v is None:
+        return "?"
+    if abs(v - round(v)) < 1e-9:
+        return f"{int(round(v)):,}"
+    return f"{v:,.2f}"
+
+
+# ── staleness + source citation (shared by every answer template) ──────────────
+def _staleness_line(facts: Dict[str, Any]) -> Optional[str]:
+    """Return a plain-English 'this data is behind' disclosure, or None.
+
+    Honours the CV2 STALENESS RULE: whenever the intent layer flags any source
+    as older than its TTL, we say so in words and give the age — we never
+    present stale data as current. No filename leaks (SIMPLE-safe).
+    """
+    if not facts.get("_stale"):
+        return None
+    age = facts.get("_stale_age_seconds")
+    label = str(facts.get("_stale_label") or "part of this reading").strip()
+    if age is not None:
+        return (
+            f"⚠️ Heads up: {label} is about {humanize_duration(age)} old, "
+            "so treat it as a little behind, not live."
+        )
+    return f"⚠️ Heads up: {label} may be out of date, so treat it as a little behind."
+
+
+def _sources_pro_line(facts: Dict[str, Any]) -> Optional[str]:
+    """PRO-only provenance line citing each runtime source + its age."""
+    sources = facts.get("_sources")
+    if not isinstance(sources, (list, tuple)) or not sources:
+        return None
+    parts: List[str] = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        path = str(s.get("path", "?"))
+        if not s.get("present", True):
+            parts.append(f"{path}(missing)")
+            continue
+        age = s.get("age_seconds")
+        age_txt = f"{int(age)}s" if isinstance(age, (int, float)) else "?"
+        flag = "STALE" if s.get("stale") else "ok"
+        parts.append(f"{path}(age={age_txt},{flag})")
+    if not parts:
+        return None
+    return "raw sources: " + "; ".join(parts)
+
+
+def _humanize_reason_word(reason: Any) -> str:
+    return _friendly_reason(reason)
+
+
+# ── conversational answer templates (one per allow-listed intent) ──────────────
+def _ans_status_overview(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    equity = f.get("equity_cad")
+    scr_state = str(f.get("scr_state") or "unknown").upper()
+    sizing = _as_float(f.get("sizing_factor"))
+    win_rate = f.get("win_rate")
+    pnl = f.get("total_pnl")
+    eff = f.get("effective_trades")
+    n_pos = int(f.get("open_positions_count") or 0)
+    fills = int(f.get("fills_today") or 0)
+    drift = int(f.get("drift_count") or 0)
+
+    posture = {
+        "CONFIDENT": "trading at full size",
+        "CAUTIOUS": "trading carefully at reduced size",
+        "WARMUP": "still warming up (small, learning-mode size)",
+        "PAUSED": "paused for now",
+        "RECOVERY": "easing back in after a rough patch",
+    }.get(scr_state, "running")
+
+    head = "ℹ️ Here's where we stand right now."
+    equity_txt = _fmt_money(equity, "CAD") if equity is not None else "not available yet"
+    body = [
+        f"Balance is about {equity_txt}, and CHAD is {posture}.",
+    ]
+    perf_bits = []
+    if win_rate is not None:
+        perf_bits.append(f"win rate {_fmt_pct(win_rate)}")
+    if pnl is not None:
+        # SCR paper P&L is a raw, currency-unnormalized paper sum — render it
+        # without a currency label rather than mislabel it CAD/USD.
+        perf_bits.append(f"paper P&L {_fmt_money(pnl, '')}")
+    if eff is not None:
+        perf_bits.append(f"{int(eff)} scored trades so far")
+    if perf_bits:
+        body.append("So far: " + ", ".join(perf_bits) + ".")
+    # "Broker-confirmed" qualifies POSITIONS only; fills/drift are separate.
+    pos_txt = (
+        "no broker-confirmed open positions" if n_pos == 0
+        else f"{n_pos} broker-confirmed open position" + ("s" if n_pos != 1 else "")
+    )
+    body.append(
+        pos_txt[0].upper() + pos_txt[1:] + ". "
+        + f"Today: {fills} fill" + ("s" if fills != 1 else "")
+        + f", and {drift} position mismatch" + ("es" if drift != 1 else "") + " to watch."
+    )
+    body.append("No action needed — this is just the lay of the land.")
+    standard = None
+    if mode == "STANDARD":
+        sz = f"{sizing:.2f}x" if sizing is not None else "its usual"
+        standard = f"CHAD is sizing new trades at {sz} of normal while in {posture.split(' (')[0]}."
+        body.append(standard)
+    pro = (
+        f"raw: scr_state={scr_state} sizing_factor={sizing} win_rate={win_rate} "
+        f"total_pnl={pnl} effective_trades={eff} open_positions={n_pos} "
+        f"fills_today={fills} drift_count={drift}"
+    )
+    return head, body, pro
+
+
+def _ans_why_paused(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    primary = str(f.get("primary_reason") or "none")
+    stop_reason = _humanize_reason_word(f.get("stop_reason"))
+    scr_state = str(f.get("scr_state") or "unknown").upper()
+
+    if primary == "halted":
+        head = "⚠️ CHAD has paused trading on purpose."
+        body = [
+            f"It's a protective stop because {stop_reason}. No new trades go out while it's on.",
+            "CHAD did this itself to protect the account — nothing was lost by pausing.",
+            "No action needed yet; these usually clear on their own within a few minutes.",
+        ]
+    elif primary == "market_closed":
+        head = "ℹ️ Nothing's wrong — the stock market is just closed right now."
+        body = [
+            "CHAD holds new stock trades until regular hours, because off-hours trading is riskier.",
+            "It paused new entries on its own; existing safety limits still apply.",
+            "No action needed — it starts up again automatically at the open.",
+        ]
+    elif primary == "regime_adverse":
+        head = "ℹ️ CHAD is sitting on its hands because conditions look poor."
+        body = [
+            "The market read is 'adverse', so CHAD silenced its strategies for now.",
+            "That's a deliberate wait-for-better-conditions stance, not a fault.",
+            "No action needed — it re-activates when the market read improves.",
+        ]
+    elif primary in ("warmup", "paused"):
+        head = "ℹ️ CHAD is being cautious, not blocked."
+        if scr_state == "WARMUP":
+            body = [
+                "It's still in warm-up: it needs more scored trades before it sizes up.",
+                "So it trades small on purpose while it builds a track record.",
+            ]
+        else:
+            body = [
+                "Its self-rating dipped, so it pulled sizing back to stay safe.",
+                "It keeps trading small until the numbers recover.",
+            ]
+        body.append("No action needed — this eases up on its own as results improve.")
+    else:
+        head = "ℹ️ Good news — nothing is blocking CHAD right now."
+        body = [
+            "No safety stop is active, the market is open, and conditions are workable.",
+            "CHAD is trading within its normal paper-mode limits.",
+            "No action needed.",
+        ]
+    standard = None
+    if mode == "STANDARD":
+        rth = f.get("rth_open")
+        rth_txt = "open" if rth else ("closed" if rth is False else "unknown")
+        standard = f"Context: safety-stop={'on' if f.get('halted') else 'off'}, market={rth_txt}, self-rating={scr_state}."
+        body.append(standard)
+    pro = (
+        f"raw: primary_reason={primary} halted={f.get('halted')} stop_reason={f.get('stop_reason')!r} "
+        f"rth_open={f.get('rth_open')} regime={f.get('regime')} scr_state={scr_state} "
+        f"ready_for_live={f.get('ready_for_live')}"
+    )
+    return head, body, pro
+
+
+def _ans_position_detail(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    symbol = str(f.get("symbol") or "that symbol").upper()
+    broker_qty = _as_float(f.get("broker_qty"))
+    broker_side = str(f.get("broker_side") or "").upper()
+    chad_lots = f.get("chad_lots") or []
+    verdict = str(f.get("exit_verdict") or "").upper()
+    reason = str(f.get("exit_reason") or "")
+
+    if not f.get("has_position"):
+        head = f"ℹ️ You have no open {symbol} position right now."
+        body = [
+            "Neither the broker nor CHAD's own book shows any shares in it.",
+            "No action needed.",
+        ]
+        pro = f"raw: symbol={symbol} broker_qty=None chad_lots=0"
+        return head, body, pro
+
+    head = f"ℹ️ Here's your {symbol} exposure."
+    body: List[str] = []
+    if broker_qty is not None:
+        dir_word = "long" if (broker_side == "BUY" or broker_qty > 0) else "short"
+        body.append(f"Broker shows {_fmt_qty(abs(broker_qty))} shares {dir_word} (confirmed by IBKR).")
+    else:
+        body.append("The broker hasn't confirmed a position in it under CHAD's tracking.")
+    if chad_lots:
+        lot_txt = ", ".join(
+            f"{humanize_name(l.get('strategy'))} {_fmt_qty(l.get('quantity'))}" for l in chad_lots[:4]
+        )
+        body.append(f"CHAD's strategies tracking it: {lot_txt}.")
+    if verdict == "WOULD_CLOSE":
+        body.append("CHAD's exit-watch says this one is at a level it would trim/close (shadow only — it hasn't).")
+    elif verdict == "HOLD":
+        body.append("CHAD's exit-watch says: hold — no exit condition met yet.")
+    elif verdict.startswith("SKIP"):
+        body.append("CHAD's exit-watch is standing aside on this one (not an equity it manages, or unconfirmed).")
+    body.append("No action needed — I only read and explain positions, I don't change them.")
+    standard = None
+    if mode == "STANDARD" and f.get("exit_price") is not None:
+        standard = (
+            f"Last look: price {f.get('exit_price')}, trailing-stop near {f.get('exit_atr_stop')}, "
+            f"held {f.get('exit_age_days')} of {f.get('exit_max_hold')} days."
+        )
+        body.append(standard)
+    pro = (
+        f"raw: symbol={symbol} broker_qty={broker_qty} broker_side={broker_side} "
+        f"chad_lots={len(chad_lots)} exit_verdict={verdict or None} exit_reason={reason or None}"
+    )
+    return head, body, pro
+
+
+def _ans_system_health(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    failed = int(f.get("failed_count") or 0)
+    stale_feeds = int(f.get("stale_feeds") or 0)
+    delivery_ok = f.get("alert_delivery_ok")
+    recent = f.get("recent_failures") or []
+
+    if failed == 0 and stale_feeds == 0:
+        head = "ℹ️ CHAD looks healthy."
+        body = ["No failed background jobs, and its key data feeds are all fresh."]
+    else:
+        head = "⚠️ A couple of things are worth a glance, but nothing urgent."
+        bits = []
+        if failed:
+            recent_units = ", ".join(humanize_name(r.get("unit")) for r in recent[:3])
+            bits.append(f"{failed} background job" + ("s" if failed != 1 else "") + f" hiccupped recently ({recent_units})")
+        if stale_feeds:
+            bits.append(f"{stale_feeds} data feed" + ("s" if stale_feeds != 1 else "") + " running behind")
+        body = ["; ".join(bits).capitalize() + "."]
+        body.append("These are set to self-heal; CHAD re-flags them only if they keep failing.")
+    if delivery_ok is False:
+        body.append("Note: the last alert may not have been delivered — worth checking the messaging service.")
+    elif delivery_ok is True:
+        body.append("Alerts are being delivered normally.")
+    body.append("No action needed unless you keep seeing the same thing.")
+    standard = None
+    if mode == "STANDARD":
+        standard = f"Checked: {len(recent)} recent failure record(s), key feeds' freshness, and last alert delivery."
+        body.append(standard)
+    pro = (
+        f"raw: failed_count={failed} stale_feeds={stale_feeds} "
+        f"alert_delivery_ok={delivery_ok} recent={[r.get('unit') for r in recent[:5]]}"
+    )
+    return head, body, pro
+
+
+def _ans_explain_last_alert(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    if not f.get("has_alert"):
+        head = "ℹ️ There are no recent alerts to explain."
+        body = ["CHAD hasn't raised anything lately — quiet is good.", "No action needed."]
+        return head, body, "raw: has_alert=false"
+    # Reuse CV1's alert voice for the actual body, then wrap with a lead-in.
+    artifact = f.get("artifact") or {}
+    inner = format_alert("service_failure", artifact, mode=mode)
+    head = "ℹ️ Here's the most recent alert, in plain English:"
+    body = [inner]
+    pro = f"raw: artifact_path={artifact.get('artifact_path', '?')}"
+    return head, body, pro
+
+
+def _ans_regime_and_roster(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    regime = str(f.get("regime") or "unknown")
+    allowed = f.get("active_now") or f.get("allowed") or []
+    halted = f.get("halted") or []
+    regime_word = {
+        "ranging": "range-bound / sideways",
+        "trending": "trending",
+        "volatile": "volatile / choppy",
+        "adverse": "adverse (stand-aside)",
+    }.get(regime.lower(), regime)
+
+    head = f"ℹ️ Right now the market reads as {regime_word}."
+    if allowed:
+        names = ", ".join(humanize_name(s) for s in allowed[:8])
+        body = [f"Strategies cleared to trade in this regime: {names}."]
+    else:
+        body = ["No strategies are cleared to trade in this regime — CHAD is standing aside."]
+    if halted:
+        h_txt = ", ".join(f"{humanize_name(h.get('strategy'))}" for h in halted[:5])
+        body.append(f"Benched for now (recent losing streaks): {h_txt}.")
+    body.append("No action needed — CHAD rotates these automatically as the market shifts.")
+    standard = None
+    if mode == "STANDARD":
+        conf = f.get("regime_confidence")
+        standard = f"Regime confidence is {_fmt_pct(conf) if conf is not None else 'n/a'}; roster follows the regime-activation matrix."
+        body.append(standard)
+    pro = (
+        f"raw: regime={regime} confidence={f.get('regime_confidence')} "
+        f"allowed={list(allowed)} halted={[h.get('strategy') for h in halted]}"
+    )
+    return head, body, pro
+
+
+def _ans_generic(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], Optional[str]]:
+    head = "ℹ️ I can tell you how CHAD is doing, why it paused, a position, its health, the last alert, or who's trading."
+    body = [
+        "Ask me something like “how are we doing?” or “why did CHAD stop?”",
+        "No action needed.",
+    ]
+    return head, body, "raw: intent=unknown"
+
+
+_ANSWER_TEMPLATES: Dict[str, Callable[[Dict[str, Any], str], Tuple[str, List[str], Optional[str]]]] = {
+    "status_overview": _ans_status_overview,
+    "why_paused": _ans_why_paused,
+    "why_blocked": _ans_why_paused,  # alias
+    "position_detail": _ans_position_detail,
+    "system_health": _ans_system_health,
+    "explain_last_alert": _ans_explain_last_alert,
+    "regime_and_roster": _ans_regime_and_roster,
+}
+
+
+def format_answer(intent: str, facts: Optional[Dict[str, Any]] = None, *, mode: Optional[str] = None) -> str:
+    """Render a read-only intent answer as a calm, plain-English coach message.
+
+    ``facts`` is produced by :mod:`chad.utils.coach_intents` (the read-only
+    intent layer). This function performs NO runtime reads — it only renders.
+    Staleness disclosure (the ``_stale`` / ``_stale_age_seconds`` / ``_stale_label``
+    keys) and PRO source citation (``_sources``) are handled uniformly here so
+    every intent obeys the CV2 staleness rule. Never raises.
+    """
+    facts = dict(facts or {})
+    active_mode = _norm_mode(mode) or resolve_mode()
+
+    try:
+        builder = _ANSWER_TEMPLATES.get(str(intent or "").strip().lower(), _ans_generic)
+        head, body, pro = builder(facts, active_mode)
+    except Exception as exc:  # never let presentation crash the bot
+        _LOG.warning("coach_voice_answer_failed intent=%s err=%s", intent, exc)
+        head, body, pro = _ans_generic(facts, active_mode)
+
+    lines: List[str] = [head] + [b for b in (body or []) if b]
+
+    # A source that could not be read is surfaced honestly (never faked).
+    if facts.get("_error"):
+        lines.append(
+            "⚠️ I couldn't read one of the underlying files, so this may be incomplete."
+        )
+
+    stale_line = _staleness_line(facts)
+    if stale_line:
+        lines.append(stale_line)
+
+    if active_mode == "PRO":
+        if pro:
+            lines.append(pro)
+        src = _sources_pro_line(facts)
+        if src:
+            lines.append(src)
+
+    text = "\n".join(ln.strip() for ln in lines if ln and ln.strip())
+    if active_mode != "PRO":
+        text = _scrub_codes(text)
+    return text
+
+
+# ── refusal path (zero-authority coach) ────────────────────────────────────────
+# topic key -> (what the coach can't do, what an operator would do instead)
+_REFUSAL_TOPICS: Dict[str, Tuple[str, str]] = {
+    "trade": (
+        "place, change, or close a trade",
+        "an operator does that in the broker/execution layer — I only read and explain.",
+    ),
+    "service": (
+        "start, stop, or restart any of CHAD's services",
+        "that's an operator action on the server; I don't control services.",
+    ),
+    "config": (
+        "change a setting, risk cap, or configuration",
+        "config changes go through a reviewed Pending Action that a human applies.",
+    ),
+    "go_live": (
+        "switch CHAD to live trading or flip its readiness flag",
+        "live activation is gated and operator-only — I can't set it.",
+    ),
+    "generic": (
+        "do that",
+        "actions like that are operator-only; I'm read-and-explain only.",
+    ),
+}
+
+
+def format_refusal(topic: Optional[str] = None, *, mode: Optional[str] = None, detail: Optional[str] = None) -> str:
+    """Render the polite, fixed refusal for an out-of-authority request.
+
+    The coach has zero execution authority: it interprets and presents only.
+    Any request to *act* (trade / service control / config / go-live) returns
+    this — 'I can tell you about it, but I can't do it' — with what an operator
+    would do instead. Never raises, never has side effects.
+    """
+    active_mode = _norm_mode(mode) or resolve_mode()
+    cant, instead = _REFUSAL_TOPICS.get(str(topic or "generic"), _REFUSAL_TOPICS["generic"])
+    lines = [
+        f"ℹ️ I can tell you about it, but I can't {cant}.",
+        f"I'm a read-only coach — {instead}",
+        "Happy to explain what's going on instead — just ask.",
+    ]
+    if active_mode == "PRO" and detail:
+        lines.append(f"raw: refused_topic={topic} matched={detail}")
+    text = "\n".join(lines)
+    if active_mode != "PRO":
+        text = _scrub_codes(text)
+    return text
+
+
+def format_mode_ack(mode: Any, ok: bool = True) -> str:
+    """Confirm a verbosity mode switch in the coach voice."""
+    m = _norm_mode(mode)
+    if not ok or not m:
+        return (
+            "ℹ️ I couldn't change how I talk just now, so I'll keep my current style.\n"
+            "You can try: 'talk simple', 'talk normal', or 'talk pro'."
+        )
+    disp = _MODE_DISPLAY.get(m, m.lower())
+    blurb = {
+        "SIMPLE": "plain and friendly, no jargon",
+        "STANDARD": "plain English with a bit more context",
+        "PRO": "detailed, with the raw numbers and sources",
+    }.get(m, "")
+    return (
+        f"ℹ️ Done — I'll talk in {disp} mode from now on ({blurb}).\n"
+        "Ask me anything, like 'how are we doing?'"
+    )
