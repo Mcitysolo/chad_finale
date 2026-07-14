@@ -964,6 +964,7 @@ def _ans_status_overview(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], 
     win_rate = f.get("win_rate")
     pnl = f.get("total_pnl")
     eff = f.get("effective_trades")
+    total = f.get("total_trades")
     n_pos = int(f.get("open_positions_count") or 0)
     fills = int(f.get("fills_today") or 0)
     drift = int(f.get("drift_count") or 0)
@@ -992,6 +993,21 @@ def _ans_status_overview(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], 
         perf_bits.append(f"{int(eff)} scored trades so far")
     if perf_bits:
         body.append("So far: " + ", ".join(perf_bits) + ".")
+    # COACH-TRUTH-FIX T1: the headline trade count is the canonical SCR
+    # effective_trades (the scoreable subset). The much larger raw paper
+    # rollup (total_trades) must NEVER be shown as "scored trades" — disclose
+    # the non-scoreable remainder explicitly so the two are never conflated.
+    not_scoreable = None
+    if total is not None and eff is not None:
+        try:
+            not_scoreable = max(0, int(total) - int(eff))
+        except (TypeError, ValueError):
+            not_scoreable = None
+    if not_scoreable:
+        body.append(
+            f"On top of that there are {not_scoreable:,} practice fills "
+            "(not yet scoreable) — those don't count toward the rating."
+        )
     # "Broker-confirmed" qualifies POSITIONS only; fills/drift are separate.
     pos_txt = (
         "no broker-confirmed open positions" if n_pos == 0
@@ -1010,8 +1026,8 @@ def _ans_status_overview(f: Dict[str, Any], mode: str) -> Tuple[str, List[str], 
         body.append(standard)
     pro = (
         f"raw: scr_state={scr_state} sizing_factor={sizing} win_rate={win_rate} "
-        f"total_pnl={pnl} effective_trades={eff} open_positions={n_pos} "
-        f"fills_today={fills} drift_count={drift}"
+        f"total_pnl={pnl} effective_trades={eff} total_trades={total} "
+        f"open_positions={n_pos} fills_today={fills} drift_count={drift}"
     )
     return head, body, pro
 

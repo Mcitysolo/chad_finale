@@ -273,6 +273,11 @@ def resolve_status_overview(now: datetime, root: Path) -> Dict[str, Any]:
             sharpe_like=st.get("sharpe_like"),
             total_pnl=st.get("total_pnl"),
             effective_trades=st.get("effective_trades"),
+            # Raw paper rollup (all finite trades). effective_trades is the
+            # scoreable SUBSET of this; the renderer discloses the remainder
+            # (total - effective) as "practice fills (not yet scoreable)" so
+            # the large raw count is never presented as scored trades.
+            total_trades=st.get("total_trades"),
         )
         sources.append(SourceRef("runtime/scr_state.json", "the performance snapshot", True, _age(scr.get("ts_utc"), now), _ttl(scr, _TTL_SCR)))
     else:

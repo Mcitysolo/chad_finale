@@ -261,6 +261,22 @@ def test_status_overview_facts_and_render(fresh_root):
     assert "2 fills" in msg
 
 
+def test_status_overview_headline_is_effective_not_raw_rollup(fresh_root):
+    # COACH-TRUTH-FIX T1: canonical SCR effective_trades (67) is the headline
+    # "scored trades" count; the raw paper rollup (total_trades=2216) must be
+    # disclosed as practice fills that are NOT scoreable — never as scored.
+    r = ci.resolve_intent("status_overview", {}, now=NOW, root=fresh_root)
+    assert r.facts["effective_trades"] == 67
+    assert r.facts["total_trades"] == 2216
+    msg = cv.format_answer("status_overview", r.facts, mode="SIMPLE")
+    assert "67 scored trades" in msg
+    # remainder = 2216 - 67 = 2149 practice fills, explicitly not scoreable
+    assert "2,149 practice fills" in msg
+    assert "not yet scoreable" in msg
+    # the raw rollup must NEVER be presented as scored trades
+    assert "2216 scored" not in msg and "2,216 scored" not in msg
+
+
 def test_status_overview_scr_pnl_not_currency_labeled(fresh_root):
     # Equity is honest CAD; the SCR raw paper P&L must carry NO currency label.
     r = ci.resolve_intent("status_overview", {}, now=NOW, root=fresh_root)
