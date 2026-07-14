@@ -65,7 +65,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from chad.core.live_execution_router import (
     build_live_signals,
@@ -984,6 +984,36 @@ def _normalize_broker_sync_symbol(symbol: str) -> str:
     return symbol
 
 
+def _fire_alert_safe(
+    kind: str,
+    fn: Callable[..., Any],
+    *args: Any,
+    logger: Optional[logging.Logger] = None,
+    **kwargs: Any,
+) -> bool:
+    """Deliver a hot-path Telegram alert without ever crashing the live loop.
+
+    P0A-A3: the stop-bus / drawdown / edge-decay alert sites previously wrapped
+    their sends in a bare ``except Exception: pass``, so a raising send (e.g. a
+    telegram config/transport error) was swallowed SILENTLY — the operator got
+    neither the alert nor any evidence the alert was lost. On 2026-07-13 a
+    mis-sized TLT flip fired and no alert reached the operator; a swallowed
+    send would have left no trace.
+
+    This helper keeps the loop fail-soft (alerting is supplementary and must
+    never propagate into trading) but logs LOUDLY on failure with the
+    greppable marker ``ALERT_DELIVERY_FAILED kind=<kind>`` so a lost alert is
+    auditable. Returns True iff the send completed without raising.
+    """
+    log = logger or logging.getLogger("chad.live_loop")
+    try:
+        fn(*args, **kwargs)
+        return True
+    except Exception as exc:  # noqa: BLE001 - alerting must never crash the loop
+        log.error("ALERT_DELIVERY_FAILED kind=%s err=%s", kind, exc)
+        return False
+
+
 def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     """
     Reconcile position_guard.json against actual broker positions.
@@ -1283,9 +1313,14 @@ def run_once(logger: logging.Logger) -> None:
                 _sb_reason = sb_result.get("reason") or ",".join(
                     str(t) for t in (sb_result.get("active_triggers") or [])
                 )
-                send_stop_bus_alert(_sb_reason or "stop_bus_triggered")
-            except Exception:
-                pass
+                _fire_alert_safe(
+                    "stop_bus", send_stop_bus_alert,
+                    _sb_reason or "stop_bus_triggered", logger=logger,
+                )
+            except Exception as _sb_alert_exc:  # noqa: BLE001 - import/setup guard
+                logger.error(
+                    "ALERT_DELIVERY_FAILED kind=stop_bus err=%s", _sb_alert_exc
+                )
             # Fall through to the single is_stop_bus_active early-return
             # below — it observes the just-persisted bus state and halts.
     except Exception as _sbt_err:  # noqa: BLE001
@@ -1402,10 +1437,18 @@ def run_once(logger: logging.Logger) -> None:
                         or 0
                     )
                     if _strat not in _EDGE_DECAY_ALERTED:
-                        send_edge_decay_alert(str(_strat), _losses)
+                        _fire_alert_safe(
+                            "edge_decay", send_edge_decay_alert,
+                            str(_strat), _losses, logger=logger,
+                        )
+                        # Mark alerted regardless of transport outcome so a
+                        # failed send does not busy-loop re-alerting every cycle
+                        # (the failure is already logged loudly by the helper).
                         _EDGE_DECAY_ALERTED.add(_strat)
-            except Exception:
-                pass
+            except Exception as _ed_alert_exc:  # noqa: BLE001 - import/setup guard
+                logger.error(
+                    "ALERT_DELIVERY_FAILED kind=edge_decay err=%s", _ed_alert_exc
+                )
         # Clear alert-tracking entries for strategies that are no longer
         # halted (operator cleared via scripts/clear_edge_decay.py),
         # so subsequent re-halts can re-alert.
@@ -2155,9 +2198,11 @@ def run_once(logger: logging.Logger) -> None:
         if _peak > 0 and _equity < _peak:
             _dd_pct = (_equity - _peak) / _peak * 100
             if _dd_pct <= -5.0:
-                send_drawdown_alert(_dd_pct, 5.0)
-    except Exception:
-        pass
+                _fire_alert_safe(
+                    "drawdown", send_drawdown_alert, _dd_pct, 5.0, logger=logger,
+                )
+    except Exception as _dd_alert_exc:  # noqa: BLE001 - import/setup guard
+        logger.error("ALERT_DELIVERY_FAILED kind=drawdown err=%s", _dd_alert_exc)
 
     # 2026-04-22 Audit-O fix: gate intents through the regime activation
     # matrix. Fail-open on any error — if the matrix is missing/malformed
