@@ -1,0 +1,5 @@
+{
+  "schema_version": "coach_voice.v1",
+  "mode": "SIMPLE",
+  "_comment": "Operator-editable Telegram coach-voice verbosity. mode is one of SIMPLE / STANDARD / PRO. SIMPLE (default) is calm plain English with no codes; STANDARD adds one context line; PRO appends a raw marker/metric line. Env override: CHAD_COACH_MODE. A fix to how alerts READ only — never changes what triggers them."
+}
