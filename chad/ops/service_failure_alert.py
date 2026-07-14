@@ -16,10 +16,21 @@ CLI:
       [--dry-run]
 
 Exit codes:
-    0 success
+    0 success (delivered OR intentionally dedupe-suppressed)
     2 unit name invalid / not a chad-* unit
     3 journal read failed (artifact still written)
-    4 telegram send failed (artifact still written)
+    4 telegram send genuinely failed — config or transport (artifact still written)
+
+Delivery auditability (schema v2)
+---------------------------------
+Every artifact records ``telegram_sent`` (bool), ``telegram_delivery_status``
+(sent / suppressed_dedupe / dry_run / config_error / transport_error /
+exception), and ``delivery_error`` (str|null). Prior to v2 a *successfully
+suppressed duplicate* alert (dedupe TTL) returned ``notify_returned_false`` and
+mapped to exit 4, latching the systemd handler into ``failed`` whenever a
+service flapped (root cause of the 2026-06-27 chad-ibkr-bar-provider latch).
+A suppressed duplicate is now exit 0 and only genuine config/transport failures
+exit 4.
 """
 
 from __future__ import annotations
@@ -34,7 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "service_failure_alert.v1"
+SCHEMA_VERSION = "service_failure_alert.v2"
 
 EXIT_OK = 0
 EXIT_INVALID_UNIT = 2
@@ -152,23 +163,44 @@ def _format_telegram_message(payload: dict[str, Any]) -> str:
     )
 
 
-def _send_telegram(payload: dict[str, Any], *, dry_run: bool) -> tuple[bool, str | None]:
+def _send_telegram(payload: dict[str, Any], *, dry_run: bool) -> tuple[bool, str | None, str]:
+    """Return (delivered, delivery_error, delivery_status).
+
+    ``delivered`` is True when the incident is considered handled at the
+    telegram layer: either the message was actually sent OR a recent identical
+    alert was intentionally dedupe-suppressed (both mean the operator is/was
+    notified). Only genuine config/transport failures return delivered=False,
+    which is what should drive EXIT_TELEGRAM_FAILED. A per-invocation
+    ``telegram_sent`` bool (message actually delivered *this* call) is derived
+    from ``delivery_status`` by the caller.
+    """
     message = _format_telegram_message(payload)
     if dry_run:
         print("=== DRY RUN: Telegram message that would be sent ===")
         print(message)
-        return True, None
+        return True, None, "dry_run"
     try:
-        from chad.utils.telegram_notify import notify  # local import: optional dep
+        from chad.utils.telegram_notify import notify_detailed  # local import: optional dep
 
-        ok = notify(
+        outcome = notify_detailed(
             message,
             severity="critical",
             dedupe_key=f"service_failure:{payload['failed_unit']}",
         )
-        return bool(ok), None if ok else "notify_returned_false"
     except Exception as exc:
-        return False, f"telegram_exception:{type(exc).__name__}:{exc}"
+        # Import failure or an unexpected defect in the notifier itself.
+        return False, f"telegram_exception:{type(exc).__name__}:{exc}", "exception"
+
+    status = outcome.status.value
+    if outcome.sent:
+        return True, None, status
+    if outcome.suppressed:
+        # A recent identical alert for this unit already delivered within the
+        # dedupe TTL — a successful no-op, NOT a delivery failure. This is the
+        # v1 defect: a flapping service latched the handler FAILED here.
+        return True, None, status
+    # config_error / transport_error / empty_message — a genuine failure.
+    return False, outcome.error, status
 
 
 def _artifact_path_for_payload(artifact_path: Path) -> str:
@@ -241,16 +273,30 @@ def run(
     )
     write_artifact(payload, artifact_path)
 
-    telegram_ok, telegram_err = _send_telegram(payload, dry_run=dry_run)
+    telegram_ok, telegram_err, delivery_status = _send_telegram(payload, dry_run=dry_run)
+
+    # v2 delivery-audit fields (recorded for EVERY incident, not just failures):
+    #   telegram_sent           — a message was actually delivered THIS invocation
+    #   telegram_delivery_status — sent / suppressed_dedupe / dry_run / config_error /
+    #                              transport_error / exception / empty_message
+    #   delivery_error          — error text, or null on success/suppression
+    payload["telegram_sent"] = bool(delivery_status == "sent")
+    payload["telegram_delivery_status"] = delivery_status
+    payload["delivery_error"] = telegram_err
+    # Back-compat: keep telegram_error populated on genuine failures only.
+    if not telegram_ok and not dry_run:
+        payload["telegram_error"] = telegram_err
 
     exit_code = EXIT_OK
     if journal_error is not None:
         exit_code = EXIT_JOURNAL_FAILED
+    # EXIT_TELEGRAM_FAILED only on a GENUINE delivery failure — never on a
+    # dedupe-suppressed duplicate (delivered=True), which is the v1 latch bug.
     if not telegram_ok and not dry_run:
         exit_code = EXIT_TELEGRAM_FAILED
-        payload["telegram_error"] = telegram_err
-        # rewrite artifact with the error annotation
-        write_artifact(payload, artifact_path)
+
+    # Rewrite the artifact so the delivery-audit fields are always persisted.
+    write_artifact(payload, artifact_path)
 
     return AlertResult(artifact_path=artifact_path, payload=payload, exit_code=exit_code)
 

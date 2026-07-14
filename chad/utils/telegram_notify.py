@@ -44,6 +44,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -64,6 +65,54 @@ class NotifyConfig:
 
 class NotifyError(RuntimeError):
     pass
+
+
+class DeliveryStatus(str, Enum):
+    """Disposition of a single notify attempt.
+
+    The historical ``notify() -> bool`` collapsed FOUR distinct outcomes onto
+    ``False`` (config error, empty message, dedupe suppression, transport
+    failure). That conflation is exactly what latched
+    ``chad-service-alert@*`` into systemd ``failed`` on 2026-06-27: a flapping
+    service fired ``OnFailure`` repeatedly, the FIRST alert delivered, and every
+    duplicate WITHIN the 15-minute dedupe TTL returned ``False`` — which the
+    caller mapped to ``EXIT_TELEGRAM_FAILED`` (exit 4). A *successfully
+    suppressed duplicate* is NOT a delivery failure; this enum lets callers tell
+    the difference.
+    """
+
+    SENT = "sent"                          # message delivered to Telegram
+    SUPPRESSED_DEDUPE = "suppressed_dedupe"  # recent duplicate; intentionally not sent
+    EMPTY_MESSAGE = "empty_message"        # nothing to send
+    CONFIG_ERROR = "config_error"          # missing/invalid env (handler misconfig)
+    TRANSPORT_ERROR = "transport_error"    # HTTP/network failure after retries
+
+
+@dataclass(frozen=True)
+class NotifyOutcome:
+    """Structured result of :func:`notify_detailed`."""
+
+    status: DeliveryStatus
+    error: Optional[str] = None
+
+    @property
+    def sent(self) -> bool:
+        return self.status is DeliveryStatus.SENT
+
+    @property
+    def suppressed(self) -> bool:
+        return self.status is DeliveryStatus.SUPPRESSED_DEDUPE
+
+    @property
+    def failed(self) -> bool:
+        """True only for genuine delivery failures (config or transport).
+
+        Dedupe suppression and empty messages are NOT failures.
+        """
+        return self.status in (
+            DeliveryStatus.CONFIG_ERROR,
+            DeliveryStatus.TRANSPORT_ERROR,
+        )
 
 
 def _env(name: str) -> str:
@@ -175,21 +224,28 @@ def _post_send_message(cfg: NotifyConfig, *, text: str) -> Tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def notify(
+def notify_detailed(
     message: str,
     *,
     severity: str = "info",
     dedupe_key: Optional[str] = None,
-    raise_on_fail: bool = False,
-) -> bool:
-    """
-    Send a Telegram alert. Returns True if sent, False if suppressed or failed.
+) -> NotifyOutcome:
+    """Send a Telegram alert and return a structured :class:`NotifyOutcome`.
 
-    - severity is used only for message prefixing.
-    - dedupe_key suppresses repeats within TELEGRAM_NOTIFY_DEDUPE_TTL_SECONDS.
-    - raise_on_fail makes this raise NotifyError on failures (default False).
+    Unlike :func:`notify` (which returns a bare bool), this distinguishes the
+    four ways a send can *not* deliver: a config error (missing/invalid env),
+    an empty message, a dedupe suppression (a recent identical alert already
+    went out — NOT a failure), and a transport/HTTP failure after retries.
+
+    Never raises: config errors are reported via ``DeliveryStatus.CONFIG_ERROR``
+    rather than propagated, so a caller can audit the disposition instead of
+    crashing. (The legacy :func:`notify` wrapper re-raises to preserve its
+    historical contract.)
     """
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except NotifyError as exc:
+        return NotifyOutcome(DeliveryStatus.CONFIG_ERROR, str(exc))
 
     sev = str(severity).strip().lower() or "info"
     prefix = {
@@ -202,7 +258,7 @@ def notify(
 
     raw_message = str(message).strip()
     if not raw_message:
-        return False
+        return NotifyOutcome(DeliveryStatus.EMPTY_MESSAGE, "empty_message")
 
     # Preserve already-formatted operator-facing messages as-is.
     # Example: "ℹ️ CHAD Daily Update"
@@ -211,9 +267,10 @@ def notify(
     else:
         text = f"{prefix} CHAD {sev.upper()}: {raw_message}"
 
-    if dedupe_key:
-        if not _dedupe_allows(cfg, dedupe_key):
-            return False
+    if dedupe_key and not _dedupe_allows(cfg, dedupe_key):
+        # A recent identical alert already delivered within the TTL window.
+        # This is a successful no-op, NOT a delivery failure.
+        return NotifyOutcome(DeliveryStatus.SUPPRESSED_DEDUPE, None)
 
     # Retry with exponential backoff + jitter
     attempt = 0
@@ -223,19 +280,49 @@ def notify(
         if ok:
             if dedupe_key:
                 _dedupe_mark(dedupe_key)
-            return True
+            return NotifyOutcome(DeliveryStatus.SENT, None)
 
         last_err = err
         if attempt >= cfg.max_retries:
-            if raise_on_fail:
-                raise NotifyError(f"Telegram notify failed after retries: {last_err}")
-            return False
+            return NotifyOutcome(DeliveryStatus.TRANSPORT_ERROR, last_err)
 
         # backoff: 0.35, 0.7, 1.4, ... + jitter
         base = 0.35 * (2 ** attempt)
         sleep_s = base + random.random() * 0.25
         time.sleep(min(5.0, float(sleep_s)))
         attempt += 1
+
+
+def notify(
+    message: str,
+    *,
+    severity: str = "info",
+    dedupe_key: Optional[str] = None,
+    raise_on_fail: bool = False,
+) -> bool:
+    """
+    Send a Telegram alert. Returns True if sent, False if suppressed or failed.
+
+    - severity is used only for message prefixing.
+    - dedupe_key suppresses repeats within TELEGRAM_NOTIFY_DEDUPE_TTL_SECONDS.
+    - raise_on_fail makes this raise NotifyError on transport failures.
+
+    Behaviour is unchanged from the pre-``notify_detailed`` implementation: a
+    missing/invalid config raises ``NotifyError`` (historical contract), an
+    empty or dedupe-suppressed message returns ``False`` without raising, and a
+    transport failure returns ``False`` (or raises when ``raise_on_fail``).
+    Callers that need to distinguish suppression from failure — notably the
+    service-failure alert handler — should use :func:`notify_detailed`.
+    """
+    outcome = notify_detailed(message, severity=severity, dedupe_key=dedupe_key)
+    if outcome.status is DeliveryStatus.CONFIG_ERROR:
+        # Historical contract: load_config() raised out of notify().
+        raise NotifyError(outcome.error or "notify config error")
+    if outcome.sent:
+        return True
+    if outcome.status is DeliveryStatus.TRANSPORT_ERROR and raise_on_fail:
+        raise NotifyError(f"Telegram notify failed after retries: {outcome.error}")
+    return False
 
 
 # =============================================================================

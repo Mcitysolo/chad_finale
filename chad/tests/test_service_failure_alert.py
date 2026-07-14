@@ -29,7 +29,9 @@ def _stub_systemctl(monkeypatch, value: str = "failed") -> None:
     monkeypatch.setattr(sfa, "_systemctl_active", lambda unit: value)
 
 
-def test_payload_schema_version_v1(monkeypatch, tmp_path):
+def test_payload_schema_version_v2(monkeypatch, tmp_path):
+    # P0A-A1: schema bumped v1 -> v2 (adds telegram_sent / telegram_delivery_status /
+    # delivery_error so per-incident delivery is auditable).
     _stub_journal_ok(monkeypatch)
     _stub_systemctl(monkeypatch)
     res = sfa.run(
@@ -40,7 +42,7 @@ def test_payload_schema_version_v1(monkeypatch, tmp_path):
         dry_run=True,
         artifact_dir=tmp_path,
     )
-    assert res.payload["schema_version"] == "service_failure_alert.v1"
+    assert res.payload["schema_version"] == "service_failure_alert.v2"
     assert res.exit_code == sfa.EXIT_OK
 
 
