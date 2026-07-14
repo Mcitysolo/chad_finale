@@ -1059,10 +1059,42 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     for key, entry in list(guard_state.items()):
         if str(key).startswith("_") or not isinstance(entry, dict):
             continue
+        symbol = entry.get("symbol", "")
+        broker_flat = bool(symbol) and (
+            _normalize_broker_sync_symbol(symbol) not in broker_symbols
+        )
+        is_broker_sync = isinstance(key, str) and key.startswith("broker_sync|")
+
+        if is_broker_sync:
+            # A6 (INCIDENT-0713 root cause): broker_sync entries must ALWAYS
+            # mirror the CURRENT broker position — qty AND sign — never a stale
+            # trade-history value. The drift reader
+            # (detect_guard_vs_broker_drift_v2) reads the recorded broker_sync
+            # `quantity` REGARDLESS of the `open` flag, so a broker_sync entry
+            # left with its historical quantity after the broker went flat is
+            # read as live broker truth (broker_sync|TLT retained SELL 1340
+            # against a flat broker; drift read broker -1340, a phantom short).
+            # For any broker_sync symbol the broker no longer holds, force
+            # quantity -> 0 so downstream readers see flat. This runs
+            # regardless of the `open` flag, so an ALREADY-closed-but-stale
+            # entry is repaired too. Symbols the broker DOES hold are refreshed
+            # to current qty/side by the loop below.
+            if broker_flat:
+                stale_qty = abs(float(entry.get("quantity", 0) or 0)) > 1e-9
+                if entry.get("open") or stale_qty:
+                    entry["open"] = False
+                    entry["quantity"] = 0.0
+                    entry["closed_by"] = "broker_truth_rebuild"
+                    entry["source"] = "broker_truth_rebuild"
+                    corrections_closed += 1
+            continue
+
+        # Non-broker_sync strategy entries: close (only) the OPEN ones the
+        # broker no longer holds. Their `quantity` is CHAD attribution history
+        # and is left intact — only the open flag flips.
         if not entry.get("open"):
             continue
-        symbol = entry.get("symbol", "")
-        if symbol and _normalize_broker_sync_symbol(symbol) not in broker_symbols:
+        if broker_flat:
             entry["open"] = False
             entry["closed_by"] = "broker_truth_rebuild"
             corrections_closed += 1
