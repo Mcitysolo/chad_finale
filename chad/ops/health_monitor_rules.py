@@ -42,9 +42,13 @@ _FEED_PUBLISHER_MAP = {
 }
 
 # SS01: feeds whose staleness must degrade to NOTIFY_ONLY rather than a
-# service restart, because the only available publisher is a trading engine.
+# service restart, because the only available publisher is a trading engine
+# (regime_state) OR because the feed has no scheduled runner at all to restart
+# (var_state — ops/var_publisher.py has no systemd service/timer, which is why
+# var_state.json froze on 2026-05-07; A4 freshness guard).
 _FEED_NOTIFY_ONLY = {
     "regime_state.json",
+    "var_state.json",
 }
 
 @dataclass
@@ -141,6 +145,10 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
         ("reconciliation_state.json", 480),
         ("choppy_regime_state.json", 900),
         ("macro_state.json", 7200),
+        # A4: report-only VaR state. NOTIFY_ONLY (see _FEED_NOTIFY_ONLY) — flags
+        # a WARNING at 2×TTL (48h) so a dead VaR publisher is surfaced rather
+        # than silently scraped as a healthy "ok" VaR by metrics_server.
+        ("var_state.json", 86400),
     ]
     for fname, ttl in feeds:
         age = _age(RUNTIME / fname)
@@ -166,7 +174,8 @@ def rule_feed_freshness(findings: List[Finding]) -> None:
                     description=(
                         f"{fname} is {int(age)}s old — more than 2× TTL. "
                         "Auto-restart suppressed: publisher is a trading "
-                        "engine. Operator investigation required."
+                        "engine or has no scheduled runner. Operator "
+                        "investigation required."
                     ),
                     remedy_type="NOTIFY_ONLY",
                     remedy_action="notify",

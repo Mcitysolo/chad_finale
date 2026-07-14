@@ -67,6 +67,13 @@ DEFAULT_PORT = int(os.environ.get("CHAD_METRICS_PORT", "9620"))
 DEFAULT_DAYS_BACK = int(os.environ.get("CHAD_METRICS_DAYS_BACK", "7"))
 DEFAULT_MAX_TRADES = int(os.environ.get("CHAD_METRICS_MAX_TRADES", "5000"))
 
+# A4/GAP-VAR-STALE: default TTL for var_state.json freshness. Before this guard,
+# metrics_server exported chad_var_status_ok=1 purely from the file's `status`
+# field, so a var_state.json frozen since 2026-05-07 (publisher dead ~66 days)
+# was scraped as a healthy "ok" VaR. Beyond this TTL the VaR is exported as
+# stale (chad_var_status_ok=0, chad_var_stale=1) regardless of `status`.
+DEFAULT_VAR_STATE_TTL_SECONDS = 86400  # 24h
+
 TRADE_FILE_GLOB = "trade_history_*.ndjson"
 
 
@@ -488,9 +495,44 @@ def _redis_lines() -> List[MetricLine]:
     return out
 
 
-def _var_drawdown_lines() -> List[MetricLine]:
+def _var_state_ttl_seconds() -> int:
+    """VaR-state freshness TTL (seconds); env override CHAD_VAR_STATE_TTL_SECONDS."""
+    raw = os.environ.get("CHAD_VAR_STATE_TTL_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_VAR_STATE_TTL_SECONDS
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_VAR_STATE_TTL_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_VAR_STATE_TTL_SECONDS
+
+
+def _compute_state_staleness(
+    obj: Dict[str, Any], *, now: datetime, ttl_s: int
+) -> Tuple[Optional[float], bool]:
+    """Return (age_seconds, is_stale) for a runtime state dict via its ``ts_utc``.
+
+    Fail-closed: a missing OR unparseable ``ts_utc`` is treated as STALE (we
+    cannot prove freshness), returning ``(None, True)``. A future-dated stamp
+    (clock skew) yields a negative age and is treated as fresh.
+    """
+    ts_raw = str(obj.get("ts_utc") or "").strip()
+    if not ts_raw:
+        return None, True
+    try:
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None, True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age = (now - dt).total_seconds()
+    return age, age > float(ttl_s)
+
+
+def _var_drawdown_lines(now: Optional[datetime] = None) -> List[MetricLine]:
     """Report-only VaR + drawdown gauges sourced from runtime state files (GAP-015A/016A)."""
     out: List[MetricLine] = []
+    now = now or _utc_now()
 
     var_obj = _read_json_file(RUNTIME_VAR_STATE_PATH) or {}
     var_status = str(var_obj.get("status") or "missing").lower()
@@ -498,11 +540,29 @@ def _var_drawdown_lines() -> List[MetricLine]:
     var_99 = _coerce_float(var_obj.get("var_99_1day_usd", 0.0), 0.0)
     var_pct = _coerce_float(var_obj.get("var_pct_of_equity", 0.0), 0.0)
     var_symbols = _coerce_float(var_obj.get("symbol_count", 0.0), 0.0)
+    # A4: staleness guard. Even a status=="ok" var_state is exported as NOT-ok
+    # once it is older than the TTL (default 24h) — a frozen publisher must not
+    # masquerade as a healthy VaR. A missing var_state (empty dict) has no
+    # ts_utc -> treated as stale, but chad_var_status_ok was already 0 for it.
+    var_present = bool(var_obj)
+    var_ttl_s = _var_state_ttl_seconds()
+    var_age, var_stale = _compute_state_staleness(var_obj, now=now, ttl_s=var_ttl_s)
+    var_ok = (var_status == "ok") and not var_stale
     out.append(MetricLine("chad_var_95_1day_usd", {}, _finite_or_zero(var_95)))
     out.append(MetricLine("chad_var_99_1day_usd", {}, _finite_or_zero(var_99)))
     out.append(MetricLine("chad_var_pct_of_equity", {}, _finite_or_zero(var_pct)))
     out.append(MetricLine("chad_var_symbol_count", {}, _finite_or_zero(var_symbols)))
-    out.append(MetricLine("chad_var_status_ok", {}, 1.0 if var_status == "ok" else 0.0))
+    out.append(MetricLine("chad_var_status_ok", {}, 1.0 if var_ok else 0.0))
+    # chad_var_stale=1 iff a var_state is present but past TTL (a missing file is
+    # reported by chad_var_status_ok=0, not as "stale").
+    out.append(MetricLine("chad_var_stale", {}, 1.0 if (var_present and var_stale) else 0.0))
+    out.append(MetricLine("chad_var_ttl_seconds", {}, float(var_ttl_s)))
+    out.append(
+        MetricLine(
+            "chad_var_age_seconds", {},
+            _finite_or_zero(var_age) if var_age is not None else -1.0,
+        )
+    )
 
     dd_obj = _read_json_file(RUNTIME_DRAWDOWN_STATE_PATH) or {}
     dd_status = str(dd_obj.get("status") or "missing").lower()
