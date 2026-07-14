@@ -256,6 +256,40 @@ def _notify(message: str, severity: str = "info",
         logger.warning("Telegram notify failed: %s", e)
 
 
+def _coach_finding_message(finding, remedy_result: str = "") -> str:
+    """Render a health-monitor Finding through the COACH-VOICE layer (U3).
+
+    Returns the calm plain-English message, or "" on any failure so the caller
+    falls back to its legacy machine-formatted text. Presentation only — the
+    Finding fields, dedupe key, and remediation decision are all unchanged.
+    """
+    try:
+        from chad.utils.coach_voice import (
+            format_alert, kind_for_finding, facts_from_finding,
+        )
+        kind = kind_for_finding(finding)
+        result = remedy_result if finding.remedy_action != "notify" else None
+        facts = facts_from_finding(finding, remedy_result=result)
+        text = format_alert(kind, facts)
+        return text if isinstance(text, str) and text.strip() else ""
+    except Exception as e:  # never let presentation block an alert
+        logger.warning("coach_voice_unavailable rule=%s err=%s",
+                       getattr(finding, "rule_id", "?"), e)
+        return ""
+
+
+def _coach_analysis_message(analysis: str) -> str:
+    """Render the Claude health-analysis narrative through COACH-VOICE (U3).
+    Returns "" on any failure so the caller falls back to legacy text."""
+    try:
+        from chad.utils.coach_voice import format_alert
+        text = format_alert("health_analysis", {"analysis": analysis})
+        return text if isinstance(text, str) and text.strip() else ""
+    except Exception as e:
+        logger.warning("coach_voice_unavailable kind=health_analysis err=%s", e)
+        return ""
+
+
 def run_monitor(dry_run: bool = False) -> None:
     """Main monitor loop — one execution cycle."""
     start = time.time()
@@ -293,18 +327,23 @@ def run_monitor(dry_run: bool = False) -> None:
     if not dry_run:
         # Send one message per critical finding with its remedy result
         for finding, result in remediation_results:
-            if finding.remedy_action == "notify":
-                # Pure notification — no auto-fix
-                msg = (f"{'🚨' if finding.severity == 'CRITICAL' else '⚠️'} "
-                       f"HEALTH MONITOR [{finding.severity}]\n"
-                       f"{finding.title}\n"
-                       f"{finding.description}\n"
-                       f"Evidence: {finding.evidence}")
-            else:
-                # Auto-fixed — report what was done
-                msg = (f"🔧 AUTO-FIXED [{finding.severity}]\n"
-                       f"{finding.title}\n"
-                       f"Action: {result}")
+            # COACH-VOICE-L1 U3: compose the operator message in the calm
+            # plain-English coach voice. Falls back to the legacy machine text
+            # if the coach layer is unavailable. Dedupe key below is unchanged.
+            msg = _coach_finding_message(finding, result)
+            if not msg:
+                if finding.remedy_action == "notify":
+                    # Pure notification — no auto-fix
+                    msg = (f"{'🚨' if finding.severity == 'CRITICAL' else '⚠️'} "
+                           f"HEALTH MONITOR [{finding.severity}]\n"
+                           f"{finding.title}\n"
+                           f"{finding.description}\n"
+                           f"Evidence: {finding.evidence}")
+                else:
+                    # Auto-fixed — report what was done
+                    msg = (f"🔧 AUTO-FIXED [{finding.severity}]\n"
+                           f"{finding.title}\n"
+                           f"Action: {result}")
             _notify(msg,
                     severity="critical" if finding.severity == "CRITICAL"
                     else "warning",
@@ -312,8 +351,13 @@ def run_monitor(dry_run: bool = False) -> None:
 
         # Send Claude analysis if it found something new
         if claude_analysis and "SYSTEM HEALTHY" not in claude_analysis:
+            # COACH-VOICE-L1 U3: route through the coach voice; fall back to the
+            # legacy narrative header if the coach layer is unavailable.
+            analysis_msg = _coach_analysis_message(claude_analysis) or (
+                f"🤖 CHAD AI HEALTH ANALYSIS\n{claude_analysis}"
+            )
             _notify(
-                f"🤖 CHAD AI HEALTH ANALYSIS\n{claude_analysis}",
+                analysis_msg,
                 severity="warning",
                 dedupe_key="health_claude_analysis",
             )

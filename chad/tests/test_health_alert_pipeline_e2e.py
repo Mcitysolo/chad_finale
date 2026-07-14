@@ -21,11 +21,19 @@ ops/pending_actions/HEALTH_ALERT_PIPELINE_operational_2026-05-28.md
 NOTE on the dispatcher's actual behaviour (verified against source):
 health_monitor.run_monitor() calls _notify() for EVERY finding. The
 finding's remedy_action selects the *message shape* — a pure
-"HEALTH MONITOR" notification when remedy_action == "notify", or a
-"🔧 AUTO-FIXED" report otherwise — but the notify() call itself is
-unconditional. test_finding_without_notify_action_uses_autofix_branch
-documents that real two-branch behaviour rather than asserting (falsely)
-that non-notify findings skip Telegram.
+notification when remedy_action == "notify", or an auto-fix report
+otherwise — but the notify() call itself is unconditional.
+test_finding_without_notify_action_uses_autofix_branch documents that
+real two-branch behaviour rather than asserting (falsely) that non-notify
+findings skip Telegram.
+
+COACH-VOICE-L1 U3: the message text is now composed by
+chad.utils.coach_voice (calm plain-English coach voice). The notify-vs-
+auto-fix branch is preserved — it selects the coach *kind*
+(``health_finding`` vs ``health_autofix``) — so these tests assert the
+coach-voice wording rather than the retired "HEALTH MONITOR" /
+"🔧 AUTO-FIXED" machine strings. Dispatch, call-count, severity, and
+dedupe behaviour are unchanged.
 """
 from __future__ import annotations
 
@@ -86,27 +94,34 @@ def test_finding_with_notify_action_calls_telegram(monkeypatch):
     _, kwargs = notify_mock.call_args
     # CRITICAL findings map to severity="critical" in the dispatcher.
     assert kwargs.get("severity") == "critical"
-    # Pure-notification message shape (no auto-fix wording).
+    # Pure-notification message shape (coach voice, health_finding kind — no
+    # auto-fix wording). U3: the retired "HEALTH MONITOR"/"[CRITICAL]" machine
+    # strings are replaced by the calm coach voice.
     message = notify_mock.call_args.args[0]
-    assert "HEALTH MONITOR" in message
-    assert "[CRITICAL]" in message
+    assert message.startswith("\U0001f6a8")   # 🚨 for a CRITICAL finding
+    assert "self-check flagged" in message     # health_finding wording
+    assert "No action needed" in message       # the four-question action line
+    assert "spotted and fixed" not in message  # NOT the auto-fix branch
 
 
 # ── Test 2 — non-notify finding takes the AUTO-FIXED branch ────────────────────
 
 def test_finding_without_notify_action_uses_autofix_branch(monkeypatch):
     """A finding whose remedy_action != "notify" still dispatches (the monitor
-    reports what it auto-fixed), but via the "🔧 AUTO-FIXED" message branch,
-    NOT the pure "HEALTH MONITOR" notification branch. This faithfully
+    reports what it auto-fixed), but via the auto-fix coach kind
+    (``health_autofix``), NOT the pure-notification kind. This faithfully
     documents the real dispatcher: notify() fires for every finding;
-    remedy_action only selects the message shape."""
+    remedy_action only selects the message shape. U3: the coach voice replaces
+    the retired "🔧 AUTO-FIXED"/"HEALTH MONITOR" machine strings."""
     finding = _make_finding(severity="WARNING", remedy_action="restart_service")
     notify_mock = _run_dispatcher_once(monkeypatch, finding)
 
     assert notify_mock.call_count == 1
     message = notify_mock.call_args.args[0]
-    assert "AUTO-FIXED" in message
-    assert "HEALTH MONITOR" not in message
+    assert message.startswith("⚠️")            # WARNING severity
+    assert "spotted and fixed" in message       # health_autofix wording
+    assert "No action needed" in message
+    assert "self-check flagged" not in message  # NOT the pure-notification branch
     _, kwargs = notify_mock.call_args
     assert kwargs.get("severity") == "warning"
 

@@ -145,6 +145,45 @@ def _systemctl_active(unit: str) -> str:
 
 
 def _format_telegram_message(payload: dict[str, Any]) -> str:
+    """Compose the operator-facing message.
+
+    COACH-VOICE-L1 U3: the message is rendered through the coach-voice
+    presentation layer (calm plain English, no codes in SIMPLE mode). This is
+    presentation only — the raw artifact JSON written to disk is unchanged, and
+    the delivery-audit fields (telegram_sent / telegram_delivery_status /
+    delivery_error) are derived from the notifier outcome, not from this text.
+    If the coach layer is unavailable, fall back to the legacy machine-formatted
+    message so the alert still delivers.
+    """
+    coached = _coach_message(payload)
+    return coached if coached else _legacy_telegram_message(payload)
+
+
+def _coach_message(payload: dict[str, Any]) -> str | None:
+    """Render this service-failure payload via chad.utils.coach_voice.
+
+    Returns None on any failure so the caller falls back to legacy text.
+    """
+    try:
+        from chad.utils.coach_voice import format_alert
+
+        facts = {
+            "failed_unit": payload.get("failed_unit", ""),
+            "severity": payload.get("severity", "HIGH"),
+            "active_unit_status": payload.get("active_unit_status", "unknown"),
+            "journal_tail": payload.get("journal_tail") or [],
+            "journal_error": payload.get("journal_error"),
+            "host": payload.get("host", ""),
+            "ts_utc": payload.get("ts_utc", ""),
+            "artifact_path": payload.get("artifact_path", ""),
+        }
+        text = format_alert("service_failure", facts)
+        return text if isinstance(text, str) and text.strip() else None
+    except Exception:
+        return None
+
+
+def _legacy_telegram_message(payload: dict[str, Any]) -> str:
     sev = payload.get("severity", "HIGH")
     icon = {"HIGH": "🚨", "MEDIUM": "⚠️", "LOW": "ℹ️"}.get(sev, "🚨")
     head = (

@@ -352,6 +352,23 @@ def _send_raw_telegram(text: str, *, dedupe_key: Optional[str] = None) -> bool:
         return False
 
 
+def _coach_format(kind: str, facts: dict) -> Optional[str]:
+    """Render an operator alert through the COACH-VOICE presentation layer.
+
+    Returns the calm plain-English message, or ``None`` on ANY failure so the
+    caller falls back to its legacy machine-formatted text. This keeps the
+    coach layer strictly presentation-only: it never changes dedupe keys,
+    delivery, or whether an alert fires — only how it reads. (COACH-VOICE-L1 U3)
+    """
+    try:
+        from chad.utils.coach_voice import format_alert
+        text = format_alert(kind, facts)
+        return text if isinstance(text, str) and text.strip() else None
+    except Exception as exc:  # never let presentation break alert delivery
+        _NOTIFY_LOGGER.warning("coach_voice_unavailable kind=%s err=%s", kind, exc)
+        return None
+
+
 def send_trade_alert(
     symbol: str,
     side: str,
@@ -469,9 +486,14 @@ def check_and_send_scr_milestone(current_state: str, effective_trades: int) -> b
 
 
 def send_stop_bus_alert(reason: str) -> bool:
-    """Telegram alert when the STOP bus trips — all trading halted."""
+    """Telegram alert when the STOP bus trips — all trading halted.
+
+    Message composed by the COACH-VOICE layer (U3); dedupe key unchanged. The
+    legacy machine-formatted text is kept as a hard fallback if the coach layer
+    is ever unavailable, so alert delivery is never lost.
+    """
     try:
-        msg = (
+        msg = _coach_format("stop_bus", {"reason": reason}) or (
             "\U0001f6d1 STOP BUS TRIGGERED\n"
             f"Reason: {reason or 'unspecified'}\n"
             "All trading halted. Check runtime/stop_bus.json"
@@ -483,9 +505,15 @@ def send_stop_bus_alert(reason: str) -> bool:
 
 
 def send_edge_decay_alert(strategy: str, consecutive_losses: int) -> bool:
-    """Telegram alert when a strategy is halted by the edge-decay monitor."""
+    """Telegram alert when a strategy is halted by the edge-decay monitor.
+
+    Message composed by the COACH-VOICE layer (U3); dedupe key unchanged.
+    """
     try:
-        msg = (
+        msg = _coach_format(
+            "edge_decay",
+            {"strategy": strategy, "consecutive_losses": consecutive_losses},
+        ) or (
             f"⚠️ EDGE DECAY — {strategy}\n"
             f"{consecutive_losses} consecutive losses. "
             "Strategy paused pending recovery."
@@ -497,9 +525,15 @@ def send_edge_decay_alert(strategy: str, consecutive_losses: int) -> bool:
 
 
 def send_drawdown_alert(drawdown_pct: float, threshold_pct: float) -> bool:
-    """Telegram alert when current drawdown breaches its threshold."""
+    """Telegram alert when current drawdown breaches its threshold.
+
+    Message composed by the COACH-VOICE layer (U3); dedupe key unchanged.
+    """
     try:
-        msg = (
+        msg = _coach_format(
+            "drawdown",
+            {"drawdown_pct": drawdown_pct, "threshold_pct": threshold_pct},
+        ) or (
             "\U0001f4c9 DRAWDOWN ALERT\n"
             f"Current drawdown: {drawdown_pct:.1f}%\n"
             f"Threshold: {threshold_pct:.1f}%"
