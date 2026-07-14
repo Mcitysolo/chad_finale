@@ -72,6 +72,7 @@ from telegram.ext import (
 )
 
 from chad.intel.advisory_engine import run_full_advisory
+from chad.utils import coach_intents, coach_voice
 
 
 # =============================================================================
@@ -1362,6 +1363,55 @@ def fake_args_context(context: CallbackContext, args: List[str]) -> CallbackCont
     return context
 
 
+def coach_conversational_reply(update: Update, context: CallbackContext, text: str) -> bool:
+    """COACH-VOICE-L2 conversational coach.
+
+    Maps a natural-language message to a STRICT ALLOW-LIST of read-only intents
+    and answers in the calm coach voice; refuses any out-of-authority *action*
+    request ("I can tell you about it, but I can't do it"); or switches
+    verbosity. Returns True if it handled the message, False to defer to the
+    legacy keyword routing below.
+
+    Authority: interpret-and-present only. It places no orders, controls no
+    services, mutates no config, and its ONLY write is the coach's own verbosity
+    file on an explicit mode switch. It makes no systemctl or broker calls. The
+    caller has already enforced the ``TELEGRAM_ALLOWED_CHAT_ID`` lockdown, so no
+    data reaches an unauthorized chat. Never raises.
+    """
+    try:
+        decision = coach_intents.route_message(text)
+    except Exception as exc:  # pragma: no cover - defensive; defer on any error
+        LOGGER.warning("coach_route_failed err=%s", exc)
+        return False
+
+    try:
+        if decision.kind == "refuse":
+            LOGGER.info("coach_refusal topic=%s text=%r", decision.refusal_topic, text)
+            send_message(update, context, coach_voice.format_refusal(decision.refusal_topic), html=False)
+            return True
+
+        if decision.kind == "mode_switch":
+            mode = decision.params.get("mode")
+            ok = coach_voice.set_config_mode(mode)
+            LOGGER.info("coach_mode_switch mode=%s ok=%s", mode, ok)
+            send_message(update, context, coach_voice.format_mode_ack(mode, ok), html=False)
+            return True
+
+        if decision.kind == "answer" and decision.intent:
+            LOGGER.info(
+                "coach_answer intent=%s source=%s params=%s",
+                decision.intent, decision.source, decision.params,
+            )
+            result = coach_intents.resolve_intent(decision.intent, decision.params)
+            send_message(update, context, coach_voice.format_answer(result.intent, result.facts), html=False)
+            return True
+    except Exception as exc:  # pragma: no cover - presentation must never crash the bot
+        LOGGER.warning("coach_reply_failed kind=%s err=%s", getattr(decision, "kind", "?"), exc)
+        return False
+
+    return False  # defer to legacy routing
+
+
 def handle_free_text(update: Update, context: CallbackContext) -> None:
     if not is_allowed(update):
         return
@@ -1373,6 +1423,12 @@ def handle_free_text(update: Update, context: CallbackContext) -> None:
         update.effective_user.id if update.effective_user else None,
         text,
     )
+
+    # COACH-VOICE-L2: conversational coach first. It answers read-only intents,
+    # refuses action requests, and switches verbosity; anything it does not own
+    # falls through to the legacy keyword routing below (price, advisory, etc.).
+    if coach_conversational_reply(update, context, text):
+        return
 
     route = nl_route(text)
     LOGGER.info("telegram_route_selected route=%s text=%r", route, text)
