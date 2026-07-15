@@ -1,0 +1,13 @@
+[Unit]
+Description=CHAD Exterminator Sentinel Timer (every 5 minutes)
+Documentation=file:///home/ubuntu/chad_finale/docs/EXTERMINATOR_SENTINEL_INSTALL.md
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=300
+AccuracySec=30s
+Persistent=true
+Unit=chad-exterminator-sentinel.service
+
+[Install]
+WantedBy=timers.target

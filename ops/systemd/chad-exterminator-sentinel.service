@@ -1,0 +1,34 @@
+[Unit]
+Description=CHAD Exterminator Sentinel — Stage 1 read-only scanner
+Documentation=file:///home/ubuntu/chad_finale/docs/EXTERMINATOR_SENTINEL_INSTALL.md
+After=network-online.target
+# Route this oneshot's own failures to the service-failure alert handler
+# (P0A-A2). A sentinel that dies silently is worse than no sentinel: the
+# operator would read "no fails reported" as "nothing is wrong".
+OnFailure=chad-service-alert@%N.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.ops.exterminator_sentinel
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-exterminator-sentinel
+
+# Stage 1 is read-only by design; these confine it by policy as well as by
+# code. The two paths it may write live under runtime/reports/.
+# NOTE: ReadWritePaths must exist before the unit starts, hence the
+# mkdir in the INSTALL doc.
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/chad_finale/runtime/reports
+PrivateTmp=true
+NoNewPrivileges=true
+
+# A scan must never wedge the timer.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
