@@ -984,6 +984,16 @@ def _normalize_broker_sync_symbol(symbol: str) -> str:
     return symbol
 
 
+def _skip_ib_connect() -> bool:
+    """True when CHAD_SKIP_IB_CONNECT suppresses the boot connect (pytest/preview).
+
+    In that mode a down API connection is expected, not a fault.
+    """
+    return os.environ.get("CHAD_SKIP_IB_CONNECT", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
 def _fire_alert_safe(
     kind: str,
     fn: Callable[..., Any],
@@ -1038,9 +1048,42 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
        broken entry as "repaired" vs "newly corrected".
     """
     import json
+    from chad.core.broker_position_sync import BrokerTruthUnavailable
     from chad.core.position_guard import _load_state, save_state
 
-    broker_positions = position_sync.fetch_positions()
+    # XOV-2345 fail-closed: an unreadable broker is UNKNOWN, never flat.
+    # fetch_positions() used to hand back ib_async's reset-empty position cache
+    # after a disconnect, and the close sweep below reads "no broker position
+    # for that symbol" as "broker is flat" — so a dead connection silently
+    # false-flatted EVERY guard entry (open=False), which in turn made
+    # load_open_positions() return {} and left the exit overlay evaluating
+    # nothing. Skipping the sweep preserves the last known guard truth; the
+    # marker + alert make the degradation loud.
+    try:
+        broker_positions = position_sync.fetch_positions()
+    except BrokerTruthUnavailable as exc:
+        if _skip_ib_connect():
+            logger.debug("BROKER_TRUTH_UNAVAILABLE (CHAD_SKIP_IB_CONNECT): %s", exc)
+            return
+        logger.error(
+            "BROKER_TRUTH_UNAVAILABLE detail=%s — guard rebuild SKIPPED; guard "
+            "state preserved (no false-flat). Broker truth is stale until the "
+            "IB API connection is restored.",
+            exc,
+        )
+        from chad.utils.telegram_notify import notify as _notify
+        _fire_alert_safe(
+            "broker_truth_unavailable",
+            _notify,
+            "CHAD could not read your positions from the broker, so it left the "
+            "position book exactly as it was rather than assuming everything had "
+            "closed. Exit checks are paused until the broker connection is back. "
+            "Nothing was bought or sold because of this.",
+            severity="critical",
+            logger=logger,
+        )
+        return
+
     guard_state = _load_state()
 
     # Collapse contract-month futures tickers ("MESM6") to their stable root
