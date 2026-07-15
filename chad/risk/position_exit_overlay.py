@@ -88,12 +88,21 @@ MARKER_SHADOW = "EXIT_OVERLAY_SHADOW"
 MARKER_SKIP = "EXIT_OVERLAY_SKIP_UNCONFIRMED"
 MARKER_ERROR = "EXIT_OVERLAY_ERROR"
 MARKER_ACTIVE = "EXIT_OVERLAY_ACTIVE_CLOSE"
+MARKER_HEARTBEAT = "EXIT_OVERLAY_HEARTBEAT"
 
 EVIDENCE_SCHEMA_VERSION = "exit_overlay.v1"
+HEARTBEAT_SCHEMA_VERSION = "exit_overlay_heartbeat.v1"
 CONFIG_SCHEMA_VERSION = "position_exit_overlay_config.v1"
 KILL_SWITCH_ENV = "CHAD_POSITION_EXIT_OVERLAY"
 
+# XOV-2345: the overlay's per-position markers/evidence are emitted only when it
+# HAS positions, so "evaluating nothing" and "not running at all" looked
+# identical for 16h. The heartbeat is written on EVERY cycle in EVERY mode
+# (including OFF and the error path) so a stalled watcher is always detectable
+# by freshness alone. TTL is deliberately generous vs the ~1min cycle.
+HEARTBEAT_TTL_SECONDS = 900
 _DEFAULT_EVIDENCE_SUBDIR = ("data", "exit_overlay")
+_DEFAULT_HEARTBEAT_RELPATH = ("runtime", "exit_overlay_heartbeat.json")
 _DEFAULT_STATE_RELPATH = ("runtime", "position_exit_overlay_state.json")
 
 # Asset classes this equity-scoped overlay acts on. Futures have their own exits
@@ -578,11 +587,13 @@ class PositionExitOverlay:
         open_positions_loader: OpenPositionsLoader,
         bars_loader: BarsLoader,
         price_loader: PriceLoader,
+        heartbeat_path: Optional[Path] = None,
         env: Optional[Mapping[str, str]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._config = config
         self._evidence_path = evidence_path
+        self._heartbeat_path = heartbeat_path
         self._state_path = state_path
         self._guard_loader = guard_loader
         self._open_positions_loader = open_positions_loader
@@ -597,9 +608,13 @@ class PositionExitOverlay:
 
     def run_cycle(self, paper_adapter: Any, *, now_utc: Optional[datetime] = None) -> ExitOverlayResult:
         mode = self.mode
-        if mode == MODE_OFF:
-            return ExitOverlayResult(evaluated=False)
         now = now_utc or datetime.now(timezone.utc)
+        if mode == MODE_OFF:
+            # Heartbeat even when OFF: "disabled" must stay distinguishable from
+            # "dead". Freshness proves the wiring still runs; `mode` explains why
+            # nothing is being evaluated.
+            self._safe_heartbeat(mode, now, evaluated=0, would_close=0, healthy=True)
+            return ExitOverlayResult(evaluated=False)
         try:
             guard_state = self._guard_loader() or {}
             open_positions = self._open_positions_loader() or {}
@@ -624,6 +639,7 @@ class PositionExitOverlay:
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
             self._safe_error(exc)
+            self._safe_heartbeat(mode, now, evaluated=0, would_close=0, healthy=False)
             return ExitOverlayResult(evaluated=False)
 
         # Observability (best-effort; a marker/evidence failure never affects submission).
@@ -631,6 +647,14 @@ class PositionExitOverlay:
             self._safe_marker(v, mode)
             self._safe_write_evidence(v)
         self._save_anchors(result.updated_anchors)
+        # XOV-2345: unconditional — evaluated=0 is exactly the state that used to
+        # be invisible (a live overlay whose position source had gone empty).
+        self._safe_heartbeat(
+            mode, now,
+            evaluated=len(result.verdicts),
+            would_close=len(result.close_intents),
+            healthy=True,
+        )
 
         # ACTIVE: submit reduce-only closes through the reconciler's proven path.
         if mode == MODE_ACTIVE and result.close_intents:
@@ -704,6 +728,47 @@ class PositionExitOverlay:
         except Exception:  # noqa: BLE001
             pass
 
+    def _safe_heartbeat(
+        self,
+        mode: str,
+        now: datetime,
+        *,
+        evaluated: int,
+        would_close: int,
+        healthy: bool,
+    ) -> None:
+        """Emit the once-per-cycle liveness proof. Best-effort; never raises.
+
+        Logs ``EXIT_OVERLAY_HEARTBEAT evaluated=N`` and atomically republishes
+        ``runtime/exit_overlay_heartbeat.json`` so health_monitor's freshness
+        rule (R14) can alert on a stalled overlay.
+        """
+        try:
+            self._log.info(
+                "%s evaluated=%d mode=%s would_close=%d healthy=%s",
+                MARKER_HEARTBEAT, evaluated, mode, would_close, healthy,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if self._heartbeat_path is None:
+            return
+        try:
+            payload = {
+                "schema_version": HEARTBEAT_SCHEMA_VERSION,
+                "ts_utc": _iso(now),
+                "ttl_seconds": HEARTBEAT_TTL_SECONDS,
+                "mode": mode,
+                "evaluated": int(evaluated),
+                "would_close": int(would_close),
+                "healthy": bool(healthy),
+            }
+            self._heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._heartbeat_path.with_suffix(self._heartbeat_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self._heartbeat_path)
+        except Exception:  # noqa: BLE001 - heartbeat persistence is best-effort
+            pass
+
     def _safe_write_evidence(self, verdict: ExitOverlayVerdict) -> None:
         path = self._resolve_evidence_path(verdict)
         if path is None:
@@ -758,6 +823,10 @@ def _reduce_only_reclamp(close_intents: List[Dict[str, Any]], guard_state: Mappi
 # --------------------------------------------------------------------------- #
 def default_evidence_dir(repo_root: Path) -> Path:
     return repo_root.joinpath(*_DEFAULT_EVIDENCE_SUBDIR)
+
+
+def default_heartbeat_path(repo_root: Path) -> Path:
+    return repo_root.joinpath(*_DEFAULT_HEARTBEAT_RELPATH)
 
 
 def _default_state_path(repo_root: Path) -> Path:
@@ -849,6 +918,7 @@ def build_default_overlay(
     config_path: Optional[Path] = None,
     evidence_dir: Optional[Path] = None,
     state_path: Optional[Path] = None,
+    heartbeat_path: Optional[Path] = None,
     env: Optional[Mapping[str, str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Optional["PositionExitOverlay"]:
@@ -891,9 +961,21 @@ def build_default_overlay(
     else:
         st = _default_state_path(repo_root)
 
+    if heartbeat_path is not None:
+        hb: Optional[Path] = heartbeat_path
+    elif _under_active_pytest():
+        raise RuntimeError(
+            f"{MARKER_ERROR} build_default_overlay: heartbeat_path is REQUIRED-explicit "
+            f"under pytest — pass heartbeat_path=tmp_path/... (never the real "
+            f"{default_heartbeat_path(repo_root)}). [exit-overlay test-write leak guard]"
+        )
+    else:
+        hb = default_heartbeat_path(repo_root)
+
     return PositionExitOverlay(
         config,
         evidence_path=ev,
+        heartbeat_path=hb,
         state_path=st,
         guard_loader=_default_guard_loader(),
         open_positions_loader=_default_open_positions_loader(),
