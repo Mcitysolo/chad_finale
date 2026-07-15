@@ -1131,6 +1131,99 @@ def rule_options_greeks_freshness(findings: List[Finding]) -> None:
         ))
 
 
+def rule_exit_overlay_heartbeat(findings: List[Finding]) -> None:
+    """R14 — the position exit overlay must never watch silently (XOV-2345).
+
+    Two distinct failures, because freshness alone is not enough:
+
+    (a) STALE/MISSING heartbeat — run_cycle stopped being called at all.
+    (b) FRESH heartbeat reporting evaluated=0 while the broker demonstrably
+        holds equity positions — the overlay is alive but its position source
+        has gone empty underneath it. This is the exact XOV-2345 signature: on
+        2026-07-14 a dead IB API connection false-flatted every guard entry, so
+        load_open_positions() returned {} and the overlay "ran" for 16h while
+        watching nothing. A heartbeat that only proved liveness would have
+        stayed green throughout — hence the cross-check against independent
+        broker truth (positions_snapshot.json, published by the collector).
+
+    NOTIFY_ONLY (SS01): the only publisher is chad-live-loop, a trading engine,
+    which health_monitor must never auto-restart.
+    """
+    hb_path = RUNTIME / "exit_overlay_heartbeat.json"
+    age = _age(hb_path)
+    if age is None:
+        findings.append(Finding(
+            rule_id="R14",
+            severity="WARNING",
+            title="Exit overlay heartbeat MISSING",
+            description=(
+                "The position exit overlay has never published a heartbeat. It "
+                "may not be wired into the live loop, or the loop has not "
+                "restarted since the heartbeat shipped."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="Confirm chad-live-loop is running the exit overlay.",
+            evidence=f"missing file={hb_path.name}",
+        ))
+        return
+
+    hb = _read_json(hb_path)
+    ttl = float(hb.get("ttl_seconds") or 900)
+    if age > ttl * 2:
+        findings.append(Finding(
+            rule_id="R14",
+            severity="CRITICAL",
+            title="Exit overlay heartbeat STALE",
+            description=(
+                "The exit overlay has stopped reporting in. Nothing is watching "
+                "open positions for stop-loss or max-hold exits right now."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="Investigate chad-live-loop; the exit overlay stopped running.",
+            evidence=f"heartbeat age={int(age)}s TTL={int(ttl)}s mode={hb.get('mode')}",
+        ))
+        return
+
+    # (b) alive but blind. Only meaningful against FRESH broker truth.
+    if int(hb.get("evaluated") or 0) > 0 or str(hb.get("mode") or "") == "off":
+        return
+    snap_path = RUNTIME / "positions_snapshot.json"
+    snap_age = _age(snap_path)
+    if snap_age is None or snap_age > 900:
+        return  # stale/absent broker truth proves nothing — do not cry wolf
+    snap = _read_json(snap_path)
+    rows = snap.get("positions")
+    if not isinstance(rows, list):
+        return
+    held = [
+        r for r in rows
+        if isinstance(r, dict)
+        and str(r.get("secType") or "").upper() == "STK"
+        and abs(float(r.get("position") or 0.0)) > 1e-9
+    ]
+    if not held:
+        return  # broker genuinely flat — evaluated=0 is correct
+    findings.append(Finding(
+        rule_id="R14",
+        severity="CRITICAL",
+        title="Exit overlay is watching nothing",
+        description=(
+            "The exit overlay is running but sees zero open positions, while the "
+            "broker is holding real ones. Its view of the position book has gone "
+            "empty, so no stop-loss or max-hold exit can fire."
+        ),
+        remedy_type="NOTIFY_ONLY",
+        remedy_action=(
+            "Check for BROKER_TRUTH_UNAVAILABLE in chad-live-loop and whether "
+            "position_guard entries were false-flatted (open=False)."
+        ),
+        evidence=(
+            f"heartbeat evaluated=0 mode={hb.get('mode')} but broker holds "
+            f"{len(held)} equity position(s)"
+        ),
+    ))
+
+
 def run_all_rules() -> List[Finding]:
     """Run all rules and return list of findings."""
     findings: List[Finding] = []
@@ -1156,6 +1249,7 @@ def run_all_rules() -> List[Finding]:
         rule_options_greeks_freshness,
         rule_ibkr_sustained_latency,
         rule_ibkr_gateway_version,
+        rule_exit_overlay_heartbeat,
     ]:
         try:
             fn(findings)
