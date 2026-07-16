@@ -1,0 +1,21 @@
+{
+  "schema_version": "llm_models.v1",
+  "updated_utc": "2026-07-16",
+  "note": "Single source of truth for LLM model IDs used by the CHAD intelligence layer (GAP-037/038). All four hardcoded sites read this: chad/intel/claude_client.py (tiers + cost table) and chad/intel/advisory_engine.py + chad/intel/gpt_client.py (openai model). If this file is missing or corrupt, the code falls back to identical hardcoded defaults, so behaviour is unchanged. Resolves the gpt-4.1 / gpt-4.1-mini / gpt-5 split -> gpt-4.1 (the value configured in /etc/chad/openai.env OPENAI_MODEL and verified working 2026-07-16). Anthropic tiers are one generation behind current (opus-4-8 / sonnet-5) but ACTIVE and NOT the cause of the refresh 400 (that is Anthropic credit exhaustion); they are intentionally left as-is here because (a) the Anthropic account is credit-exhausted so the Claude tier is inert, and (b) a model upgrade is a separate behavioural change out of scope for INTEL-REPAIR.",
+  "anthropic": {
+    "tiers": {
+      "routine": "claude-haiku-4-5-20251001",
+      "standard": "claude-haiku-4-5-20251001",
+      "complex": "claude-sonnet-4-6"
+    },
+    "cost_per_1k_usd": {
+      "claude-haiku-4-5-20251001": 0.001,
+      "claude-sonnet-4-6": 0.003,
+      "claude-opus-4-7": 0.015
+    }
+  },
+  "openai": {
+    "model": "gpt-4.1"
+  },
+  "fallback_order": ["ollama", "anthropic", "openai"]
+}

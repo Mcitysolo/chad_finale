@@ -492,10 +492,15 @@ class OpenAIAdvisoryClient:
         temperature: float = 0.2,
         max_prompt_chars: int = 120_000,
     ) -> None:
+        # GAP-037/038: default OpenAI model comes from config/llm_models.json
+        # (documented choice: gpt-4.1) rather than a divergent hardcoded "gpt-5".
+        # Env overrides still win, preserving operator control.
+        from chad.intel import llm_models as _llm_models
+
         env_model = (
             str(os.environ.get("CHAD_ADVISORY_OPENAI_MODEL", "")).strip()
             or str(os.environ.get("OPENAI_MODEL", "")).strip()
-            or "gpt-5"
+            or _llm_models.openai_model()
         )
         self._model = model or env_model
         self._temperature = float(temperature)

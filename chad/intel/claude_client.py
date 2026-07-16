@@ -44,14 +44,16 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 CLAUDE_ENV_PATH = "/etc/chad/claude.env"
+OPENAI_ENV_PATH = "/etc/chad/openai.env"
 LOG_DIR_DEFAULT = "/home/ubuntu/chad_finale/logs/claude"
 USAGE_FILE = "/home/ubuntu/chad_finale/runtime/claude_usage.json"
 
-TIER_MODELS = {
-    "routine": "claude-haiku-4-5-20251001",
-    "standard": "claude-haiku-4-5-20251001",
-    "complex": "claude-sonnet-4-6",
-}
+# GAP-037/038: model IDs are centralised in config/llm_models.json (read via
+# chad.intel.llm_models). The accessors fall back to the exact pre-IR1 literals
+# when the config is missing/corrupt, so behaviour is unchanged on load failure.
+from chad.intel import llm_models as _llm_models  # noqa: E402
+
+TIER_MODELS = _llm_models.anthropic_tiers()
 
 DEFAULT_REQUEST_TIMEOUT_SEC = 15.0
 DEFAULT_MAX_REQUESTS_PER_MIN = int(os.environ.get("CHAD_MAX_REQUESTS_PER_MIN", "30"))
@@ -65,11 +67,7 @@ OLLAMA_MIN_RAM_MB: int = int(
     os.environ.get("CHAD_OLLAMA_MIN_RAM_MB", "1500")
 )
 
-_MODEL_COST_PER_1K_TOKENS: dict = {
-    "claude-haiku-4-5-20251001": 0.001,
-    "claude-sonnet-4-6": 0.003,
-    "claude-opus-4-7": 0.015,
-}
+_MODEL_COST_PER_1K_TOKENS: dict = _llm_models.anthropic_cost_per_1k()
 _DEFAULT_COST_PER_1K = 0.003  # conservative default
 
 MAX_RETRIES = 2
@@ -151,6 +149,35 @@ def _load_claude_env_file(path: str = CLAUDE_ENV_PATH) -> None:
                     os.environ[key] = value
     except Exception:
         pass
+
+
+def _openai_fallback_enabled() -> bool:
+    """Kill-switch for the OpenAI advisory fallback (default ON).
+
+    Set CHAD_INTEL_OPENAI_FALLBACK=0 (or false/no) to disable — reverts the
+    client to the pre-IR1 behaviour where /etc/chad/openai.env is not loaded
+    and the OpenAI fallback cannot fire.
+    """
+    return os.environ.get("CHAD_INTEL_OPENAI_FALLBACK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _load_openai_env_file(path: str = OPENAI_ENV_PATH) -> None:
+    """Load /etc/chad/openai.env so the OpenAI advisory fallback has its key.
+
+    IR1 root-cause fix: the refresh service unit has no EnvironmentFile and the
+    client previously loaded only claude.env, so OPENAI_API_KEY was never in the
+    process and _try_openai_fallback bailed at the key check — leaving zero
+    working advisory tiers once Anthropic credits were exhausted. Gated by the
+    CHAD_INTEL_OPENAI_FALLBACK kill-switch.
+    """
+    if not _openai_fallback_enabled():
+        return
+    _load_claude_env_file(path)
 
 
 def _get_logger() -> logging.Logger:
@@ -295,6 +322,32 @@ class ClaudeClient:
         )
         self._lock = threading.Lock()
 
+        # IR1 provider-outcome telemetry (per process run). "real" = a genuine
+        # LLM (Anthropic/OpenAI/Ollama) answered; "fallback" = every tier failed
+        # and chat_json returned the neutral structured stub. Read by the
+        # strategy-intelligence refresh to detect a fully-dead advisory tier and
+        # raise the INTEL_REFRESH_FAILED marker instead of failing silently.
+        self._provider_calls = {"real": 0, "fallback": 0}
+        # IR1 billing short-circuit: once Anthropic reports credit exhaustion,
+        # skip further doomed Anthropic calls this run (stops the ~14-calls/cycle
+        # retry storm) and go straight to the OpenAI fallback.
+        self._anthropic_unavailable = False
+        self._last_error_class = ""
+
+    def provider_call_stats(self) -> Dict[str, int]:
+        """Return this run's provider-outcome counters (copy)."""
+        return dict(self._provider_calls)
+
+    @property
+    def last_error_class(self) -> str:
+        """Coarse classification of the most recent provider failure."""
+        return self._last_error_class
+
+    @property
+    def anthropic_unavailable(self) -> bool:
+        """True once Anthropic has reported credit exhaustion this run."""
+        return self._anthropic_unavailable
+
     # ------------------------------------------------------------------ #
     # Construction
     # ------------------------------------------------------------------ #
@@ -319,6 +372,10 @@ class ClaudeClient:
         """Load Claude configuration from environment variables."""
         if not os.environ.get("ANTHROPIC_API_KEY"):
             _load_claude_env_file()
+        # IR1: also source /etc/chad/openai.env so the OpenAI advisory fallback
+        # has its key (the systemd unit provides no EnvironmentFile for it).
+        if not os.environ.get("OPENAI_API_KEY"):
+            _load_openai_env_file()
 
         api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         if not api_key:
@@ -416,6 +473,12 @@ class ClaudeClient:
         if self._client is None:
             raise ClaudeAPIError("Anthropic client not initialised")
 
+        # IR1 billing short-circuit: a credit-exhaustion 400 is a persistent
+        # account state, not a transient error — once seen, every further call
+        # this run 400s identically. Skip them and fall through to OpenAI.
+        if self._anthropic_unavailable:
+            raise ClaudeAPIError("anthropic_credit_exhausted (short-circuit)")
+
         model = self.model_for_tier(task_type)
         messages = [{"role": "user", "content": prompt}]
 
@@ -449,6 +512,20 @@ class ClaudeClient:
                 last_error = exc
                 exc_str = str(exc).lower()
 
+                # IR1: Anthropic credit exhaustion — a persistent, non-retryable
+                # account state. Latch it so the rest of this run short-circuits
+                # the Anthropic tier instead of re-issuing doomed 400 calls.
+                if "credit balance is too low" in exc_str or (
+                    "credit" in exc_str and "too low" in exc_str
+                ):
+                    self._anthropic_unavailable = True
+                    self._last_error_class = "anthropic_credit_exhausted"
+                    self._logger.warning(
+                        "anthropic_credit_exhausted — latching Anthropic tier off "
+                        "for this run; falling through to OpenAI fallback"
+                    )
+                    break
+
                 # Check if retryable
                 is_retryable = any(
                     frag in exc_str
@@ -456,6 +533,8 @@ class ClaudeClient:
                 )
 
                 if not is_retryable or attempt > MAX_RETRIES:
+                    if not self._last_error_class:
+                        self._last_error_class = "anthropic_api_error"
                     break
 
                 backoff = min(2 ** attempt, 8) + 0.1 * attempt
@@ -538,10 +617,12 @@ class ClaudeClient:
             try:
                 if _ollama_ram_ok():
                     _ollama = OllamaClient()
-                    return _ollama.chat_json(
+                    _olm_res = _ollama.chat_json(
                         prompt=prompt,
                         system=system,
                     )
+                    self._provider_calls["real"] += 1  # IR1: Ollama answered
+                    return _olm_res
             except Exception as _olm_err:
                 logging.getLogger("chad.intel.claude_client").warning(
                     "ollama_tier0_failed fallback_to_haiku err=%s",
@@ -574,15 +655,20 @@ class ClaudeClient:
                 system=full_system,
                 task_type=task_type,
             )
+            self._provider_calls["real"] += 1  # IR1: Anthropic answered
         except ClaudeAPIError:
             # Try OpenAI fallback
             fallback = self._try_openai_fallback(prompt=prompt, system=full_system)
             if fallback is not None:
+                self._provider_calls["real"] += 1  # IR1: OpenAI answered
                 text = fallback
                 model = "openai_fallback"
                 self._logger.info("Used OpenAI fallback for chat_json")
             else:
-                # Return structured fallback
+                # Return structured fallback — every tier failed.
+                self._provider_calls["fallback"] += 1  # IR1: no real provider
+                if not self._last_error_class:
+                    self._last_error_class = "all_providers_unavailable"
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 _write_call_log(
                     model=model, task_type=task_type,
