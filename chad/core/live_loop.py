@@ -1024,6 +1024,227 @@ def _fire_alert_safe(
         return False
 
 
+# ---------------------------------------------------------------------------
+# CONN-RESILIENCE — self-healing of the SHARED truth-reading `ib` connection.
+#
+# The shared `ib` (clientId LIVE_LOOP=99) is connected exactly ONCE at module
+# import (the ib.connect near the top of this file) and never reconnects. IBKR's
+# ~23:45 UTC daily session reset AND our own 03:15 gateway nightly restart both
+# drop it. XOV-2345 made that drop safe-and-loud (fail-closed: no false-flat,
+# BROKER_TRUTH_UNAVAILABLE marker + operator alert) but it stayed DEAD until a
+# manual process restart — observed 13:30->19:11 UTC, 272 dead cycles. This
+# makes it HEAL.
+#
+# L1-CLD safety — read ops/pending_actions/L1_CLD_cross_loop_deadlock_fix_2026-07-08.md:
+#   * The shared `ib`'s socket reader is bound to whatever loop ran connectAsync.
+#     It was homed on MainThread at import, and EVERY truth read
+#     (position_sync.fetch_positions) runs on MainThread inside run_once/
+#     _rebuild_guard_from_broker. So the reconnect is performed ON MainThread —
+#     it rebinds the reader to the SAME loop run_once already pumps. No
+#     cross-loop hand-off is introduced, so the uninterruptible deadlock L1-CLD
+#     roots out cannot recur here (that bug was a call dispatched onto a foreign
+#     worker loop whose reply lived on the un-pumped MainThread loop).
+#   * If ever called off MainThread we REFUSE (never rebind the shared reader to
+#     a foreign loop) and stay loud.
+#   * The dedicated EXECUTION connection (clientId EXECUTION=9007, broker_loop.py)
+#     is a SEPARATE object owned by its own loop and is NEVER touched here — the
+#     scope of this heal is the truth-reading shared `ib` only.
+#   * `ib.connect(..., timeout=T)` is bounded; attempts are bounded with backoff
+#     (no reconnect storm). The reader stays pumped because connectAsync
+#     re-issues reqPositions on MainThread and the very next fetch reads that
+#     freshly-populated cache within the same cycle.
+#   * The reconnect runs at the TOP of the cycle (guard rebuild is run_once
+#     step 1), before any downstream shared-`ib` read, on the single-threaded
+#     MainThread cycle — no concurrent reader can race the disconnect.
+#
+# Kill-switch: CHAD_TRUTH_RECONNECT=0 disables healing (reverts to the pure
+# XOV2-1 loud-and-dead behavior). Default ON.
+# ---------------------------------------------------------------------------
+
+def _truth_reconnect_enabled() -> bool:
+    """False only when CHAD_TRUTH_RECONNECT is explicitly disabled. Default ON."""
+    return os.environ.get("CHAD_TRUTH_RECONNECT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _truth_reconnect_max_attempts() -> int:
+    """Bounded reconnect attempts per unavailable cycle (>=1). Env override:
+    CHAD_TRUTH_RECONNECT_MAX_ATTEMPTS. Invalid values fall back to the default."""
+    try:
+        return max(1, int(os.environ.get("CHAD_TRUTH_RECONNECT_MAX_ATTEMPTS", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _truth_reconnect_timeout_s() -> float:
+    """Per-attempt connect timeout (>=5s). Env: CHAD_TRUTH_RECONNECT_TIMEOUT_S.
+    Kept well under the 120s boot connect since a mid-cycle reconnect must not
+    stall the loop for minutes; the attempt is bounded and the failure stays
+    loud."""
+    try:
+        return max(5.0, float(os.environ.get("CHAD_TRUTH_RECONNECT_TIMEOUT_S", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+_TRUTH_RECONNECT_BASE_BACKOFF_S = 2.0
+_TRUTH_RECONNECT_MAX_BACKOFF_S = 8.0
+
+
+def _attempt_shared_ib_reconnect(logger: logging.Logger) -> bool:
+    """Bounded, backed-off reconnect of the shared truth `ib`, on MainThread.
+
+    Returns True iff the API connection probes healthy again after a reconnect.
+    Never raises. See the CONN-RESILIENCE / L1-CLD block above for the safety
+    argument."""
+    # Hard test/preview I/O-safety gate — identical to the module-level connect
+    # guard and _home_execution_connection: NEVER perform real IB I/O when
+    # CHAD_SKIP_IB_CONNECT is set, even if a test has patched _skip_ib_connect()
+    # to exercise the loud path. Reading the env directly (not the overridable
+    # helper) keeps a suite run from ever touching the live gateway / clientId 99.
+    if os.environ.get("CHAD_SKIP_IB_CONNECT", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if not _truth_reconnect_enabled():
+        logger.warning(
+            "BROKER_TRUTH_RECONNECT_DISABLED via CHAD_TRUTH_RECONNECT=0 — "
+            "staying loud (no self-heal)"
+        )
+        return False
+    if threading.current_thread() is not threading.main_thread():
+        # L1-CLD: the shared reader is bound to MainThread's loop. Reconnecting
+        # on any other thread would rebind it to a foreign loop and recreate the
+        # exact cross-loop deadlock. Refuse; stay loud.
+        logger.error(
+            "BROKER_TRUTH_RECONNECT_REFUSED off-MainThread (L1-CLD: never rebind "
+            "the shared truth reader to a foreign loop)"
+        )
+        return False
+
+    truth_ib = position_sync.ib
+    attempts = _truth_reconnect_max_attempts()
+    timeout_s = _truth_reconnect_timeout_s()
+    for i in range(1, attempts + 1):
+        logger.warning(
+            "BROKER_TRUTH_RECONNECT_ATTEMPT %d/%d clientId=%s timeout=%.0fs",
+            i, attempts, _IBKR_LIVE_LOOP_CLIENT_ID, timeout_s,
+        )
+        try:
+            try:
+                truth_ib.disconnect()
+            except Exception:  # noqa: BLE001 - a dead socket may already be gone
+                pass
+            truth_ib.connect(
+                "127.0.0.1", 4002,
+                clientId=_IBKR_LIVE_LOOP_CLIENT_ID,
+                timeout=timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - any connect error → retry/exhaust
+            logger.warning(
+                "BROKER_TRUTH_RECONNECT_ATTEMPT %d/%d FAILED: %s", i, attempts, exc
+            )
+        else:
+            if position_sync.api_connected():
+                logger.warning(
+                    "BROKER_TRUTH_RECONNECT_OK attempt=%d/%d clientId=%s",
+                    i, attempts, _IBKR_LIVE_LOOP_CLIENT_ID,
+                )
+                return True
+            logger.warning(
+                "BROKER_TRUTH_RECONNECT_ATTEMPT %d/%d connected-but-probe-false",
+                i, attempts,
+            )
+        if i < attempts:
+            backoff = min(
+                _TRUTH_RECONNECT_BASE_BACKOFF_S * (2 ** (i - 1)),
+                _TRUTH_RECONNECT_MAX_BACKOFF_S,
+            )
+            time.sleep(backoff)
+    logger.error(
+        "BROKER_TRUTH_RECONNECT_EXHAUSTED after %d attempts — staying XOV2-1 loud",
+        attempts,
+    )
+    return False
+
+
+def _emit_broker_truth_restored(logger: logging.Logger) -> None:
+    """Success marker BROKER_TRUTH_RESTORED + one calm, coach-voiced recovery
+    note. Never raises (presentation/alerting is supplementary)."""
+    logger.warning(
+        "BROKER_TRUTH_RESTORED — shared IB truth connection re-established; "
+        "guard rebuild resuming from live broker positions",
+        extra={"marker": "BROKER_TRUTH_RESTORED"},
+    )
+    note = (
+        "CHAD reconnected to the broker on its own and can read your positions "
+        "again. It re-checked your position book against the broker and resumed "
+        "exit checks. Nothing was bought or sold while it was reconnecting."
+    )
+    try:
+        from chad.utils import coach_voice
+        note = coach_voice.format_alert(
+            "broker_truth_restored",
+            {
+                "headline": "CHAD is reading your positions again.",
+                "detail": note,
+                "severity": "info",
+            },
+        )
+    except Exception:  # noqa: BLE001 - coach-voice presentation must never break recovery
+        pass
+    from chad.utils.telegram_notify import notify as _notify
+    _fire_alert_safe(
+        "broker_truth_restored", _notify, note, severity="info", logger=logger,
+    )
+
+
+def _handle_broker_truth_unavailable(logger: logging.Logger, exc: Exception):
+    """Guarded-path handler for a BrokerTruthUnavailable read.
+
+    Returns the FRESH broker positions dict when a self-heal reconnect succeeded
+    (caller resumes the rebuild from live truth), or None when the caller must
+    abort the rebuild this cycle: skip-mode (expected), healing disabled, or
+    exhausted attempts — the latter two stay XOV2-1 loud (state preserved, no
+    false-flat, operator alerted)."""
+    from chad.core.broker_position_sync import BrokerTruthUnavailable
+    if _skip_ib_connect():
+        logger.debug("BROKER_TRUTH_UNAVAILABLE (CHAD_SKIP_IB_CONNECT): %s", exc)
+        return None
+
+    # CONN-RESILIENCE: try to HEAL the shared truth connection before giving up.
+    if _attempt_shared_ib_reconnect(logger):
+        try:
+            positions = position_sync.fetch_positions()
+        except BrokerTruthUnavailable as exc2:
+            logger.warning(
+                "BROKER_TRUTH_RECONNECT reconnected but re-read still "
+                "unavailable: %s", exc2,
+            )
+        else:
+            _emit_broker_truth_restored(logger)
+            return positions
+
+    # Stay XOV2-1 loud: guard state preserved, operator alerted (unchanged).
+    logger.error(
+        "BROKER_TRUTH_UNAVAILABLE detail=%s — guard rebuild SKIPPED; guard "
+        "state preserved (no false-flat). Broker truth is stale until the "
+        "IB API connection is restored.",
+        exc,
+    )
+    from chad.utils.telegram_notify import notify as _notify
+    _fire_alert_safe(
+        "broker_truth_unavailable",
+        _notify,
+        "CHAD could not read your positions from the broker, so it left the "
+        "position book exactly as it was rather than assuming everything had "
+        "closed. Exit checks are paused until the broker connection is back. "
+        "Nothing was bought or sold because of this.",
+        severity="critical",
+        logger=logger,
+    )
+    return None
+
+
 def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     """
     Reconcile position_guard.json against actual broker positions.
@@ -1062,27 +1283,13 @@ def _rebuild_guard_from_broker(logger: logging.Logger) -> None:
     try:
         broker_positions = position_sync.fetch_positions()
     except BrokerTruthUnavailable as exc:
-        if _skip_ib_connect():
-            logger.debug("BROKER_TRUTH_UNAVAILABLE (CHAD_SKIP_IB_CONNECT): %s", exc)
+        # CONN-RESILIENCE: attempt a bounded, backed-off self-heal reconnect of
+        # the shared truth `ib` before giving up. On success the handler returns
+        # fresh broker truth (BROKER_TRUTH_RESTORED + coach recovery note) and we
+        # resume the rebuild; otherwise it stays XOV2-1 loud and returns None.
+        broker_positions = _handle_broker_truth_unavailable(logger, exc)
+        if broker_positions is None:
             return
-        logger.error(
-            "BROKER_TRUTH_UNAVAILABLE detail=%s — guard rebuild SKIPPED; guard "
-            "state preserved (no false-flat). Broker truth is stale until the "
-            "IB API connection is restored.",
-            exc,
-        )
-        from chad.utils.telegram_notify import notify as _notify
-        _fire_alert_safe(
-            "broker_truth_unavailable",
-            _notify,
-            "CHAD could not read your positions from the broker, so it left the "
-            "position book exactly as it was rather than assuming everything had "
-            "closed. Exit checks are paused until the broker connection is back. "
-            "Nothing was bought or sold because of this.",
-            severity="critical",
-            logger=logger,
-        )
-        return
 
     guard_state = _load_state()
 
