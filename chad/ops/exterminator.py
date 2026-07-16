@@ -45,6 +45,13 @@ TTL_RUNTIME_FILES: tuple[str, ...] = (
     "choppy_regime_state.json",
     "macro_state.json",
     "event_risk.json",
+    # IR1 R3: the advisory-refresh liveness marker (ts_utc + ttl_seconds=1800).
+    # NB: we watch intel_refresh_state.json, NOT strategy_intelligence_cache.json
+    # — the cache is rewritten with a fresh mtime even on total advisory failure
+    # (neutral fallback) and carries no ts_utc/ttl_seconds, so it can never go
+    # "stale" and is useless as a sentinel. The state marker DOES go stale if the
+    # refresh timer itself dies, which is the failure worth catching here.
+    "intel_refresh_state.json",
 )
 
 SCHEMA_REQUIRED_FILES: tuple[str, ...] = tuple(

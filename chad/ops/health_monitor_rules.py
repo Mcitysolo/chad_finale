@@ -1224,12 +1224,63 @@ def rule_exit_overlay_heartbeat(findings: List[Finding]) -> None:
     ))
 
 
+# IR1 R3: consecutive failed advisory refreshes before we NOTIFY. At the
+# 15-min refresh cadence, 3 consecutive all-fallback runs ≈ 45 min of a dead
+# advisory tier — long enough to be real, short enough to catch what was a
+# ~100-day silent carry-forward of stale bias.
+_INTEL_REFRESH_FAIL_THRESHOLD = 3
+
+
+def rule_intel_refresh_stale(findings: List[Finding]) -> None:
+    """R23 — advisory (strategy-intelligence) refresh has no live LLM tier.
+
+    Reads runtime/intel_refresh_state.json (written by the refresh). After
+    _INTEL_REFRESH_FAIL_THRESHOLD consecutive all-fallback runs, emits a
+    NOTIFY_ONLY finding with a dedupe-STABLE title (no fluctuating values in the
+    first 30 chars, so the alert dedupe key stays constant across cycles instead
+    of re-sending every 5 min). Downstream bias is fail-open, so this never
+    halts trading — it only makes the previously-silent dead advisory visible.
+    """
+    state = _read_json(RUNTIME / "intel_refresh_state.json")
+    if not state:
+        return  # marker not yet written — say nothing (fail-open)
+    consecutive = int(state.get("consecutive_failures", 0) or 0)
+    if (
+        state.get("marker") != "INTEL_REFRESH_FAILED"
+        or consecutive < _INTEL_REFRESH_FAIL_THRESHOLD
+    ):
+        return
+    err_class = str(state.get("last_error_class") or "unknown")
+    last_ok = state.get("last_success_utc") or "never"
+    findings.append(Finding(
+        rule_id="R23",
+        severity="WARNING",
+        # Dedupe-stable title — no counts/timestamps in the first 30 chars.
+        title="Advisory intel refresh FAILED — no live LLM tier",
+        description=(
+            f"The strategy-intelligence refresh has produced no fresh advisory "
+            f"bias for {consecutive} consecutive runs (last real answer: "
+            f"{last_ok}). Downstream confidence bias (live_loop "
+            f"_apply_intelligence_bias) is fail-open, so trading is unaffected, "
+            f"but the advisory brain is dead. Likely cause: {err_class}. "
+            f"Check Anthropic credits / OpenAI key / Ollama tier."
+        ),
+        remedy_type="NOTIFY_ONLY",
+        remedy_action="notify",
+        evidence=(
+            f"intel_refresh_state marker=INTEL_REFRESH_FAILED "
+            f"consecutive={consecutive} err_class={err_class}"
+        ),
+    ))
+
+
 def run_all_rules() -> List[Finding]:
     """Run all rules and return list of findings."""
     findings: List[Finding] = []
     for fn in [
         rule_critical_services,
         rule_feed_freshness,
+        rule_intel_refresh_stale,
         rule_scr_state,
         rule_stop_bus,
         rule_reconciliation,

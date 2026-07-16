@@ -952,6 +952,15 @@ Rules:
         )
         elapsed = time.monotonic() - t0
 
+        # IR1 R4: a structured-fallback result means every advisory tier failed
+        # (chat_json swallows the provider error and returns a neutral stub).
+        # Do NOT persist it — raising here routes to get_confidence_bias's
+        # neutral return, leaving the last-good cache entry intact instead of
+        # clobbering it with a fresh-timestamped neutral 0.0 that would pass the
+        # 300s freshness gate while carrying no real signal.
+        if isinstance(result, dict) and (result.get("fallback") or result.get("error")):
+            raise RuntimeError("advisory_provider_unavailable")
+
         if elapsed > MAX_CALL_TIMEOUT_SEC:
             LOG.warning("Confidence bias took %.1fs (>%.1fs limit)", elapsed, MAX_CALL_TIMEOUT_SEC)
 
