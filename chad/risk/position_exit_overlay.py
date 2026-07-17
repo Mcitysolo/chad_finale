@@ -414,6 +414,18 @@ def _age_days(entry: Mapping[str, Any], anchor: Mapping[str, Any], now: datetime
     return max(0.0, (now.astimezone(timezone.utc) - opened).total_seconds() / 86400.0)
 
 
+def _stable_age_days(opened_at: Any, now: datetime) -> Optional[float]:
+    """Age in days from a single already-resolved, rebuild-immune open time (B-3).
+
+    Callers resolve ``opened_at`` from the FIFO lot / persisted anchor (never the guard's
+    rewritten ``opened_at``) so the max-hold clock cannot be reset by paper_ledger_rebuild.
+    """
+    opened = _parse_iso(opened_at)
+    if opened is None:
+        return None
+    return max(0.0, (now.astimezone(timezone.utc) - opened).total_seconds() / 86400.0)
+
+
 # --------------------------------------------------------------------------- #
 # Core evaluation (pure)
 # --------------------------------------------------------------------------- #
@@ -428,24 +440,39 @@ def evaluate_exit_conditions(
     age_days: Optional[float],
     max_hold_days: Optional[float],
     config: ExitOverlayConfig,
+    prior_atr_stop: Optional[float] = None,
 ) -> Tuple[Optional[str], float, Optional[float]]:
     """Pure exit-condition kernel shared by the equity and crypto lanes.
 
     Fixed, documented order; first True wins:
       hard-stop (most urgent / largest loss) -> ATR trailing -> max-hold.
 
-    Returns ``(fired_reason_or_None, hard_stop_price, atr_stop_or_None)``. Extracted verbatim
-    from the equity loop (UC1) so the Kraken lane cannot drift from the equity semantics —
-    one kernel, one set of thresholds-per-lane, pinned by both lanes' tests.
+    Returns ``(fired_reason_or_None, hard_stop_price, atr_stop_or_None)`` where the returned
+    ``atr_stop`` is the RATCHETED stop actually used to test ``atr_hit`` (see below). Extracted
+    verbatim from the equity loop (UC1) so the Kraken lane cannot drift from the equity
+    semantics — one kernel, one set of thresholds-per-lane, pinned by both lanes' tests.
+
+    B-3 (FLIP-UNBLOCK 2026-07-17): monotonic trailing stop. A trailing stop must only move in
+    the favourable direction — up for a long, down for a short. The raw ``peak - mult*atr``
+    LOOSENS when ATR is revised upward (the audit measured the UNH stop drop $11 as ATR rose
+    +45%, un-firing 744 standing closes). ``prior_atr_stop`` is the tightest stop persisted so
+    far; when supplied the effective stop is ratcheted against it and can never loosen. The
+    crypto lane omits the argument (default ``None``) → identical pre-B-3 behaviour. The ratchet
+    also HOLDS through a transient ATR gap: if ``atr`` is momentarily unavailable but a prior
+    ratchet exists, the stop is retained rather than dropped.
     """
     if side == "BUY":
         hard_stop_price = entry_price * (1.0 - config.hard_stop_loss_pct)
         atr_stop = (peak - config.atr_trail_mult * atr) if atr is not None else None
+        if prior_atr_stop is not None:
+            atr_stop = prior_atr_stop if atr_stop is None else max(atr_stop, prior_atr_stop)
         hard_hit = price <= hard_stop_price
         atr_hit = atr_stop is not None and price <= atr_stop
     else:  # SELL / short
         hard_stop_price = entry_price * (1.0 + config.hard_stop_loss_pct)
         atr_stop = (trough + config.atr_trail_mult * atr) if atr is not None else None
+        if prior_atr_stop is not None:
+            atr_stop = prior_atr_stop if atr_stop is None else min(atr_stop, prior_atr_stop)
         hard_hit = price >= hard_stop_price
         atr_hit = atr_stop is not None and price >= atr_stop
     hold_hit = max_hold_days is not None and age_days is not None and age_days >= max_hold_days
@@ -469,6 +496,7 @@ def evaluate_positions(
     anchors: Mapping[str, Mapping[str, Any]],
     config: ExitOverlayConfig,
     now_utc: datetime,
+    fifo_truth_by_key: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> ExitOverlayResult:
     """Deterministic core. Given the position/guard/bars/price/anchor snapshot and the config,
     return verdicts, reduce-only close-intent dicts (for WOULD_CLOSE), and the anchors to
@@ -476,8 +504,19 @@ def evaluate_positions(
 
     Reduce-only invariant: a proposed close qty never exceeds the broker-confirmed same-side
     quantity at evaluation time (``min(guard_qty, broker_held_same_side)``).
+
+    B-3 (FLIP-UNBLOCK 2026-07-17): ``fifo_truth_by_key`` supplies a real cost basis and a
+    STABLE open time per ``strategy|symbol`` position, read from the FIFO lot book
+    (``trade_closer_state.json``). The guard carries no ``entry_price`` field at all, so before
+    B-3 the anchor re-seeded ``entry_price = peak = trough = spot`` on every first sight — the
+    hard stop was computed off a price that was never an entry. And ``opened_at`` is rewritten
+    by ``paper_ledger_rebuild`` every ~1–2 days, so ``max_hold`` could never fire. FIFO truth
+    fixes both: the cost basis comes from the lot ``fill_price``, and the age from the lot
+    ``ts_utc`` (which the rebuild does not touch). Absent FIFO truth the code falls back to the
+    prior behaviour so this is a strict superset. ``None`` → the map is empty.
     """
     ts = _iso(now_utc)
+    fifo_truth = fifo_truth_by_key or {}
     broker_signed = _broker_signed_by_symbol(guard_state)
     verdicts: List[ExitOverlayVerdict] = []
     close_intents: List[Dict[str, Any]] = []
@@ -537,30 +576,59 @@ def evaluate_positions(
 
         # Anchor (entry/peak/trough) — seed on first sight, otherwise trail the extreme.
         prior = anchors.get(key) if isinstance(anchors.get(key), Mapping) else None
+        fifo = fifo_truth.get(key) if isinstance(fifo_truth.get(key), Mapping) else None
+
+        # entry_price: a persisted anchor wins (stable across cycles once set); else the FIFO
+        # cost basis (real paid price); else spot as a last resort (documented fallback — the
+        # guard has no price field, so this is all that is knowable for a lot with no FIFO row).
         entry_price = _f(prior.get("entry_price")) if prior else 0.0
+        entry_price_source = "anchor" if entry_price > 0.0 else ""
+        if entry_price <= 0.0 and fifo:
+            entry_price = _f(fifo.get("entry_price"))
+            if entry_price > 0.0:
+                entry_price_source = "fifo_cost_basis"
         if entry_price <= 0.0:
             entry_price = price
+            entry_price_source = "spot_fallback"
+
         peak = max(_f(prior.get("peak")) if prior else 0.0, price)
         trough_raw = _f(prior.get("trough")) if prior else 0.0
         trough = min(trough_raw, price) if trough_raw > 0.0 else price
         first_seen = (prior.get("first_seen_utc") if prior else None) or ts
-        anchor = {
-            "entry_price": entry_price,
-            "peak": peak,
-            "trough": trough,
-            "first_seen_utc": first_seen,
-            "last_seen_utc": ts,
-        }
-        updated_anchors[key] = anchor
 
-        atr = _atr(bars, config.atr_period) if len(list(bars)) >= config.min_bars_for_atr else None
-        age = _age_days(entry, anchor, now_utc)
+        # Stable open time for max-hold: FIFO lot ts_utc (authoritative, rebuild-immune) >
+        # a previously-persisted stable time > the anchor first_seen. The guard's own
+        # ``opened_at`` is deliberately NOT preferred — paper_ledger_rebuild rewrites it every
+        # 1–2 days, which is exactly why max_hold could never fire pre-B-3.
+        opened_at = (
+            (fifo.get("opened_at") if fifo else None)
+            or (prior.get("opened_at_utc") if prior else None)
+            or first_seen
+        )
+
         max_hold = config.max_hold_for(asset_class)
+        atr = _atr(bars, config.atr_period) if len(list(bars)) >= config.min_bars_for_atr else None
+        age = _stable_age_days(opened_at, now_utc)
+        prior_ratchet = _f(prior.get("atr_stop_ratchet")) if prior else 0.0
 
         fired, hard_stop_price, atr_stop = evaluate_exit_conditions(
             side=side, price=price, entry_price=entry_price, peak=peak, trough=trough,
             atr=atr, age_days=age, max_hold_days=max_hold, config=config,
+            prior_atr_stop=(prior_ratchet if prior_ratchet > 0.0 else None),
         )
+
+        anchor = {
+            "entry_price": entry_price,
+            "entry_price_source": entry_price_source,
+            "peak": peak,
+            "trough": trough,
+            "first_seen_utc": first_seen,
+            "opened_at_utc": opened_at,
+            "last_seen_utc": ts,
+            # Persist the ratcheted stop so it survives to the next cycle and can only tighten.
+            "atr_stop_ratchet": atr_stop if atr_stop is not None else prior_ratchet,
+        }
+        updated_anchors[key] = anchor
 
         common = dict(
             price=price, atr=atr, atr_stop=atr_stop, entry_price=entry_price,
@@ -607,6 +675,9 @@ BarsLoader = Callable[[Sequence[str]], Dict[str, List[Dict[str, Any]]]]
 PriceLoader = Callable[[Sequence[str]], Dict[str, float]]
 GuardLoader = Callable[[], Dict[str, Any]]
 OpenPositionsLoader = Callable[[], Dict[str, Dict[str, Any]]]
+# B-3: returns {"strategy|symbol": {"entry_price": float, "opened_at": iso}} from the FIFO
+# lot book. Optional — an overlay built without one behaves exactly as pre-B-3.
+FifoTruthLoader = Callable[[], Dict[str, Dict[str, Any]]]
 
 
 class PositionExitOverlay:
@@ -623,6 +694,7 @@ class PositionExitOverlay:
         open_positions_loader: OpenPositionsLoader,
         bars_loader: BarsLoader,
         price_loader: PriceLoader,
+        fifo_truth_loader: Optional[FifoTruthLoader] = None,
         heartbeat_path: Optional[Path] = None,
         env: Optional[Mapping[str, str]] = None,
         logger: Optional[logging.Logger] = None,
@@ -635,6 +707,7 @@ class PositionExitOverlay:
         self._open_positions_loader = open_positions_loader
         self._bars_loader = bars_loader
         self._price_loader = price_loader
+        self._fifo_truth_loader = fifo_truth_loader
         self._env = os.environ if env is None else env
         self._log = logger or LOGGER
 
@@ -663,6 +736,12 @@ class PositionExitOverlay:
             bars = self._bars_loader(symbols) if symbols else {}
             prices = self._price_loader(symbols) if symbols else {}
             anchors = self._load_anchors()
+            fifo_truth = {}
+            if self._fifo_truth_loader is not None:
+                try:
+                    fifo_truth = self._fifo_truth_loader() or {}
+                except Exception:  # noqa: BLE001 - FIFO truth is an enrichment, never fatal
+                    fifo_truth = {}
 
             result = evaluate_positions(
                 open_positions=open_positions,
@@ -672,6 +751,7 @@ class PositionExitOverlay:
                 anchors=anchors,
                 config=self._config,
                 now_utc=now,
+                fifo_truth_by_key=fifo_truth,
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
             self._safe_error(exc)
@@ -682,7 +762,11 @@ class PositionExitOverlay:
         for v in result.verdicts:
             self._safe_marker(v, mode)
             self._safe_write_evidence(v)
-        self._save_anchors(result.updated_anchors)
+        # B-3: every position that produced a verdict this cycle is still in the book
+        # (WOULD_CLOSE/HOLD/SKIP_* all iterate live guard entries) — that is the live-key set
+        # the merge prunes against.
+        live_keys = frozenset(v.position_key for v in result.verdicts)
+        self._save_anchors(result.updated_anchors, live_keys)
         # XOV-2345: unconditional — evaluated=0 is exactly the state that used to
         # be invisible (a live overlay whose position source had gone empty).
         self._safe_heartbeat(
@@ -726,15 +810,39 @@ class PositionExitOverlay:
         except Exception:  # noqa: BLE001
             return {}
 
-    def _save_anchors(self, anchors: Mapping[str, Dict[str, Any]]) -> None:
+    def _save_anchors(
+        self,
+        updated_anchors: Mapping[str, Dict[str, Any]],
+        live_keys: "frozenset[str]",
+    ) -> None:
+        """MERGE the freshly-evaluated anchors onto the persisted set (B-3).
+
+        The pre-B-3 code REPLACED the file with ``updated_anchors``, which contains only the
+        keys that reached a full evaluation this cycle. Every skip path (SKIP_UNCONFIRMED /
+        SKIP_NON_EQUITY / SKIP_NO_DATA) omits its key, so a single skip cycle ERASED the
+        anchor and the next cycle re-seeded ``entry = peak = trough = spot`` — the anchor wipe
+        the audit proved live twice, both right after a 23:45 broker false-flat.
+
+        Fix, per the audit's own prescription ("MERGE, not replace; prune only on a *confirmed*
+        close"):
+          * Start from the on-disk anchors so a skipped-but-open position keeps its history.
+          * Prune a key only when the book is NON-empty and the key is absent from it (a real
+            close). When ``live_keys`` is empty — the exact signature of a whole-book false-flat
+            (guard read returned nothing) — prune NOTHING, so the wipe cannot recur.
+          * Overlay the fresh anchors last (new peak/ratchet for evaluated positions).
+        """
         if self._state_path is None:
             return
         try:
+            merged: Dict[str, Dict[str, Any]] = dict(self._load_anchors())
+            if live_keys:
+                merged = {k: v for k, v in merged.items() if k in live_keys}
+            merged.update(updated_anchors)
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
             payload = {
                 "schema_version": "position_exit_overlay_state.v1",
-                "anchors": dict(anchors),
+                "anchors": merged,
             }
             tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
             os.replace(tmp, self._state_path)
@@ -944,6 +1052,64 @@ def _default_open_positions_loader() -> OpenPositionsLoader:
     return _load
 
 
+def _fifo_truth_from_state(data: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Build ``{strategy|symbol: {entry_price, opened_at}}`` from a trade_closer_state mapping.
+
+    Cost basis = quantity-weighted mean of the open lots' ``fill_price`` (the true FIFO basis);
+    open time = the earliest lot ``ts_utc`` (rebuild-immune). Pure so it is unit-testable
+    without touching disk. A row missing usable lots is skipped rather than emitted with a
+    zero basis — an absent entry falls the caller back to prior/spot behaviour.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(data, Mapping):
+        return out
+    for row in data.get("queues") or []:
+        if not isinstance(row, Mapping):
+            continue
+        strategy = str(row.get("strategy", "") or "").strip()
+        symbol = str(row.get("symbol", "") or "").strip().upper()
+        if not strategy or not symbol:
+            continue
+        wsum = 0.0
+        qsum = 0.0
+        earliest: Optional[str] = None
+        earliest_dt: Optional[datetime] = None
+        for lot in row.get("lots") or []:
+            if not isinstance(lot, Mapping):
+                continue
+            q = abs(_f(lot.get("quantity")))
+            px = _f(lot.get("fill_price"))
+            if q <= 0.0 or px <= 0.0:
+                continue
+            wsum += px * q
+            qsum += q
+            ts_raw = lot.get("ts_utc")
+            ts_dt = _parse_iso(ts_raw)
+            if ts_dt is not None and (earliest_dt is None or ts_dt < earliest_dt):
+                earliest_dt = ts_dt
+                earliest = str(ts_raw)
+        if qsum <= 0.0:
+            continue
+        entry: Dict[str, Any] = {"entry_price": wsum / qsum}
+        if earliest:
+            entry["opened_at"] = earliest
+        out[f"{strategy}|{symbol}"] = entry
+    return out
+
+
+def _default_fifo_truth_loader(repo_root: Path) -> FifoTruthLoader:
+    state_path = repo_root / "runtime" / "trade_closer_state.json"
+
+    def _load() -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - missing/corrupt state → no FIFO enrichment
+            return {}
+        return _fifo_truth_from_state(data)
+
+    return _load
+
+
 def _under_active_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
@@ -1017,6 +1183,7 @@ def build_default_overlay(
         open_positions_loader=_default_open_positions_loader(),
         bars_loader=_default_bars_loader(repo_root),
         price_loader=_default_price_loader(repo_root),
+        fifo_truth_loader=_default_fifo_truth_loader(repo_root),
         env=env,
         logger=log,
     )
