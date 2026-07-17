@@ -204,10 +204,20 @@ def load_overlay_config(payload: Mapping[str, Any]) -> ExitOverlayConfig:
     )
 
 
-def resolve_mode(config_mode: str, env: Optional[Mapping[str, str]] = None) -> str:
-    """Effective mode = env kill-switch (if set to a valid value) overriding the config mode."""
+def resolve_mode(
+    config_mode: str,
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    env_var: str = KILL_SWITCH_ENV,
+) -> str:
+    """Effective mode = env kill-switch (if set to a valid value) overriding the config mode.
+
+    ``env_var`` defaults to the equity lane's switch; the crypto lane (UC1) passes its own
+    (``CHAD_CRYPTO_EXIT_OVERLAY``) so the two lanes are independently inertable — killing
+    crypto must never require killing equities, or vice versa.
+    """
     env = os.environ if env is None else env
-    raw = str(env.get(KILL_SWITCH_ENV, "") or "").strip().lower()
+    raw = str(env.get(env_var, "") or "").strip().lower()
     if raw in _VALID_MODES:
         return raw
     return config_mode
@@ -407,6 +417,49 @@ def _age_days(entry: Mapping[str, Any], anchor: Mapping[str, Any], now: datetime
 # --------------------------------------------------------------------------- #
 # Core evaluation (pure)
 # --------------------------------------------------------------------------- #
+def evaluate_exit_conditions(
+    *,
+    side: str,
+    price: float,
+    entry_price: float,
+    peak: float,
+    trough: float,
+    atr: Optional[float],
+    age_days: Optional[float],
+    max_hold_days: Optional[float],
+    config: ExitOverlayConfig,
+) -> Tuple[Optional[str], float, Optional[float]]:
+    """Pure exit-condition kernel shared by the equity and crypto lanes.
+
+    Fixed, documented order; first True wins:
+      hard-stop (most urgent / largest loss) -> ATR trailing -> max-hold.
+
+    Returns ``(fired_reason_or_None, hard_stop_price, atr_stop_or_None)``. Extracted verbatim
+    from the equity loop (UC1) so the Kraken lane cannot drift from the equity semantics —
+    one kernel, one set of thresholds-per-lane, pinned by both lanes' tests.
+    """
+    if side == "BUY":
+        hard_stop_price = entry_price * (1.0 - config.hard_stop_loss_pct)
+        atr_stop = (peak - config.atr_trail_mult * atr) if atr is not None else None
+        hard_hit = price <= hard_stop_price
+        atr_hit = atr_stop is not None and price <= atr_stop
+    else:  # SELL / short
+        hard_stop_price = entry_price * (1.0 + config.hard_stop_loss_pct)
+        atr_stop = (trough + config.atr_trail_mult * atr) if atr is not None else None
+        hard_hit = price >= hard_stop_price
+        atr_hit = atr_stop is not None and price >= atr_stop
+    hold_hit = max_hold_days is not None and age_days is not None and age_days >= max_hold_days
+
+    fired: Optional[str] = None
+    if hard_hit:
+        fired = "hard_stop_loss"
+    elif atr_hit:
+        fired = "atr_trailing_stop"
+    elif hold_hit:
+        fired = "max_hold"
+    return fired, hard_stop_price, atr_stop
+
+
 def evaluate_positions(
     *,
     open_positions: Mapping[str, Mapping[str, Any]],
@@ -504,27 +557,10 @@ def evaluate_positions(
         age = _age_days(entry, anchor, now_utc)
         max_hold = config.max_hold_for(asset_class)
 
-        # Condition evaluation — fixed, documented order; first True wins.
-        # Order: hard-stop (most urgent / largest loss) -> ATR trailing -> max-hold.
-        if side == "BUY":
-            hard_stop_price = entry_price * (1.0 - config.hard_stop_loss_pct)
-            atr_stop = (peak - config.atr_trail_mult * atr) if atr is not None else None
-            hard_hit = price <= hard_stop_price
-            atr_hit = atr_stop is not None and price <= atr_stop
-        else:  # SELL / short
-            hard_stop_price = entry_price * (1.0 + config.hard_stop_loss_pct)
-            atr_stop = (trough + config.atr_trail_mult * atr) if atr is not None else None
-            hard_hit = price >= hard_stop_price
-            atr_hit = atr_stop is not None and price >= atr_stop
-        hold_hit = max_hold is not None and age is not None and age >= max_hold
-
-        fired = None
-        if hard_hit:
-            fired = "hard_stop_loss"
-        elif atr_hit:
-            fired = "atr_trailing_stop"
-        elif hold_hit:
-            fired = "max_hold"
+        fired, hard_stop_price, atr_stop = evaluate_exit_conditions(
+            side=side, price=price, entry_price=entry_price, peak=peak, trough=trough,
+            atr=atr, age_days=age, max_hold_days=max_hold, config=config,
+        )
 
         common = dict(
             price=price, atr=atr, atr_stop=atr_stop, entry_price=entry_price,
