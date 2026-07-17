@@ -1,0 +1,23 @@
+{
+  "_comment": "CHAD Position-Aware CRYPTO (Kraken) Exit Overlay — pre-registered config, UC1/U2-A. Deliberately a SEPARATE file from config/position_exit_overlay.json: that file declares its thresholds FROZEN as a running trial, and re-tuning it for a second asset class would silently re-open a trial already in progress. Two files = two independently-frozen trials. THRESHOLDS HERE ARE FROZEN on the same terms: changing any threshold is a deliberate logged event and a post-evaluation change counts as a NEW trial. The SOLE field expected to change post-freeze is `mode` (off -> shadow -> active), each mode change being its own authorization commit (git history is the authorization log). Env kill-switch CHAD_CRYPTO_EXIT_OVERLAY (OFF|SHADOW|ACTIVE) overrides `mode` for emergency inerting, and is INDEPENDENT of the equity lane's CHAD_POSITION_EXIT_OVERLAY.",
+  "schema_version": "position_exit_overlay_config.v1",
+  "mode": "shadow",
+  "atr_period": 14,
+  "atr_trail_mult": 3.0,
+  "hard_stop_loss_pct": 0.12,
+  "min_bars_for_atr": 16,
+  "max_hold_days": {
+    "crypto": 4.0,
+    "default": 4.0
+  },
+  "max_tick_age_seconds": 60.0,
+  "_threshold_notes": {
+    "_rationale": "Crypto is not equities with a different ticker: it trades 24/7 (no overnight gap to absorb, no RTH gate to throttle a storm) and realizes several times the daily volatility. Reusing the equity numbers unchanged would be a category error — a 2.5-ATR trail calibrated to a 1%/day instrument is a hair-trigger on a 4%/day one.",
+    "atr_period": "14 — same Wilder lookback as the equity lane; a bar is a bar. Bars come from data/bars/1d/{BTC,ETH,SOL}-USD.json (already populated).",
+    "atr_trail_mult": "3.0 vs the equity lane's 2.5. WIDER, deliberately: crypto's daily ATR is a larger fraction of price, and 24/7 tape means the trail is evaluated ~3x more often per unit of price movement (no 17.5h overnight pause), so an equity-tight trail would be whipsawed out by ordinary noise. 3.0 is the smallest widening that clears observed SOL daily noise; it is NOT tuned on outcomes.",
+    "hard_stop_loss_pct": "0.12 (12%) vs the equity lane's 8%. Measured off the REAL fee-inclusive VWAP cost basis from the kraken_trusted_lots book — unlike the equity lane, which has no cost basis available and anchors to first-observed price. A 12% backstop on a ~4%/day instrument is ~3 daily ranges, the same order of magnitude 8% represents for a ~1.2%/day equity.",
+    "min_bars_for_atr": "16 — below this only max-hold and hard-stop arm. Same as equity.",
+    "max_hold_days": "4.0 calendar days. Crypto trades 24/7, so 4 days is ~96 trading hours vs the equity lane's 20 days x 6.5h = 130 trading hours — comparable exposure, far less wall-clock. Rationale: an alpha_crypto thesis that has not resolved in 4 days of continuous tape is not going to; holding longer is inventory accumulation, which is the disease this overlay exists to prevent.",
+    "max_tick_age_seconds": "60.0. FAIL-CLOSED: on a 24/7 tape a stale tick is NEVER 'the market is closed', it is always a broken feed, so a mark older than 60s yields SKIP_NO_DATA and the overlay proposes nothing. (The equity lane can lean on the RTH gate for this; crypto has no such backstop.)"
+  }
+}
