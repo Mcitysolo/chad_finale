@@ -63,6 +63,10 @@ def _fills_dir(fills_dir: Optional[Path] = None) -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "fills"
 
 
+def _trade_closer_state_path(runtime_dir: Optional[Path] = None) -> Path:
+    return _runtime_dir(runtime_dir) / "trade_closer_state.json"
+
+
 def _iter_manifest_paths(runtime_dir: Path) -> Iterable[Path]:
     if not runtime_dir.is_dir():
         return ()
@@ -195,6 +199,72 @@ def get_untrusted_fill_ids_from_fills(
     return out
 
 
+# B2 (FLIP-UNBLOCK 2026-07-17): the FIFO-lot backstop.
+#
+# The fills scan above can only quarantine ids that EXIST in data/fills/. The
+# Epoch-3 reconciler's seed lots are minted straight into
+# runtime/trade_closer_state.json with ids like ``RECON_ADOPT_UNH_<stamp>`` and
+# never pass through a fills file — so a `get_exclusion_sets()` returning 4,782
+# ids matched exactly ZERO of them. Both the flag path and the id backstop
+# missed, and a seed-lot close banked fabricated PnL as clean evidence.
+#
+# This scan closes the backstop at its source: the lots themselves. Marker-driven
+# (meta.pnl_untrusted / meta.scoring_excluded) rather than prefix-driven, so any
+# future minter that stamps the markers is covered without touching this code.
+# The RECON_ADOPT_ prefix is honoured as a belt-and-braces fallback for lots that
+# predate the markers.
+_SEED_LOT_ID_PREFIXES: Tuple[str, ...] = ("RECON_ADOPT_",)
+_LOT_EXCLUSION_MARKER_KEYS: Tuple[str, ...] = ("pnl_untrusted", "scoring_excluded")
+
+
+def _lot_is_untrusted(lot: Mapping[str, object]) -> bool:
+    meta = lot.get("meta")
+    if isinstance(meta, Mapping):
+        for key in _LOT_EXCLUSION_MARKER_KEYS:
+            if meta.get(key) is True:
+                return True
+    fid = lot.get("fill_id")
+    if isinstance(fid, str):
+        return any(fid.startswith(p) for p in _SEED_LOT_ID_PREFIXES)
+    return False
+
+
+def get_untrusted_fill_ids_from_fifo_lots(
+    runtime_dir: Optional[Path] = None,
+) -> Set[str]:
+    """Return ``fill_id``s of FIFO lots in trade_closer_state.json marked unscoreable.
+
+    These ids are what a derived closed trade carries in ``payload.fill_ids``, so
+    quarantining them here makes the existing fill_ids check in
+    ``trade_stats_engine._parse_ledger_file`` reject a seed-lot round-trip even if
+    every flag-based defense upstream were bypassed.
+
+    Fail-safe: a missing/corrupt state file yields an empty set — a publisher must
+    keep running rather than crash.
+    """
+    out: Set[str] = set()
+    path = _trade_closer_state_path(runtime_dir)
+    try:
+        if not path.is_file():
+            return out
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOG.warning("fifo_lot_scan_unreadable path=%s err=%s — skipping", path, exc)
+        return out
+    if not isinstance(data, Mapping):
+        return out
+    for row in data.get("queues") or []:
+        if not isinstance(row, Mapping):
+            continue
+        for lot in row.get("lots") or []:
+            if not isinstance(lot, Mapping):
+                continue
+            fid = lot.get("fill_id")
+            if isinstance(fid, str) and fid and _lot_is_untrusted(lot):
+                out.add(fid)
+    return out
+
+
 def get_exclusion_sets(
     runtime_dir: Optional[Path] = None,
     fills_dir: Optional[Path] = None,
@@ -219,6 +289,12 @@ def get_exclusion_sets(
         fill_ids = fill_ids | get_untrusted_fill_ids_from_fills(fills_dir=fills_dir)
     except Exception as exc:  # noqa: BLE001 — must never break publishers
         LOG.warning("untrusted_fills_scan_failed err=%s — using manifest only", exc)
+    try:
+        # B2: seed lots exist ONLY in trade_closer_state.json — no fills row will
+        # ever carry a RECON_ADOPT_* id, so the fills scan above cannot see them.
+        fill_ids = fill_ids | get_untrusted_fill_ids_from_fifo_lots(runtime_dir=runtime_dir)
+    except Exception as exc:  # noqa: BLE001 — must never break publishers
+        LOG.warning("fifo_lot_scan_failed err=%s — seed lots not pinned", exc)
     try:
         # Local import keeps a chad.utils -> chad.analytics dependency
         # contained to this single function instead of the module top.

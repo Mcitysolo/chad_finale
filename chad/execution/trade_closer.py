@@ -130,6 +130,65 @@ def _fill_multiplier(fill: Dict[str, Any]) -> float:
 # ClosedTrade dataclass
 # ---------------------------------------------------------------------------
 
+# B2 (FLIP-UNBLOCK 2026-07-17): the trust markers that matter live on the
+# OPENING lot's meta. The Epoch-3 reconciler seeds adopted broker positions
+# with a fabricated cost basis and stamps the lot
+# ``meta={"pnl_untrusted": True, "scoring_excluded": True,
+#         "provenance": "UNATTRIBUTED_EPOCH3_ACCUMULATION", ...}``.
+# Those markers reached the closed_trade.v1 payload under ``payload["meta"]``
+# only — but every downstream trust gate (SCR ``trade_stats_engine._is_untrusted``
+# and Stage-2 ``trade_log_adapter.trust_exclusion``) reads ``payload["extra"]``
+# and ``payload["tags"]`` and NEVER reads ``meta``. A seed-lot round-trip
+# therefore scored as clean alpha: PnL measured against a cost basis that was
+# invented by the rebuild rather than paid in the market.
+# Mirroring the markers into ``extra``/``tags`` here — at the single point where
+# a closed trade becomes a payload — makes the exclusion un-missable for every
+# reader, present and future, without asking each one to learn about ``meta``.
+_TRUST_EXCLUSION_META_KEYS: Tuple[str, ...] = ("pnl_untrusted", "scoring_excluded")
+
+# Provenance carried alongside the markers so an excluded row can be explained
+# without re-reading the FIFO state. Copied only when a marker is present.
+_TRUST_PROVENANCE_META_KEYS: Tuple[str, ...] = (
+    "provenance", "source", "seeded_from", "reconciled",
+)
+
+
+def _trust_extra_from_meta(meta: Any) -> Dict[str, Any]:
+    """Return the ``extra`` trust-marker block implied by an opening lot's *meta*.
+
+    Empty dict when *meta* carries no exclusion marker — so a clean trade's
+    payload shape is byte-for-byte what it was before B2 (no ``extra`` key at
+    all). Only a genuinely tainted lot grows the block.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    markers = {k: True for k in _TRUST_EXCLUSION_META_KEYS if bool(meta.get(k))}
+    if not markers:
+        return {}
+    out: Dict[str, Any] = dict(markers)
+    for k in _TRUST_PROVENANCE_META_KEYS:
+        v = meta.get(k)
+        if v is not None:
+            out[k] = v
+    # A human/grep-readable cause. SCR's placeholder detector keys off
+    # `pnl_untrusted_reason`, so keep the phrasing distinct from the $100
+    # placeholder literal it hunts for.
+    out.setdefault(
+        "pnl_untrusted_reason",
+        "seed_lot_fabricated_cost_basis (provenance={}; scoring_excluded={})".format(
+            meta.get("provenance", "unknown"), bool(meta.get("scoring_excluded")),
+        ),
+    )
+    return out
+
+
+def _trust_tags_from_meta(meta: Any) -> List[str]:
+    """Tag mirror of :func:`_trust_extra_from_meta` — tags are the other read path."""
+    if not isinstance(meta, dict):
+        return []
+    return [k for k in _TRUST_EXCLUSION_META_KEYS if bool(meta.get(k))]
+
+
 def _sanitize_meta(value: Any) -> Dict[str, Any]:
     """Gap-4 (v9.1 audit): return a JSON-safe shallow copy of *value*.
 
@@ -222,7 +281,12 @@ class ClosedTrade:
         commission_top = breakdown["commission"] if breakdown["commission"] is not None else 0.0
         slippage_top = breakdown["slippage"] if breakdown["slippage"] is not None else 0.0
         fees_top = breakdown["fees"]  # None preserved; legacy field already nullable
-        return {
+        # B2: mirror the opening lot's trust markers onto the two fields the
+        # downstream gates actually read. Clean trades add neither key.
+        sanitized_meta = _sanitize_meta(self.meta)
+        trust_extra = _trust_extra_from_meta(sanitized_meta)
+        tags = ["paper", "closed", self.strategy] + _trust_tags_from_meta(sanitized_meta)
+        payload: Dict[str, Any] = {
             "schema_version": self.schema,
             "strategy": self.strategy,
             "symbol": self.symbol,
@@ -245,7 +309,7 @@ class ClosedTrade:
             "broker": "paper_exec",
             "account_id": "PAPER_EXEC",
             "is_live": False,
-            "tags": ["paper", "closed", self.strategy],
+            "tags": tags,
             "pnl_breakdown": breakdown,
             # Gap-4 (v9.1 audit): forwarded TradeSignal/position meta block.
             # setup_family_expectancy_updater reads payload["meta"]["setup_family"]
@@ -253,8 +317,13 @@ class ClosedTrade:
             # trades by ORB / VWAP_RECLAIM / etc. Empty default for strategies
             # that emit no meta — schema_version is unchanged (no formal
             # closed_trade.v1 migration framework exists).
-            "meta": _sanitize_meta(self.meta),
+            "meta": sanitized_meta,
         }
+        # Only a tainted lot grows an `extra` block — an untainted closed trade's
+        # payload keeps the exact shape it had before B2.
+        if trust_extra:
+            payload["extra"] = trust_extra
+        return payload
 
 
 # ---------------------------------------------------------------------------

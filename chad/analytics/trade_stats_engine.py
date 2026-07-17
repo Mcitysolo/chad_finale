@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -108,14 +108,36 @@ def _is_manual(tags: Sequence[str]) -> bool:
     return any(str(t).strip().lower() == "manual" for t in (tags or []))
 
 
-def _is_untrusted(tags: Sequence[str], extra: Dict[str, Any]) -> bool:
-    if any(str(t).strip().lower() == "pnl_untrusted" for t in (tags or [])):
+# B2 (FLIP-UNBLOCK 2026-07-17): exclusion truth may arrive on ANY of three
+# carriers. `tags`/`extra` are the historical fill-tagged path; `meta` is the
+# FIFO-lot path (an Epoch-3 seed lot's fabricated cost basis is marked
+# scoring_excluded/pnl_untrusted on the opening lot's meta only). trade_closer
+# now mirrors meta into extra/tags at write time, but this reader must ALSO
+# honour meta directly: ~4,782 already-written rows and any future writer that
+# forgets the mirror would otherwise score fabricated PnL as clean alpha.
+# Both keys are exclusion truth — `scoring_excluded` says "never score me"
+# even where a PnL number happens to be arithmetically well-formed.
+_EXCLUSION_MARKER_KEYS: Tuple[str, ...] = ("pnl_untrusted", "scoring_excluded")
+
+
+def _is_untrusted(
+    tags: Sequence[str],
+    extra: Dict[str, Any],
+    meta: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when any carrier marks this row as unscoreable. Fail-closed on error."""
+    tag_set = {str(t).strip().lower() for t in (tags or [])}
+    if tag_set & set(_EXCLUSION_MARKER_KEYS):
         return True
-    try:
-        if bool((extra or {}).get("pnl_untrusted")):
+    for block in (extra, meta):
+        try:
+            if not block:
+                continue
+            if any(bool(block.get(k)) for k in _EXCLUSION_MARKER_KEYS):
+                return True
+        except Exception:
+            # An unreadable trust block is not evidence of trustworthiness.
             return True
-    except Exception:
-        return True
     return False
 
 
@@ -251,6 +273,9 @@ class ParsedTrade:
     extra: Dict[str, Any]
     source: str  # "raw" or "enriched"
     txid: Optional[str] = None
+    # B2: the closed_trade.v1 meta block (FIFO lot provenance). Default {} keeps
+    # every existing positional/keyword construction site valid.
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def _is_unfilled_ibkr_paper(t: ParsedTrade) -> bool:
@@ -434,6 +459,11 @@ def _parse_ledger(
 
         tags = list(payload.get("tags") or [])
         extra = dict(payload.get("extra") or {}) if isinstance(payload.get("extra") or {}, dict) else {}
+        # B2: carry the FIFO-lot meta block so the trust gate below can see a
+        # seed lot's scoring_excluded marker on rows written before the
+        # trade_closer extra/tags mirror existed.
+        _raw_meta = payload.get("meta")
+        meta = dict(_raw_meta) if isinstance(_raw_meta, dict) else {}
 
         # Tag-based attribution recovery: legacy "paper_exec" rows carry the
         # real strategy name in their tag list. Recover at read time so SCR
@@ -452,6 +482,7 @@ def _parse_ledger(
             extra=extra,
             source=source,
             txid=_kraken_txid(payload) if broker.strip().lower() == "kraken" else None,
+            meta=meta,
         )
         out.append(pt)
 
@@ -673,7 +704,7 @@ def load_and_compute(
         if _is_validate_only(tags, extra):
             excluded_validate_only += 1
             continue
-        if _is_untrusted(tags, extra):
+        if _is_untrusted(tags, extra, getattr(t, "meta", None)):
             excluded_untrusted += 1
             continue
         # item 5b: drop futures rows from the performance sample. Bug-B futures

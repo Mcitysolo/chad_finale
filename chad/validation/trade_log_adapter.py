@@ -116,6 +116,8 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "non_fill_status",
     "validate_only",
     "pnl_untrusted",
+    # B2 (FLIP-UNBLOCK): fabricated cost basis (Epoch-3 seed lot).
+    "scoring_excluded",
 )
 
 _LEDGER_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
@@ -158,6 +160,19 @@ def _extra(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _tags(payload: Mapping[str, Any]) -> list[str]:
     return [str(t).lower() for t in (payload.get("tags") or []) if t is not None]
+
+
+def _meta(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The closed_trade.v1 FIFO-lot meta block (B2) — the third trust carrier.
+
+    An Epoch-3 seed lot's fabricated cost basis is marked ``pnl_untrusted`` /
+    ``scoring_excluded`` on the opening lot's meta. trade_closer mirrors those
+    into ``extra``/``tags`` at write time, but rows written before that mirror
+    existed carry the marker on ``meta`` alone — and admitting one injects
+    invented alpha into the scorer.
+    """
+    m = payload.get("meta")
+    return m if isinstance(m, Mapping) else {}
 
 
 def _status(payload: Mapping[str, Any], extra: Mapping[str, Any]) -> Optional[str]:
@@ -289,8 +304,23 @@ def trust_exclusion(record: Mapping[str, Any]) -> Optional[str]:
         return "validate_only"
 
     # 5. Any explicitly untrusted PnL (reset-stamped, synthetic-credit, etc.).
-    if _truthy(extra.get("pnl_untrusted")) or "pnl_untrusted" in tags:
+    meta = _meta(payload)
+    if (
+        _truthy(extra.get("pnl_untrusted"))
+        or "pnl_untrusted" in tags
+        or _truthy(meta.get("pnl_untrusted"))
+    ):
         return "pnl_untrusted"
+
+    # 6. B2: scored-basis exclusion. A row whose cost basis was fabricated by the
+    # Epoch-3 rebuild (seed lot) rather than paid in the market is arithmetically
+    # well-formed but economically fictional. It must never reach the scorer.
+    if (
+        _truthy(extra.get("scoring_excluded"))
+        or "scoring_excluded" in tags
+        or _truthy(meta.get("scoring_excluded"))
+    ):
+        return "scoring_excluded"
 
     return None
 
