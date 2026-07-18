@@ -175,6 +175,11 @@ class TrustedFill:
     touch_ts_utc: str
     fee_model: str = FEE_MODEL_KRAKEN_PAPER_V1
     provenance: str = PROVENANCE_SIMULATED_LIVE_TICKS
+    # CRYPTO-EXPLORE-WIRE W3: the live regime this fill was produced in. Stamped onto the
+    # opening lot so the harness can slice crypto edge by the regime that was live at ENTRY
+    # (the exploration regime of interest). Default "" keeps every legacy construction site
+    # unchanged; a blank regime records nothing new.
+    regime: str = ""
 
 
 def model_fill_price(side: str, touch: Touch, impact_floor_bps: float) -> Tuple[float, float]:
@@ -206,6 +211,7 @@ def simulate_fill(
     qty: float,
     touch: Touch,
     config: KrakenTradingConfig,
+    regime: str = "",
 ) -> TrustedFill:
     fill_price, slippage_bps = model_fill_price(side, touch, config.slippage_impact_floor_bps)
     notional = fill_price * float(qty)
@@ -215,6 +221,7 @@ def simulate_fill(
         side=(side or "").strip().lower(), qty=float(qty),
         fill_price=fill_price, notional=notional, fee=fee,
         slippage_bps=slippage_bps, mid=touch.mid, touch_ts_utc=touch.ts_utc,
+        regime=str(regime or ""),
     )
 
 
@@ -235,6 +242,12 @@ class RealizedRoundTrip:
     realized_pnl: float
     opened_at_utc: str
     closed_at_utc: str
+    # CRYPTO-EXPLORE-WIRE W3: the regime that was live when the CLOSED lot was OPENED, read
+    # back from the lot book on FIFO match. This is what _build_trade_history_kwargs stamps
+    # onto the round-trip's `regime` field (replacing the old hardcoded "paper"), so a
+    # round-trip is attributable to its ENTRY regime — the falsifiable slice exploration exists
+    # to produce. Default "" for legacy round-trips minted before the column existed.
+    entry_regime: str = ""
 
 
 def _default_book_db_path() -> Path:
@@ -275,6 +288,16 @@ class RoundTripBook:
                     opened_at_utc TEXT NOT NULL
                 )"""
             )
+            # CRYPTO-EXPLORE-WIRE W3: additive, idempotent regime column so every open lot
+            # records the live regime it was opened in. Backward-compatible — pre-existing rows
+            # default to '' and every reader in-tree selects explicit columns (the crypto
+            # overlay's _default_lots_loader, record()'s own SELECTs, open_qty), so appending a
+            # column at the end breaks nothing. ALTER-if-missing keeps a running store safe.
+            cols = {r[1] for r in con.execute(f"PRAGMA table_info({self._TABLE})").fetchall()}
+            if "regime" not in cols:
+                con.execute(
+                    f"ALTER TABLE {self._TABLE} ADD COLUMN regime TEXT NOT NULL DEFAULT ''"
+                )
 
     def record(self, fill: TrustedFill) -> List[RealizedRoundTrip]:
         """Apply a fill; return realized round-trips (empty on a pure open)."""
@@ -286,10 +309,12 @@ class RoundTripBook:
         now = self._now_iso()
         realized: List[RealizedRoundTrip] = []
 
+        fill_regime = str(getattr(fill, "regime", "") or "")
         with contextlib.closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE;")
             rows = con.execute(
-                f"SELECT rowid, direction, qty_remaining, entry_price, entry_fee_per_unit, opened_at_utc "
+                f"SELECT rowid, direction, qty_remaining, entry_price, entry_fee_per_unit, "
+                f"opened_at_utc, regime "
                 f"FROM {self._TABLE} WHERE strategy=? AND symbol=? ORDER BY rowid ASC",
                 (strategy, symbol),
             ).fetchall()
@@ -298,18 +323,20 @@ class RoundTripBook:
             fill_dir = "long" if fill_opens_long else "short"
 
             if not rows or book_dir == fill_dir:
-                # OPEN (same direction or flat): push a lot.
+                # OPEN (same direction or flat): push a lot, stamping the entry regime (W3).
                 con.execute(
                     f"INSERT INTO {self._TABLE} (strategy, symbol, direction, qty_remaining, "
-                    f"entry_price, entry_fee_per_unit, opened_at_utc) VALUES (?,?,?,?,?,?,?)",
-                    (strategy, symbol, fill_dir, qty, fill.fill_price, fill.fee / qty, now),
+                    f"entry_price, entry_fee_per_unit, opened_at_utc, regime) VALUES (?,?,?,?,?,?,?,?)",
+                    (strategy, symbol, fill_dir, qty, fill.fill_price, fill.fee / qty, now,
+                     fill_regime),
                 )
                 con.execute("COMMIT;")
                 return []
 
-            # CLOSE (opposite direction): FIFO-match; exit fee allocated pro-rata.
+            # CLOSE (opposite direction): FIFO-match; exit fee allocated pro-rata. The matched
+            # lot's stored regime (its ENTRY regime) rides onto the realized round-trip (W3).
             remaining = qty
-            for rowid, direction, qty_rem, entry_price, entry_fpu, opened_at in rows:
+            for rowid, direction, qty_rem, entry_price, entry_fpu, opened_at, lot_regime in rows:
                 if remaining <= _EPS:
                     break
                 matched = min(float(qty_rem), remaining)
@@ -325,6 +352,7 @@ class RoundTripBook:
                     entry_fee=entry_fee_alloc, exit_fee=exit_fee_alloc,
                     realized_pnl=gross - entry_fee_alloc - exit_fee_alloc,
                     opened_at_utc=str(opened_at), closed_at_utc=now,
+                    entry_regime=str(lot_regime or ""),
                 ))
                 new_rem = float(qty_rem) - matched
                 if new_rem <= _EPS:
@@ -336,12 +364,13 @@ class RoundTripBook:
                     )
                 remaining -= matched
 
-            # FLIP: residual opens a new lot in the fill's own direction.
+            # FLIP: residual opens a new lot in the fill's own direction (its regime = this fill's).
             if remaining > _EPS:
                 con.execute(
                     f"INSERT INTO {self._TABLE} (strategy, symbol, direction, qty_remaining, "
-                    f"entry_price, entry_fee_per_unit, opened_at_utc) VALUES (?,?,?,?,?,?,?)",
-                    (strategy, symbol, fill_dir, remaining, fill.fill_price, fill.fee / qty, now),
+                    f"entry_price, entry_fee_per_unit, opened_at_utc, regime) VALUES (?,?,?,?,?,?,?,?)",
+                    (strategy, symbol, fill_dir, remaining, fill.fill_price, fill.fee / qty, now,
+                     fill_regime),
                 )
             con.execute("COMMIT;")
         return realized
@@ -362,6 +391,23 @@ class RoundTripBook:
 def _synthetic_execution_id(strategy: str, pair: str, side: str, qty: float, minute_bucket: str) -> str:
     raw = "|".join([strategy, pair, side, f"{qty:.10f}", minute_bucket])
     return "KPT-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _intent_regime(intent: Any) -> str:
+    """The live regime carried on an intent (CRYPTO-EXPLORE-WIRE W3).
+
+    Prefers the explicit ``regime`` field stamped at the regime gate; falls back to the
+    signal-derived ``regime_state``. Returns "" when neither is populated (e.g. an
+    exit-overlay close intent) — the caller records no regime for that fill, and the closing
+    round-trip carries the ENTRY regime read back from the lot book instead.
+    """
+    for attr in ("regime", "regime_state"):
+        v = getattr(intent, attr, None)
+        if v:
+            s = str(v).strip()
+            if s:
+                return s
+    return ""
 
 
 class TrustedFillEngine:
@@ -441,9 +487,14 @@ class TrustedFillEngine:
                 return {"trusted": False, "reason": "dedup_error"}
 
         strategy = str(getattr(intent, "strategy", "alpha_crypto") or "alpha_crypto")
+        # CRYPTO-EXPLORE-WIRE W3: forward the live regime the intent was gated in (option (a):
+        # threaded onto the intent at the regime gate, NO hidden I/O in this pure-ish core).
+        # An exit-overlay close intent carries no regime — the round-trip inherits its ENTRY
+        # regime from the closed lot instead, which is the more meaningful slice anyway.
+        regime = _intent_regime(intent)
         fill = simulate_fill(
             strategy=strategy, pair=pair, symbol=symbol, side=side, qty=qty,
-            touch=touch, config=self._config,
+            touch=touch, config=self._config, regime=regime,
         )
         extra_markers = tuple(str(m) for m in (getattr(intent, "markers", ()) or ()) if str(m))
 
@@ -499,6 +550,10 @@ class TrustedFillEngine:
             account_id="KRAKEN_PAPER",
             is_live=False,
             asset_class="crypto",
+            # CRYPTO-EXPLORE-WIRE W3: the live regime this fill was produced in (was universally
+            # "paper" before — every fill row is now regime-sliceable at the fill level). "" is
+            # normalized to "paper" by PaperExecEvidence's own default.
+            regime=(fill.regime or "paper"),
             order_type=str(getattr(intent, "ordertype", "market") or "market"),
             status="paper_fill",
             fill_time_utc=now_iso,
@@ -540,7 +595,11 @@ class TrustedFillEngine:
             is_live=False,
             broker="kraken_paper",
             account_id="KRAKEN_PAPER",
-            regime="paper",
+            # CRYPTO-EXPLORE-WIRE W3: the round-trip is attributed to the regime that was live
+            # when the CLOSED lot was OPENED (read back from the lot book on FIFO match), NOT
+            # the old hardcoded "paper". This is the falsifiable edge-by-regime slice. Legacy
+            # lots minted before the regime column fall back to "paper".
+            regime=(rt.entry_regime or "paper"),
             tags=self._trust_tags(extra_markers),
             extra={
                 "fee_model": FEE_MODEL_KRAKEN_PAPER_V1,

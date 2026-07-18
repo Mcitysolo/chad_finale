@@ -115,6 +115,13 @@ class StrategyTradeIntent:
     # unchanged.
     markers: Tuple[str, ...] = ()
 
+    # CRYPTO-EXPLORE-WIRE W3: the LIVE regime this intent was gated in, stamped at the
+    # regime-activation check (chad/portfolio/regime_activation.py) where read_regime_state()
+    # has already run. Distinct from ``regime_state`` (the stale signal-carried label): this is
+    # the authoritative live regime the trusted-fill engine records so fills are edge-sliceable
+    # by regime. Default "" keeps every construction site unchanged.
+    regime: str = ""
+
 
 @dataclass(frozen=True)
 class RiskGateResult:
