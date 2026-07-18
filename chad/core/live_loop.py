@@ -2278,6 +2278,30 @@ def run_once(logger: logging.Logger) -> None:
         logger.warning("position_exit_overlay failed (non-fatal): %s", _xov_err)
 
     # ------------------------------------------------------------------
+    # Position-aware CRYPTO (Kraken) EXIT OVERLAY (CRYPTO-EXPLORE-WIRE W1;
+    # default SHADOW). The Kraken-lane sibling of the equity overlay above.
+    # It reads ONLY the kraken_trusted_lots FIFO book (broker-truth-unreadable
+    # => UNKNOWN, never flat — the house rule) and takes no adapter: in ACTIVE
+    # it dispatches reduce-only closes through the trusted-fill engine itself.
+    # Own heartbeat (runtime/crypto_exit_overlay_heartbeat.json) and own
+    # evidence file (data/exit_overlay/crypto_*.ndjson). Per-lane kill-switch
+    # CHAD_CRYPTO_EXIT_OVERLAY (default shadow) is INDEPENDENT of the equity
+    # lane's. Ordering matters (UC1 §0): this exit path is wired BEFORE crypto
+    # exploration can pass a signal — exploration that cannot exit is
+    # accumulation. Non-fatal — a build/run failure submits nothing.
+    # ------------------------------------------------------------------
+    try:
+        from chad.risk.crypto_exit_overlay import build_default_crypto_overlay
+
+        _crypto_exit_overlay = build_default_crypto_overlay(
+            repo_root=Path(__file__).resolve().parents[2]
+        )
+        if _crypto_exit_overlay is not None:
+            _crypto_exit_overlay.run_cycle()
+    except Exception as _cxov_err:  # noqa: BLE001
+        logger.warning("crypto_exit_overlay failed (non-fatal): %s", _cxov_err)
+
+    # ------------------------------------------------------------------
     # Phase-8 Session 6 (G1 feed): publish runtime/market_metrics.json from
     # current daily bars so the regime classifier sees real vol / ADX /
     # trend_slope / breadth inputs rather than defaulting to 'unknown'.
@@ -2506,18 +2530,37 @@ def run_once(logger: logging.Logger) -> None:
     # pre-wiring behavior). Applied to both IBKR and Kraken lanes so the
     # matrix governs crypto too.
     try:
-        from chad.portfolio.regime_activation import filter_intents_by_regime
+        from chad.portfolio.regime_activation import (
+            apply_crypto_exploration,
+            filter_intents_by_regime,
+            stamp_intent_regime,
+        )
         from chad.analytics.regime_classifier import read_regime_state
         _regime_now = str(read_regime_state().get("regime", "unknown"))
         _pre_regime_intents = list(intents or []) + list(kraken_intents or [])
         _kept_ibkr, _dropped_ibkr = filter_intents_by_regime(intents, _regime_now)
         _kept_kr, _dropped_kr = filter_intents_by_regime(kraken_intents, _regime_now)
-        if _dropped_ibkr or _dropped_kr:
+        # CRYPTO-EXPLORE-WIRE W2: paper-epoch-only exploration. When CHAD_CRYPTO_EXPLORATION=1
+        # AND CHAD_EXECUTION_MODE=paper, alpha_crypto intents the matrix would drop are
+        # re-admitted in ALL regimes (tagged CRYPTO_EXPLORATION_PASS + exploration=true). Flag
+        # on + non-paper => fail-closed refusal (CRYPTO_EXPLORATION_REFUSED_NON_PAPER, stock
+        # gating). Flag off => byte-identical stock gating; config/regime_activation_matrix.json
+        # is never touched, so the rollback is the default.
+        _kept_kr, _dropped_kr, _expl_info = apply_crypto_exploration(
+            _kept_kr, _dropped_kr, _regime_now, env=os.environ, logger=logger,
+        )
+        # CRYPTO-EXPLORE-WIRE W3: stamp the LIVE regime onto every kept Kraken intent so the
+        # trusted-fill engine records it (fills become edge-sliceable by regime). Re-admitted
+        # exploration intents are already tagged above; re-stamping is idempotent.
+        _kept_kr = [stamp_intent_regime(_i, _regime_now) for _i in _kept_kr]
+        if _dropped_ibkr or _dropped_kr or _expl_info.get("readmitted"):
             logger.info(
-                "REGIME_GATE regime=%s ibkr_kept=%d ibkr_dropped=%d kraken_kept=%d kraken_dropped=%d",
+                "REGIME_GATE regime=%s ibkr_kept=%d ibkr_dropped=%d kraken_kept=%d "
+                "kraken_dropped=%d explore=%s readmitted=%d",
                 _regime_now,
                 len(_kept_ibkr), len(_dropped_ibkr),
                 len(_kept_kr), len(_dropped_kr),
+                _expl_info.get("state"), int(_expl_info.get("readmitted") or 0),
             )
             for _intent, _reason in (_dropped_ibkr + _dropped_kr)[:8]:
                 logger.info(
