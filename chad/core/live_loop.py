@@ -2300,7 +2300,10 @@ def run_once(logger: logging.Logger) -> None:
             read_regime_state,
             write_regime_state,
         )
-        from chad.risk.regime_reduction import handle_regime_transition
+        from chad.risk.regime_reduction import (
+            broker_signed_qty_by_symbol,
+            handle_regime_transition,
+        )
 
         previous_state = read_regime_state()
         previous_regime = previous_state.get("regime")
@@ -2322,10 +2325,21 @@ def run_once(logger: logging.Logger) -> None:
         )
 
         if previous_regime and previous_regime != new_state.get("regime"):
+            # B-4 (INCIDENT-0713 regression guard): clamp the reduction leg against broker
+            # truth so an inflated ledger end can never oversell into a short. Broker truth
+            # comes from the guard's broker_sync|* mirror (the same authority the exit overlay
+            # reduce-only clamp uses). _load_state() reads the FULL guard, including open=False
+            # mirrors that load_open_positions() filters out.
+            from chad.core.position_guard import _load_state as _load_guard_state
+            try:
+                _broker_signed = broker_signed_qty_by_symbol(_load_guard_state())
+            except Exception:  # noqa: BLE001 - absent broker truth must fail closed, not crash
+                _broker_signed = {}
             transition = handle_regime_transition(
                 from_regime=previous_regime,
                 to_regime=new_state.get("regime"),
                 open_positions=load_open_positions(),
+                broker_signed_by_symbol=_broker_signed,
             )
             close_intents = transition.get("close_intents") or []
             if close_intents:
