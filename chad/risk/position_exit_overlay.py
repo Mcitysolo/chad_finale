@@ -89,11 +89,26 @@ MARKER_SKIP = "EXIT_OVERLAY_SKIP_UNCONFIRMED"
 MARKER_ERROR = "EXIT_OVERLAY_ERROR"
 MARKER_ACTIVE = "EXIT_OVERLAY_ACTIVE_CLOSE"
 MARKER_HEARTBEAT = "EXIT_OVERLAY_HEARTBEAT"
+MARKER_STAND_DOWN = "EXIT_OVERLAY_STAND_DOWN"
+MARKER_BACKOFF = "EXIT_OVERLAY_SUBMIT_BACKOFF"
 
 EVIDENCE_SCHEMA_VERSION = "exit_overlay.v1"
 HEARTBEAT_SCHEMA_VERSION = "exit_overlay_heartbeat.v1"
 CONFIG_SCHEMA_VERSION = "position_exit_overlay_config.v1"
+SUBMIT_LEDGER_SCHEMA_VERSION = "position_exit_overlay_submit_ledger.v1"
+STAND_DOWN_SCHEMA_VERSION = "exit_overlay_stand_down.v1"
 KILL_SWITCH_ENV = "CHAD_POSITION_EXIT_OVERLAY"
+
+# B-5 (FLIP-UNBLOCK 2026-07-17): bounded close-retry governor. ULTRA_CLOSE_AUDIT §B-5 proved a
+# standing WOULD_CLOSE re-proposes the SAME close every ~72s cycle (385/session), and the adapter
+# idempotency store has two holes — a rejected row is re-INSERTed (retry every cycle, forever) and
+# a filled key reclaims after 900s (another close every 15 min). The overlay had NO feedback
+# channel and NO cooldown, so a stuck close storms the broker unbounded. The governor caps submits
+# per position_key with exponential backoff, then STANDS DOWN permanently for that key and raises a
+# one-shot coach alert. Defaults are code-level constants (no config-file mutation).
+SUBMIT_MAX_ATTEMPTS = 5
+SUBMIT_BACKOFF_BASE_SECONDS = 300.0   # first retry gate: 5 min after the first submit
+SUBMIT_BACKOFF_MAX_SECONDS = 3600.0   # cap the doubling interval at 1 hour
 
 # XOV-2345: the overlay's per-position markers/evidence are emitted only when it
 # HAS positions, so "evaluating nothing" and "not running at all" looked
@@ -424,6 +439,73 @@ def _stable_age_days(opened_at: Any, now: datetime) -> Optional[float]:
     if opened is None:
         return None
     return max(0.0, (now.astimezone(timezone.utc) - opened).total_seconds() / 86400.0)
+
+
+def _submit_backoff_required_seconds(attempts: int) -> float:
+    """Minimum seconds that must elapse since the last submit before attempt ``attempts+1``.
+
+    Exponential from ``SUBMIT_BACKOFF_BASE_SECONDS``, doubling per prior attempt, capped at
+    ``SUBMIT_BACKOFF_MAX_SECONDS``. attempts<=0 → 0 (the first submit is never gated).
+    """
+    if attempts <= 0:
+        return 0.0
+    return min(SUBMIT_BACKOFF_BASE_SECONDS * (2.0 ** (attempts - 1)), SUBMIT_BACKOFF_MAX_SECONDS)
+
+
+def _submit_gate(record: Optional[Mapping[str, Any]], now: datetime) -> Tuple[str, Dict[str, Any]]:
+    """Pure bounded-retry decision for ONE position_key's standing close (B-5).
+
+    Given the persisted submit record (or ``None`` on first sight) and ``now``, return
+    ``(decision, new_record)`` where ``decision`` ∈ {``"submit"``, ``"backoff"``, ``"stand_down"``}:
+
+      * ``submit``     — allowed this cycle; ``attempts`` incremented, ``last_utc`` stamped.
+      * ``backoff``    — inside the exponential cooldown; record unchanged (no submit).
+      * ``stand_down`` — attempts ceiling reached (or already stood down); never submits again.
+
+    Deterministic — every wall-clock comparison uses the injected ``now`` (no ambient clock),
+    so the whole governor is unit-testable without patching time.
+    """
+    now_iso = _iso(now)
+    attempts = int(record.get("attempts", 0)) if isinstance(record, Mapping) else 0
+    first_utc = (record.get("first_utc") if isinstance(record, Mapping) else None) or now_iso
+    last_utc = record.get("last_utc") if isinstance(record, Mapping) else None
+    stood_down = bool(record.get("stood_down")) if isinstance(record, Mapping) else False
+    alerted = bool(record.get("alerted")) if isinstance(record, Mapping) else False
+    stood_down_utc = record.get("stood_down_utc") if isinstance(record, Mapping) else None
+
+    new: Dict[str, Any] = {
+        "attempts": attempts,
+        "first_utc": first_utc,
+        "last_utc": last_utc,
+        "stood_down": stood_down,
+        "alerted": alerted,
+    }
+    if stood_down_utc:
+        new["stood_down_utc"] = stood_down_utc
+
+    # Already stood down — terminal, never submits again for this key.
+    if stood_down:
+        return "stand_down", new
+
+    # Ceiling reached — transition to stand-down (the caller raises the one-shot coach alert).
+    if attempts >= SUBMIT_MAX_ATTEMPTS:
+        new["stood_down"] = True
+        new["stood_down_utc"] = now_iso
+        return "stand_down", new
+
+    # Exponential backoff gate (the first submit, attempts==0, is never gated).
+    required = _submit_backoff_required_seconds(attempts)
+    if required > 0.0 and last_utc:
+        prev = _parse_iso(last_utc)
+        if prev is not None:
+            elapsed = (now.astimezone(timezone.utc) - prev).total_seconds()
+            if elapsed < required:
+                return "backoff", new
+
+    # Allowed — count this submit.
+    new["attempts"] = attempts + 1
+    new["last_utc"] = now_iso
+    return "submit", new
 
 
 # --------------------------------------------------------------------------- #
@@ -776,16 +858,72 @@ class PositionExitOverlay:
             healthy=True,
         )
 
-        # ACTIVE: submit reduce-only closes through the reconciler's proven path.
-        if mode == MODE_ACTIVE and result.close_intents:
-            self._submit_active(result.close_intents, paper_adapter)
+        # ACTIVE: run the bounded-retry governor + submit reduce-only closes through the
+        # reconciler's proven path. Called on EVERY active cycle (even with zero close intents)
+        # so the governor can prune ledger records for positions that have since closed (B-5).
+        if mode == MODE_ACTIVE:
+            self._submit_active(result, paper_adapter, now)
         return result
 
     # -- active submit -------------------------------------------------------- #
-    def _submit_active(self, close_intents: List[Dict[str, Any]], paper_adapter: Any) -> None:
+    def _submit_active(self, result: "ExitOverlayResult", paper_adapter: Any, now: datetime) -> None:
+        """Gate the cycle's close intents through the bounded-retry governor (B-5), then submit
+        the survivors reduce-only. Every step is best-effort; a governor or submit error must
+        never propagate into the trading loop."""
         try:
+            close_intents = list(result.close_intents or [])
+            # would_close keys are the positions still trying to close this cycle. A record whose
+            # key is absent (position closed / condition cleared) is pruned so a later genuine
+            # close starts fresh. On a whole-book false-flat (no verdicts at all) prune NOTHING —
+            # the same empty-book signature B-3 refuses to act on.
+            would_close_keys = {
+                str(c.get("position_key") or "") for c in close_intents if c.get("position_key")
+            }
+            book_non_empty = bool(result.verdicts)
+
+            ledger = self._load_submit_ledger()
+            if book_non_empty:
+                ledger = {k: v for k, v in ledger.items() if k in would_close_keys}
+
+            allowed: List[Dict[str, Any]] = []
+            newly_stood_down: List[Dict[str, Any]] = []
+            for c in close_intents:
+                key = str(c.get("position_key") or "")
+                if not key:
+                    # No key to govern by — fall back to submitting (reclamp still applies).
+                    allowed.append(c)
+                    continue
+                decision, record = _submit_gate(ledger.get(key), now)
+                if decision == "submit":
+                    ledger[key] = record
+                    allowed.append(c)
+                elif decision == "backoff":
+                    ledger[key] = record
+                    self._log.info(
+                        "%s position_key=%s symbol=%s attempts=%s (cooling down — not submitting)",
+                        MARKER_BACKOFF, key, c.get("symbol"), record.get("attempts"),
+                    )
+                else:  # stand_down
+                    if not record.get("alerted"):
+                        record["alerted"] = True
+                        newly_stood_down.append({
+                            "position_key": key,
+                            "symbol": c.get("symbol"),
+                            "strategy": c.get("strategy"),
+                            "reason": c.get("reason"),
+                            "attempts": record.get("attempts"),
+                            "stood_down_utc": record.get("stood_down_utc"),
+                        })
+                    ledger[key] = record
+
+            self._save_submit_ledger(ledger)
+            if newly_stood_down:
+                self._safe_stand_down_alert(newly_stood_down, now)
+
+            if not allowed:
+                return
             fresh_guard = self._guard_loader() or {}
-            intents = _reduce_only_reclamp(close_intents, fresh_guard)
+            intents = _reduce_only_reclamp(allowed, fresh_guard)
             if not intents:
                 return
             from chad.core.position_reconciler import apply_close_intents  # lazy: reuse, don't fork
@@ -798,6 +936,80 @@ class PositionExitOverlay:
             apply_close_intents(intents, paper_adapter)
         except Exception as exc:  # noqa: BLE001 - a submit error must not stop the loop
             self._safe_error(exc)
+
+    # -- submit governor state (B-5) ----------------------------------------- #
+    def _submit_ledger_path(self) -> Optional[Path]:
+        """Sibling of the anchor state file — keeps the retry ledger out of B-3's anchor payload
+        so ``_save_anchors`` stays untouched. ``None`` when the overlay has no state path (the
+        governor then degrades to in-cycle-only: still bounded per cycle, just not across a
+        process restart)."""
+        if self._state_path is None:
+            return None
+        return self._state_path.with_name(self._state_path.stem + "_submit_ledger.json")
+
+    def _load_submit_ledger(self) -> Dict[str, Dict[str, Any]]:
+        path = self._submit_ledger_path()
+        if path is None or not path.is_file():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            led = raw.get("ledger") if isinstance(raw, dict) else None
+            if not isinstance(led, dict):
+                return {}
+            return {k: dict(v) for k, v in led.items() if isinstance(k, str) and isinstance(v, dict)}
+        except Exception:  # noqa: BLE001 - a corrupt ledger must never stop a cycle
+            return {}
+
+    def _save_submit_ledger(self, ledger: Mapping[str, Mapping[str, Any]]) -> None:
+        path = self._submit_ledger_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            payload = {
+                "schema_version": SUBMIT_LEDGER_SCHEMA_VERSION,
+                "ledger": {k: dict(v) for k, v in ledger.items()},
+            }
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 - ledger persistence is best-effort
+            pass
+
+    def _safe_stand_down_alert(self, stood_down: List[Dict[str, Any]], now: datetime) -> None:
+        """One-shot coach alert when a standing close hits the attempts ceiling (B-5).
+
+        Emits a loud ``EXIT_OVERLAY_STAND_DOWN`` marker (scanned by health_monitor) and atomically
+        publishes ``runtime/exit_overlay_stand_down.json`` so the alert spine can surface it by
+        freshness. Best-effort — never raises. Dedupe is handled by the caller via the ledger
+        ``alerted`` flag, so this fires exactly once per key."""
+        for item in stood_down:
+            try:
+                self._log.error(
+                    "%s position_key=%s symbol=%s reason=%s attempts=%s — STOOD DOWN after "
+                    "%d attempts; a standing close could not clear. Operator action required "
+                    "(check broker fill / reconciliation; the overlay will not retry this key).",
+                    MARKER_STAND_DOWN, item.get("position_key"), item.get("symbol"),
+                    item.get("reason"), item.get("attempts"), SUBMIT_MAX_ATTEMPTS,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if self._state_path is None:
+            return
+        try:
+            alert_path = self._state_path.with_name("exit_overlay_stand_down.json")
+            alert_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": STAND_DOWN_SCHEMA_VERSION,
+                "ts_utc": _iso(now),
+                "max_attempts": SUBMIT_MAX_ATTEMPTS,
+                "stood_down": stood_down,
+            }
+            tmp = alert_path.with_suffix(alert_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, alert_path)
+        except Exception:  # noqa: BLE001 - stand-down alert file is best-effort
+            pass
 
     # -- anchors -------------------------------------------------------------- #
     def _load_anchors(self) -> Dict[str, Dict[str, Any]]:
