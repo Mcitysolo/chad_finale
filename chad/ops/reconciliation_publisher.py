@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -29,6 +30,10 @@ RUNTIME_DIR = Path("/home/ubuntu/chad_finale/runtime")
 GUARD_PATH = RUNTIME_DIR / "position_guard.json"
 OUT_PATH = RUNTIME_DIR / "reconciliation_state.json"
 DRIFT_OUT_PATH = RUNTIME_DIR / "position_guard_drift.json"
+# W1A-5 / D2: the CHAD_DRIFT_V4 independent-leg view writes a SIBLING file only.
+# It never touches DRIFT_OUT_PATH and never feeds the live-readiness RED gate.
+SNAPSHOT_PATH = RUNTIME_DIR / "positions_snapshot.json"
+DRIFT_V4_OUT_PATH = RUNTIME_DIR / "position_guard_drift_v4.json"
 
 IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4002
@@ -325,6 +330,87 @@ def _emit_position_guard_drift() -> int:
     return drift_count
 
 
+def _flag_on(name: str) -> bool:
+    """Strict truthy env parse — '0'/'false'/'no'/'off'/'' all read as OFF."""
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _emit_position_guard_drift_v4(
+    *,
+    guard_path: "Path | None" = None,
+    snapshot_path: "Path | None" = None,
+    out_path: "Path | None" = None,
+    now: "float | None" = None,
+) -> "Dict[str, Any] | None":
+    """W1A-5 / CHAD_DRIFT_V4 (default OFF) — observability-only sibling drift file.
+
+    Emits an INDEPENDENT-leg drift view (``position_guard_drift.v4``) to
+    ``runtime/position_guard_drift_v4.json`` via
+    ``detect_guard_vs_independent_snapshot_drift`` — which compares the guard's
+    two same-source legs SEPARATELY against the ONE independent
+    ``positions_snapshot.json`` leg (the EXS4 model; never sums the dual-booked
+    legs, freshness-gates the independent leg to blind).
+
+    D2 (Wave-1): SIBLING file only. It does NOT touch
+    ``position_guard_drift.json`` and does NOT feed the live-readiness RED gate —
+    a new comparator must soak before it can flip live-readiness. When the flag is
+    unset this is a **no-op**: nothing is read, nothing is written, and the v3
+    path (``_emit_position_guard_drift``) is entirely unaffected.
+
+    Returns the v4 payload dict when it ran, else ``None`` (flag off).
+    """
+    if not _flag_on("CHAD_DRIFT_V4"):
+        return None
+    try:
+        from chad.core.position_guard import detect_guard_vs_independent_snapshot_drift
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("position_guard import failed for v4 drift emit: %s", exc)
+        return None
+
+    gpath = guard_path or GUARD_PATH
+    spath = snapshot_path or SNAPSHOT_PATH
+    opath = out_path or DRIFT_V4_OUT_PATH
+
+    try:
+        guard_state = json.loads(gpath.read_text(encoding="utf-8")) if gpath.is_file() else {}
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("position_guard.json unreadable for v4 drift emit: %s", exc)
+        guard_state = {}
+    try:
+        snapshot = json.loads(spath.read_text(encoding="utf-8")) if spath.is_file() else None
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("positions_snapshot.json unreadable for v4 drift emit: %s", exc)
+        snapshot = None
+
+    excluded_symbols = {
+        str(s).strip().upper()
+        for s in (set(EXCLUSION_POLICY.keys()) | set(_BROKER_PREEXISTING))
+        if s
+    }
+    result = detect_guard_vs_independent_snapshot_drift(
+        guard_state if isinstance(guard_state, dict) else {},
+        snapshot if isinstance(snapshot, dict) else None,
+        excluded_symbols=excluded_symbols,
+        now=now,
+    )
+    payload = {
+        **result,
+        "ts_utc": _utc_now_iso(),
+        "ttl_seconds": TTL_SECONDS,
+        "excluded_symbols": sorted(excluded_symbols),
+    }
+    opath.parent.mkdir(parents=True, exist_ok=True)
+    tmp = opath.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(opath)
+    LOG.info(
+        "position_guard_drift_v4 (observability sibling) leg=%s drift_count=%d info_count=%d path=%s",
+        result.get("independent_leg"), int(result.get("drift_count", 0) or 0),
+        int(result.get("info_count", 0) or 0), opath,
+    )
+    return payload
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -335,6 +421,14 @@ def main() -> int:
         _emit_position_guard_drift()
     except Exception as exc:  # noqa: BLE001
         LOG.warning("position_guard_drift emit failed: %s", exc)
+
+    # W1A-5 (CHAD_DRIFT_V4, default OFF): observability-only independent-leg
+    # sibling file. No-op unless the flag is on; never touches the v3 file or the
+    # RED gate. Defensive so it can never block reconciliation.
+    try:
+        _emit_position_guard_drift_v4()
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("position_guard_drift_v4 emit failed: %s", exc)
 
     # GAP-032 preventive: refresh runtime/systemd_wants_lint.json on the
     # publisher's existing ~5-min cadence so a regression to the
