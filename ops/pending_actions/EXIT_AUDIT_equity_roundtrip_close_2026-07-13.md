@@ -2,12 +2,40 @@
 
 - **Filed:** 2026-07-13
 - **Type:** Forensic finding + Pending Action. SHADOW-first fix BUILT + wired 2026-07-13 (see §6);
-  ACTIVE flip and any deploy remain PROPOSED.
+  **DEPLOYED IN SHADOW** (corrected 2026-07-18); ACTIVE flip remains PROPOSED.
 - **Author:** EXIT-AUDIT (read-only forensic) + EXIT-OVERLAY (implementation)
-- **Status:** SHADOW implementation landed repo-side (default-safe, not deployed). The ACTIVE flip
-  requires typed operator GO against the §4 pre-registered criteria.
+- **Status:** SHADOW implementation landed repo-side and is **deployed in shadow** (default-safe;
+  submits nothing — corrected 2026-07-18, was "not deployed"). The ACTIVE flip requires typed
+  operator GO against the §4 pre-registered criteria.
 - **Governance:** One change at a time · no direct config mutation · default-OFF, shadow-first · no
   flip without pre-registered written activation criteria (per dormant-census governance).
+
+---
+
+## FU1-B6 DOC CORRECTIONS (2026-07-18) — 5 stale claims fixed
+
+`docs/ULTRA_CLOSE_AUDIT_2026-07-17.md` §F found five drifted claims in this PA. All five are
+corrected inline below; recorded here for the audit trail (each re-verified against the live tree,
+not merely copied from the audit):
+
+1. **§6 "NOT DEPLOYED" was STALE.** The overlay **is deployed and running in SHADOW** — heartbeat
+   fresh `runtime/exit_overlay_heartbeat.json` `mode=shadow ts=2026-07-18T01:55:20Z evaluated=7`.
+   §6 header and deploy-status line corrected.
+2. **§3 "honors `_EFFECTIVE_NON_CHAD_SYMBOLS`" was FALSE as written.** No exclusion term existed in
+   the module; exclusions were honoured only accidentally at the `apply_close_intents` chokepoint.
+   **FU1-B6 makes it TRUE** — `evaluate_positions` now skips excluded symbols in-module
+   (`SKIP_EXCLUDED`), before the phantom guard. The doc claim now matches the code.
+3. **§3 "default OFF" contradicted the shipped `config/position_exit_overlay.json` `mode: "shadow"`**
+   (env unset → `resolve_mode` returns the config's `shadow`, not OFF). Corrected to "shipped
+   default = shadow".
+4. **§3 evidence path `data/exit_overlay_shadow/` was wrong** — the code writes `data/exit_overlay/`
+   (`_DEFAULT_EVIDENCE_SUBDIR = ("data", "exit_overlay")`; §6 and the markers block already said so).
+   Corrected.
+5. **§6 hot-path wiring cited `live_loop.py:1933-1953`** — the actual block is
+   `live_loop.py:2270-2278` (verified). Corrected.
+
+The criteria-amendment items the audit also raised (C5 proxy ruling, C7 rollback procedure, the
+WARMUP re-grade paradox) are handled separately in the FU1-B7 amendment PA, not here.
 
 ---
 
@@ -128,9 +156,13 @@ not because SELLs are absent.
   excursion > `k · ATR` from a persisted entry anchor, or (ii) **time-based max-hold** — position age
   > `max_hold_bars`. Entry anchor/age persisted to `runtime/position_exit_overlay_state.json` (survives
   restart — unlike gamma's in-process `_STATE`).
-- **Safety:** config-gated `CHAD_POSITION_EXIT_OVERLAY` **default OFF**; a `shadow` mode that writes
-  marker evidence to `data/exit_overlay_shadow/` and emits **no** intents; kill-switch; fail-closed on
-  missing ATR/price; honors `_EFFECTIVE_NON_CHAD_SYMBOLS` operator exclusions and paper/dry-run gating.
+- **Safety:** config-gated `CHAD_POSITION_EXIT_OVERLAY`; the **shipped default is `mode: "shadow"`**
+  (env unset → `resolve_mode` returns the config's `shadow`, not OFF — corrected 2026-07-18, was
+  "default OFF"); shadow writes marker evidence to `data/exit_overlay/` (corrected, was
+  `data/exit_overlay_shadow/`) and emits **no** intents; kill-switch; fail-closed on missing
+  ATR/price; honors `_EFFECTIVE_NON_CHAD_SYMBOLS` operator exclusions — enforced **in the overlay
+  itself** (`evaluate_positions` → `SKIP_EXCLUDED`, before the phantom guard) since FU1-B6, not only
+  at the downstream `apply_close_intents` chokepoint — and paper/dry-run gating.
 
 **Why (b) over the alternatives**
 
@@ -183,7 +215,7 @@ logged, never inferred as coverage.
 
 ---
 
-## 6. Implementation status — Q5(b) SHADOW-first landed 2026-07-13 (repo-side; NOT deployed)
+## 6. Implementation status — Q5(b) SHADOW-first landed 2026-07-13; DEPLOYED IN SHADOW (corrected 2026-07-18)
 
 The recommended overlay is **built and wired in SHADOW mode** (U0–U3). It activates in shadow
 only at the next live-loop restart; the **ACTIVE flip remains a separate future PA** gated on the
@@ -206,8 +238,9 @@ Implementation citations:
   the adapter RTH gate `ibkr_adapter._evaluate_rth_gate`, idempotency, margin-shadow).
   `build_default_overlay` (:846) fail-opens to `None` on bad config and carries the margin-gate
   pytest evidence/state leak guard. A cycle error logs `EXIT_OVERLAY_ERROR` and submits nothing.
-- **Hot-path wiring:** `chad/core/live_loop.py:1933-1953` — inside `run_once`, immediately after
-  the reconciler block and before the market-metrics publisher / intent planning.
+- **Hot-path wiring:** `chad/core/live_loop.py:2270-2278` (corrected 2026-07-18, was `1933-1953`) —
+  inside `run_once`, immediately after the reconciler block and before the market-metrics publisher
+  / intent planning.
 - **Tests:** `chad/tests/test_position_exit_overlay.py` (23) + `..._wiring.py` (4) — every
   condition, all skip classes, reduce-only clamp + reclamp, short mirror, anchor seed/update/prune,
   config validation, kill-switch, SHADOW-writes-evidence-submits-nothing, OFF inert, error
@@ -218,5 +251,9 @@ New markers: `EXIT_OVERLAY_SHADOW`, `EXIT_OVERLAY_SKIP_UNCONFIRMED`, `EXIT_OVERL
 `EXIT_OVERLAY_ACTIVE_CLOSE`. Evidence: `data/exit_overlay/exit_overlay_YYYYMMDD.ndjson`
 (schema `exit_overlay.v1`).
 
-**Deploy status: NOT DEPLOYED.** SHADOW activates at the next live-loop restart (operator action).
-The ACTIVE flip is its own authorization PA per §4. No service files touched; no restart performed.
+**Deploy status: DEPLOYED IN SHADOW** (corrected 2026-07-18; was "NOT DEPLOYED"). The overlay is
+live in shadow — `runtime/exit_overlay_heartbeat.json` fresh `mode=shadow ts=2026-07-18T01:55:20Z
+evaluated=7`; it emits marker/heartbeat evidence and submits **nothing** (SHADOW). The ACTIVE flip
+is still its own authorization PA per §4. No service files touched by this correction; no restart
+performed. (The FU1 B-2..B-6 fixes below land at the next gated restart; SHADOW keeps submitting
+nothing until the ACTIVE flip.)

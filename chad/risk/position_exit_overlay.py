@@ -54,7 +54,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import AbstractSet, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "MODE_OFF",
@@ -244,7 +244,7 @@ def resolve_mode(
 @dataclass(frozen=True)
 class ExitOverlayVerdict:
     """One position's evaluation outcome. ``verdict`` ∈ {WOULD_CLOSE, HOLD,
-    SKIP_UNCONFIRMED, SKIP_NON_EQUITY, SKIP_NO_DATA}."""
+    SKIP_UNCONFIRMED, SKIP_NON_EQUITY, SKIP_NO_DATA, SKIP_EXCLUDED}."""
 
     verdict: str
     reason: str
@@ -382,6 +382,22 @@ def _atr(bars: Sequence[Mapping[str, Any]], period: int) -> Optional[float]:
     for v in tr[1:]:
         e = alpha * v + (1.0 - alpha) * e
     return e if e > 0 else None
+
+
+def _default_excluded_symbols() -> "frozenset[str]":
+    """Operator-owned / non-CHAD symbols the overlay must never propose a close for (B-6).
+
+    Resolved from the reconciler's single-source exclusion set (``_EFFECTIVE_NON_CHAD_SYMBOLS``,
+    itself derived from ``config/reconciliation_exclusions.json``) so there is no parallel config
+    reader. Fail-open to empty on any resolution failure: the downstream ``apply_close_intents``
+    chokepoint (position_reconciler.py) remains the backstop, so a failed import never sells an
+    excluded symbol — it only loses the redundant overlay-level layer for that build.
+    """
+    try:
+        from chad.core.position_reconciler import _EFFECTIVE_NON_CHAD_SYMBOLS
+        return frozenset(str(s).strip().upper() for s in _EFFECTIVE_NON_CHAD_SYMBOLS)
+    except Exception:  # noqa: BLE001 - the chokepoint is the backstop; never fatal
+        return frozenset()
 
 
 def _broker_signed_by_symbol(guard_state: Mapping[str, Any]) -> Dict[str, float]:
@@ -579,6 +595,7 @@ def evaluate_positions(
     config: ExitOverlayConfig,
     now_utc: datetime,
     fifo_truth_by_key: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    excluded_symbols: Optional[AbstractSet[str]] = None,
 ) -> ExitOverlayResult:
     """Deterministic core. Given the position/guard/bars/price/anchor snapshot and the config,
     return verdicts, reduce-only close-intent dicts (for WOULD_CLOSE), and the anchors to
@@ -586,6 +603,14 @@ def evaluate_positions(
 
     Reduce-only invariant: a proposed close qty never exceeds the broker-confirmed same-side
     quantity at evaluation time (``min(guard_qty, broker_held_same_side)``).
+
+    B-6 (FLIP-UNBLOCK 2026-07-17): ``excluded_symbols`` are operator-owned / non-CHAD symbols
+    (``_EFFECTIVE_NON_CHAD_SYMBOLS``) the overlay must never touch. Pre-B-6 the PA §3 CLAIMED the
+    overlay "honors ``_EFFECTIVE_NON_CHAD_SYMBOLS``", but no exclusion term existed in the module —
+    exclusions were honoured only accidentally, one layer downstream at the ``apply_close_intents``
+    chokepoint, and the phantom guard even confirmed CHAD's position against the operator's own
+    broker shares. Skipping here (BEFORE the phantom confirmation and any close intent) makes the
+    doc's claim true and adds the second, module-level layer. ``None`` → no exclusions applied.
 
     B-3 (FLIP-UNBLOCK 2026-07-17): ``fifo_truth_by_key`` supplies a real cost basis and a
     STABLE open time per ``strategy|symbol`` position, read from the FIFO lot book
@@ -629,6 +654,13 @@ def evaluate_positions(
             )
             base.update(kw)
             return ExitOverlayVerdict(**base)
+
+        # B-6: operator-owned / non-CHAD symbols are skipped FIRST — before the phantom
+        # confirmation reads broker truth and before any close intent. The overlay never
+        # proposes a close for them and never treats the operator's inventory as confirmation.
+        if excluded_symbols and symbol in excluded_symbols:
+            verdicts.append(_mk("SKIP_EXCLUDED", "operator_excluded_symbol"))
+            continue
 
         # Scope guard — equity/ETF only. Futures/options/other skipped (they own their exits).
         if asset_class not in _ACTED_ASSET_CLASSES:
@@ -780,6 +812,7 @@ class PositionExitOverlay:
         heartbeat_path: Optional[Path] = None,
         env: Optional[Mapping[str, str]] = None,
         logger: Optional[logging.Logger] = None,
+        excluded_symbols: Optional[AbstractSet[str]] = None,
     ) -> None:
         self._config = config
         self._evidence_path = evidence_path
@@ -792,10 +825,27 @@ class PositionExitOverlay:
         self._fifo_truth_loader = fifo_truth_loader
         self._env = os.environ if env is None else env
         self._log = logger or LOGGER
+        # B-6: operator-owned / non-CHAD exclusions. An explicit set (tests) wins; otherwise
+        # resolved lazily+cached from the reconciler's single-source set on first cycle.
+        self._excluded_symbols_override = excluded_symbols
+        self._excluded_cache: Optional["frozenset[str]"] = None
 
     @property
     def mode(self) -> str:
         return resolve_mode(self._config.mode, self._env)
+
+    def _excluded_symbols(self) -> "frozenset[str]":
+        if self._excluded_symbols_override is not None:
+            return frozenset(self._excluded_symbols_override)
+        if self._excluded_cache is None:
+            # Under pytest, default to NO exclusions unless a test passes an explicit set — so
+            # fixtures may freely use real tickers (BAC/SPY/QQQ) that happen to be operator-owned.
+            # Production resolves the reconciler's single-source set. Mirrors the module's
+            # _under_active_pytest() leak-guard philosophy (build_default_overlay).
+            self._excluded_cache = (
+                frozenset() if _under_active_pytest() else _default_excluded_symbols()
+            )
+        return self._excluded_cache
 
     def run_cycle(self, paper_adapter: Any, *, now_utc: Optional[datetime] = None) -> ExitOverlayResult:
         mode = self.mode
@@ -834,6 +884,7 @@ class PositionExitOverlay:
                 config=self._config,
                 now_utc=now,
                 fifo_truth_by_key=fifo_truth,
+                excluded_symbols=self._excluded_symbols(),
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
             self._safe_error(exc)
