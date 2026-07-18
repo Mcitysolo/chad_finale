@@ -1,0 +1,16 @@
+[Unit]
+Description=CHAD VaR Publisher Timer (every 30 minutes)
+Documentation=file:///home/ubuntu/chad_finale/docs/VAR_PUBLISHER_INSTALL.md
+
+[Timer]
+# 30-minute cadence is deliberately BELOW the strictest consumer floor: EXS1
+# fails var_state at fail_after_seconds=7200 (2h) and the artifact TTL is 3600s
+# (1h). A >1h cadence would leave EXS1 red between runs, so do not relax this.
+OnBootSec=180
+OnUnitActiveSec=1800
+AccuracySec=60s
+Persistent=true
+Unit=chad-var-publisher.service
+
+[Install]
+WantedBy=timers.target
