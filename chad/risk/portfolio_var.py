@@ -382,13 +382,34 @@ def compute_portfolio_var(
     )
 
 
-def report_to_state_dict(report: VarReport, ts_utc: str, ttl_seconds: int = 3600) -> Dict[str, Any]:
-    """Render a VarReport into the var_state.v1 schema."""
+def report_to_state_dict(
+    report: VarReport,
+    ts_utc: str,
+    ttl_seconds: int = 3600,
+    *,
+    status_override: Optional[str] = None,
+    inputs_fresh: Optional[bool] = None,
+    oldest_input_age_seconds: Optional[float] = None,
+    oldest_input: Optional[str] = None,
+    input_max_age_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Render a VarReport into the var_state.v1 schema.
+
+    ``status_override`` lets the publisher downgrade the reported ``status``
+    (e.g. ``ok`` -> ``stale_inputs``) when the underlying market-data inputs are
+    stale, without mutating the frozen ``VarReport``. The ``inputs_fresh`` /
+    ``oldest_input*`` keys are ADDITIVE observability fields (schema stays
+    ``var_state.v1``): they surface *input* freshness so a timer that recomputes
+    against stale bars cannot silently re-stamp a fresh ``ts_utc`` over stale
+    market data (the "stale-as-fresh" failure, one layer down from the
+    artifact's own ``ts_utc`` that EXS1 / the A4 metrics guard already inspect).
+    All default ``None`` so existing callers are unchanged.
+    """
     return {
         "schema_version": "var_state.v1",
         "ts_utc": ts_utc,
         "ttl_seconds": int(ttl_seconds),
-        "status": report.status,
+        "status": status_override if status_override is not None else report.status,
         "method": report.method,
         "confidence_levels": list(report.confidence_levels),
         "var_95_1day_usd": round(float(report.var_95_1day_usd), 2),
@@ -399,6 +420,17 @@ def report_to_state_dict(report: VarReport, ts_utc: str, ttl_seconds: int = 3600
         "symbols_used": list(report.symbols_used),
         "symbols_missing_data": list(report.symbols_missing_data),
         "enforcement_active": False,
+        # Additive input-freshness observability (var_state.v1, additive keys).
+        "inputs_fresh": inputs_fresh,
+        "oldest_input_age_seconds": (
+            round(float(oldest_input_age_seconds), 1)
+            if oldest_input_age_seconds is not None
+            else None
+        ),
+        "oldest_input": oldest_input,
+        "input_max_age_seconds": (
+            int(input_max_age_seconds) if input_max_age_seconds is not None else None
+        ),
         "notes": list(report.notes),
     }
 
