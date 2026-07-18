@@ -68,6 +68,17 @@ logger = logging.getLogger(__name__)
 _REGIME_STATE_PATH = Path("/home/ubuntu/chad_finale/runtime/regime_state.json")
 _BARS_DIR = Path("/home/ubuntu/chad_finale/data/bars/1d")
 
+# CBAR-S1 — CRYPTO-DAILY-BARS "real wire". The regime short-circuit in
+# alpha_crypto_handler returns [] in ranging/adverse BEFORE any signal computes, which is why
+# feeding daily bars alone cannot un-silence this brain. Under the CEW1 exploration flag
+# (CHAD_CRYPTO_EXPLORATION on AND CHAD_EXECUTION_MODE=paper AND CHAD_KRAKEN_MODE!=live), the
+# handler proceeds through its FULL momentum/breakout path in ALL regimes so CHAD can measure
+# the "crypto has no edge in ranging" assumption on paper. Flag OFF — or either fail-closed
+# refusal — restores byte-identical stock gating. The flag is resolved by the SINGLE CEW1
+# authority (regime_activation.crypto_exploration_state); this module is the SECOND consumption
+# site, never a second flag-evaluation path (one authority, two consumers).
+MARKER_EXPLORATION_HANDLER_PASS = "CRYPTO_EXPLORATION_HANDLER_PASS"
+
 
 # -------------------------
 # Default Universe (safe)
@@ -569,6 +580,25 @@ def _read_regime(ctx: Any) -> str:
     return "unknown"
 
 
+def _exploration_bypass_active() -> bool:
+    """True only when CEW1's exploration flag resolves to ``active`` — flag on AND global
+    ``CHAD_EXECUTION_MODE=paper`` AND the Kraken lane not live (``CHAD_KRAKEN_MODE!=live``).
+
+    Delegates to the ONE authority (``regime_activation.crypto_exploration_state``); it never
+    re-implements the two-axis fail-closed logic here. Any import/eval failure fails CLOSED
+    (returns False → stock gating), so a broken import can only ever restore stock behavior,
+    never widen exploration. Both fail-closed refusals (``refused_non_paper`` /
+    ``refused_kraken_live``) resolve ``active=False`` here, so a refused posture keeps the
+    handler's stock ranging/adverse short-circuit.
+    """
+    try:
+        from chad.portfolio.regime_activation import crypto_exploration_state
+        active, _reason = crypto_exploration_state()
+        return bool(active)
+    except Exception:
+        return False
+
+
 def _load_bars_for_symbol(ctx: Any, symbol: str) -> List[Mapping[str, Any]]:
     """
     Pull the daily bar series for ``symbol`` from ctx.bars first (populated by
@@ -641,8 +671,14 @@ def alpha_crypto_handler(ctx: Any, params: AlphaCryptoParams) -> List[TradeSigna
 
     regime = _read_regime(ctx)
     if regime in ("ranging", "adverse"):
-        logger.info("alpha_crypto: no signals this cycle (reason: regime_%s)", regime)
-        return []
+        if _exploration_bypass_active():
+            # CBAR-S1: exploration armed (paper-epoch only) — do NOT short-circuit; fall through
+            # into the full momentum/breakout path in this otherwise-excluded regime. The loud
+            # marker is the observability proof that the internal bypass engaged this cycle.
+            logger.info("%s regime=%s", MARKER_EXPLORATION_HANDLER_PASS, regime)
+        else:
+            logger.info("alpha_crypto: no signals this cycle (reason: regime_%s)", regime)
+            return []
     regime_mult = 0.5 if regime == "trending_bear" else 1.0
 
     universe = [s for s in params.actual_universe() if s.endswith("-USD")]
