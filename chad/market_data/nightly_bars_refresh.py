@@ -138,16 +138,48 @@ def _write_bar_file(symbol: str, bars: List[Dict[str, Any]], source: str) -> Non
     _atomic_write_json(out_path, payload)
 
 
+def _write_kraken_bars_state(crypto_results: Dict[str, bool]) -> None:
+    """CBAR-S2 — freshness marker + state file for the EXS1 sentinel table.
+
+    Emits the ``KRAKEN_BARS_REFRESH ok=N fail=M`` marker line (over the CRYPTO symbols only,
+    NOT the shared results dict which also holds IBKR/VIX rows) and writes
+    ``runtime/kraken_bars_state.json`` carrying its own ``ts_utc`` + ``ttl_seconds`` so the
+    Exterminator Sentinel's ``check_stale_feeds`` can judge crypto-bar freshness once an
+    operator adds the feed row to ``config/exterminator.json``. ttl=90000s (25h) gives a 1h
+    grace over the 24h refresh cadence. Purely observability: a state-write failure is logged
+    and swallowed so it can never fail the refresh run or block the bar writes above.
+    """
+    ok = sum(1 for v in crypto_results.values() if v)
+    fail = sum(1 for v in crypto_results.values() if not v)
+    print(f"[{_ts_now()}] KRAKEN_BARS_REFRESH ok={ok} fail={fail}", flush=True)
+    try:
+        payload = {
+            "schema_version": "kraken_bars_state.v1",
+            "ts_utc": _ts_now(),
+            "ttl_seconds": 90000,
+            "ok": ok,
+            "fail": fail,
+            "symbols": {s: ("ok" if v else "fail") for s, v in sorted(crypto_results.items())},
+        }
+        _atomic_write_json(REPO_ROOT / "runtime" / "kraken_bars_state.json", payload)
+    except Exception as e:  # noqa: BLE001 — observability must never fail the refresh
+        _log("KRAKEN_BARS_STATE", f"state write FAILED {e}")
+
+
 def _run_kraken(results: Dict[str, bool]) -> None:
+    crypto_results: Dict[str, bool] = {}
     for symbol, pair_key in KRAKEN_PAIRS.items():
         try:
             bars = fetch_kraken_bars(symbol, pair_key)
             _write_bar_file(symbol, bars, source="kraken")
             _log(symbol, f"wrote {len(bars)} bars, source=kraken")
             results[symbol] = True
+            crypto_results[symbol] = True
         except Exception as e:
             _log(symbol, f"FAILED {e}")
             results[symbol] = False
+            crypto_results[symbol] = False
+    _write_kraken_bars_state(crypto_results)
 
 
 def _run_vix(results: Dict[str, bool]) -> None:
