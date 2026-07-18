@@ -1224,6 +1224,119 @@ def rule_exit_overlay_heartbeat(findings: List[Finding]) -> None:
     ))
 
 
+def _kraken_open_lot_qty() -> Optional[float]:
+    """Total open qty across the Kraken trusted-fill lot book, or None if unreadable.
+
+    Read-only (``mode=ro``) so the health monitor never creates or locks the paper store.
+    Returns None (not 0.0) on a missing DB / absent table / any error, so the caller can tell
+    "book proves nothing" apart from "book is genuinely flat".
+
+    The store path + table name are imported from their canonical owner
+    (``kraken_trusted_fill_engine``) rather than re-typed, so a future rename of the store
+    cannot silently point this blind-check at a nonexistent DB. Lazy import keeps the
+    health-monitor cold path free of the engine's config imports until this rule actually runs.
+    """
+    try:
+        from chad.core.kraken_trusted_fill_engine import RoundTripBook, _default_book_db_path
+        db = _default_book_db_path()
+        table = RoundTripBook._TABLE
+    except Exception:
+        db = RUNTIME / "exec_state_paper.sqlite3"
+        table = "kraken_trusted_lots"
+    if not db.is_file():
+        return None
+    try:
+        import contextlib
+        import sqlite3
+        with contextlib.closing(
+            sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        ) as con:
+            row = con.execute(
+                f"SELECT COALESCE(SUM(qty_remaining), 0) FROM {table}"
+            ).fetchone()
+        return float(row[0]) if row else 0.0
+    except Exception:
+        return None
+
+
+def rule_crypto_exit_overlay_heartbeat(findings: List[Finding]) -> None:
+    """R24 — the CRYPTO exit overlay must never watch silently (XOV-2345, crypto lane).
+
+    The Kraken-lane sibling of R14. Same two failures, cross-checked against the crypto lane's
+    OWN position truth — the ``kraken_trusted_lots`` FIFO book — because there is no independent
+    crypto broker leg (the lot book IS the position truth for this lane):
+
+    (a) STALE/MISSING heartbeat — run_cycle stopped being called at all.
+    (b) FRESH heartbeat reporting evaluated=0 while the lot book demonstrably holds open lots —
+        the overlay is alive but its position source went empty underneath it. Fail-closed: an
+        UNREADABLE book proves nothing (say nothing), a genuinely FLAT book makes evaluated=0
+        correct (say nothing); only a readable book with real open qty vs evaluated=0 fires.
+
+    NOTIFY_ONLY (SS01): the only publisher is chad-live-loop, a trading engine, which
+    health_monitor must never auto-restart.
+    """
+    hb_path = RUNTIME / "crypto_exit_overlay_heartbeat.json"
+    age = _age(hb_path)
+    if age is None:
+        findings.append(Finding(
+            rule_id="R24",
+            severity="WARNING",
+            title="Crypto exit overlay heartbeat MISSING",
+            description=(
+                "The CRYPTO (Kraken) exit overlay has never published a heartbeat. It "
+                "may not be wired into the live loop, or the loop has not restarted "
+                "since the crypto overlay shipped."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="Confirm chad-live-loop is running the crypto exit overlay.",
+            evidence=f"missing file={hb_path.name}",
+        ))
+        return
+
+    hb = _read_json(hb_path)
+    ttl = float(hb.get("ttl_seconds") or 900)
+    if age > ttl * 2:
+        findings.append(Finding(
+            rule_id="R24",
+            severity="CRITICAL",
+            title="Crypto exit overlay heartbeat STALE",
+            description=(
+                "The crypto exit overlay has stopped reporting in. Nothing is watching "
+                "the Kraken lot book for stop-loss or max-hold exits right now."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="Investigate chad-live-loop; the crypto exit overlay stopped running.",
+            evidence=f"heartbeat age={int(age)}s TTL={int(ttl)}s mode={hb.get('mode')}",
+        ))
+        return
+
+    # (b) alive but blind. Only meaningful against a READABLE, non-empty lot book.
+    if int(hb.get("evaluated") or 0) > 0 or str(hb.get("mode") or "") == "off":
+        return
+    held = _kraken_open_lot_qty()
+    if held is None or held <= 1e-9:
+        return  # book unreadable (proves nothing) or genuinely flat (evaluated=0 is correct)
+    findings.append(Finding(
+        rule_id="R24",
+        severity="CRITICAL",
+        title="Crypto exit overlay is watching nothing",
+        description=(
+            "The crypto exit overlay is running but sees zero open lots, while the Kraken "
+            "trusted-fill book is holding real ones. Its view of the lot book has gone "
+            "empty, so no stop-loss or max-hold exit can fire on the crypto lane."
+        ),
+        remedy_type="NOTIFY_ONLY",
+        remedy_action=(
+            "Check chad-live-loop for CRYPTO_EXIT_OVERLAY_ERROR and whether the lot-book "
+            "loader (kraken_trusted_lots) is reading the right store."
+        ),
+        evidence=(
+            f"heartbeat evaluated=0 mode={hb.get('mode')} but Kraken lot book holds "
+            f"open qty={held:.8f}"
+        ),
+    ))
+
+
 # IR1 R3: consecutive failed advisory refreshes before we NOTIFY. At the
 # 15-min refresh cadence, 3 consecutive all-fallback runs ≈ 45 min of a dead
 # advisory tier — long enough to be real, short enough to catch what was a
@@ -1301,6 +1414,7 @@ def run_all_rules() -> List[Finding]:
         rule_ibkr_sustained_latency,
         rule_ibkr_gateway_version,
         rule_exit_overlay_heartbeat,
+        rule_crypto_exit_overlay_heartbeat,
     ]:
         try:
             fn(findings)

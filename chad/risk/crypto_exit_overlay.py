@@ -643,8 +643,9 @@ class CryptoExitOverlay:
             return
         try:
             row = verdict.to_dict()
-            # Lane tag: crypto verdicts share the equity evidence stream (one exit-evidence
-            # surface), so a reader must be able to separate them without inferring from symbol.
+            # Lane tag: crypto verdicts write their OWN file (crypto_*.ndjson, W1) in the shared
+            # data/exit_overlay directory. The tag is belt-and-braces so a reader that globs the
+            # whole directory can still separate lanes without inferring from symbol.
             row["lane"] = "crypto"
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:
@@ -658,8 +659,12 @@ class CryptoExitOverlay:
         base = self._evidence_path
         if base.suffix == ".ndjson":
             return base
+        # CRYPTO-EXPLORE-WIRE W1: OWN evidence file (data/exit_overlay/crypto_*.ndjson), never
+        # the equity lane's exit_overlay_*.ndjson. Same directory, distinct filename — so a
+        # reader never has to disambiguate two lanes appending to one file, and the crypto
+        # trail cannot be interleaved with (or mistaken for) the equity trail.
         day = verdict.ts_utc[:10].replace("-", "") if verdict.ts_utc else "19700101"
-        return base / f"exit_overlay_{day}.ndjson"
+        return base / f"crypto_exit_overlay_{day}.ndjson"
 
 
 # --------------------------------------------------------------------------- #
