@@ -320,6 +320,57 @@ def test_real_notification_emits_marker_and_notify(tmp_path, monkeypatch, caplog
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# W1B-5 (review): scratch / manual / warmup_sim rows must not drive a clear
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_trades(tmp_path: Path, records: list[dict]) -> str:
+    d = tmp_path / "data" / "trades"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "trade_history_test.ndjson"
+    with f.open("w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+    return str(d / "trade_history_*.ndjson")
+
+
+def test_pnl_zero_tail_does_not_manufacture_recovery(tmp_path, spy_notify):
+    store = tmp_path / "strategy_allocations.json"
+    _seed_store(store, "gamma", halted_at=(_now() - timedelta(days=1)).isoformat())
+    # 5 trusted losses then a scratch (pnl==0). The scratch must be EXCLUDED so
+    # it cannot reset the decay streak into a wrongful recovery clear.
+    rows = [{"strategy": "gamma", "pnl": -1.0} for _ in range(5)]
+    rows.append({"strategy": "gamma", "pnl": 0.0})
+    glob = _write_raw_trades(tmp_path, rows)
+
+    edm.EdgeDecayMonitor(
+        min_trades=5, consecutive_threshold=5, clear_on_recovery=True,
+        halt_ttl_days=14, allocations_path=store, trades_glob=glob,
+    ).check_all()
+
+    assert _entry(store, "gamma")["halted"] is True  # still decaying, not cleared
+    assert spy_notify == []
+
+
+def test_manual_tagged_win_tail_does_not_clear(tmp_path, spy_notify):
+    store = tmp_path / "strategy_allocations.json"
+    _seed_store(store, "gamma", halted_at=(_now() - timedelta(days=1)).isoformat())
+    # A "manual"-tagged win is not strategy performance -> excluded -> the
+    # trusted streak stays at 5 and the halt holds.
+    rows = [{"strategy": "gamma", "pnl": -1.0} for _ in range(5)]
+    rows.append({"strategy": "gamma", "pnl": 5.0, "tags": ["manual"]})
+    glob = _write_raw_trades(tmp_path, rows)
+
+    edm.EdgeDecayMonitor(
+        min_trades=5, consecutive_threshold=5, clear_on_recovery=True,
+        halt_ttl_days=14, allocations_path=store, trades_glob=glob,
+    ).check_all()
+
+    assert _entry(store, "gamma")["halted"] is True
+    assert spy_notify == []
+
+
 def test_idempotent_rerun_no_second_clear(tmp_path, spy_notify):
     store = tmp_path / "strategy_allocations.json"
     _seed_store(store, "alpha_crypto", halted_at=(_now() - timedelta(days=30)).isoformat())

@@ -245,9 +245,24 @@ def _iter_trade_payloads(
                         continue
                     if payload.get("historical_pre_rebuild") is True:
                         continue
+                    # W1B-5 (review): mirror trade_stats_engine's exclusion truth
+                    # so the streak that drives BOTH the halt AND the self-clear
+                    # uses only genuine trusted performance. scoring_excluded is
+                    # the meta-carrier "never score me" flag; manual / warmup_sim
+                    # rows are not strategy performance. Excluding them keeps a
+                    # manual/synthetic tail from masking a decay streak (halt) or
+                    # manufacturing a recovery (clear) — rider (i). No effect on
+                    # current real-strategy data (which carries none of these);
+                    # this is forward-looking hardening.
+                    if payload.get("scoring_excluded") is True:
+                        continue
                     tags = payload.get("tags") or []
                     if isinstance(tags, list) and (
-                        "pnl_untrusted" in tags or "historical_pre_rebuild" in tags
+                        "pnl_untrusted" in tags
+                        or "historical_pre_rebuild" in tags
+                        or "scoring_excluded" in tags
+                        or "manual" in tags
+                        or "warmup_sim" in tags
                     ):
                         continue
                     yield payload
@@ -290,6 +305,12 @@ def collect_recent_trades_by_strategy(
         strat = str(payload.get("strategy") or "unknown")
         pnl = _pnl_of(payload)
         if pnl is None:
+            continue
+        # W1B-5 (review): a scratch (pnl == 0) is neither a win nor a loss;
+        # trade_stats_engine excludes it, and counting it here would let a
+        # zero-pnl tail row reset a decay streak and (now that clears persist)
+        # manufacture a recovery auto-clear with no actual winning trade.
+        if pnl == 0.0:
             continue
         per_strat.setdefault(strat, []).append(pnl)
     # Trim to keep memory bounded — newest 1000 are all we ever need.
