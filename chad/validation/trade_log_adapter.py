@@ -70,10 +70,12 @@ __all__ = [
     "AdapterManifest",
     "AdapterResult",
     "trust_exclusion",
+    "is_quarantined",
     "classify_instrument",
     "is_placeholder_fill",
     "adapt_records",
     "iter_ledger_files",
+    "load_quarantine_pins",
     "load_ndjson",
     "run_adapter",
     "main",
@@ -118,6 +120,15 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "pnl_untrusted",
     # B2 (FLIP-UNBLOCK): fabricated cost basis (Epoch-3 seed lot).
     "scoring_excluded",
+    # W2A-1: operator quarantine pin (runtime/quarantine_manifest_*.json). A row whose
+    # ``record_hash`` / ``fill_id`` / ``fill_ids`` is pinned in an operator manifest is
+    # dropped BEFORE the trust gate — the same authority SCR honours natively
+    # (chad.analytics.trade_stats_engine via chad.utils.quarantine.get_exclusion_sets), so
+    # both scorekeepers exclude the identical set. This is the ONLY way to scrub a genuine-
+    # looking round-trip (e.g. the PFF1 harvester double-book phantoms) without rewriting the
+    # hash-chained ledger. Read as TEXT (see :func:`load_quarantine_pins`) — no chad import,
+    # so the harness import-closure isolation (tests/validation/test_isolation.py) is preserved.
+    "quarantined",
 )
 
 _LEDGER_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
@@ -323,6 +334,40 @@ def trust_exclusion(record: Mapping[str, Any]) -> Optional[str]:
         return "scoring_excluded"
 
     return None
+
+
+def is_quarantined(
+    record: Mapping[str, Any],
+    quarantined_hashes: "frozenset[str]",
+    quarantined_fill_ids: "frozenset[str]",
+) -> bool:
+    """True iff *record* is pinned by an operator quarantine manifest.
+
+    Mirrors ``chad.utils.quarantine.is_record_quarantined`` for the manifest-derived
+    pins ONLY — top-level ``record_hash``, ``payload.fill_id``, and any element of
+    ``payload.fill_ids`` (the derived-closed-trade carrier, which is what catches a
+    round-trip built from a pinned opening/closing fill). Reimplemented here as a pure
+    stdlib helper rather than imported, so the adapter's import closure stays free of
+    ``chad.utils`` (tests/validation/test_isolation.py). It deliberately does NOT
+    re-derive ``pnl_untrusted`` — that in-band trust marker is :func:`trust_exclusion`'s
+    job; this gate is only the operator's explicit manifest pin.
+    """
+    if not (quarantined_hashes or quarantined_fill_ids):
+        return False
+    rh = record.get("record_hash")
+    if isinstance(rh, str) and rh in quarantined_hashes:
+        return True
+    payload = record.get("payload")
+    if isinstance(payload, Mapping):
+        fid = payload.get("fill_id")
+        if isinstance(fid, str) and fid in quarantined_fill_ids:
+            return True
+        fids = payload.get("fill_ids")
+        if isinstance(fids, list):
+            for f in fids:
+                if isinstance(f, str) and f in quarantined_fill_ids:
+                    return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -531,6 +576,8 @@ def adapt_records(
     *,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    quarantined_hashes: "Optional[frozenset[str]]" = None,
+    quarantined_fill_ids: "Optional[frozenset[str]]" = None,
 ) -> tuple[list[AdmittedTrade], dict[str, int]]:
     """Filter + map an iterable of ``(record_or_None, source_file)`` into admitted trades.
 
@@ -543,6 +590,13 @@ def adapt_records(
     matched files); rows lacking a hash cannot be de-duplicated and are admitted. Returns the
     stable-sorted admitted list and a counters dict. Never raises on bad data.
 
+    ``quarantined_hashes`` / ``quarantined_fill_ids`` (W2A-1) are the operator manifest pins
+    from :func:`load_quarantine_pins`. An in-window row matched by :func:`is_quarantined` is
+    dropped as ``excluded:quarantined`` BEFORE the trust gate — the same authority SCR honours
+    — so a genuine-looking round-trip pinned by the operator (e.g. a PFF1 double-book phantom)
+    cannot reach the scorer even though it carries no in-band untrust marker. Both default to
+    ``None`` (no pins), keeping output byte-identical to pre-W2A for every existing caller.
+
     Structural guarantee: a row reaches ``admitted`` ONLY on the ``trust_exclusion(...) is
     None`` branch (the sole append site) — THIS is what makes the adapter unable to feed an
     untrusted row into the scorer. The post-loop re-run of :func:`trust_exclusion` on each
@@ -551,6 +605,8 @@ def adapt_records(
     rather than shipping such a row. It is an ``assert`` (advisory under ``python -O``); the
     append-gate above is the non-advisory guarantee.
     """
+    q_hashes: "frozenset[str]" = quarantined_hashes or frozenset()
+    q_fill_ids: "frozenset[str]" = quarantined_fill_ids or frozenset()
     admitted_pairs: list[tuple[AdmittedTrade, Mapping[str, Any]]] = []
     seen_hashes: set[str] = set()
     counters: dict[str, int] = {
@@ -578,6 +634,14 @@ def adapt_records(
             counters["out_of_window"] += 1
             continue
         counters["rows_in_window"] += 1
+
+        # W2A-1: operator quarantine pin (manifest record_hash / fill_id) — checked BEFORE
+        # the trust gate because a pinned row is genuine-looking (no in-band untrust marker)
+        # yet operator-invalidated; this is the only exclusion that would otherwise ADMIT.
+        if q_hashes or q_fill_ids:
+            if is_quarantined(record, q_hashes, q_fill_ids):
+                counters["excluded:quarantined"] += 1
+                continue
 
         reason = trust_exclusion(record)
         if reason is not None:
@@ -607,6 +671,11 @@ def adapt_records(
     # gate above (a row is only ever added when trust_exclusion(...) returned None).
     leaked = [rec for _, rec in admitted_pairs if trust_exclusion(rec) is not None]
     assert not leaked, f"trust-filter leak: {len(leaked)} admitted rows are excludable"
+    if q_hashes or q_fill_ids:
+        q_leaked = [
+            rec for _, rec in admitted_pairs if is_quarantined(rec, q_hashes, q_fill_ids)
+        ]
+        assert not q_leaked, f"quarantine leak: {len(q_leaked)} admitted rows are pinned"
 
     return admitted, counters
 
@@ -627,6 +696,61 @@ def iter_ledger_files(trades_dir: Path) -> list[Path]:
         (p for p in trades_dir.iterdir() if p.is_file() and _LEDGER_RE.match(p.name)),
         key=lambda p: p.name,
     )
+
+
+_MANIFEST_GLOB = "quarantine_manifest_*.json"
+
+
+def load_quarantine_pins(
+    runtime_dir: Optional[Path],
+) -> tuple[frozenset[str], frozenset[str], list[str]]:
+    """Return ``(record_hashes, fill_ids, consulted_manifest_names)`` from the operator
+    quarantine manifests under ``runtime_dir``.
+
+    Reads every ``runtime/quarantine_manifest_*.json`` as TEXT (json.loads) and unions
+    ``invalid_trades[].record_hash`` + ``invalid_fills[].fill_id`` — the manifest-only
+    subset of ``chad.utils.quarantine.get_exclusion_sets`` (the runtime fills-scan / FIFO-lot
+    / sidecar legs are deliberately excluded: they require importing runtime/execution readers
+    that would break the harness isolation contract, and the ghost-scrub pins by
+    ``record_hash`` regardless). Stdlib-only, no chad import.
+
+    Fail-safe (mirrors :func:`chad.utils.quarantine.get_quarantine_sets`): a missing dir,
+    unreadable file, or bad shape contributes nothing rather than raising — a scrub manifest
+    a reviewer forgot to fix must never crash the offline gate. ``runtime_dir is None`` (the
+    default in :func:`adapt_records`) yields empty sets, so the adapter's behaviour is
+    byte-identical to pre-W2A output unless a runtime dir is supplied.
+    """
+    if runtime_dir is None:
+        return frozenset(), frozenset(), []
+    rdir = Path(runtime_dir)
+    if not rdir.is_dir():
+        return frozenset(), frozenset(), []
+    hashes: set[str] = set()
+    fill_ids: set[str] = set()
+    consulted: list[str] = []
+    for manifest_path in sorted(rdir.glob(_MANIFEST_GLOB)):
+        try:
+            doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, Mapping):
+            continue
+        consulted.append(manifest_path.name)
+        for entry in doc.get("invalid_trades") or []:
+            if isinstance(entry, Mapping):
+                v = entry.get("record_hash")
+                if isinstance(v, str) and v:
+                    hashes.add(v)
+            elif isinstance(entry, str) and entry:
+                hashes.add(entry)
+        for entry in doc.get("invalid_fills") or []:
+            if isinstance(entry, Mapping):
+                v = entry.get("fill_id")
+                if isinstance(v, str) and v:
+                    fill_ids.add(v)
+            elif isinstance(entry, str) and entry:
+                fill_ids.add(entry)
+    return frozenset(hashes), frozenset(fill_ids), consulted
 
 
 def load_ndjson(path: Path) -> Iterable[tuple[Optional[Mapping[str, Any]], str]]:
@@ -665,15 +789,22 @@ def run_adapter(
     until: Optional[str] = None,
     out_dir: Optional[Path] = None,
     generated_at: Optional[str] = None,
+    runtime_dir: Optional[Path] = None,
 ) -> AdapterResult:
     """Read the on-box ledgers, apply the trust gate, and (optionally) write the artifacts.
 
-    Reads every canonical ledger under ``trades_dir`` (no ``runtime/`` access, read-only),
-    filters to ``[since, until]``, and returns an :class:`AdapterResult`. When ``out_dir`` is
-    given, writes ``stage2_trades_<since>_<until>.ndjson`` (stable-ordered admitted trades)
-    and ``stage2_manifest_<since>_<until>.json`` under it. Deterministic in its inputs; the
-    only clock value is the manifest ``generated_at`` (defaulted to now, overridable).
+    Reads every canonical ledger under ``trades_dir`` (read-only), filters to ``[since,
+    until]``, and returns an :class:`AdapterResult`. When ``runtime_dir`` is given (W2A-1)
+    the operator quarantine manifests under it are read as TEXT and their record_hash /
+    fill_id pins drop the matching rows (reason ``quarantined``) — the same authority SCR
+    honours, so both scorekeepers exclude the identical set; ``runtime_dir=None`` reads no
+    manifest and is byte-identical to pre-W2A. When ``out_dir`` is given, writes
+    ``stage2_trades_<since>_<until>.ndjson`` (stable-ordered admitted trades) and
+    ``stage2_manifest_<since>_<until>.json`` under it. Deterministic in its inputs (ledgers +
+    any consulted manifests, which are listed in the output manifest ``notes`` for audit);
+    the only clock value is the manifest ``generated_at`` (defaulted to now, overridable).
     """
+    q_hashes, q_fill_ids, consulted_manifests = load_quarantine_pins(runtime_dir)
     files = iter_ledger_files(trades_dir)
     input_files: list[dict[str, Any]] = []
     per_file_rows: dict[str, int] = {}
@@ -686,7 +817,13 @@ def run_adapter(
                 yield rec, name
             per_file_rows[fp.name] = n
 
-    admitted, counters = adapt_records(_stream(), since=since, until=until)
+    admitted, counters = adapt_records(
+        _stream(),
+        since=since,
+        until=until,
+        quarantined_hashes=q_hashes,
+        quarantined_fill_ids=q_fill_ids,
+    )
 
     for fp in files:
         input_files.append(
@@ -721,6 +858,17 @@ def run_adapter(
         "SIMULATED_AGAINST_LIVE_TICKS crypto rows are counted apart from broker-confirmed "
         "fills so no verdict silently mixes simulated and broker-confirmed evidence.",
     ]
+    if consulted_manifests:
+        notes.append(
+            "Operator quarantine honoured (W2A-1): pinned record_hash/fill_id rows dropped "
+            "as excluded_by_reason['quarantined'] — same authority SCR uses. Manifests "
+            "consulted: " + ", ".join(consulted_manifests) + "."
+        )
+    elif runtime_dir is not None:
+        notes.append(
+            "Operator quarantine checked (W2A-1): no quarantine_manifest_*.json present under "
+            "the runtime dir; nothing pinned."
+        )
     manifest = AdapterManifest(
         schema_version=SCHEMA_VERSION,
         generated_at=generated_at,
@@ -811,6 +959,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out-dir", default=None, help="artifact dir (default: <repo>/edge_reports/stage2)")
     parser.add_argument("--now", default=None, help="override the manifest timestamp (ISO 8601)")
     parser.add_argument("--repo-root", default=None, help="repo root (default: inferred)")
+    parser.add_argument("--runtime-dir", default=None,
+                        help="runtime dir holding quarantine_manifest_*.json (default: <repo>/runtime)")
+    parser.add_argument("--no-quarantine", action="store_true",
+                        help="ignore operator quarantine manifests (admit pinned rows; default honours them)")
     args = parser.parse_args(argv)
 
     for name in ("since", "until"):
@@ -825,6 +977,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(__file__).resolve().parents[2]
     trades_dir = Path(args.trades_dir).resolve() if args.trades_dir else repo_root / "data" / "trades"
     out_dir = Path(args.out_dir).resolve() if args.out_dir else repo_root / "edge_reports" / "stage2"
+    if args.no_quarantine:
+        runtime_dir: Optional[Path] = None
+    elif args.runtime_dir:
+        runtime_dir = Path(args.runtime_dir).resolve()
+    else:
+        runtime_dir = repo_root / "runtime"
 
     result = run_adapter(
         trades_dir=trades_dir,
@@ -832,6 +990,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         until=args.until,
         out_dir=out_dir,
         generated_at=args.now,
+        runtime_dir=runtime_dir,
     )
     _print_manifest(result.manifest)
     print(f"artifacts written under: {out_dir}")
