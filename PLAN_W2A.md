@@ -21,19 +21,62 @@ the live `runtime/`.
 
 ---
 
-## Baseline (measure "suite green vs baseline" against this)
+## Baseline — CORRECTED after measuring (this is a methodology finding)
 
-Suite on `goal/wave2-books-cleanup` == suite on `main`: **known-5 failures**, all
-proven pre-existing and unrelated to code (they read live `runtime/`/`config`):
-1. `test_tier_manager.py::test_1_scale_tier_at_182k`
-2. `test_tier_manager.py::test_2_starter_caps_at_2600`
-3. `test_tier_manager.py::test_7_promotion_immediate`
-4. `test_quarantine_sidecar.py::test_per_strategy_loss_guard_excludes_quarantined_delta_trades`
-5. `test_futures_expiry_gate.py::test_bar_provider_skips_expired_in_polling_loop`
+Running the full suite **in the worktree** does NOT reproduce the live-tree's
+"known-5". Measured result in `/home/ubuntu/chad_w2a`:
+**18 failed, 3828 passed, 5 skipped** — the failing SET is environment-dependent
+because many tests are coupled to absolute live-tree paths / live runtime+config
+while loading code from the worktree.
 
-Item (3) is expected to clear #1–#3 → **known-5 shrinks to known-2**. Items (1),(2),(4)
-must not regress the baseline. (Baseline suite re-run in this worktree is in flight;
-number will be pinned in the first build commit.)
+The worktree-18 failing set (record this — it is the real baseline):
+```
+test_backtest_unified_interface.py::test_backtest_legacy_path_preserves_zero_slippage
+test_backtest_unified_interface.py::test_backtest_unified_preserves_existing_pnl_run_completes
+test_futures_expiry_gate.py::test_bar_provider_skips_expired_in_polling_loop          [also fails live]
+test_kraken_execution.py::test_intent_builder_btc_basic
+test_phase_a_item5_liquidity.py::test_real_spy_bar_file_classified
+test_pr03_ib_async_phase2_migration.py::test_live_posture_unchanged_paper_only
+test_pr04_options_chain_refresh_remediation.py::test_live_posture_artifacts_unchanged_paper_only
+test_repo_write_guard.py::  (6 tests — hardcodes REPO=Path("/home/ubuntu/chad_finale"))
+test_routing_gates.py::test_e4_kraken_passive_order_params
+test_routing_gates.py::test_e4_kraken_aggressive_order_params
+test_tier_manager.py::test_1_scale_tier_at_182k                                       [also fails live; item 3 fixes]
+test_tier_manager.py::test_2_starter_caps_at_2600                                     [also fails live; item 3 fixes]
+test_tier_manager.py::test_7_promotion_immediate                                      [also fails live; item 3 fixes]
+```
+
+Cross-checked against the live tree (`/home/ubuntu/chad_finale`, main):
+- The live-tree known-5 = `tier_manager`×3 + `quarantine_sidecar`×1 +
+  `futures_expiry_gate`×1.
+- **Only `tier_manager`×3 + `futures_expiry_gate`×1 fail in BOTH trees.**
+- The worktree's other 14 are **worktree-execution artifacts** — verified PASS in
+  the live tree for `repo_write_guard`×2 and `routing_gates`×2 (spot-checked); the
+  rest (`backtest_unified`, `kraken_execution`, `phase_a_item5` "real SPY bar
+  file", `pr03/pr04` "live posture", the other 4 `repo_write_guard`) are the same
+  coupling class (they read `data/bars`, live posture/config, or hardcode the live
+  repo path).
+- Conversely the live-tree `quarantine_sidecar` failure does NOT reproduce in the
+  worktree — the coupling cuts both ways.
+
+**Methodology correction (this supersedes "green vs baseline by count"):**
+Because the full-suite failing set is environment-specific, per-commit verification
+uses a **failing-test-ID SET diff**, not a count:
+1. Primary fast check: run the **affected test files** for the commit in the
+   worktree and require them green (the new script tests use `tmp_path` and are
+   coupling-free; the Stage-2 and tier tests are the ones we intend to change).
+2. Gate: re-run the full suite in the worktree and require
+   `new_failing_set ⊆ baseline_18` — i.e. **no new failing test ID**. Item 3 must
+   REMOVE exactly the 3 `tier_manager` IDs from the set (→ worktree-15). None of
+   the 14 artifacts overlap any W2A-touched test, so they cannot mask a regression.
+3. Do NOT attempt to "fix the count" by de-coupling the 14 artifact tests here —
+   that is a separate test-hygiene lane (see D8); Wave-2A only guarantees the set
+   does not grow and shrinks by the 3 tier IDs.
+
+This coupling is itself a finding worth surfacing: the suite is not hermetic
+(absolute `/home/ubuntu/chad_finale` paths, live `runtime`/`config`/`data/bars`
+reads), so worktree-based CI for any lane will see spurious failures until the
+tests are made tree-relative.
 
 ---
 
@@ -246,8 +289,14 @@ independent of the double-book.
 - **D7 — Item-2 build-blocker:** approve spending the first build step on confirming
   `_rebuild_guard_from_broker` dedups gamma|UNH vs re-creating broker_sync|UNH
   (the over-count risk) before writing the re-attribution script.
+- **D8 — Green-vs-baseline methodology:** adopt the **failing-test-ID SET diff**
+  against the recorded worktree-18 (require ⊆, item 3 removes the 3 tier IDs) —
+  recommended, minimal — vs the larger detour of de-coupling the ~14 absolute-path
+  artifact tests so the worktree suite is hermetic (a separate test-hygiene lane).
+  Confirm which. (This is why the plan's original "known-5" baseline was wrong: the
+  worktree suite fails 18, not 5, purely from environment coupling.)
 
-## Phase-2 commit order (all `W2A`-prefixed, green-vs-baseline each)
+## Phase-2 commit order (all `W2A`-prefixed, set-diff green-vs-baseline each)
 
 1. `W2A: Stage-2 honours quarantine manifest (+ test)` [enables item 1]
 2. `W2A: ghost-scrub one-shot script (dry-run default) + acceptance test`
