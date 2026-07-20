@@ -4,9 +4,9 @@
   "tiers": {
     "MICRO": {
       "description": "Proving account — single instrument, minimum frequency",
-      "min_equity_usd": 0,
-      "max_equity_usd": 2500,
-      "demotion_equity_usd": null,
+      "min_equity_cad": 0,
+      "max_equity_cad": 3540,
+      "demotion_equity_cad": null,
       "enabled_strategies": ["alpha_intraday_micro"],
       "allowed_instruments": ["MES"],
       "risk_profile": {
@@ -23,9 +23,9 @@
     },
     "STARTER": {
       "description": "Controlled scaling — two instruments, primary session only",
-      "min_equity_usd": 2500,
-      "max_equity_usd": 25000,
-      "demotion_equity_usd": 2250,
+      "min_equity_cad": 3540,
+      "max_equity_cad": 35400,
+      "demotion_equity_cad": 3186,
       "enabled_strategies": [
         "alpha_intraday_micro",
         "alpha_intraday",
@@ -47,9 +47,9 @@
     },
     "PRO_GROWTH": {
       "description": "Full futures + equities — primary and secondary session",
-      "min_equity_usd": 25000,
-      "max_equity_usd": 160000,
-      "demotion_equity_usd": 22500,
+      "min_equity_cad": 35400,
+      "max_equity_cad": 226560,
+      "demotion_equity_cad": 31860,
       "enabled_strategies": [
         "alpha",
         "alpha_intraday",
@@ -77,9 +77,9 @@
     },
     "SCALE": {
       "description": "Full stack — all 16 strategies, existing sizing pipeline unchanged",
-      "min_equity_usd": 160000,
-      "max_equity_usd": 10000000,
-      "demotion_equity_usd": 144000,
+      "min_equity_cad": 226560,
+      "max_equity_cad": 14160000,
+      "demotion_equity_cad": 203904,
       "enabled_strategies": ["*"],
       "allowed_instruments": ["*"],
       "risk_profile": {
