@@ -568,6 +568,67 @@ def _extract_fill(
 EXCLUDED_FROM_ROUTING = {"broker_sync", "manual", "paper_exec", "unknown", ""}
 
 
+# PFF1 (2026-07-20): the paper_trade_executor emits ONE aggregate SIM fill per
+# order (account PAPER_EXEC, source paper_trade_executor). The
+# ibkr_paper_fill_harvester ADDITIVELY mirrors that SAME order as the real IBKR
+# paper broker's slice fills (account DUR119533, source
+# ibkr_paper_fill_harvester, tag ibkr_harvest) — see the harvester docstring:
+# "additive — it does not replace the existing paper trade executor". Both land
+# in the same FILLS_*.ndjson, so feeding BOTH into FIFO double-books the order.
+# On 2026-07-20 the first ACTIVE exit-overlay close (one 273-share SELL) surfaced
+# it: the executor aggregate SELL 273 closed the Epoch-3 seed lot (the untrusted
+# +625.17 close), while the harvester's 273-in-slices — because the aggregate had
+# already flattened the queue — opened phantom SHORT lots that round-tripped the
+# re-buys (BUY 5 + BUY 223), fabricating 6 "trusted" closes over ~233 shares and
+# netting the gamma queue to zero against a real +228 broker position. This is
+# the same double-count behind the ~1.9x guard drift seen since the harvester was
+# enabled (~2026-07-08).
+#
+# Dedup rule (symbol-scoped): a harvester fill is a redundant broker MIRROR for
+# any symbol the executor has already booked this day, and is dropped before
+# FIFO. Symbol scope (not (strategy,symbol)) is deliberate — the harvester
+# re-attributes some mirror slices to "broker_sync" (its resolve_strategy path),
+# so keying on strategy would let those broker_sync mirrors survive as a phantom
+# lot. A harvester fill for a symbol with NO executor fill is a genuine ORPHAN
+# (a broker-side position CHAD never executed through its own pipeline) and is
+# preserved so the harvester keeps feeding FIFO for executor-less fills
+# (Bug B Fix B, 2026-06-03) and broker-truth adoption is untouched.
+_HARVESTER_SOURCES: frozenset = frozenset({"ibkr_paper_fill_harvester"})
+_HARVESTER_TAG = "ibkr_harvest"
+
+
+def _payload_symbol(payload: Dict[str, Any]) -> str:
+    """Normalized symbol (upper-cased) for a raw fill payload; '' when absent.
+
+    Mirrors the symbol normalization _extract_fill applies so the mirror-dedup
+    set below keys on the same value FIFO uses.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("symbol", "")).strip().upper()
+
+
+def _payload_is_harvester(payload: Dict[str, Any]) -> bool:
+    """True when the fill was written by the IBKR paper-fill harvester (a broker
+    mirror). Either carrier is sufficient: source or the ibkr_harvest tag."""
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("source", "")).strip().lower() in _HARVESTER_SOURCES:
+        return True
+    tags = payload.get("tags")
+    if isinstance(tags, (list, tuple)):
+        return any(str(t).strip().lower() == _HARVESTER_TAG for t in tags)
+    return False
+
+
+def _payload_is_executor(payload: Dict[str, Any]) -> bool:
+    """True when the fill was written by the paper trade executor — the canonical
+    single-record-per-order SIM aggregate that owns FIFO."""
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("source", "")).strip().lower() == "paper_trade_executor"
+
+
 class TradeCloser:
     def __init__(
         self,
@@ -880,14 +941,47 @@ class TradeCloser:
         except Exception:
             quarantined_fill_ids, quarantined_record_hashes = set(), set()
 
-        closed_all: List[ClosedTrade] = []
-        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+        # PFF1: pre-scan for the symbols the paper_trade_executor has already
+        # booked in this day's file. A harvester fill for such a symbol is a
+        # redundant broker mirror of the executor's aggregate (the executor is
+        # always written first — at submit time — so whenever a harvester slice
+        # is present its executor counterpart is too); dropping it below stops
+        # the aggregate+slices double-book. Recomputed every call so incremental
+        # cycles stay consistent; symbols with no executor fill keep their
+        # harvester fills (orphans) and match normally.
+        executor_symbols: set = set()
+        for raw in lines:
             line = raw.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            if _payload_is_executor(payload):
+                sym = _payload_symbol(payload)
+                if sym:
+                    executor_symbols.add(sym)
+
+        closed_all: List[ClosedTrade] = []
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # PFF1: skip harvester mirrors of executor-booked symbols before FIFO
+            # so one order booked from two sources cannot double-count.
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            if (
+                _payload_is_harvester(payload)
+                and _payload_symbol(payload) in executor_symbols
+            ):
                 continue
             fill = _extract_fill(
                 obj,

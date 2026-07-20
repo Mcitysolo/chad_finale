@@ -722,9 +722,24 @@ def load_and_compute(
         effective.append(t)
 
     # Metrics
-    # total_pnl is defined over ALL finite trades (total_trades), not just effective.
-    # (Tests and ops reports expect this.)
-    total_pnl = float(sum(float(t.pnl) for t in trades)) if trades else 0.0
+    # PFF1 (2026-07-20): total_pnl must honour the SAME trust filter as
+    # effective_trades. It previously summed pnl over ALL finite trades, so a
+    # pnl_untrusted row leaked straight into the headline: on 2026-07-20 an
+    # Epoch-3 seed-lot close carrying a fabricated cost basis (+625.17, tagged
+    # scoring_excluded / pnl_untrusted) flipped total_pnl from -375.60 to
+    # +103.78 while effective_trades correctly excluded it. Apply the trust
+    # bucket (untrusted / manual / warmup_sim) here too so the headline reflects
+    # trusted PnL only. Data-quality exclusions that are NOT trust conditions
+    # (an unfilled-placeholder row that still carries a real pnl, futures rows)
+    # remain in total_pnl to preserve the pre-existing semantics those callers
+    # and tests depend on — only the untrust leak is closed.
+    total_pnl = float(sum(
+        float(t.pnl)
+        for t in trades
+        if not _is_warmup_sim(t.tags or [])
+        and not _is_manual(t.tags or [])
+        and not _is_untrusted(t.tags or [], t.extra or {}, getattr(t, "meta", None))
+    )) if trades else 0.0
 
     # Performance metrics used for trust/SCR are based on effective trades only.
     # Exclude PnL=0 trades: these are open positions or unmatched entry fills,
