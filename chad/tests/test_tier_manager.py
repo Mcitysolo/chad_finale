@@ -1,14 +1,16 @@
 """Tests for the v9.1 TierManager and the legacy `_select_tier` shim.
 
 Covers the 10 acceptance cases for the v9.1 tier ladder
-(MICRO < STARTER < PRO_GROWTH < SCALE):
-    1. SCALE for $182k, risk_profile fields all None.
-    2. STARTER caps at $2,600.
+(MICRO < STARTER < PRO_GROWTH < SCALE). Cases 1/2/7 were re-priced to the CAD bands
+(config/tiers.json v9_1 *_equity_cad, ×1.4160) in W2A-6; the rest already used
+CAD-band-consistent equities:
+    1. SCALE for CAD 257,712 (= 182k USD × 1.4160), risk_profile fields all None.
+    2. STARTER caps at CAD 3,681.6 (= 2,600 USD × 1.4160).
     3. MICRO caps at $500.
     4. STARTER held inside its band ($2,480).
     5. Mid-session demotion deferred ($2,100, market open).
     6. Demotion applied off-session ($2,100, market closed).
-    7. Promotion applies immediately ($2,600 from MICRO).
+    7. Promotion applies immediately (CAD 3,681.6 from MICRO).
     8. SCALE null risk_profile yields all-None caps without raising.
     9. PRO_GROWTH caps at $50,000.
    10. Pending demotion in the warning band ($159,999 with current=SCALE).
@@ -30,7 +32,12 @@ from chad.risk.tier_manager import (
 )
 from chad.utils.market_hours import market_is_open
 
-REPO_ROOT = Path("/home/ubuntu/chad_finale")
+# W2A-6 (D5): tree-relative repo root, NOT the absolute live tree. The fixture reads
+# ``<repo>/config/tiers.json``; hardcoding ``/home/ubuntu/chad_finale`` made this suite read
+# the LIVE tree's config from any worktree, so a worktree copy of the tests silently depended
+# on live config (they read the CAD bands while asserting the old USD bands → 3 spurious fails).
+# parents[2] = <repo>  (this file is <repo>/chad/tests/test_tier_manager.py).
+REPO_ROOT = Path(__file__).resolve().parents[2]
 TIERS_CONFIG_PATH = REPO_ROOT / "config" / "tiers.json"
 
 
@@ -44,7 +51,8 @@ def tiers_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def test_1_scale_tier_at_182k(tiers_config):
-    tm = TierManager(equity=182_000.0, tiers_config=tiers_config)
+    # W2A-6: CAD bands (SCALE min_equity_cad=226 560). 182k USD × 1.4160 = 257 712 CAD → SCALE.
+    tm = TierManager(equity=257_712.0, tiers_config=tiers_config)
     assert tm.tier_name == "SCALE"
     profile = tm.get_risk_profile()
     assert profile.max_contracts_per_trade is None
@@ -61,7 +69,9 @@ def test_1_scale_tier_at_182k(tiers_config):
 # ---------------------------------------------------------------------------
 
 def test_2_starter_caps_at_2600(tiers_config):
-    tm = TierManager(equity=2_600.0, tiers_config=tiers_config)
+    # W2A-6: CAD bands (STARTER = [3540, 35400) CAD). 2 600 USD × 1.4160 = 3 681.6 CAD → STARTER.
+    # risk_profile caps are NOT re-priced, so the asserted caps are unchanged.
+    tm = TierManager(equity=3_681.6, tiers_config=tiers_config)
     assert tm.tier_name == "STARTER"
     profile = tm.get_risk_profile()
     assert profile.max_contracts_per_trade == 2
@@ -131,8 +141,10 @@ def test_6_demotion_applied_market_closed(tiers_config):
 # ---------------------------------------------------------------------------
 
 def test_7_promotion_immediate(tiers_config):
+    # W2A-6: CAD bands. 2 600 USD × 1.4160 = 3 681.6 CAD, above STARTER floor (3540) → a
+    # MICRO→STARTER promotion applies immediately (promotions are not deferred).
     tm = TierManager(
-        equity=2_600.0,
+        equity=3_681.6,
         current_tier="MICRO",
         market_open=True,
         tiers_config=tiers_config,
