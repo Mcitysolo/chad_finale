@@ -158,6 +158,27 @@ def main() -> int:
         "latency_ms": float(res.latency_ms),
         "error": res.error,
         "live_gate": res.payload,
+        # W1B-1 schema merge: additively surface the two posture keys at the
+        # top level so this timer writer and the orchestrator writer (Writer B,
+        # chad/core/orchestrator.py::_write_decision_trace_heartbeat) agree on
+        # THESE TWO KEYS regardless of which service wrote last. Both writers are
+        # live and alternately overwrite runtime/decision_trace_heartbeat.json;
+        # they still diverge on other top-level keys (Writer B additionally
+        # emits source/scr_state/executions_today/... ), so this merge only
+        # guarantees allow_ibkr_live/allow_ibkr_paper are always present and
+        # consistent — it does not make the whole file schema-identical. Both
+        # keys are sourced from the /live-gate response exactly as Writer B
+        # sources them (live_gate.get(...)); when the endpoint is unreachable
+        # res.payload is None -> both keys are None, matching Writer B's
+        # endpoint-down behavior. Readers are additive-tolerant (operator_surface
+        # reads a guarded subset), so this breaks no consumer and introduces no
+        # schema_version.
+        "allow_ibkr_live": (
+            res.payload.get("allow_ibkr_live") if isinstance(res.payload, dict) else None
+        ),
+        "allow_ibkr_paper": (
+            res.payload.get("allow_ibkr_paper") if isinstance(res.payload, dict) else None
+        ),
     }
 
     # Alerts: only on failure to fetch/parse.

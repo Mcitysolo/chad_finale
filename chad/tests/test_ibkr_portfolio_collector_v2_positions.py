@@ -15,6 +15,7 @@ systemd units. The subcommand must:
 from __future__ import annotations
 
 import json
+import signal
 import sys
 import types
 from dataclasses import dataclass
@@ -24,6 +25,32 @@ from typing import Any, List
 import pytest
 
 from chad.portfolio import ibkr_portfolio_collector_v2 as collector_module
+
+
+# ---------------------------------------------------------------------------
+# W1B-0 — de-flake the leaked collector SIGALRM.
+#
+# collector_module.main() (called 3x in this module) arms a 60s wall-clock
+# guard via install_wall_clock_guard() -> signal.alarm(60) and never disarms
+# it: production relies on process exit to clear the alarm, but under pytest
+# the alarm survives into whatever tests run next. When it fires mid-suite it
+# either aborts the whole session (INTERNALERROR CollectorWallClockTimeout) or
+# lands as a spurious failure inside an unrelated test (e.g. xgb.train). That
+# non-determinism makes the "5 consecutive full-suite runs" acceptance for the
+# heartbeat fix (W1B-1) impossible. This autouse fixture mirrors the existing
+# _clear_alarm in test_gap043_collector_wall_clock_guard.py: clear any pending
+# alarm before and after every test in this module so nothing leaks out.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_alarm():
+    """Each test starts and ends with no pending SIGALRM (see W1B-0 note)."""
+    if hasattr(signal, "SIGALRM"):
+        signal.alarm(0)
+    yield
+    if hasattr(signal, "SIGALRM"):
+        signal.alarm(0)
 
 
 # ---------------------------------------------------------------------------

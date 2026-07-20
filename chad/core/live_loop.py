@@ -3382,9 +3382,28 @@ def _init_redis_live_gate_subscriber(logger: logging.Logger) -> None:
         logger.info("Redis live_gate subscriber not available (non-fatal): %s", exc)
 
 
-def run_loop() -> None:
-    global _redis_stop_flag, _redis_stop_reason
-    logger = logging.getLogger("chad.live_loop")
+def _configure_live_loop_logging() -> logging.Logger:
+    """Bootstrap the live-loop process's logging and return the loop logger.
+
+    W1B-2: the handler + INFO level are bound to the ``chad`` root logger, not
+    the ``chad.live_loop`` sibling. This is the whole fix for the strategy-INFO
+    visibility gap: every ``chad.*`` logger -- including ``chad.strategies.*``
+    (e.g. ``chad.strategies.alpha_crypto`` emitting
+    CRYPTO_EXPLORATION_HANDLER_PASS) -- inherits INFO and reaches the single
+    stderr handler by propagation, so those lines now land in journald. Before
+    this, the handler bound to ``chad.live_loop`` while the root stayed at the
+    default WARNING, so ``chad.strategies.*`` .info() was dropped at source
+    (isEnabledFor(INFO) was False). The other ``getLogger("chad.live_loop")``
+    call sites in this module (and execution_pipeline) still reach journald --
+    they propagate up to the single ``chad`` handler; effective level is
+    unchanged (INFO) because ``chad.live_loop`` inherits from ``chad``.
+
+    The ``if not handlers`` guard keeps a single handler across repeated calls,
+    so promoting the placement to ``chad`` must not also leave a handler on
+    ``chad.live_loop`` (that would double-emit). The format string carries no
+    ``%(name)s``, so on-wire output is visually unchanged.
+    """
+    logger = logging.getLogger("chad")
 
     if not logger.handlers:
         handler = logging.StreamHandler()
@@ -3394,6 +3413,12 @@ def run_loop() -> None:
         logger.addHandler(handler)
 
     logger.setLevel(logging.INFO)
+    return logger
+
+
+def run_loop() -> None:
+    global _redis_stop_flag, _redis_stop_reason
+    logger = _configure_live_loop_logging()
     logger.info("Starting CHAD live loop")
 
     import signal as _signal

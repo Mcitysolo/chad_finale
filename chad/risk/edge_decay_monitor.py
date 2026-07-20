@@ -70,29 +70,92 @@ CONFIG_PATH = ROOT / "config" / "edge_decay_config.json"
 DEFAULT_CONSECUTIVE_THRESHOLD: int = 5
 DEFAULT_MIN_TRADES: int = 20
 
+# W1B-3 self-clear defaults (D3: ship the LOGIC + conservative in-code defaults
+# as code; the config VALUES land as a Pending Action because
+# config/edge_decay_config.json is governed strategy config -- see
+# docs/PA_W1B3_edge_decay_config_v2.md). A v1 config (which lacks these keys)
+# therefore runs unchanged on these defaults.
+#   halt_ttl_days: auto-clear a monitor-imposed halt only after this many days
+#     AND only when the trusted ledger shows no fresh losing evidence. <=0
+#     disables TTL clears.
+#   clear_on_recovery: when a ledger-resident halted strategy's trusted streak
+#     falls below consecutive_threshold, persist the recovery (halted:False).
+DEFAULT_HALT_TTL_DAYS: int = 14
+DEFAULT_CLEAR_ON_RECOVERY: bool = True
+
+# Provenance stamped on halts the edge-decay mechanism imposes (both the
+# monitor and strategy_throttle_gate route through set_strategy_halted). Only
+# halts carrying this provenance (or, for legacy records, the monitor's own
+# consecutive_negative_* reason signature) may be auto-cleared -- operator
+# manual halts are never touched (rider iv).
+MONITOR_HALT_PROVENANCE: str = "edge_decay_monitor"
+
 
 def _load_config_values() -> tuple:
-    """Return (consecutive_threshold, min_trades) from JSON config.
+    """Return (consecutive_threshold, min_trades, halt_ttl_days,
+    clear_on_recovery) from JSON config.
 
-    Missing / malformed config returns the hardcoded defaults.
+    Missing / malformed config -- or a v1 config that predates the W1B-3
+    self-clear keys -- falls back to the hardcoded defaults per key, so the
+    self-clear logic ships and runs on in-code defaults regardless of the
+    config file version.
     """
+    ct, mt = DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+    ttl, cor = DEFAULT_HALT_TTL_DAYS, DEFAULT_CLEAR_ON_RECOVERY
     if not CONFIG_PATH.is_file():
-        return DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+        return ct, mt, ttl, cor
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+        return ct, mt, ttl, cor
     if not isinstance(data, dict):
-        return DEFAULT_CONSECUTIVE_THRESHOLD, DEFAULT_MIN_TRADES
+        return ct, mt, ttl, cor
     try:
-        ct = int(data.get("consecutive_threshold", DEFAULT_CONSECUTIVE_THRESHOLD))
+        ct = int(data.get("consecutive_threshold", ct))
     except (TypeError, ValueError):
-        ct = DEFAULT_CONSECUTIVE_THRESHOLD
+        pass
     try:
-        mt = int(data.get("min_trades", DEFAULT_MIN_TRADES))
+        mt = int(data.get("min_trades", mt))
     except (TypeError, ValueError):
-        mt = DEFAULT_MIN_TRADES
-    return ct, mt
+        pass
+    try:
+        ttl = int(data.get("halt_ttl_days", ttl))
+    except (TypeError, ValueError):
+        pass
+    raw_cor = data.get("clear_on_recovery", cor)
+    if isinstance(raw_cor, bool):
+        cor = raw_cor
+    return ct, mt, ttl, cor
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC timestamp (as written by ``_utc_now_iso``) back to
+    an aware datetime, or ``None`` if absent/unparseable. A missing/unparseable
+    ``halted_at`` is treated as "age unknown" so TTL never clears on it."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_monitor_imposed(entry: Mapping[str, Any]) -> bool:
+    """Rider (iv): only halts the edge-decay mechanism imposed may auto-clear.
+
+    Forward records carry ``halted_by == MONITOR_HALT_PROVENANCE``. Legacy
+    records (written before W1B-3, no ``halted_by``) are inferred from the
+    monitor's own ``consecutive_negative_*`` reason signature. Any explicit,
+    non-monitor provenance (an operator manual halt) is protected.
+    """
+    hb = entry.get("halted_by")
+    if isinstance(hb, str) and hb:
+        return hb == MONITOR_HALT_PROVENANCE
+    reason = str(entry.get("halt_reason") or "")
+    return reason.startswith("consecutive_negative_")
 
 
 SCHEMA_VERSION = "strategy_allocations.v1"
@@ -182,9 +245,24 @@ def _iter_trade_payloads(
                         continue
                     if payload.get("historical_pre_rebuild") is True:
                         continue
+                    # W1B-5 (review): mirror trade_stats_engine's exclusion truth
+                    # so the streak that drives BOTH the halt AND the self-clear
+                    # uses only genuine trusted performance. scoring_excluded is
+                    # the meta-carrier "never score me" flag; manual / warmup_sim
+                    # rows are not strategy performance. Excluding them keeps a
+                    # manual/synthetic tail from masking a decay streak (halt) or
+                    # manufacturing a recovery (clear) — rider (i). No effect on
+                    # current real-strategy data (which carries none of these);
+                    # this is forward-looking hardening.
+                    if payload.get("scoring_excluded") is True:
+                        continue
                     tags = payload.get("tags") or []
                     if isinstance(tags, list) and (
-                        "pnl_untrusted" in tags or "historical_pre_rebuild" in tags
+                        "pnl_untrusted" in tags
+                        or "historical_pre_rebuild" in tags
+                        or "scoring_excluded" in tags
+                        or "manual" in tags
+                        or "warmup_sim" in tags
                     ):
                         continue
                     yield payload
@@ -227,6 +305,12 @@ def collect_recent_trades_by_strategy(
         strat = str(payload.get("strategy") or "unknown")
         pnl = _pnl_of(payload)
         if pnl is None:
+            continue
+        # W1B-5 (review): a scratch (pnl == 0) is neither a win nor a loss;
+        # trade_stats_engine excludes it, and counting it here would let a
+        # zero-pnl tail row reset a decay streak and (now that clears persist)
+        # manufacture a recovery auto-clear with no actual winning trade.
+        if pnl == 0.0:
             continue
         per_strat.setdefault(strat, []).append(pnl)
     # Trim to keep memory bounded — newest 1000 are all we ever need.
@@ -298,6 +382,10 @@ def set_strategy_halted(
         "halted": True,
         "halt_reason": f"consecutive_negative_{int(consecutive_negative)}",
         "halted_at": _utc_now_iso(),
+        # W1B-3 provenance (rider iv): stamps this halt as edge-decay-imposed so
+        # the self-clear path may release it. Operator manual halts never carry
+        # this and are therefore protected.
+        "halted_by": MONITOR_HALT_PROVENANCE,
         "cleared_at": None,
         "cleared_by": "",
         "consecutive_negative": int(consecutive_negative),
@@ -370,12 +458,81 @@ def clear_strategy_halt(
 # ---------------------------------------------------------------------------
 
 
+def _emit_auto_clear_notification(
+    strategy: str,
+    *,
+    reason: str,
+    streak: int,
+    total: int,
+    ttl_days: int,
+    halted_at: Any,
+) -> None:
+    """Rider (iii): every self-clear emits a greppable marker AND a
+    coach-voiced operator NOTIFY, so an operator sees each release.
+
+    Fully fail-soft: a notification/transport failure is logged and swallowed
+    so it can never break the monitor (which runs every live-loop cycle). The
+    marker is always emitted first, before the best-effort telegram push.
+    """
+    LOG.warning(
+        "EDGE_DECAY_AUTO_CLEARED strategy=%s reason=%s streak=%d total=%d "
+        "ttl_days=%s halted_at=%s cleared_by=edge_decay_monitor_auto",
+        strategy, reason, int(streak), int(total), ttl_days, halted_at,
+    )
+    try:
+        facts = {
+            "title": f"Edge-decay halt lifted: {strategy}",
+            "strategy": strategy,
+            "reason": reason,
+            "summary": (
+                f"The automatic edge-decay halt on {strategy} has been "
+                "released — the trusted trade ledger shows no fresh losing "
+                "streak."
+            ),
+        }
+        msg: Optional[str] = None
+        try:
+            from chad.utils.coach_voice import format_alert
+
+            rendered = format_alert("edge_decay_cleared", facts)
+            if isinstance(rendered, str) and rendered.strip():
+                msg = rendered
+        except Exception:  # noqa: BLE001 — presentation is optional
+            msg = None
+        if not msg:
+            msg = (
+                f"Edge-decay halt auto-cleared for {strategy} ({reason}); "
+                "no fresh trusted losing evidence."
+            )
+        from chad.utils.telegram_notify import notify
+
+        notify(
+            msg,
+            severity="info",
+            dedupe_key=f"edge_decay_auto_clear:{strategy}",
+            raise_on_fail=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — NOTIFY is best-effort, never fatal
+        LOG.warning(
+            "edge_decay_auto_clear_notify_failed strategy=%s err=%s",
+            strategy, exc,
+        )
+
+
 def _config_consecutive_threshold() -> int:
     return _load_config_values()[0]
 
 
 def _config_min_trades() -> int:
     return _load_config_values()[1]
+
+
+def _config_halt_ttl_days() -> int:
+    return _load_config_values()[2]
+
+
+def _config_clear_on_recovery() -> bool:
+    return _load_config_values()[3]
 
 
 @dataclass
@@ -398,6 +555,8 @@ class EdgeDecayMonitor:
 
     consecutive_threshold: int = field(default_factory=_config_consecutive_threshold)
     min_trades: int = field(default_factory=_config_min_trades)
+    halt_ttl_days: int = field(default_factory=_config_halt_ttl_days)
+    clear_on_recovery: bool = field(default_factory=_config_clear_on_recovery)
     allocations_path: Path = ALLOCATIONS_PATH
     trades_glob: str = TRADES_GLOB
 
@@ -410,21 +569,32 @@ class EdgeDecayMonitor:
 
         `pnls` is optional — if omitted, the monitor reads the ledger itself.
         Tests pass a list explicitly to avoid filesystem dependence.
+
+        W1B-3: the two non-halt branches (``insufficient_trades`` and ``ok``)
+        now also run the self-clear path so a stale monitor-imposed halt can
+        actually be released and persisted, rather than the historical
+        in-memory-only ``halted:False`` that never reached disk.
         """
         if pnls is None:
             ledger = collect_recent_trades_by_strategy(self.trades_glob)
             pnls = ledger.get(strategy, [])
 
         total = len(pnls)
+        streak = count_consecutive_negative(pnls)
+
         if total < int(self.min_trades):
+            # Sparse / ledger-absent (e.g. alpha_crypto, whose fills are all
+            # pnl_untrusted/validate_only and excluded from the trusted ledger):
+            # eligible for a TTL-based clear once the halt is old enough and
+            # there is no fresh trusted losing evidence.
+            self._maybe_self_clear(strategy, streak=streak, total=total)
             return {
                 "halted": False,
                 "reason": "insufficient_trades",
-                "consecutive_neg": count_consecutive_negative(pnls),
+                "consecutive_neg": streak,
                 "total_trades": total,
             }
 
-        streak = count_consecutive_negative(pnls)
         if streak >= int(self.consecutive_threshold):
             set_strategy_halted(
                 strategy,
@@ -438,6 +608,9 @@ class EdgeDecayMonitor:
                 "total_trades": total,
             }
 
+        # Ledger-resident and recovered (streak below threshold): eligible for a
+        # recovery clear.
+        self._maybe_self_clear(strategy, streak=streak, total=total)
         return {
             "halted": False,
             "reason": "ok",
@@ -445,12 +618,89 @@ class EdgeDecayMonitor:
             "total_trades": total,
         }
 
+    def _maybe_self_clear(self, strategy: str, *, streak: int, total: int) -> Optional[str]:
+        """Release a stale monitor-imposed halt when the TRUSTED ledger shows no
+        fresh losing evidence. Persists ``halted:False`` (rider ii) and emits a
+        marker + coach-voiced NOTIFY (rider iii). Returns the clear-reason if it
+        cleared, else ``None``.
+
+        Rider compliance:
+          (i)  every decision uses only the trusted-ledger ``streak``/``total``
+               (collect_recent_trades_by_strategy already excludes
+               pnl_untrusted / validate_only / quarantined rows), so untrusted
+               rows can neither keep nor clear a halt;
+          (iv) only monitor-imposed halts (see ``_is_monitor_imposed``) are
+               touched — operator manual halts are protected, and operator-
+               *cleared* entries are ``halted:False`` so they short-circuit here.
+        """
+        state = read_allocations(self.allocations_path)
+        entry = (state.get("allocations") or {}).get(str(strategy))
+        if not isinstance(entry, dict) or not entry.get("halted"):
+            return None  # not halted -> nothing to clear (also skips operator-cleared)
+        if not _is_monitor_imposed(entry):
+            return None  # rider (iv): operator-imposed halt is untouched
+        # Fresh trusted losing evidence keeps the halt — never clear an active decay.
+        if streak >= int(self.consecutive_threshold):
+            return None
+
+        resident = total >= int(self.min_trades)
+        if resident:
+            # Mechanism 2 — ledger-resident strategy has recovered.
+            if not self.clear_on_recovery:
+                return None
+            reason = "auto_recovery_streak_below_threshold"
+        else:
+            # Mechanism 1 — sparse/absent: require TTL elapsed on a real
+            # halted_at timestamp (a missing/unparseable stamp is "age unknown"
+            # and never clears).
+            ttl = int(self.halt_ttl_days)
+            if ttl <= 0:
+                return None
+            halted_at = entry.get("halted_at")
+            dt = _parse_iso(halted_at)
+            if dt is None:
+                return None
+            age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+            if age_days <= float(ttl):
+                return None
+            reason = "auto_ttl_no_trusted_losing_evidence"
+
+        clear_strategy_halt(
+            strategy,
+            cleared_by="edge_decay_monitor_auto",
+            path=self.allocations_path,
+            clear_reason=reason,
+        )
+        _emit_auto_clear_notification(
+            strategy,
+            reason=reason,
+            streak=int(streak),
+            total=int(total),
+            ttl_days=int(self.halt_ttl_days),
+            halted_at=entry.get("halted_at"),
+        )
+        return reason
+
     def check_all(self) -> Dict[str, Dict[str, Any]]:
-        """Evaluate every strategy found in the trade ledger."""
+        """Evaluate every strategy in the trusted ledger UNION every strategy
+        currently halted in the store.
+
+        W1B-3 Mechanism 1: without the union, a strategy that is halted but
+        absent from the trusted ledger (all of its fills excluded as
+        pnl_untrusted/validate_only) is never re-evaluated, so its halt can
+        never self-clear — the roach motel. Unioning the halted-store keys in
+        lets ``check_strategy`` run the self-clear path for them each cycle.
+        """
         ledger = collect_recent_trades_by_strategy(self.trades_glob)
+        state = read_allocations(self.allocations_path)
+        halted_in_store = {
+            str(s)
+            for s, v in (state.get("allocations") or {}).items()
+            if isinstance(v, dict) and v.get("halted")
+        }
         results: Dict[str, Dict[str, Any]] = {}
-        for strategy, pnls in ledger.items():
-            results[strategy] = self.check_strategy(strategy, pnls=pnls)
+        for strategy in set(ledger.keys()) | halted_in_store:
+            results[strategy] = self.check_strategy(strategy, pnls=ledger.get(strategy, []))
         return results
 
 

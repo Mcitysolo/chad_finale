@@ -272,10 +272,16 @@ def _append_ndjson_locked(path: Path, line_obj: Dict[str, Any]) -> None:
 # Live trace enrichment helpers (best-effort, fail-soft)
 #
 # These replace the previous reads of runtime/full_execution_cycle_last.json and
-# runtime/decision_trace_heartbeat.json, both of which had been frozen since
-# 2026-04-03 when their writer processes (full_execution_cycle.py oneshot and
-# decision_trace_heartbeat.py timer) stopped running. The orchestrator now
-# composes a fresh gate snapshot every cycle from authoritative sources:
+# runtime/decision_trace_heartbeat.json. NOTE (W1B-1, 2026-07-19): the
+# chad-decision-trace-heartbeat.timer is NOT dead — it is enabled+active and
+# writes runtime/decision_trace_heartbeat.json every ~5 min, so the orchestrator
+# (Writer B) and the timer (Writer A, chad/core/decision_trace_heartbeat.py) are
+# BOTH live writers of that file and alternately overwrite it. The timer remains
+# the SOLE source of the decision_trace_livegate_down alert and cannot be
+# retired. W1B-1 aligned Writer A's top-level allow_ibkr_live/allow_ibkr_paper
+# with Writer B's so those two keys are stable regardless of writer. The
+# orchestrator still composes a fresh gate snapshot every cycle from
+# authoritative sources:
 #   - HTTP /live-gate            (live evaluation, source of truth for permissions)
 #   - runtime/scr_state.json     (chad-scr-sync writes from /shadow)
 #   - runtime/live_readiness.json (chad-live-readiness oneshot)
@@ -419,8 +425,10 @@ def _write_decision_trace_heartbeat(
 ) -> None:
     """
     Atomically write a fresh runtime/decision_trace_heartbeat.json composed
-    from current live state. Replaces the dead chad/core/decision_trace_heartbeat.py
-    timer-driven oneshot.
+    from current live state. Co-writes this file with the (still-live)
+    chad/core/decision_trace_heartbeat.py timer oneshot — see the note above;
+    both writers agree on the top-level allow_ibkr_live/allow_ibkr_paper keys
+    (W1B-1) but otherwise emit different top-level shapes, last-writer-wins.
     """
     payload: Dict[str, Any] = {
         "ts_utc": str(ts_utc),
