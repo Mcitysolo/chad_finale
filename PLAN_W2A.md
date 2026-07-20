@@ -306,3 +306,34 @@ independent of the double-book.
 
 Scripts (steps 2,3) and the `_cii_backup` rm execute against live `runtime/`/tree
 **only on explicit Phase-3 operator GO**, dry-run first.
+
+---
+
+## PHASE 2 — CLOSURE RECORD (built 2026-07-20)
+
+All eight decisions locked by the operator and built to the finish line. Worktree-only; live
+tree untouched (the two runtime scripts are dry-run-by-default and were only dry-run against
+live, read-only — verified: no output files written to `/home/ubuntu/chad_finale`).
+
+| Decision | Resolution (locked) | Landed in |
+|----------|---------------------|-----------|
+| D1 | quarantine-manifest scrub + small Stage-2 change so both scorekeepers honour it; ledger never rewritten. Implemented isolation-safe (stdlib manifest reader, NOT a `chad.utils` import — the harness import-closure test forbids it). | W2A-1 |
+| D2 | Phase-3 deploy MUST restart the SCR shadow server (:9618) so Q2 loads; −375.60 assumes it. Operator-gated. | W2A-7 runbook |
+| D3 | build the narrow *trusted* re-attribution script (not the reconcile tool's fabricated untrusted basis). | W2A-4 |
+| D4 | UNH cost basis = broker-truth VWAP **424.97** (corroborated live by broker avgCost ~424.98). | W2A-4 |
+| D5 | fix the tier fixture to a tree-relative path; sweep/document the other hardcoded `/home/ubuntu/chad_finale` test paths. | W2A-6 + W2A-7 findings |
+| D6 | delete `config/_cii_backup_20260630…` as a gated Phase-3 step (untracked → live-tree `rm`). | W2A-7 runbook |
+| D7 | prove FIRST (test/replay) that re-attribution leaves NO `broker_sync|UNH` duplicate summing to 451/456; no script until proven. Proven — readers compare legs, never sum. | W2A-3 (then W2A-4) |
+| D8 | failing-test-ID SET-diff gate (⊆ worktree-18; item 3 removes exactly the 3 tier IDs). Non-hermetic suite logged as a standing finding. | all commits; W2A-7 findings |
+
+**Commits:** W2A-1 Stage-2 quarantine honouring · W2A-2 ghost-scrub script · W2A-3 D7 proof ·
+W2A-4 UNH re-attribution script · W2A-5 CAD config officialization · W2A-6 tier tests CAD +
+tree-relative fixture · W2A-7 docs (PA + findings + runbook) · W2A-8 this closure record.
+
+**Gate result (definitive, `chad/tests/`):** 15 failed / 3867 passed / 5 skipped. The failing
+set is **exactly** the worktree-18 baseline minus the 3 `test_tier_manager` IDs — zero new
+failing IDs. `tests/validation/test_isolation.py` 11/11 green (D1 isolation preserved).
+`full_cycle_preview` clean.
+
+**Phase-2 status: COMPLETE.** Stopped at the push decision — branch `goal/wave2-books-cleanup`
+is NOT pushed; the runtime scripts and `_cii_backup` rm await Phase-3 operator GO.
