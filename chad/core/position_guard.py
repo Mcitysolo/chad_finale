@@ -756,6 +756,225 @@ def detect_guard_vs_broker_drift_v2(
     }
 
 
+_V4_TOL = 1e-6  # QTY_TOLERANCE, matched to sentinel EXS4 for identical semantics.
+
+
+def _parse_iso_to_epoch(ts: Any) -> Optional[float]:
+    """Parse an ISO ts_utc (trailing Z tolerated) to epoch seconds, or None."""
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _agg_snapshot_positions(snapshot: Mapping[str, Any]) -> Dict[str, float]:
+    """Signed positions per symbol from the independent collector snapshot.
+
+    Mirrors chad/ops/exterminator_sentinel.py::_aggregate_snapshot.
+    """
+    out: Dict[str, float] = {}
+    for row in snapshot.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        try:
+            qty = float(row.get("position") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        out[symbol] = out.get(symbol, 0.0) + qty
+    return {k: v for k, v in out.items() if abs(v) > _V4_TOL}
+
+
+def _agg_guard_broker_mirror(guard: Mapping[str, Any]) -> Dict[str, float]:
+    """Guard's recorded mirror of broker truth (broker_sync| rows), NOT gated on
+    open. Mirrors exterminator_sentinel.py::_aggregate_guard_broker_mirror.
+    """
+    out: Dict[str, float] = {}
+    for key, entry in guard.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if not key.startswith("broker_sync|"):
+            continue
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        out[symbol] = out.get(symbol, 0.0) + _signed_qty(entry)
+    return {k: v for k, v in out.items() if abs(v) > _V4_TOL}
+
+
+def _agg_guard_strategy(guard: Mapping[str, Any]) -> Dict[str, float]:
+    """Strategy-attributed OPEN guard quantity per symbol. NEVER summed with the
+    broker_sync mirror (the guard dual-books the same shares — summing invents a
+    2.0x phantom). Mirrors exterminator_sentinel.py::_aggregate_guard_strategy.
+    """
+    out: Dict[str, float] = {}
+    for key, entry in guard.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        if key.startswith("_") or key.startswith("broker_sync|"):
+            continue
+        if entry.get("open") is not True:
+            continue
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        out[symbol] = out.get(symbol, 0.0) + _signed_qty(entry)
+    return {k: v for k, v in out.items() if abs(v) > _V4_TOL}
+
+
+def detect_guard_vs_independent_snapshot_drift(
+    guard_state: Mapping[str, Any],
+    snapshot: Optional[Mapping[str, Any]],
+    *,
+    excluded_symbols: Optional[Set[str]] = None,
+    now: Optional[float] = None,
+    snapshot_ttl_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """W1A-4: pure three-leg drift detector using the INDEPENDENT snapshot leg.
+
+    Lifts sentinel EXS4 (chad/ops/exterminator_sentinel.py:657) into a pure,
+    disk-free function so the ``position_guard_drift`` emitter can run it behind
+    ``CHAD_DRIFT_V4``. Position truth has three legs and only ONE is independent:
+
+      * independent broker  — ``positions_snapshot.json`` (clientId=99, own process)
+      * guard broker mirror — ``position_guard.json`` ``broker_sync|<sym>`` rows
+      * guard strategy      — ``position_guard.json`` open non-``broker_sync`` rows
+
+    The two guard legs share a source (``position_guard.json``), so them agreeing
+    is NOT evidence — that is the XOV-2345 false-flat that let a whole-book flat
+    read as GREEN. Each guard leg is compared SEPARATELY to the independent broker
+    leg; the legs are NEVER summed (the guard dual-books ``gamma|UNH 273`` AND
+    ``broker_sync|UNH 273`` for one 273-share position; summing invents a 2.0×
+    phantom on every mixed symbol).
+
+    Freshness gate: the independent leg must prove itself fresh before it may
+    indict the guard. Missing/unreadable snapshot, no parseable ``ts_utc``, or age
+    > ``ttl*3`` (mirroring EXS4) ⇒ ``independent_leg="blind"`` with zero actionable
+    drift — never a false "all agree", never a false indict. Likewise an
+    unreadable ``guard_state`` degrades to blind.
+
+    Pure: no disk I/O, no mutation of inputs. Returns::
+
+        {"schema_version": "position_guard_drift.v4",
+         "independent_leg": "fresh"|"blind", "blind_reason": <str|None>,
+         "snapshot_age_seconds": <float|None>, "snapshot_ts_utc": <str|None>,
+         "snapshot_generation": <int|None>,
+         "drift_count": <int>,   # actionable only — mixed/attribution info excluded
+         "info_count": <int>, "counts_by_kind": {...}, "drifts": [ {rec}, ... ]}
+    """
+    empty_counts = {
+        "mirror_vs_independent_broker": 0,
+        "phantom_guard_entry": 0,
+        "mixed_ownership_info": 0,
+        "strategy_attribution_info": 0,
+    }
+    generation = guard_state.get("_version") if isinstance(guard_state, Mapping) else None
+
+    def _blind(reason: str, age: Optional[float], ts: Optional[str]) -> Dict[str, Any]:
+        return {
+            "schema_version": "position_guard_drift.v4",
+            "independent_leg": "blind",
+            "blind_reason": reason,
+            "snapshot_age_seconds": age,
+            "snapshot_ts_utc": ts,
+            "snapshot_generation": generation,
+            "drift_count": 0,
+            "info_count": 0,
+            "counts_by_kind": dict(empty_counts),
+            "drifts": [],
+        }
+
+    if not isinstance(guard_state, Mapping):
+        return _blind("guard_unreadable", None, None)
+    if not isinstance(snapshot, Mapping):
+        return _blind("snapshot_unreadable", None, None)
+
+    snap_ts = snapshot.get("ts_utc") if isinstance(snapshot.get("ts_utc"), str) else None
+    ts_epoch = _parse_iso_to_epoch(snap_ts)
+    if ts_epoch is None:
+        return _blind("snapshot_no_timestamp", None, snap_ts)
+
+    now_ts = now if now is not None else _time.time()
+    age = now_ts - ts_epoch
+    ttl = float(snapshot_ttl_seconds) if snapshot_ttl_seconds is not None else float(snapshot.get("ttl_seconds") or 300)
+    if age > ttl * 3:
+        return _blind("snapshot_stale", age, snap_ts)
+
+    broker = _agg_snapshot_positions(snapshot)
+    mirror = _agg_guard_broker_mirror(guard_state)
+    strategy = _agg_guard_strategy(guard_state)
+    excluded = {str(s).strip().upper() for s in (excluded_symbols or ())}
+
+    counts = dict(empty_counts)
+    drifts: List[Dict[str, Any]] = []
+    for symbol in sorted(set(broker) | set(mirror) | set(strategy)):
+        b = broker.get(symbol, 0.0)
+        m = mirror.get(symbol, 0.0)
+        s = strategy.get(symbol, 0.0)
+        mirror_delta = m - b
+        strat_delta = s - b
+        if abs(mirror_delta) <= _V4_TOL and abs(strat_delta) <= _V4_TOL:
+            continue  # both legs agree with the independent broker → no drift
+        row: Dict[str, Any] = {
+            "symbol": symbol,
+            "independent_broker_qty": b,
+            "guard_broker_mirror_qty": m,
+            "guard_strategy_qty": s,
+            "mirror_delta": round(mirror_delta, 6),
+            "strategy_delta": round(strat_delta, 6),
+            "snapshot_generation": generation,
+        }
+        # Mixed-ownership symbols blend operator shares with CHAD lots, so a
+        # strategy-vs-broker delta is not like-with-like — informational, never
+        # actionable (re-introducing drift here is the false-RED class WKF U3 fixed).
+        if symbol in excluded:
+            row["drift_kind"] = "mixed_ownership_info"
+            row["is_excluded"] = True
+            counts["mixed_ownership_info"] += 1
+            drifts.append(row)
+            continue
+        if abs(mirror_delta) > _V4_TOL:
+            # XOV-2345 signature: the guard's own broker mirror disagrees with the
+            # independent collector.
+            row["drift_kind"] = "mirror_vs_independent_broker"
+            row["is_excluded"] = False
+            counts["mirror_vs_independent_broker"] += 1
+        elif abs(s) > _V4_TOL and abs(b) <= _V4_TOL:
+            row["drift_kind"] = "phantom_guard_entry"
+            row["is_excluded"] = False
+            counts["phantom_guard_entry"] += 1
+        else:
+            row["drift_kind"] = "strategy_attribution_info"
+            row["is_excluded"] = True
+            counts["strategy_attribution_info"] += 1
+        drifts.append(row)
+
+    actionable = counts["mirror_vs_independent_broker"] + counts["phantom_guard_entry"]
+    info = counts["mixed_ownership_info"] + counts["strategy_attribution_info"]
+    return {
+        "schema_version": "position_guard_drift.v4",
+        "independent_leg": "fresh",
+        "blind_reason": None,
+        "snapshot_age_seconds": round(age, 1),
+        "snapshot_ts_utc": snap_ts,
+        "snapshot_generation": generation,
+        "drift_count": actionable,
+        "info_count": info,
+        "counts_by_kind": counts,
+        "drifts": drifts,
+    }
+
+
 def close_stale_position_from_broker_truth(
     strategy: str,
     symbol: str,

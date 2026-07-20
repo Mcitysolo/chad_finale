@@ -1,0 +1,33 @@
+[Unit]
+Description=CHAD VaR Publisher — report-only portfolio VaR (runtime/var_state.json)
+Documentation=file:///home/ubuntu/chad_finale/docs/VAR_PUBLISHER_INSTALL.md
+After=network-online.target
+# Route this oneshot's own failures to the service-failure alert handler
+# (P0A-A2). A publisher that dies silently would let var_state.json freeze and
+# re-trip EXS1 exactly as it does today — the failure must be surfaced.
+OnFailure=chad-service-alert@%N.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m ops.var_publisher
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-var-publisher
+
+# Report-only by design: no broker calls, no live-mode/risk-cap mutation, never
+# wired into live_loop. The single artifact it writes is runtime/var_state.json.
+# ProtectSystem=full keeps everything else read-only.
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/chad_finale/runtime
+PrivateTmp=true
+NoNewPrivileges=true
+
+# A recompute must never wedge the timer.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

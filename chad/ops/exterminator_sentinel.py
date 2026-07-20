@@ -79,6 +79,34 @@ def worst_status(statuses: Iterable[str]) -> str:
     return out
 
 
+def _build_rollup(checks: list, overall: str) -> dict[str, Any]:
+    """Additive driver-attribution over the existing overall_status rollup.
+
+    The rollup already computes ``ok``/``warn``/``fail`` via :func:`worst_status`;
+    what was missing is WHICH checks drove it, so an operator does not have to open
+    all eight. This is purely derived from the same ``checks`` list — no new status
+    values, no vocabulary change. ``driver_check_ids`` are the checks AT the overall
+    severity (the ones that set it); for ``overall=ok`` there are none. Structural
+    quirks are respected automatically because this reads real statuses: EXS6/EXS8
+    top out at warn, the EXS999 self-check is always warn, and stale/blind/unknown
+    are already folded into warn upstream. Values live here (not in a title), so
+    nothing feeds the CTF-T2 dedupe identity.
+    """
+    drivers = [c for c in checks if c.status == overall] if overall != STATUS_OK else []
+    first_fail = next((c.check_id for c in checks if c.status == STATUS_FAIL), None)
+    if overall == STATUS_OK:
+        driver_reason = "all checks ok"
+    else:
+        named = ", ".join(f"{c.check_id}:{c.name}" for c in drivers)
+        driver_reason = f"overall={overall} driven by {len(drivers)} check(s): {named}"
+    return {
+        "overall": overall,
+        "first_fail": first_fail,
+        "driver_check_ids": [c.check_id for c in drivers],
+        "driver_reason": driver_reason,
+    }
+
+
 def stable_identity(text: str) -> str:
     """Strip fluctuating numeric values from ``text`` to build a dedupe identity.
 
@@ -1113,6 +1141,7 @@ class ExterminatorSentinel:
             if check.status in counts:
                 counts[check.status] += 1
         overall = worst_status(c.status for c in checks)
+        rollup = _build_rollup(checks, overall)
 
         return {
             "schema_version": SCHEMA_VERSION,
@@ -1121,6 +1150,7 @@ class ExterminatorSentinel:
             "stage": 1,
             "overall_status": overall,
             "counts": counts,
+            "rollup": rollup,
             "checks": [c.to_dict() for c in checks],
             "read_only_confirmed": True,
             "runtime_files_modified": [],
