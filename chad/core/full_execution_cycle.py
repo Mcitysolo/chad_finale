@@ -56,6 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
+from chad.core.context_positions import build_cycle_context
 from chad.engine import StrategyEngine
 from chad.execution.execution_pipeline import ExecutionPlan, build_execution_plan, build_ibkr_intents_from_plan
 from chad.strategies import register_core_strategies
@@ -198,7 +199,12 @@ def _run_single_cycle() -> FullCycleSummary:
     """
     builder, engine, pipeline, router = _build_cycle_components()
 
-    result = builder.build()
+    # W2B: position-aware context (CHAD_CTX_POSITIONS). OFF is byte-identical to
+    # the legacy builder.build(). A None result means positions are UNKNOWN in ON
+    # mode (D3) — persist an idle summary rather than plan on a false-empty book.
+    result, _ctx_view, _ctx_mode = build_cycle_context(builder=builder)
+    if result is None:
+        return _persist_idle_cycle(reason="ctx_positions_unknown")
     ctx = result.context
     prices = result.prices or {}
     current_symbol_notional = result.current_symbol_notional or {}
@@ -242,6 +248,47 @@ def _run_single_cycle() -> FullCycleSummary:
 
     _persist_plan_artifact(summary=summary, plan=plan, ibkr_intents=ibkr_intents)
     _print_human_summary(summary=summary, plan=plan, ibkr_intents=ibkr_intents)
+    return summary
+
+
+def _persist_idle_cycle(*, reason: str) -> FullCycleSummary:
+    """W2B (D3): persist an honest idle summary when positions are UNKNOWN in ON
+    mode. Zero counts, no orders/intents, and an ``idle_reason`` marker — never a
+    plan built on a false-empty book."""
+    from chad.execution.execution_config import get_execution_mode as _get_exec_mode
+
+    now_dt = _utc_now()
+    summary = FullCycleSummary(
+        now_iso=now_dt.isoformat(),
+        tick_symbols=[],
+        legend_num_symbols=0,
+        raw_signals=0,
+        evaluated_signals=0,
+        routed_signals=0,
+        orders_count=0,
+        total_notional=0.0,
+        ibkr_intents_count=0,
+        repo_root=str(REPO_ROOT),
+        runtime_dir=str(RUNTIME_DIR),
+        plan_path=str(LAST_SUMMARY_PATH),
+        execution_mode=_get_exec_mode().value,
+    )
+    payload: Dict[str, Any] = {
+        "counts": {
+            "raw_signals": 0,
+            "evaluated_signals": 0,
+            "routed_signals": 0,
+            "orders_count": 0,
+            "ibkr_intents_count": 0,
+            "total_notional": 0.0,
+        },
+        "summary": asdict(summary),
+        "orders": [],
+        "ibkr_intents": [],
+        "idle_reason": reason,
+    }
+    _atomic_write_json(LAST_SUMMARY_PATH, payload)
+    print(f"=== CHAD Full Execution Cycle: IDLE ({reason}) ===")
     return summary
 
 

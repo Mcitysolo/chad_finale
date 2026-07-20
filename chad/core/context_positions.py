@@ -306,3 +306,62 @@ def load_context_positions(
             "injected": injected,
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# W2B-2: flag + the shared cycle-context chokepoint
+# --------------------------------------------------------------------------- #
+
+_MODE_ENV = "CHAD_CTX_POSITIONS"
+_VALID_MODES = ("off", "shadow", "on")
+
+
+def resolve_ctx_positions_mode(env: Optional[Mapping[str, str]] = None) -> str:
+    """Effective ``CHAD_CTX_POSITIONS`` mode. Default OFF; a garbage value -> OFF
+    (mirrors the exit-overlay ``resolve_mode`` contract: env-driven, tolerant).
+
+    off    : legacy behaviour — ContextBuilder built with NO positions (empty book).
+    shadow : act on the empty book (zero behaviour change); the injected view is
+             returned so the W2B shadow recorder can log the would-be diff.
+    on     : inject the CHAD-attributed positions; UNKNOWN -> caller idles (D3).
+    """
+    env = os.environ if env is None else env
+    raw = str(env.get(_MODE_ENV, "") or "").strip().lower()
+    return raw if raw in _VALID_MODES else "off"
+
+
+def build_cycle_context(*, builder: Any = None, logger: Any = None, env: Optional[Mapping[str, str]] = None):
+    """Position-aware ``ContextBuilder`` wrapper for the live cycle chokepoints.
+
+    Returns ``(result, view, mode)``:
+      * ``result`` — a ``ContextResult`` (``ContextBuilder.build()``), or ``None``
+        when the caller MUST idle this cycle (mode ``on`` + UNKNOWN positions, D3).
+      * ``view``  — the :class:`PositionsView` (``None`` in OFF).
+      * ``mode``  — the resolved mode string.
+
+    OFF is byte-identical to the legacy ``ContextBuilder().build()`` call (the
+    injection path is not taken and the loader is not consulted). The loader is
+    fail-closed and never raises; ``build()`` exceptions propagate to the caller's
+    existing per-cycle try/except exactly as before.
+    """
+    mode = resolve_ctx_positions_mode(env)
+    from chad.utils.context_builder import ContextBuilder  # lazy: avoid import cycles
+
+    cb = builder if builder is not None else ContextBuilder()
+
+    if mode == "off":
+        return cb.build(), None, "off"
+
+    view = load_context_positions()  # fail-closed; never raises
+
+    if mode == "on":
+        if not view.known:
+            if logger is not None:
+                logger.warning(
+                    "CTX_POSITIONS_UNKNOWN mode=on reason=%s -> idle cycle", view.reason
+                )
+            return None, view, "on"
+        return cb.build(current_positions=view.positions), view, "on"
+
+    # shadow: act on the empty book (no behaviour change); expose the view.
+    return cb.build(), view, "shadow"

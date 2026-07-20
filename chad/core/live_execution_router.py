@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import logging
 
 from chad.utils.context_builder import ContextBuilder
+from chad.core.context_positions import build_cycle_context
 from chad.portfolio.capital_allocator import load_allocation_weights
 from chad.portfolio.strategy_router import (
     choose_strategy_route,
@@ -46,8 +47,17 @@ def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], D
 
     Loads all registered strategies from the canonical registry and
     evaluates each handler against the current market context.
+
+    W2B: the market context is built via ``build_cycle_context`` so strategies
+    can see the CHAD-attributed positions when ``CHAD_CTX_POSITIONS`` is on.
+    OFF (default) is byte-identical to the legacy ``ContextBuilder().build()``.
+    A ``None`` result means positions are UNKNOWN in ON mode (D3) — idle this
+    cycle (no signals), never run strategies on a false-empty book.
     """
-    ctx = ContextBuilder().build().context
+    result, _view, _mode = build_cycle_context(logger=logger)
+    if result is None:
+        return {}, load_allocation_weights()
+    ctx = result.context
 
     from chad.strategies import iter_strategy_registrations
 
