@@ -124,10 +124,15 @@ def _keyset(available):
 def _wire(monkeypatch, *, view):
     import chad.strategies as strategies
     import chad.core.live_execution_router as router
+    import chad.core.ctx_positions_shadow as shadow
     monkeypatch.setattr("chad.utils.context_builder.ContextBuilder", _FakeBuilder)
     monkeypatch.setattr(cp, "load_context_positions", lambda *a, **k: view)
     monkeypatch.setattr(strategies, "iter_strategy_registrations", _fake_registry)
     monkeypatch.setattr(router, "load_allocation_weights", lambda: {})
+    # shadow/heartbeat I/O is tested separately (test_ctx_positions_shadow with
+    # tmp_path); here we only assert the router's signal logic, so stub the
+    # recorder to a no-op (it would otherwise write to runtime/ in on/shadow).
+    monkeypatch.setattr(shadow, "record_cycle", lambda **k: None)
     return router
 
 

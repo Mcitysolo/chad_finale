@@ -60,11 +60,26 @@ def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], D
     ctx = result.context
 
     from chad.strategies import iter_strategy_registrations
+    regs = list(iter_strategy_registrations())
 
     available_signals: Dict[str, List] = {}
-    for reg in iter_strategy_registrations():
+    for reg in regs:
         name = reg.name.value  # StrategyName enum → string
         available_signals[name] = _run_handler(name, reg.handler, ctx, logger)
+
+    # W2B-3: shadow-compare + heartbeat (shadow/on only — OFF stays strictly
+    # inert). Best-effort: an observability failure never breaks the cycle. In
+    # shadow this logs what strategies WOULD emit with the injected book (acting
+    # on nothing); in on it just heartbeats.
+    if _mode in ("shadow", "on"):
+        try:
+            from chad.core.ctx_positions_shadow import record_cycle
+            record_cycle(
+                mode=_mode, regs=regs, run_handler=_run_handler,
+                ctx_off=ctx, available_off=available_signals, view=_view, logger=logger,
+            )
+        except Exception as exc:  # pragma: no cover - non-fatal observability
+            logger.warning("ctx_positions shadow/heartbeat failed (non-fatal): %s", exc)
 
     weights = load_allocation_weights()
     return available_signals, weights
