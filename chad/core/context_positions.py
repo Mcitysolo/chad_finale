@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+chad/core/context_positions.py  —  Wave-2 Lane B (W2B)
+
+The single authoritative position view a strategy's ``MarketContext`` should
+see: netted to **ONE** :class:`chad.types.Position` per symbol, **CHAD-attributed
+only**, and **fail-closed to UNKNOWN** (never empty-as-truth).
+
+Read-only. No side effects. Never raises.
+
+Why this module exists
+----------------------
+``ContextBuilder`` already accepts ``current_positions`` but no caller passes it,
+so ``ctx.portfolio.positions`` is hardwired ``{}`` and every strategy is
+position-blind (root cause of the gamma re-buy churn, beta's perpetual
+underweight-BUY, and dormant native exits). This module produces the value that
+the W2B injection feeds into ``ContextBuilder.build(current_positions=...)``.
+
+Sources (D1)
+------------
+* PRIMARY broker truth — ``runtime/positions_snapshot.json``: an *independent*
+  collector (a different clientId from the guard writers), carrying already-signed
+  ``position`` and ``avgCost`` per row. This is the only leg that does not share a
+  source with the strategy legs, so it cannot false-flat the way the two guard
+  legs can (the XOV-2345 trap).
+* CROSS-CHECK mirror — ``position_guard.json`` ``broker_sync|<SYM>`` legs.
+* ATTRIBUTION — ``position_guard.json`` strategy legs (``gamma|<SYM>``, ...).
+
+Netting rule (D1 / D2 — never sum the dual-booked copies)
+---------------------------------------------------------
+``gamma|UNH`` and ``broker_sync|UNH`` are the SAME shares booked twice; summing
+invents a 2x phantom (see ``position_guard._agg_guard_strategy`` docstring). So::
+
+    injected_qty(S) = clamp_to_broker( strategy_net(S), broker_signed(S) )
+                    = sign(broker) * min(|strategy_net|, |broker|)   # signs agree
+                    = 0                                              # otherwise
+
+Only CHAD-attributed shares that the broker confirms are injected. Operator-only
+inventory (a broker position with no strategy leg — e.g. LLY) is invisible;
+over-attribution (CHAD claims more than the broker holds — e.g. AAPL 14 vs 7) is
+clamped down to broker truth. No strategy ever sees or acts on operator inventory.
+
+Fail-closed (D3)
+----------------
+Snapshot missing / stale / malformed, or the snapshot disagrees with the guard
+broker mirror beyond tolerance  ->  ``status == UNKNOWN``, ``positions == {}``.
+The caller MUST treat UNKNOWN as "idle this cycle", NEVER as an empty book —
+empty-as-truth is the original disease.
+
+Asset-class classifier (D6 — MAINTENANCE SURFACE)
+-------------------------------------------------
+``asset_class`` reuses the exit overlay's ETF/futures allow-lists via
+``position_exit_overlay._asset_class`` (single source of truth). That allow-list
+is a maintenance surface: an ETF **not** on the list classifies as EQUITY.
+Candidate hardening (future): a sentinel that warns on an unknown symbol instead
+of silently guessing EQUITY.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+from chad.types import AssetClass, Position
+from chad.core import position_guard as _pg
+
+# D6: reuse the overlay's classifier (ETF/futures allow-list). Fail-soft so the
+# loader never hard-depends on the overlay import succeeding.
+try:  # pragma: no cover - exercised indirectly
+    from chad.risk.position_exit_overlay import _asset_class as _overlay_asset_class
+except Exception:  # pragma: no cover - defensive fallback
+    def _overlay_asset_class(symbol: str) -> str:  # type: ignore[misc]
+        return "equity"
+
+
+STATUS_KNOWN = "KNOWN"
+STATUS_UNKNOWN = "UNKNOWN"
+
+_DEFAULT_TTL_SECONDS = 300
+# Snapshot vs guard broker-mirror agreement tolerance, in shares. Larger than
+# _pg._V4_TOL because the two are independently-timed broker reads; a sub-share
+# rounding delta must not idle the whole cycle, a real position delta must.
+_MIRROR_TOL = 0.5
+_SNAPSHOT_ENV = "CHAD_POSITIONS_SNAPSHOT_PATH"
+
+
+@dataclass(frozen=True)
+class PositionsView:
+    """Result of :func:`load_context_positions`.
+
+    ``status`` is ``KNOWN`` or ``UNKNOWN``. ``positions`` is a symbol -> Position
+    map, empty whenever ``status == UNKNOWN``. ``reason`` and ``evidence`` are for
+    markers / the W2B shadow record.
+    """
+
+    status: str
+    positions: Mapping[str, Position]
+    reason: str
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def known(self) -> bool:
+        return self.status == STATUS_KNOWN
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+def _asset_class_enum(symbol: str) -> AssetClass:
+    """Symbol -> AssetClass enum (D6). Overlay classifier returns the lowercase
+    strings that ARE the enum values ('equity'/'etf'/'futures')."""
+    try:
+        return AssetClass(_overlay_asset_class(symbol))
+    except Exception:  # pragma: no cover - defensive
+        return AssetClass.EQUITY
+
+
+def _clamp_to_broker(strategy_qty: float, broker_qty: float) -> float:
+    """CHAD-attributed shares the broker confirms (D2): same sign as the broker,
+    magnitude ``min(|strategy|, |broker|)``; ``0.0`` if the broker does not hold
+    the symbol on CHAD's side."""
+    if broker_qty == 0.0:
+        return 0.0
+    if (strategy_qty > 0.0) != (broker_qty > 0.0):
+        return 0.0  # opposite sides — broker does not confirm CHAD's claim
+    mag = min(abs(strategy_qty), abs(broker_qty))
+    return mag if broker_qty > 0.0 else -mag
+
+
+def _parse_ts(ts_raw: Any) -> Optional[datetime]:
+    if not isinstance(ts_raw, str) or not ts_raw:
+        return None
+    try:
+        clean = ts_raw[:-1] if ts_raw.endswith("Z") else ts_raw
+        dt = datetime.fromisoformat(clean)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _resolve_snapshot_path(snapshot_path: Optional[Any]) -> Path:
+    if snapshot_path is not None:
+        return Path(snapshot_path)
+    env = os.getenv(_SNAPSHOT_ENV)
+    if env:
+        return Path(env)
+    return Path.cwd() / "runtime" / "positions_snapshot.json"
+
+
+def _parse_snapshot(
+    path: Path, now: datetime
+) -> Tuple[bool, str, Dict[str, float], Dict[str, float], Optional[str], Optional[float]]:
+    """Returns (fresh, reason, signed_by_symbol, avgcost_by_symbol, ts_utc, age_s)."""
+    try:
+        if not path.is_file():
+            return False, "snapshot_missing", {}, {}, None, None
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, f"snapshot_read_error:{type(exc).__name__}", {}, {}, None, None
+    if not isinstance(doc, dict):
+        return False, "snapshot_malformed", {}, {}, None, None
+
+    ts_raw = doc.get("ts_utc")
+    try:
+        ttl = int(doc.get("ttl_seconds", _DEFAULT_TTL_SECONDS))
+    except (TypeError, ValueError):
+        ttl = _DEFAULT_TTL_SECONDS
+    feed_ts = _parse_ts(ts_raw)
+    if feed_ts is None:
+        return False, "snapshot_bad_ts", {}, {}, (ts_raw if isinstance(ts_raw, str) else None), None
+    age_s = (now - feed_ts).total_seconds()
+    if age_s > ttl:
+        return False, "snapshot_stale", {}, {}, ts_raw, age_s
+
+    signed = _pg._agg_snapshot_positions(doc)  # {SYM: signed qty}, filtered by _V4_TOL
+    avgcost: Dict[str, float] = {}
+    for row in doc.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        try:
+            ac = float(row.get("avgCost"))
+        except (TypeError, ValueError):
+            continue
+        if ac > 0.0:
+            avgcost[sym] = ac
+    return True, "fresh", signed, avgcost, ts_raw, age_s
+
+
+def _read_guard(path: Path) -> Mapping[str, Any]:
+    try:
+        if not path.is_file():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _first_mirror_conflict(
+    snapshot_signed: Mapping[str, float],
+    mirror_signed: Mapping[str, float],
+    tol: float,
+) -> Optional[Tuple[str, float, float]]:
+    """The two broker views (independent snapshot vs guard ``broker_sync`` mirror)
+    must agree on symbols they share; a material disagreement means we cannot
+    trust the book and must idle (D3). Returns the first conflicting symbol."""
+    for sym in sorted(set(snapshot_signed) & set(mirror_signed)):
+        sv = snapshot_signed[sym]
+        mv = mirror_signed[sym]
+        if abs(sv - mv) > tol:
+            return (sym, sv, mv)
+    return None
+
+
+def _excluded_symbols() -> set:
+    try:
+        from chad.core.position_reconciler import _EFFECTIVE_NON_CHAD_SYMBOLS
+        return set(_EFFECTIVE_NON_CHAD_SYMBOLS)
+    except Exception:  # pragma: no cover - defensive
+        return set()
+
+
+# --------------------------------------------------------------------------- #
+# public API
+# --------------------------------------------------------------------------- #
+
+def load_context_positions(
+    *,
+    snapshot_path: Optional[Any] = None,
+    guard_path: Optional[Any] = None,
+    now: Optional[datetime] = None,
+    mirror_tol: float = _MIRROR_TOL,
+) -> PositionsView:
+    """Load the CHAD-attributed, broker-confirmed position view (see module docstring).
+
+    Never raises. Fail-closed to ``UNKNOWN`` on any unreadable/stale/conflicting
+    broker truth. All paths are injectable for hermetic tests.
+    """
+    now = now or datetime.now(timezone.utc)
+    snap_path = _resolve_snapshot_path(snapshot_path)
+    g_path = Path(guard_path) if guard_path is not None else _pg.STATE_PATH
+
+    # 1) PRIMARY broker truth — the independent snapshot is REQUIRED for KNOWN.
+    fresh, reason, broker_signed, avgcost, ts_utc, age_s = _parse_snapshot(snap_path, now)
+    if not fresh:
+        return PositionsView(
+            STATUS_UNKNOWN, {}, reason,
+            {"snapshot_ts_utc": ts_utc, "snapshot_age_s": age_s},
+        )
+
+    # 2) Guard — strategy attribution + broker mirror (cross-check only).
+    guard = _read_guard(g_path)
+    strat_net = _pg._agg_guard_strategy(guard)      # NEVER summed with the mirror
+    mirror = _pg._agg_guard_broker_mirror(guard)
+
+    # 3) Cross-check: independent snapshot must agree with the guard's own mirror
+    #    on shared symbols; a conflict means we do not guess (D3).
+    conflict = _first_mirror_conflict(broker_signed, mirror, mirror_tol)
+    if conflict is not None:
+        sym, sv, mv = conflict
+        return PositionsView(
+            STATUS_UNKNOWN, {}, "snapshot_mirror_conflict",
+            {"symbol": sym, "snapshot_qty": sv, "mirror_qty": mv, "snapshot_ts_utc": ts_utc},
+        )
+
+    # 4) Net to ONE CHAD-attributed Position per symbol (D1/D2 — never sum legs).
+    excluded = _excluded_symbols()
+    positions: Dict[str, Position] = {}
+    injected: list = []
+    for sym, s_qty in strat_net.items():
+        b_qty = broker_signed.get(sym, 0.0)
+        qty = _clamp_to_broker(s_qty, b_qty)
+        if abs(qty) <= _pg._V4_TOL:
+            continue
+        positions[sym] = Position(
+            symbol=sym,
+            asset_class=_asset_class_enum(sym),
+            quantity=qty,
+            avg_price=float(avgcost.get(sym, 0.0)),
+        )
+        injected.append({
+            "symbol": sym,
+            "qty": qty,
+            "strategy_net": s_qty,
+            "broker": b_qty,
+            "operator_mixed": sym in excluded,
+        })
+
+    return PositionsView(
+        STATUS_KNOWN, positions, "fresh",
+        {
+            "snapshot_ts_utc": ts_utc,
+            "snapshot_age_s": age_s,
+            "n_injected": len(positions),
+            "n_strategy_symbols": len(strat_net),
+            "injected": injected,
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
+# W2B-2: flag + the shared cycle-context chokepoint
+# --------------------------------------------------------------------------- #
+
+_MODE_ENV = "CHAD_CTX_POSITIONS"
+_VALID_MODES = ("off", "shadow", "on")
+
+
+def resolve_ctx_positions_mode(env: Optional[Mapping[str, str]] = None) -> str:
+    """Effective ``CHAD_CTX_POSITIONS`` mode. Default OFF; a garbage value -> OFF
+    (mirrors the exit-overlay ``resolve_mode`` contract: env-driven, tolerant).
+
+    off    : legacy behaviour — ContextBuilder built with NO positions (empty book).
+    shadow : act on the empty book (zero behaviour change); the injected view is
+             returned so the W2B shadow recorder can log the would-be diff.
+    on     : inject the CHAD-attributed positions; UNKNOWN -> caller idles (D3).
+    """
+    env = os.environ if env is None else env
+    raw = str(env.get(_MODE_ENV, "") or "").strip().lower()
+    return raw if raw in _VALID_MODES else "off"
+
+
+def build_cycle_context(*, builder: Any = None, logger: Any = None, env: Optional[Mapping[str, str]] = None):
+    """Position-aware ``ContextBuilder`` wrapper for the live cycle chokepoints.
+
+    Returns ``(result, view, mode)``:
+      * ``result`` — a ``ContextResult`` (``ContextBuilder.build()``), or ``None``
+        when the caller MUST idle this cycle (mode ``on`` + UNKNOWN positions, D3).
+      * ``view``  — the :class:`PositionsView` (``None`` in OFF).
+      * ``mode``  — the resolved mode string.
+
+    OFF is byte-identical to the legacy ``ContextBuilder().build()`` call (the
+    injection path is not taken and the loader is not consulted). The loader is
+    fail-closed and never raises; ``build()`` exceptions propagate to the caller's
+    existing per-cycle try/except exactly as before.
+    """
+    mode = resolve_ctx_positions_mode(env)
+    from chad.utils.context_builder import ContextBuilder  # lazy: avoid import cycles
+
+    cb = builder if builder is not None else ContextBuilder()
+
+    if mode == "off":
+        return cb.build(), None, "off"
+
+    view = load_context_positions()  # fail-closed; never raises
+
+    if mode == "on":
+        if not view.known:
+            if logger is not None:
+                logger.warning(
+                    "CTX_POSITIONS_UNKNOWN mode=on reason=%s -> idle cycle", view.reason
+                )
+            return None, view, "on"
+        return cb.build(current_positions=view.positions), view, "on"
+
+    # shadow: act on the empty book (no behaviour change); expose the view.
+    return cb.build(), view, "shadow"
+
+
+# --------------------------------------------------------------------------- #
+# W2B-5: D4 double-exit guardrail — the ACTIVE exit overlay is the SOLE
+# equity/ETF exit authority.
+#
+# Injecting positions (mode ``on``) makes strategies position-aware, which ALSO
+# makes their ``qty>0``-gated NATIVE exits reachable — unclamped equity/ETF SELLs
+# that would race the overlay's reduce-only, broker-clamped closes on a disjoint
+# path (oversell / short-flip; the INCIDENT-0713 shape). The same single
+# injection produces both the SAFE behaviours (gamma/beta stop over-buying) and
+# this DANGEROUS one; you cannot cherry-pick with the injection alone.
+#
+# This filter neutralises exactly the dangerous half — strategy SELLs on
+# EQUITY/ETF symbols — at the injection chokepoint, so the ON flip delivers
+# BUY-suppression + beta weight-awareness (defects b, c) with ZERO new SELL
+# surface. Native exits (defect a) are DEFERRED to the exit-routing-unification
+# follow-on lane, which will route strategy exits through the shared reduce-only,
+# lot-keyed close path. Futures/crypto/options SELLs are NOT equity/ETF and are
+# left untouched — their own lanes own them.
+#
+# INERT unless ``mode == "on"``: OFF/shadow return the input unchanged, so the
+# guardrail cannot alter today's (or the shadow's) behaviour. The rollback is the
+# default.
+# --------------------------------------------------------------------------- #
+
+_OVERLAY_OWNED_CLASSES = (AssetClass.EQUITY, AssetClass.ETF)
+
+
+def _signal_side_str(sig: Any) -> str:
+    side = getattr(sig, "side", None)
+    return str(getattr(side, "value", None) or getattr(side, "name", None) or side or "").upper()
+
+
+def _signal_asset_class(sig: Any) -> AssetClass:
+    """The signal's asset class. Prefer the signal's OWN ``asset_class`` (the
+    emitting strategy knows it); fall back to the D6 symbol classifier only when
+    the signal does not carry a usable one. Preferring the signal's class avoids
+    misclassifying a futures/crypto SELL whose *symbol* the equity classifier
+    would read as EQUITY (the overlay's ``_asset_class`` returns "equity" for any
+    non-futures/non-ETF ticker)."""
+    ac = getattr(sig, "asset_class", None)
+    if isinstance(ac, AssetClass):
+        return ac
+    if ac is not None:
+        try:
+            return AssetClass(str(getattr(ac, "value", ac)).lower())
+        except (ValueError, AttributeError):
+            pass
+    return _asset_class_enum(str(getattr(sig, "symbol", "") or ""))
+
+
+def is_overlay_owned_exit(sig: Any) -> bool:
+    """True iff ``sig`` is a strategy **equity/ETF SELL** — an exit the ACTIVE
+    overlay owns (D4). BUYs, and SELLs on any non-equity/ETF asset class
+    (futures/crypto/options/forex/cash), are False."""
+    if _signal_side_str(sig) != "SELL":
+        return False
+    return _signal_asset_class(sig) in _OVERLAY_OWNED_CLASSES
+
+
+def filter_overlay_owned_exits(signals: Any, *, mode: str) -> Tuple[list, list]:
+    """Split ``signals`` into ``(kept, dropped)`` where ``dropped`` is the strategy
+    equity/ETF SELLs — but ONLY when ``mode == "on"``. In every other mode this is
+    INERT: it returns ``(list(signals), [])`` unchanged, so OFF/shadow stay
+    byte-identical (the ON flip is the only place the guardrail acts). Never
+    raises; order is preserved."""
+    dropped: list = []
+    if mode != "on":
+        return list(signals or []), dropped
+    kept: list = []
+    for s in (signals or []):
+        (dropped if is_overlay_owned_exit(s) else kept).append(s)
+    return kept, dropped
