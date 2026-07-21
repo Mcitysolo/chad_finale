@@ -50,6 +50,12 @@ _STATEFUL_MODULES = (
 _EVIDENCE_DIR_ENV = "CHAD_CTX_POSITIONS_EVIDENCE_DIR"
 _HEARTBEAT_ENV = "CHAD_CTX_POSITIONS_HEARTBEAT_PATH"
 
+# Advertised freshness budget (seconds), mirroring the exit/crypto overlay
+# heartbeats. The health monitor (R25) treats age > ttl*2 as STALE. The live
+# router fires record_cycle every cycle (~60-90s), so 900s tolerates several
+# skipped cycles before crying wolf.
+_HEARTBEAT_TTL_SECONDS = 900
+
 
 # --------------------------------------------------------------------------- #
 # signal-key extraction
@@ -250,6 +256,10 @@ def record_cycle(
         "schema_version": "ctx_positions_heartbeat.v1",
         "ts_utc": _iso(now),
         "mode": mode,
+        # W2BS (Q4): ttl_seconds + healthy mirror the two overlay heartbeats so the
+        # health monitor's R25 rule reads the same shape (STALE at age > ttl*2).
+        "ttl_seconds": _HEARTBEAT_TTL_SECONDS,
+        "healthy": True,
         "positions_status": getattr(view, "status", None) if view is not None else None,
         "n_injected": (getattr(view, "evidence", {}) or {}).get("n_injected") if view is not None else None,
         "n_signals_acted": n_acted,

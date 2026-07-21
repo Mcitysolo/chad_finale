@@ -87,20 +87,24 @@ def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], D
                 _exits_filtered,
             )
 
-    # W2B-3: shadow-compare + heartbeat (shadow/on only — OFF stays strictly
-    # inert). Best-effort: an observability failure never breaks the cycle. In
-    # shadow this logs what strategies WOULD emit with the injected book (acting
-    # on nothing); in on it just heartbeats the (post-guardrail) acting set.
-    if _mode in ("shadow", "on"):
-        try:
-            from chad.core.ctx_positions_shadow import record_cycle
-            record_cycle(
-                mode=_mode, regs=regs, run_handler=_run_handler,
-                ctx_off=ctx, available_off=available_signals, view=_view, logger=logger,
-                exits_filtered=_exits_filtered,
-            )
-        except Exception as exc:  # pragma: no cover - non-fatal observability
-            logger.warning("ctx_positions shadow/heartbeat failed (non-fatal): %s", exc)
+    # W2B-3 + W2BS (Q4): shadow-compare + heartbeat. The HEARTBEAT is now written
+    # EVERY cycle — including OFF — so the health monitor (R25) can distinguish
+    # "installed but off" (fresh off-heartbeat) from "the instrument is dead"
+    # (stale/missing). This is observer-only: OFF stays byte-identical in its
+    # TRADING path — record_cycle in off mode computes NO counterfactual, writes
+    # NO evidence ndjson, and the D4 guardrail already returned the signals
+    # unchanged; it only stamps a liveness file that no trading decision reads.
+    # The shadow DIFF (+ evidence) still happens only in shadow; the guardrail
+    # only acts in on. Best-effort: an observability failure never breaks a cycle.
+    try:
+        from chad.core.ctx_positions_shadow import record_cycle
+        record_cycle(
+            mode=_mode, regs=regs, run_handler=_run_handler,
+            ctx_off=ctx, available_off=available_signals, view=_view, logger=logger,
+            exits_filtered=_exits_filtered,
+        )
+    except Exception as exc:  # pragma: no cover - non-fatal observability
+        logger.warning("ctx_positions shadow/heartbeat failed (non-fatal): %s", exc)
 
     weights = load_allocation_weights()
     return available_signals, weights

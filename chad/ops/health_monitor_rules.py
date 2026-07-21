@@ -1337,6 +1337,67 @@ def rule_crypto_exit_overlay_heartbeat(findings: List[Finding]) -> None:
     ))
 
 
+def rule_ctx_positions_heartbeat(findings: List[Finding]) -> None:
+    """R25 — the W2B ContextBuilder position-awareness instrument must never run silently.
+
+    The sibling of R14/R24 for the ``CHAD_CTX_POSITIONS`` shadow/guardrail. Its
+    heartbeat (``runtime/ctx_positions_heartbeat.json``, published by the live
+    router every cycle in EVERY mode incl. off) is the only liveness signal for
+    the shadow-compare (the go/no-go ``added_sells_count`` evidence) and the D4
+    double-exit guardrail. Two failures:
+
+    (a) MISSING — the router has never published a heartbeat: the instrument is
+        not wired, or the loop has not restarted since it shipped.
+    (b) STALE — the router stopped publishing: the shadow corpus is no longer
+        accumulating and, if the flag is ON, the D4 guardrail's ``exits_filtered``
+        accounting is dark.
+
+    Because the heartbeat is written even when the flag is OFF, a fresh off-mode
+    heartbeat is healthy (installed-but-off), so this never cries wolf on the
+    default posture — only a genuinely dead instrument fires.
+
+    NOTIFY_ONLY (SS01): the only publisher is chad-live-loop, a trading engine
+    the health monitor must never auto-restart.
+    """
+    hb_path = RUNTIME / "ctx_positions_heartbeat.json"
+    age = _age(hb_path)
+    if age is None:
+        findings.append(Finding(
+            rule_id="R25",
+            severity="WARNING",
+            title="Ctx-positions heartbeat MISSING",
+            description=(
+                "The W2B position-awareness instrument (CHAD_CTX_POSITIONS "
+                "shadow/guardrail) has never published a heartbeat. It may not be "
+                "wired into the live loop, or the loop has not restarted since it "
+                "shipped. The shadow go/no-go corpus is not being written."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="Confirm chad-live-loop is running the live_execution_router record_cycle path.",
+            evidence=f"missing file={hb_path.name}",
+        ))
+        return
+
+    hb = _read_json(hb_path)
+    ttl = float(hb.get("ttl_seconds") or 900)
+    if age > ttl * 2:
+        findings.append(Finding(
+            rule_id="R25",
+            severity="CRITICAL",
+            title="Ctx-positions heartbeat STALE",
+            description=(
+                "The W2B position-awareness instrument has stopped reporting in. "
+                "The shadow-compare corpus is no longer accumulating; if the flag "
+                "is ON, the D4 double-exit guardrail's exits_filtered accounting is "
+                "dark."
+            ),
+            remedy_type="NOTIFY_ONLY",
+            remedy_action="Investigate chad-live-loop; the ctx-positions record_cycle path stopped running.",
+            evidence=f"heartbeat age={int(age)}s TTL={int(ttl)}s mode={hb.get('mode')}",
+        ))
+        return
+
+
 # IR1 R3: consecutive failed advisory refreshes before we NOTIFY. At the
 # 15-min refresh cadence, 3 consecutive all-fallback runs ≈ 45 min of a dead
 # advisory tier — long enough to be real, short enough to catch what was a
@@ -1415,6 +1476,7 @@ def run_all_rules() -> List[Finding]:
         rule_ibkr_gateway_version,
         rule_exit_overlay_heartbeat,
         rule_crypto_exit_overlay_heartbeat,
+        rule_ctx_positions_heartbeat,
     ]:
         try:
             fn(findings)
