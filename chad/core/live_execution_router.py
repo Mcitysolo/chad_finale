@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import logging
 
 from chad.utils.context_builder import ContextBuilder
-from chad.core.context_positions import build_cycle_context
+from chad.core.context_positions import build_cycle_context, filter_overlay_owned_exits
 from chad.portfolio.capital_allocator import load_allocation_weights
 from chad.portfolio.strategy_router import (
     choose_strategy_route,
@@ -67,16 +67,37 @@ def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], D
         name = reg.name.value  # StrategyName enum → string
         available_signals[name] = _run_handler(name, reg.handler, ctx, logger)
 
+    # W2B-5: D4 double-exit guardrail. In ON mode the injected book makes the
+    # strategies' native qty>0 exits reachable — unclamped equity/ETF SELLs that
+    # would race the ACTIVE exit overlay (the sole equity/ETF exit authority).
+    # Drop exactly those here so ON delivers BUY-suppression + beta-weighting with
+    # ZERO new SELL surface. INERT unless ON (filter returns the input unchanged),
+    # so OFF stays byte-identical. Futures/crypto/options SELLs are untouched.
+    _exits_filtered = 0
+    if _mode == "on":
+        for name in list(available_signals):
+            kept, dropped = filter_overlay_owned_exits(available_signals[name], mode=_mode)
+            if dropped:
+                available_signals[name] = kept
+                _exits_filtered += len(dropped)
+        if _exits_filtered:
+            logger.warning(
+                "CTX_POSITIONS_EXIT_FILTERED site=router dropped=%d "
+                "(overlay is sole equity/ETF exit authority — D4)",
+                _exits_filtered,
+            )
+
     # W2B-3: shadow-compare + heartbeat (shadow/on only — OFF stays strictly
     # inert). Best-effort: an observability failure never breaks the cycle. In
     # shadow this logs what strategies WOULD emit with the injected book (acting
-    # on nothing); in on it just heartbeats.
+    # on nothing); in on it just heartbeats the (post-guardrail) acting set.
     if _mode in ("shadow", "on"):
         try:
             from chad.core.ctx_positions_shadow import record_cycle
             record_cycle(
                 mode=_mode, regs=regs, run_handler=_run_handler,
                 ctx_off=ctx, available_off=available_signals, view=_view, logger=logger,
+                exits_filtered=_exits_filtered,
             )
         except Exception as exc:  # pragma: no cover - non-fatal observability
             logger.warning("ctx_positions shadow/heartbeat failed (non-fatal): %s", exc)

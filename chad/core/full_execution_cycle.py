@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
-from chad.core.context_positions import build_cycle_context
+from chad.core.context_positions import build_cycle_context, filter_overlay_owned_exits
 from chad.engine import StrategyEngine
 from chad.execution.execution_pipeline import ExecutionPlan, build_execution_plan, build_ibkr_intents_from_plan
 from chad.strategies import register_core_strategies
@@ -218,9 +218,17 @@ def _run_single_cycle() -> FullCycleSummary:
         current_total_notional=current_total_notional,
     )
 
+    # W2B-5: D4 double-exit guardrail. In ON mode drop strategy equity/ETF exit
+    # SELLs so the ACTIVE exit overlay stays the sole equity/ETF exit authority;
+    # the persisted plan artifact then reflects exactly what would execute. INERT
+    # unless ON (returns routed_signals unchanged) -> OFF byte-identical.
+    _routed = list(getattr(pipeline_result, "routed_signals", []) or [])
+    if _ctx_mode == "on":
+        _routed, _dropped_exits = filter_overlay_owned_exits(_routed, mode=_ctx_mode)
+
     # Build execution plan
     plan: ExecutionPlan = build_execution_plan(
-        routed_signals=pipeline_result.routed_signals,
+        routed_signals=_routed,
         prices=prices,
     )
 

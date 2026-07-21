@@ -59,7 +59,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequenc
 
 from chad.analytics.shadow_confidence_router import evaluate_confidence
 from chad.analytics.trade_stats_engine import load_and_compute
-from chad.core.context_positions import build_cycle_context
+from chad.core.context_positions import build_cycle_context, filter_overlay_owned_exits
 from chad.core.live_gate import evaluate_live_gate
 from chad.engine import StrategyEngine
 from chad.execution.execution_pipeline import (
@@ -424,6 +424,21 @@ def _build_plan_and_intents(logger: logging.Logger) -> tuple[Any, Any, list[Any]
     )
 
     routed_signals = list(getattr(pipeline_result, "routed_signals", []) or [])
+
+    # W2B-5: D4 double-exit guardrail on the EXECUTED path. In ON mode the injected
+    # book makes strategies' native qty>0 exits reachable; drop strategy equity/ETF
+    # SELLs here (before they become IBKR intents) so the ACTIVE exit overlay stays
+    # the sole equity/ETF exit authority. INERT unless ON (returns routed_signals
+    # unchanged), so OFF is byte-identical. Futures/crypto SELLs are untouched.
+    if _ctx_mode == "on":
+        routed_signals, _dropped_exits = filter_overlay_owned_exits(routed_signals, mode=_ctx_mode)
+        if _dropped_exits:
+            logger.warning(
+                "CTX_POSITIONS_EXIT_FILTERED site=pipeline dropped=%d "
+                "(overlay is sole equity/ETF exit authority — D4)",
+                len(_dropped_exits),
+            )
+
     ibkr_signals, kraken_signals = split_signals_by_asset_class(routed_signals)
 
     plan = build_execution_plan(

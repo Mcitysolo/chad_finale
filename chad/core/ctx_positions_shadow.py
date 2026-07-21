@@ -190,6 +190,7 @@ def record_cycle(
     now: Optional[datetime] = None,
     evidence_dir: Optional[Any] = None,
     heartbeat_path: Optional[Any] = None,
+    exits_filtered: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """In shadow: compute + persist the OFF-vs-ON signal-set diff and heartbeat,
     acting on nothing and perturbing no strategy state. In on: heartbeat only.
@@ -253,5 +254,8 @@ def record_cycle(
         "n_injected": (getattr(view, "evidence", {}) or {}).get("n_injected") if view is not None else None,
         "n_signals_acted": n_acted,
         "added_sells_count": (record or {}).get("added_sells_count"),
+        # W2B-5: how many strategy equity/ETF exit SELLs the D4 guardrail dropped
+        # this cycle (on mode). None in shadow (the guardrail does not act there).
+        "exits_filtered": exits_filtered,
     })
     return record

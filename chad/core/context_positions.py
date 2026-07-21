@@ -365,3 +365,77 @@ def build_cycle_context(*, builder: Any = None, logger: Any = None, env: Optiona
 
     # shadow: act on the empty book (no behaviour change); expose the view.
     return cb.build(), view, "shadow"
+
+
+# --------------------------------------------------------------------------- #
+# W2B-5: D4 double-exit guardrail — the ACTIVE exit overlay is the SOLE
+# equity/ETF exit authority.
+#
+# Injecting positions (mode ``on``) makes strategies position-aware, which ALSO
+# makes their ``qty>0``-gated NATIVE exits reachable — unclamped equity/ETF SELLs
+# that would race the overlay's reduce-only, broker-clamped closes on a disjoint
+# path (oversell / short-flip; the INCIDENT-0713 shape). The same single
+# injection produces both the SAFE behaviours (gamma/beta stop over-buying) and
+# this DANGEROUS one; you cannot cherry-pick with the injection alone.
+#
+# This filter neutralises exactly the dangerous half — strategy SELLs on
+# EQUITY/ETF symbols — at the injection chokepoint, so the ON flip delivers
+# BUY-suppression + beta weight-awareness (defects b, c) with ZERO new SELL
+# surface. Native exits (defect a) are DEFERRED to the exit-routing-unification
+# follow-on lane, which will route strategy exits through the shared reduce-only,
+# lot-keyed close path. Futures/crypto/options SELLs are NOT equity/ETF and are
+# left untouched — their own lanes own them.
+#
+# INERT unless ``mode == "on"``: OFF/shadow return the input unchanged, so the
+# guardrail cannot alter today's (or the shadow's) behaviour. The rollback is the
+# default.
+# --------------------------------------------------------------------------- #
+
+_OVERLAY_OWNED_CLASSES = (AssetClass.EQUITY, AssetClass.ETF)
+
+
+def _signal_side_str(sig: Any) -> str:
+    side = getattr(sig, "side", None)
+    return str(getattr(side, "value", None) or getattr(side, "name", None) or side or "").upper()
+
+
+def _signal_asset_class(sig: Any) -> AssetClass:
+    """The signal's asset class. Prefer the signal's OWN ``asset_class`` (the
+    emitting strategy knows it); fall back to the D6 symbol classifier only when
+    the signal does not carry a usable one. Preferring the signal's class avoids
+    misclassifying a futures/crypto SELL whose *symbol* the equity classifier
+    would read as EQUITY (the overlay's ``_asset_class`` returns "equity" for any
+    non-futures/non-ETF ticker)."""
+    ac = getattr(sig, "asset_class", None)
+    if isinstance(ac, AssetClass):
+        return ac
+    if ac is not None:
+        try:
+            return AssetClass(str(getattr(ac, "value", ac)).lower())
+        except (ValueError, AttributeError):
+            pass
+    return _asset_class_enum(str(getattr(sig, "symbol", "") or ""))
+
+
+def is_overlay_owned_exit(sig: Any) -> bool:
+    """True iff ``sig`` is a strategy **equity/ETF SELL** — an exit the ACTIVE
+    overlay owns (D4). BUYs, and SELLs on any non-equity/ETF asset class
+    (futures/crypto/options/forex/cash), are False."""
+    if _signal_side_str(sig) != "SELL":
+        return False
+    return _signal_asset_class(sig) in _OVERLAY_OWNED_CLASSES
+
+
+def filter_overlay_owned_exits(signals: Any, *, mode: str) -> Tuple[list, list]:
+    """Split ``signals`` into ``(kept, dropped)`` where ``dropped`` is the strategy
+    equity/ETF SELLs — but ONLY when ``mode == "on"``. In every other mode this is
+    INERT: it returns ``(list(signals), [])`` unchanged, so OFF/shadow stay
+    byte-identical (the ON flip is the only place the guardrail acts). Never
+    raises; order is preserved."""
+    dropped: list = []
+    if mode != "on":
+        return list(signals or []), dropped
+    kept: list = []
+    for s in (signals or []):
+        (dropped if is_overlay_owned_exit(s) else kept).append(s)
+    return kept, dropped
