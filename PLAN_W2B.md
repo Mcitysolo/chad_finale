@@ -357,3 +357,63 @@ Phase 2 is entirely OFF/shadow, worktree-only, no runtime mutation.
 Grounded by four parallel read-only forensic sweeps (position-truth, blast-radius, overlay
 interaction, test methodology) + a measured worktree-15 baseline. Live tree untouched; nothing
 in `runtime/` mutated.
+
+---
+
+## PHASE 2 — CLOSURE RECORD (built 2026-07-21)
+
+All eight decisions locked by the operator ("GO with all recommendations — locked") and built
+to the finish line (W2B-1..5). Worktree-only (`/home/ubuntu/chad_w2b`, branch
+`goal/wave2-contextbuilder`); the live tree `/home/ubuntu/chad_finale` was untouched and nothing
+in `runtime/` was mutated. Everything lands **DEFAULT-OFF**: `CHAD_CTX_POSITIONS` is unset, so
+all five commits are byte-identical to today until an operator flips the flag. The rollback IS
+the default.
+
+### Decisions → landing commits
+
+| Decision | Resolution (locked) | Landed in |
+|----------|---------------------|-----------|
+| **D1** position source & netting | broker truth, netted to ONE `Position` per symbol, snapshot-primary (`positions_snapshot.json`, freshness-gated), guard `broker_sync` mirror as GREEN-gated cross-check; **never sum** the dual-booked legs. | W2B-1 (`load_context_positions`) |
+| **D2** excluded-symbol policy | inject the **CHAD-attributed portion only**, clamped to broker (`sign(broker)·min(\|strat\|,\|broker\|)`); operator inventory invisible, no strategy can act on operator shares. | W2B-1 (`_clamp_to_broker`) |
+| **D3** UNKNOWN-not-empty | unreadable/stale/mirror-conflicting broker truth → UNKNOWN → **idle the cycle**; never feed empty-as-truth. | W2B-2 (`build_cycle_context`→`None`→router/runner idle) + W2B-3 (shadow never reached on a false-empty book) |
+| **D4** double-exit guardrail (crux) | ON = **BUY-suppression + beta-weighting ONLY**; the ACTIVE overlay stays the **sole equity/ETF exit authority**; native strategy exits quarantined behind the filter, **deferred** to the exit-routing-unification follow-on lane (their oversell collision is why they don't ride along). | W2B-5 (`filter_overlay_owned_exits` at router + pipeline + full_cycle) |
+| **D5** wiring scope | wire the hot path via the shared loader; audit the other 4 sites, wire live, document dead → **3 live wired** (router, `ibkr_execution_runner:407`, `full_execution_cycle`); **2 dead documented** (`ibkr_execution_runner:296` no-caller, `routed_execution_runner` `__main__`-only). | W2B-2 |
+| **D6** asset_class classifier | reuse the overlay ETF allow-list (`_asset_class`) → `AssetClass` enum; the allow-list is a **maintenance surface** (unlisted ETF → EQUITY). Sentinel candidate (unknown symbol → warn, not guess) documented in the `context_positions` module docstring, deferred as hardening. | W2B-1 (`_asset_class_enum` + docstring) |
+| **D7** no-over-count proof (build-step 1) | set-equality proof that the loader returns exactly one netted `Position` per symbol and never sums `strategy\|X + broker_sync\|X` (the SVXY 156+156→312 hazard); plus OFF-inert / ON-characterized-diff proofs. | W2B-1 (loader proof) + W2B-4 (UNH characterized diff) |
+| **D8** verification methodology | failing-test-ID **SET-diff** gate against worktree-15 (⊆, no new ID) + in-test set-equality (OFF inert / ON characterized-diff). | every commit |
+
+### Commits
+`9f7d6c9` W2B-1 loader + no-over-count proof · `8cf6932` W2B-2 tri-state flag + OFF-inert wiring
+(3 live sites) · `710570d` W2B-3 shadow-compare + evidence ndjson + heartbeat · `bffe157` W2B-4
+UNH churn regression fixture · `8b632b3` W2B-5 D4 double-exit guardrail + blast-radius test.
+
+### Gate result (definitive, `chad/tests/`)
+**15 failed / 3918 passed / 5 skipped.** The failing set is **exactly** the recorded worktree-15
+baseline (9 env-coupling IDs + the 6 `test_repo_write_guard` IDs) — **zero new failing IDs**
+across all five commits. Targeted W2B suite **51/51** (loader 14 / flag 18 / shadow 8 / churn 3
+/ blast-radius 8). `full_cycle_preview` clean in OFF (default), exit 0. None of the 15 failures
+touch any W2B file.
+
+### Load-bearing finding recorded during the build
+The **executed** strategy SELLs come from the **pipeline** (`_build_plan_and_intents`,
+`live_loop:2503`), NOT the router — the router's `routed_signals` feed `routed_signal_map`
+(attribution). So the D4 guardrail is wired at **all three** ON-injection chokepoints, not just
+the router the plan named; a router-only filter would have been cosmetic. The filter classifies
+from each signal's **own** `asset_class` (D6 symbol classifier as fallback) so a futures/crypto/
+options SELL whose *symbol* the equity classifier would misread as EQUITY is never mis-dropped.
+
+### Phase-3 ON-flip go/no-go (gated on the shadow corpus + operator GO)
+The ON flip (`CHAD_CTX_POSITIONS=on` via a unit drop-in) and the defect-(a) exit-routing
+follow-on remain **Phase-3, operator-gated**. Run `CHAD_CTX_POSITIONS=shadow` first to build the
+corpus (`data/ctx_positions_shadow/ctx_positions_YYYYMMDD.ndjson`, schema `ctx_positions_shadow.v1`;
+heartbeat `runtime/ctx_positions_heartbeat.json`). Flip to `on` only when the corpus shows:
+1. the diff is **dominated by removed BUYs** (safe suppression), and
+2. **`added_sells_count == 0`** on the unclamped path across the corpus — OR every such SELL is
+   neutralized by the D4 guardrail (which, once ON, drops them and records `exits_filtered` in
+   the heartbeat). The guardrail makes (2) hold by construction at ON; the shadow *measures* the
+   surface in advance so the flip is judged on evidence.
+
+Until then: `goal/wave2-contextbuilder` is **NOT pushed** — stopped at the push decision; the box
+runs `main` unchanged.
+
+### Phase-2 status: COMPLETE.
