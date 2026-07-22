@@ -76,6 +76,8 @@ __all__ = [
     "adapt_records",
     "iter_ledger_files",
     "load_quarantine_pins",
+    "load_scr_effective",
+    "ScrCrosscheckError",
     "load_ndjson",
     "verify_ledger_chain",
     "LedgerChainError",
@@ -619,6 +621,10 @@ class AdapterManifest:
     # exit<entry timestamp (kept but flagged; the walk-forward axis orders robustly).
     admitted_pnl_field_counts: dict[str, int] = field(default_factory=dict)
     inverted_duration_admitted: int = 0
+    # W3A-3 (D2): read-only reconciliation vs SCR's effective set (runtime/scr_state.json).
+    # None when the cross-check was not run; a dict surfacing the admitted-vs-effective delta
+    # so a divergence between the two scorekeepers is loud, never silent.
+    scr_reconciliation: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -641,6 +647,7 @@ class AdapterManifest:
             "admitted_by_instrument_class": dict(self.admitted_by_instrument_class),
             "admitted_pnl_field_counts": dict(self.admitted_pnl_field_counts),
             "inverted_duration_admitted": self.inverted_duration_admitted,
+            "scr_reconciliation": self.scr_reconciliation,
         }
 
 
@@ -870,6 +877,69 @@ def load_quarantine_pins(
     return frozenset(hashes), frozenset(fill_ids), consulted
 
 
+class ScrCrosscheckError(RuntimeError):
+    """The SCR reconciliation cross-check was requested but ``runtime/scr_state.json`` is
+    absent / unreadable / malformed. The operator granted this read explicitly as READ-only,
+    **fail-loud on absence, never written** (D2) — so a missing SCR truth is an error, not a
+    silent skip."""
+
+
+def load_scr_effective(scr_state_path: Optional[Path]) -> tuple[Optional[int], Optional[str]]:
+    """Read ``runtime/scr_state.json`` as TEXT (read-only) → ``(effective_trades, ts_utc)``.
+
+    ``scr_state_path is None`` disables the cross-check → ``(None, None)`` (no read). When a
+    path IS given it is READ (never written) and a missing / unreadable / malformed file
+    raises :class:`ScrCrosscheckError` — fail-loud on absence (D2). This is the same one-way
+    text-read shape as :func:`load_quarantine_pins`; no ``chad`` runtime module is imported, so
+    the harness import-closure isolation (tests/validation/test_isolation.py) is preserved.
+    """
+    if scr_state_path is None:
+        return (None, None)
+    p = Path(scr_state_path)
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ScrCrosscheckError(f"scr_state.json unreadable at {p}: {exc}") from exc
+    if not isinstance(doc, Mapping):
+        raise ScrCrosscheckError(f"scr_state.json malformed at {p} (not a JSON object)")
+    stats = doc.get("stats")
+    eff = stats.get("effective_trades") if isinstance(stats, Mapping) else None
+    if not isinstance(eff, int) or isinstance(eff, bool):
+        raise ScrCrosscheckError(
+            f"scr_state.json at {p} has no integer stats.effective_trades"
+        )
+    ts = doc.get("ts_utc")
+    return (int(eff), str(ts) if ts is not None else None)
+
+
+def _scr_reconciliation(
+    admitted: Sequence[AdmittedTrade],
+    excluded_by_reason: Mapping[str, int],
+    scr_effective: int,
+    scr_ts: Optional[str],
+) -> dict[str, Any]:
+    """Build the read-only reconciliation block: adapter admissions vs SCR effective set (D2)."""
+    pnl_zero = sum(1 for t in admitted if t.gross_pnl == 0.0)
+    return {
+        "scr_effective_trades": scr_effective,
+        "scr_state_ts": scr_ts,
+        "adapter_admitted": len(admitted),
+        "delta_admitted_minus_scr": len(admitted) - scr_effective,
+        # SCR drops pnl==0 laps; the adapter keeps them as legitimate 0-return samples — a
+        # KNOWN, reported component of the delta (never silent).
+        "adapter_admitted_pnl_zero": pnl_zero,
+        "adapter_excluded_by_reason": dict(excluded_by_reason),
+        "note": (
+            "Two INDEPENDENT scorekeepers. The adapter re-derives admissions from "
+            "trade_history over [since, until] with its own fail-closed gate; SCR aggregates "
+            "its effective set its own way over its own window. A nonzero delta is EXPECTED "
+            "(differing windows; the adapter admits pnl==0 laps SCR drops and excludes "
+            "futures/manual SCR also excludes). A LARGE unexplained delta warrants "
+            "investigation — surfaced here so the two can never silently diverge."
+        ),
+    }
+
+
 def load_ndjson(path: Path) -> Iterable[tuple[Optional[Mapping[str, Any]], str]]:
     """Yield ``(parsed_record_or_None, path_name)`` for every non-blank line in ``path``.
 
@@ -980,6 +1050,7 @@ def run_adapter(
     runtime_dir: Optional[Path] = None,
     include_futures: bool = False,
     verify_chain: bool = False,
+    scr_state_path: Optional[Path] = None,
 ) -> AdapterResult:
     """Read the on-box ledgers, apply the trust gate, and (optionally) write the artifacts.
 
@@ -1040,6 +1111,15 @@ def run_adapter(
     excluded_by_reason = {
         reason: counters[f"excluded:{reason}"] for reason in EXCLUSION_REASONS
     }
+    # W3A-3 (D2): read-only reconciliation vs SCR's effective set (fail-loud on absence when a
+    # path is supplied). None when the cross-check is disabled (scr_state_path is None).
+    scr_reconciliation: Optional[dict[str, Any]] = None
+    if scr_state_path is not None:
+        scr_eff, scr_ts = load_scr_effective(scr_state_path)
+        if scr_eff is not None:
+            scr_reconciliation = _scr_reconciliation(
+                admitted, excluded_by_reason, scr_eff, scr_ts
+            )
     strategies: dict[str, int] = {}
     by_provenance: dict[str, int] = {}
     by_instrument: dict[str, int] = {}
@@ -1097,6 +1177,7 @@ def run_adapter(
         admitted_by_instrument_class=dict(sorted(by_instrument.items())),
         admitted_pnl_field_counts=dict(sorted(by_pnl_field.items())),
         inverted_duration_admitted=counters.get("inverted_duration", 0),
+        scr_reconciliation=scr_reconciliation,
     )
     result = AdapterResult(admitted=admitted, manifest=manifest)
 
@@ -1177,6 +1258,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="admit futures rows (default excludes them as Bug-B-contaminated, D2)")
     parser.add_argument("--no-verify-chain", action="store_true",
                         help="skip ledger hash-chain verification (default verifies + fails loud, D6)")
+    parser.add_argument("--scr-crosscheck", action="store_true",
+                        help="reconcile admitted count vs runtime/scr_state.json effective_trades "
+                             "(read-only; fails loud if absent, D2)")
+    parser.add_argument("--scr-state", default=None,
+                        help="scr_state.json path for --scr-crosscheck (default: <repo>/runtime/scr_state.json)")
     args = parser.parse_args(argv)
 
     for name in ("since", "until"):
@@ -1198,6 +1284,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         runtime_dir = repo_root / "runtime"
 
+    if args.scr_crosscheck:
+        scr_state_path: Optional[Path] = (
+            Path(args.scr_state).resolve() if args.scr_state else repo_root / "runtime" / "scr_state.json"
+        )
+    else:
+        scr_state_path = None
+
     try:
         result = run_adapter(
             trades_dir=trades_dir,
@@ -1208,10 +1301,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             runtime_dir=runtime_dir,
             include_futures=args.include_futures,
             verify_chain=not args.no_verify_chain,
+            scr_state_path=scr_state_path,
         )
     except LedgerChainError as exc:
         # D6 fail-loud: refuse to emit an artifact from a tampered/corrupt ledger.
         print(f"LEDGER CHAIN VERIFICATION FAILED (D6): {exc}")
+        return 2
+    except ScrCrosscheckError as exc:
+        # D2 fail-loud: the SCR cross-check was requested but SCR truth is absent/unreadable.
+        print(f"SCR CROSS-CHECK FAILED (D2): {exc}")
         return 2
     _print_manifest(result.manifest)
     print(f"artifacts written under: {out_dir}")

@@ -616,3 +616,61 @@ def test_run_adapter_verify_chain_fails_loud(tmp_path):
         run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z", verify_chain=True)
     # default (verify_chain=False) does not raise — still admits/handles gracefully.
     run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+
+
+# --------------------------------------------------------------------------- #
+# 17. W3A-3 — read-only SCR reconciliation cross-check (D2; fail-loud on absence).
+# --------------------------------------------------------------------------- #
+def _write_scr(tmp_path, effective, ts="2026-07-22T18:09:35Z"):
+    p = tmp_path / "scr_state.json"
+    p.write_text(json.dumps({"state": "WARMUP", "ts_utc": ts,
+                             "stats": {"effective_trades": effective}}))
+    return p
+
+
+def test_load_scr_effective_reads_effective_trades(tmp_path):
+    from chad.validation.trade_log_adapter import load_scr_effective
+    eff, ts = load_scr_effective(_write_scr(tmp_path, 67))
+    assert eff == 67 and ts == "2026-07-22T18:09:35Z"
+    assert load_scr_effective(None) == (None, None)  # disabled → no read
+
+
+def test_load_scr_effective_fails_loud_on_absence(tmp_path):
+    from chad.validation.trade_log_adapter import ScrCrosscheckError, load_scr_effective
+    with pytest.raises(ScrCrosscheckError):
+        load_scr_effective(tmp_path / "does_not_exist.json")
+    (tmp_path / "bad.json").write_text('{"no_stats": true}')
+    with pytest.raises(ScrCrosscheckError):
+        load_scr_effective(tmp_path / "bad.json")
+
+
+def test_run_adapter_reconciliation_block(tmp_path):
+    """The manifest surfaces the admitted-vs-SCR-effective delta (D2) when a path is supplied,
+    including the pnl==0 laps the adapter keeps but SCR drops."""
+    d = tmp_path / "trades"
+    d.mkdir()
+    lines = [
+        json.dumps(_rec(pnl=5.0, gross_pnl=5.0, _hash="a", _seq=1)),
+        json.dumps(_rec(pnl=0.0, gross_pnl=0.0, _hash="b", _seq=2)),  # 0-return: kept, SCR drops
+    ]
+    (d / "trade_history_20260703.ndjson").write_text("\n".join(lines) + "\n")
+    scr = _write_scr(tmp_path, 1)  # SCR scored 1; adapter admits 2
+    result = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z", scr_state_path=scr)
+    recon = result.manifest.to_dict()["scr_reconciliation"]
+    assert recon["scr_effective_trades"] == 1
+    assert recon["adapter_admitted"] == 2
+    assert recon["delta_admitted_minus_scr"] == 1
+    assert recon["adapter_admitted_pnl_zero"] == 1
+    # Disabled by default → no reconciliation block.
+    result2 = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+    assert result2.manifest.to_dict()["scr_reconciliation"] is None
+
+
+def test_run_adapter_scr_crosscheck_fails_loud(tmp_path):
+    from chad.validation.trade_log_adapter import ScrCrosscheckError
+    d = tmp_path / "trades"
+    d.mkdir()
+    (d / "trade_history_20260703.ndjson").write_text(json.dumps(_rec()) + "\n")
+    with pytest.raises(ScrCrosscheckError):
+        run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z",
+                    scr_state_path=tmp_path / "absent_scr.json")
