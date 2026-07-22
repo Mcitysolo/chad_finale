@@ -77,6 +77,8 @@ __all__ = [
     "iter_ledger_files",
     "load_quarantine_pins",
     "load_ndjson",
+    "verify_ledger_chain",
+    "LedgerChainError",
     "run_adapter",
     "main",
 ]
@@ -120,6 +122,19 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "pnl_untrusted",
     # B2 (FLIP-UNBLOCK): fabricated cost basis (Epoch-3 seed lot).
     "scoring_excluded",
+    # W3A-2 (D2): SCR-predicate parity. SCR's effective set excludes operator hand-trades
+    # (tag "manual") and synthetic warmup rows (tag "warmup_sim"); the adapter mirrors both so
+    # the two scorekeepers exclude the same kinds (see chad/analytics/trade_stats_engine.py
+    # _is_manual :107-108 / _is_warmup_sim :146-148).
+    "manual",
+    "warmup_sim",
+    # W3A-2 (D2): futures rows are Bug-B-contaminated (untrusted PnL) pending the Bug-B book
+    # disposition; excluded from scoring by default (re-enable with include_futures=True once
+    # Bug-B is resolved). SCR excludes futures for the same reason (is_futures_row).
+    "futures_bug_b",
+    # W3A-2 (D6): a row without schema_version == "closed_trade.v1" (legacy / foreign-writer)
+    # is not a canonical closed round-trip → excluded structurally, before the trust gate.
+    "non_closed_trade",
     # W2A-1: operator quarantine pin (runtime/quarantine_manifest_*.json). A row whose
     # ``record_hash`` / ``fill_id`` / ``fill_ids`` is pinned in an operator manifest is
     # dropped BEFORE the trust gate — the same authority SCR honours natively
@@ -132,6 +147,10 @@ EXCLUSION_REASONS: tuple[str, ...] = (
 )
 
 _LEDGER_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
+
+# The canonical closed-round-trip schema (D6). Only rows carrying this schema_version are the
+# real FIFO-closed laps written by chad/execution/trade_closer.py:write_trade_history.
+_CLOSED_TRADE_SCHEMA: str = "closed_trade.v1"
 
 
 # --------------------------------------------------------------------------- #
@@ -376,6 +395,13 @@ def trust_exclusion(record: Mapping[str, Any]) -> Optional[str]:
         or _truthy(meta.get("scoring_excluded"))
     ):
         return "scoring_excluded"
+
+    # 7. W3A-2 (D2): SCR-predicate parity — operator hand-trades and synthetic warmup rows are
+    # not strategy edge; SCR excludes them from its effective set, so the adapter does too.
+    if "manual" in tags or str(payload.get("strategy") or "").strip().lower() == "manual":
+        return "manual"
+    if "warmup_sim" in tags:
+        return "warmup_sim"
 
     return None
 
@@ -652,6 +678,7 @@ def adapt_records(
     until: Optional[str] = None,
     quarantined_hashes: "Optional[frozenset[str]]" = None,
     quarantined_fill_ids: "Optional[frozenset[str]]" = None,
+    include_futures: bool = False,
 ) -> tuple[list[AdmittedTrade], dict[str, int]]:
     """Filter + map an iterable of ``(record_or_None, source_file)`` into admitted trades.
 
@@ -702,6 +729,12 @@ def adapt_records(
             continue
 
         payload = _payload(record)
+        # D6 (W3A-2): only canonical closed round-trips enter — a row lacking
+        # schema_version == "closed_trade.v1" (legacy / foreign-writer) is excluded
+        # structurally, before the trust gate and the date window.
+        if str(payload.get("schema_version") or "") != _CLOSED_TRADE_SCHEMA:
+            counters["excluded:non_closed_trade"] += 1
+            continue
         row_date = _row_date(payload, record)
         if (since is not None and (row_date is None or row_date < since)) or (
             until is not None and (row_date is None or row_date > until)
@@ -727,6 +760,13 @@ def adapt_records(
             trade = _to_admitted(record, source_file)
         except _MalformedRow:
             counters["malformed"] += 1
+            continue
+
+        # D2 (W3A-2): futures rows are Bug-B-contaminated (untrusted PnL) — excluded from
+        # scoring by default, mirroring SCR's is_futures_row exclusion. Re-enable only once the
+        # Bug-B book disposition lands (include_futures=True).
+        if not include_futures and trade.instrument_class == InstrumentClass.FUT.value:
+            counters["excluded:futures_bug_b"] += 1
             continue
 
         rh = record.get("record_hash")
@@ -850,6 +890,77 @@ def load_ndjson(path: Path) -> Iterable[tuple[Optional[Mapping[str, Any]], str]]
             yield (obj if isinstance(obj, dict) else None), name
 
 
+class LedgerChainError(RuntimeError):
+    """A ledger file's hash chain is broken (linkage / sequence / recomputed record_hash) —
+    tamper or corruption. Raised fail-loud by :func:`run_adapter` when ``verify_chain=True``."""
+
+
+def verify_ledger_chain(path: Path) -> list[str]:
+    """Verify one daily ledger's per-file hash chain (D6). Returns a list of issue strings
+    (empty ⇒ intact). Read-only; never raises on I/O.
+
+    Each ``trade_history_YYYYMMDD.ndjson`` is its OWN chain starting at ``prev_hash="GENESIS"``
+    (chad/execution/trade_closer.py:1011). For every row in file order this checks:
+      * **linkage** — ``prev_hash`` equals the previous row's ``record_hash`` (first ==
+        ``"GENESIS"``); a break means an inserted / reordered / deleted row;
+      * **sequence** — ``sequence_id`` increments by exactly 1;
+      * **recomputed record_hash** — for ``closed_trade.v1`` rows only, ``sha256(json.dumps(
+        {payload, prev_hash, sequence_id, timestamp_utc}, sort_keys=True, default=str))`` must
+        equal the stored ``record_hash`` (verified byte-exact on the real ledgers, 2026-07-22).
+        Legacy/foreign-writer rows keep linkage but are NOT hash-recomputed (a different writer
+        core), so they never false-positive — matching the ``schema_version`` admit gate.
+    """
+    issues: list[str] = []
+    try:
+        raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:  # pragma: no cover - unreadable file
+        return [f"{path.name}: unreadable ({exc})"]
+    prev = "GENESIS"
+    prev_seq: Optional[int] = None
+    idx = 0
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+        except ValueError:
+            issues.append(f"{path.name}[{idx}]: unparseable line")
+            idx += 1
+            continue
+        if not isinstance(rec, dict):
+            issues.append(f"{path.name}[{idx}]: not a JSON object")
+            idx += 1
+            continue
+        if rec.get("prev_hash") != prev:
+            issues.append(
+                f"{path.name}[{idx}]: prev_hash {rec.get('prev_hash')!r} != expected {prev!r} "
+                "(broken chain — inserted/reordered/deleted row)"
+            )
+        seq = rec.get("sequence_id")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if prev_seq is not None and seq != prev_seq + 1:
+                issues.append(f"{path.name}[{idx}]: sequence_id {seq} != {prev_seq} + 1")
+            prev_seq = seq
+        payload = rec.get("payload")
+        rh = rec.get("record_hash")
+        if isinstance(payload, Mapping) and payload.get("schema_version") == _CLOSED_TRADE_SCHEMA:
+            core = {
+                "payload": payload,
+                "prev_hash": rec.get("prev_hash"),
+                "sequence_id": rec.get("sequence_id"),
+                "timestamp_utc": rec.get("timestamp_utc"),
+            }
+            recomputed = hashlib.sha256(
+                json.dumps(core, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            if recomputed != rh:
+                issues.append(f"{path.name}[{idx}]: record_hash mismatch (tampered payload)")
+        prev = rh if isinstance(rh, str) and rh else prev
+        idx += 1
+    return issues
+
+
 def _date_range(admitted: Sequence[AdmittedTrade]) -> Optional[str]:
     dates = sorted(
         d for d in (str(t.provenance.get("entry_time_utc") or "")[:10] for t in admitted) if d
@@ -867,6 +978,8 @@ def run_adapter(
     out_dir: Optional[Path] = None,
     generated_at: Optional[str] = None,
     runtime_dir: Optional[Path] = None,
+    include_futures: bool = False,
+    verify_chain: bool = False,
 ) -> AdapterResult:
     """Read the on-box ledgers, apply the trust gate, and (optionally) write the artifacts.
 
@@ -883,6 +996,20 @@ def run_adapter(
     """
     q_hashes, q_fill_ids, consulted_manifests = load_quarantine_pins(runtime_dir)
     files = iter_ledger_files(trades_dir)
+
+    # D6 (W3A-2): fail-loud on a broken hash chain before admitting anything from a
+    # tampered/corrupt ledger. Off by default (unit tests use synthetic hashes); the CLIs
+    # turn it on for real on-box ledgers.
+    if verify_chain:
+        chain_issues: list[str] = []
+        for fp in files:
+            chain_issues.extend(verify_ledger_chain(fp))
+        if chain_issues:
+            raise LedgerChainError(
+                "ledger hash-chain verification FAILED (D6) — refusing to admit from a "
+                "tampered/corrupt ledger:\n  " + "\n  ".join(chain_issues[:20])
+            )
+
     input_files: list[dict[str, Any]] = []
     per_file_rows: dict[str, int] = {}
 
@@ -900,6 +1027,7 @@ def run_adapter(
         until=until,
         quarantined_hashes=q_hashes,
         quarantined_fill_ids=q_fill_ids,
+        include_futures=include_futures,
     )
 
     for fp in files:
@@ -1045,6 +1173,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="runtime dir holding quarantine_manifest_*.json (default: <repo>/runtime)")
     parser.add_argument("--no-quarantine", action="store_true",
                         help="ignore operator quarantine manifests (admit pinned rows; default honours them)")
+    parser.add_argument("--include-futures", action="store_true",
+                        help="admit futures rows (default excludes them as Bug-B-contaminated, D2)")
+    parser.add_argument("--no-verify-chain", action="store_true",
+                        help="skip ledger hash-chain verification (default verifies + fails loud, D6)")
     args = parser.parse_args(argv)
 
     for name in ("since", "until"):
@@ -1066,14 +1198,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         runtime_dir = repo_root / "runtime"
 
-    result = run_adapter(
-        trades_dir=trades_dir,
-        since=args.since,
-        until=args.until,
-        out_dir=out_dir,
-        generated_at=args.now,
-        runtime_dir=runtime_dir,
-    )
+    try:
+        result = run_adapter(
+            trades_dir=trades_dir,
+            since=args.since,
+            until=args.until,
+            out_dir=out_dir,
+            generated_at=args.now,
+            runtime_dir=runtime_dir,
+            include_futures=args.include_futures,
+            verify_chain=not args.no_verify_chain,
+        )
+    except LedgerChainError as exc:
+        # D6 fail-loud: refuse to emit an artifact from a tampered/corrupt ledger.
+        print(f"LEDGER CHAIN VERIFICATION FAILED (D6): {exc}")
+        return 2
     _print_manifest(result.manifest)
     print(f"artifacts written under: {out_dir}")
     return 0

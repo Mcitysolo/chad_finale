@@ -32,6 +32,7 @@ def _fill(strategy="alpha_a", pnl=12.0, price=190.0, qty=10.0, day="03",
         extra["validate_only"] = True
         extra["pnl_untrusted"] = True
     payload = {
+        "schema_version": "closed_trade.v1",
         "broker": broker, "symbol": symbol, "asset_class": asset_class,
         "side": "BUY", "strategy": strategy, "quantity": qty, "fill_price": price,
         "notional": qty * price, "pnl": pnl, "is_live": False, "regime": "risk_on",

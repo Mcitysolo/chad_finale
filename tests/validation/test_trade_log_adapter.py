@@ -46,6 +46,7 @@ def _rec(**payload_over):
     """A wrapped ledger record with a trusted-by-default payload; overrides merge in."""
     extra = payload_over.pop("extra", {})
     payload = {
+        "schema_version": "closed_trade.v1",
         "broker": "paper_exec",
         "symbol": "AAPL",
         "asset_class": "equity",
@@ -387,7 +388,7 @@ def test_cli_writes_artifacts_and_returns_zero(tmp_path, capsys):
     out = tmp_path / "out"
     rc = main(["--since", "2026-07-01", "--until", "2026-07-31",
                "--trades-dir", str(src), "--out-dir", str(out),
-               "--now", "2026-07-10T00:00:00Z"])
+               "--now", "2026-07-10T00:00:00Z", "--no-verify-chain"])  # synthetic hashes
     assert rc == 0
     assert (out / "stage2_trades_2026-07-01_2026-07-31.ndjson").exists()
     assert (out / "stage2_manifest_2026-07-01_2026-07-31.json").exists()
@@ -479,9 +480,11 @@ def test_pnl_fallback_when_gross_absent():
 
 
 def test_contract_multiplier_is_used():
-    """A futures row's contract_multiplier (the key real rows carry) reaches the cost mapping."""
+    """A futures row's contract_multiplier (the key real rows carry) reaches the cost mapping.
+    (Futures are excluded by default under D2, so admit them explicitly here to test the map.)"""
     admitted, _ = adapt_records(
-        _stream([_rec(symbol="MESU6", asset_class="future", contract_multiplier=5.0)])
+        _stream([_rec(symbol="MESU6", asset_class="future", contract_multiplier=5.0)]),
+        include_futures=True,
     )
     assert admitted[0].multiplier == 5.0
     assert admitted[0].instrument_class == InstrumentClass.FUT.value
@@ -534,3 +537,82 @@ def test_manifest_carries_w3a1_fields(tmp_path):
     md = result.manifest.to_dict()
     assert md["admitted_pnl_field_counts"] == {"gross_pnl": 1, "pnl": 1}
     assert md["inverted_duration_admitted"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 16. W3A-2 — trust-gate alignment (manual/warmup_sim/futures) + integrity gates (D2/D6).
+# --------------------------------------------------------------------------- #
+def test_manual_hand_trade_is_excluded():
+    """D2: SCR excludes operator hand-trades; the adapter mirrors it (tag or strategy)."""
+    assert trust_exclusion(_rec(tags=["paper", "manual"])) == "manual"
+    assert trust_exclusion(_rec(strategy="manual")) == "manual"
+    admitted, c = adapt_records(_stream([_rec(strategy="manual")]))
+    assert admitted == [] and c["excluded:manual"] == 1
+
+
+def test_warmup_sim_is_excluded():
+    """D2: synthetic warmup rows must never reach the scorer (SCR parity)."""
+    assert trust_exclusion(_rec(tags=["warmup_sim"])) == "warmup_sim"
+    _, c = adapt_records(_stream([_rec(tags=["warmup_sim"])]))
+    assert c["excluded:warmup_sim"] == 1
+
+
+def test_futures_excluded_by_default_bug_b():
+    """D2: a futures row is Bug-B-contaminated → excluded by default, admitted with the flag."""
+    fut = _rec(symbol="MESU6", asset_class="future", contract_multiplier=5.0)
+    admitted, c = adapt_records(_stream([fut]))
+    assert admitted == [] and c["excluded:futures_bug_b"] == 1
+    admitted2, c2 = adapt_records(_stream([_rec(symbol="MESU6", asset_class="future",
+                                                contract_multiplier=5.0)]), include_futures=True)
+    assert len(admitted2) == 1 and c2["excluded:futures_bug_b"] == 0
+
+
+def test_non_closed_trade_schema_excluded():
+    """D6: a legacy/foreign-writer row without schema_version=='closed_trade.v1' is excluded."""
+    legacy = _rec()
+    del legacy["payload"]["schema_version"]
+    admitted, c = adapt_records(_stream([legacy]))
+    assert admitted == [] and c["excluded:non_closed_trade"] == 1
+    wrong = _rec(schema_version="open_fill.v0")
+    _, c2 = adapt_records(_stream([wrong]))
+    assert c2["excluded:non_closed_trade"] == 1
+
+
+def test_verify_ledger_chain_intact_and_tampered(tmp_path):
+    """D6: an intact synthetic chain yields no issues; a mutated payload / broken link is caught."""
+    import hashlib as _h, json as _j
+    from chad.validation.trade_log_adapter import verify_ledger_chain
+
+    def _hash(core):
+        return _h.sha256(_j.dumps(core, sort_keys=True, default=str).encode()).hexdigest()
+
+    rows, prev = [], "GENESIS"
+    for seq in (1, 2, 3):
+        core = {"payload": {"schema_version": "closed_trade.v1", "pnl": float(seq)},
+                "prev_hash": prev, "sequence_id": seq, "timestamp_utc": f"2026-07-20T0{seq}:00:00Z"}
+        core["record_hash"] = _hash({k: core[k] for k in ("payload", "prev_hash", "sequence_id", "timestamp_utc")})
+        rows.append(core)
+        prev = core["record_hash"]
+    p = tmp_path / "trade_history_20260720.ndjson"
+    p.write_text("\n".join(_j.dumps(r) for r in rows) + "\n")
+    assert verify_ledger_chain(p) == []  # intact
+
+    rows[1]["payload"]["pnl"] = 999.0  # tamper a payload without re-hashing
+    p.write_text("\n".join(_j.dumps(r) for r in rows) + "\n")
+    issues = verify_ledger_chain(p)
+    assert any("record_hash mismatch" in i for i in issues)
+
+
+def test_run_adapter_verify_chain_fails_loud(tmp_path):
+    """D6: run_adapter(verify_chain=True) refuses to admit from a broken-chain ledger."""
+    from chad.validation.trade_log_adapter import LedgerChainError
+    d = tmp_path / "trades"
+    d.mkdir()
+    # A row whose prev_hash is not GENESIS → broken link on the first row.
+    bad = {"payload": {"schema_version": "closed_trade.v1"}, "prev_hash": "NOTGENESIS",
+           "sequence_id": 1, "timestamp_utc": "2026-07-20T01:00:00Z", "record_hash": "x"}
+    (d / "trade_history_20260720.ndjson").write_text(json.dumps(bad) + "\n")
+    with pytest.raises(LedgerChainError):
+        run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z", verify_chain=True)
+    # default (verify_chain=False) does not raise — still admits/handles gracefully.
+    run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
