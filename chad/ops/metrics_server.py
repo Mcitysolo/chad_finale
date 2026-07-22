@@ -74,6 +74,14 @@ DEFAULT_MAX_TRADES = int(os.environ.get("CHAD_METRICS_MAX_TRADES", "5000"))
 # stale (chad_var_status_ok=0, chad_var_stale=1) regardless of `status`.
 DEFAULT_VAR_STATE_TTL_SECONDS = 86400  # 24h
 
+# W3B-2: the same stale-as-fresh class existed for the drawdown gauges — A4
+# covered only var_state, while chad_drawdown_status_ok trusted `status`=="ok"
+# with no age check (a frozen drawdown_state.json from a dead publisher would
+# scrape healthy forever — the P1-3 era went 10 days like that). 900s = 3x the
+# publisher's declared ttl_seconds=300 (ops/drawdown_publisher.py:41), same
+# headroom ratio as the W3B-1 sentinel row.
+DEFAULT_DRAWDOWN_STATE_TTL_SECONDS = 900
+
 TRADE_FILE_GLOB = "trade_history_*.ndjson"
 
 
@@ -507,6 +515,18 @@ def _var_state_ttl_seconds() -> int:
         return DEFAULT_VAR_STATE_TTL_SECONDS
 
 
+def _drawdown_state_ttl_seconds() -> int:
+    """Drawdown-state freshness TTL (seconds); env override CHAD_DRAWDOWN_STATE_TTL_SECONDS."""
+    raw = os.environ.get("CHAD_DRAWDOWN_STATE_TTL_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_DRAWDOWN_STATE_TTL_SECONDS
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_DRAWDOWN_STATE_TTL_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_DRAWDOWN_STATE_TTL_SECONDS
+
+
 def _compute_state_staleness(
     obj: Dict[str, Any], *, now: datetime, ttl_s: int
 ) -> Tuple[Optional[float], bool]:
@@ -570,11 +590,27 @@ def _var_drawdown_lines(now: Optional[datetime] = None) -> List[MetricLine]:
     dd_threshold = _coerce_float(dd_obj.get("halt_threshold_pct", 0.0), 0.0)
     dd_halt = bool(dd_obj.get("halt", False))
     dd_enforce = bool(dd_obj.get("enforcement_active", False))
+    # W3B-2: A4-pattern staleness guard, mirrored from the VaR block above.
+    # A status=="ok" drawdown_state past TTL exports as NOT-ok — a frozen
+    # publisher must not masquerade as healthy. Missing file (empty dict) is
+    # reported by status_ok=0, not as "stale".
+    dd_present = bool(dd_obj)
+    dd_ttl_s = _drawdown_state_ttl_seconds()
+    dd_age, dd_stale = _compute_state_staleness(dd_obj, now=now, ttl_s=dd_ttl_s)
+    dd_ok = (dd_status == "ok") and not dd_stale
     out.append(MetricLine("chad_drawdown_pct", {}, _finite_or_zero(dd_pct)))
     out.append(MetricLine("chad_drawdown_halt_threshold_pct", {}, _finite_or_zero(dd_threshold)))
     out.append(MetricLine("chad_drawdown_halt_active", {}, 1.0 if dd_halt else 0.0))
     out.append(MetricLine("chad_drawdown_enforcement_active", {}, 1.0 if dd_enforce else 0.0))
-    out.append(MetricLine("chad_drawdown_status_ok", {}, 1.0 if dd_status == "ok" else 0.0))
+    out.append(MetricLine("chad_drawdown_status_ok", {}, 1.0 if dd_ok else 0.0))
+    out.append(MetricLine("chad_drawdown_stale", {}, 1.0 if (dd_present and dd_stale) else 0.0))
+    out.append(MetricLine("chad_drawdown_ttl_seconds", {}, float(dd_ttl_s)))
+    out.append(
+        MetricLine(
+            "chad_drawdown_age_seconds", {},
+            _finite_or_zero(dd_age) if dd_age is not None else -1.0,
+        )
+    )
 
     return out
 
