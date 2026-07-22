@@ -134,14 +134,8 @@
   },
   "git": {
     "production_paths": ["chad/", "ops/", "config/", "scripts/", "shared/"],
-    "allowlist": [
-      {
-        "pattern": "_archive/",
-        "status_codes": ["D "," D","D"],
-        "reason": "Staged deletions of _archive/bak_purge_* and _archive/bak_quarantine_* backups, present in the working tree since before this sentinel existed. Documented allowlist entry pending disposition -- REMOVE this entry once the deletions are committed or reverted.",
-        "expires_action": "ops/pending_actions/EXTERMINATOR_stage1_deploy.md"
-      }
-    ]
+    "allowlist": [],
+    "_note": "W3B-12: the _archive/ deletion allowlist entry was removed per its own expiry note -- the 20 disk-guard-purged files' deletions are now committed (docs/DYNAMIC_CAPS_DISPOSITION_2026-07-22.md). From here on, a disk-guard purge of tracked _archive files surfaces as EXS6 warn until its own disposition commit: that is the correct signal, not noise."
   },
   "schema_contracts": {
     "_doc": [

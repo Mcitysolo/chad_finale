@@ -782,18 +782,33 @@ def test_dirty_production_path_warns(tmp_path, clock, quiet_providers):
     assert result.evidence["dirty_count"] == 2
 
 
-def test_archive_deletions_are_allowlisted(tmp_path, clock, quiet_providers):
-    """The 20 staged _archive deletions are documented, not drift."""
+def test_archive_deletions_production_filtered_not_allowlisted(tmp_path, clock, quiet_providers):
+    """W3B-12 disposition pin: the 20 disk-guard-purged _archive deletions
+    were committed and the allowlist entry removed per its own expiry note.
+    The allowlist is now EMPTY — _archive/ paths fall to the production_paths
+    filter (outside scope, not drift), so a future disk-guard purge of
+    tracked archives is neither dirty nor 'allowlisted noise' in every
+    report. The disposition lifecycle (archive by git-committed move → purge
+    → commit the deletions at the next hygiene pass) is convention, recorded
+    in docs/DYNAMIC_CAPS_DISPOSITION_2026-07-22.md; history keeps the bytes."""
     _fresh_runtime(tmp_path / "runtime")
     providers = {**quiet_providers, "git_provider": lambda: {
         "head": "a", "branch": "main", "error": None,
-        "entries": ["D  _archive/bak_purge_20260506/chad/intel/advisory_engine.py.bak",
+        "entries": ["D  _archive/bak_purge_20260722/chad/risk/dominance_strategy.py",
                     " D _archive/bak_quarantine_20260402/chad/utils/telegram_bot.py.bak"],
     }}
     result = _make(tmp_path, clock, providers).check_dirty_git()
     assert result.status == "ok"
-    assert result.evidence["allowlisted_count"] == 2
-    assert result.evidence["dirty_count"] == 0
+    assert result.evidence["allowlisted_count"] == 0  # the entry is GONE
+    assert result.evidence["dirty_count"] == 0  # production-filtered, not drift
+    # and a production-path deletion still flags exactly as before
+    providers2 = {**quiet_providers, "git_provider": lambda: {
+        "head": "a", "branch": "main", "error": None,
+        "entries": [" D chad/risk/somefile.py"],
+    }}
+    result2 = _make(tmp_path, clock, providers2).check_dirty_git()
+    assert result2.status == "warn"
+    assert result2.evidence["dirty_count"] == 1
 
 
 def test_untracked_files_are_not_dirty(tmp_path, clock, quiet_providers):
