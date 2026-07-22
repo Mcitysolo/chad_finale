@@ -24,6 +24,12 @@ WATCHED_FEEDS = [
     {"name": "event_risk",     "file": "event_risk.json",           "ttl": 2400},
     {"name": "choppy_regime",  "file": "choppy_regime_state.json",  "ttl": 900},
     {"name": "macro_state",    "file": "macro_state.json",          "ttl": 7200},
+    # W3B-1: secondary net for the two 120s-cadence publishers that no
+    # freshness check watched (P1-3/P1-4 went 10 and 44 days stale unseen).
+    # TTLs match the exterminator EXS1 warn thresholds, 3x cadence, so the
+    # two nets agree and neither flaps on timer jitter.
+    {"name": "drawdown_state", "file": "drawdown_state.json",       "ttl": 300},
+    {"name": "ibkr_watchdog",  "file": "ibkr_watchdog_last.json",   "ttl": 360},
 ]
 
 

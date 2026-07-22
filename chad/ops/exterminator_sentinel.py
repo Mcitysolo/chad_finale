@@ -273,6 +273,14 @@ class ExterminatorSentinel:
 
     @staticmethod
     def _parse_ts(value: Any) -> datetime | None:
+        # W3B-1: numeric epoch support (ibkr_watchdog_last.json stamps ts_unix).
+        # Floor 1e9 (2001-09-09) rejects counters/durations masquerading as
+        # timestamps; ceiling 4e9 (2096) rejects millisecond epochs. bool is
+        # excluded explicitly because bool is an int subclass.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if 1e9 <= float(value) < 4e9:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            return None
         if not isinstance(value, str) or not value:
             return None
         try:

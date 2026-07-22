@@ -95,6 +95,28 @@
       "warn_after_seconds": 129600,
       "fail_after_seconds": null,
       "_note": "Appended daily by chad/ops/equity_history_publisher.py; no TTL is declared anywhere. 86400 reflects the documented daily cadence and 129600 (36h) allows one missed publish before warning. Capped at warn until ratified."
+    },
+    "drawdown_state": {
+      "path": "runtime/drawdown_state.json",
+      "format": "json",
+      "ts_field": "ts_utc",
+      "ttl_seconds": 300,
+      "ttl_verified": true,
+      "ttl_source": "artifact:ttl_seconds; publisher DEFAULT_TTL_SECONDS=300 at ops/drawdown_publisher.py:41",
+      "warn_after_seconds": 300,
+      "fail_after_seconds": 900,
+      "_note": "W3B-1. Written by chad-drawdown-publisher.timer every 120s (installed unit; repo copies under ops/systemd/). fail_after=3x TTL. The P1-3 'orphaned publisher' era (10-day-stale file, closed 2026-06-17) is exactly the outage this row exists to page on -- until W3B-1 neither freshness net watched this artifact."
+    },
+    "ibkr_watchdog_last": {
+      "path": "runtime/ibkr_watchdog_last.json",
+      "format": "json",
+      "ts_field": "ts_unix",
+      "ttl_seconds": 120,
+      "ttl_verified": true,
+      "ttl_source": "artifact:ttl_seconds (pass-through of runtime/ibkr_status.json ttl, stamped at chad/core/ibkr_watchdog.py:388); output cadence contract = 120s installed chad-ibkr-watchdog.timer",
+      "warn_after_seconds": 360,
+      "fail_after_seconds": 720,
+      "_note": "W3B-1. ts_unix is a NUMERIC epoch -- _parse_ts numeric support added in the same commit. warn_after=3x cadence mirrors the watchdog's own internal 3x-ttl staleness convention (chad/core/ibkr_watchdog.py:243-246); a bare 120s warn would flap against the 120s timer + RandomizedDelaySec=15s on a 5-min sentinel scan. The artifact is a self-heartbeat (zero code readers); its value is proving the IBKR-health alerter itself is alive -- the P1-4 44-day silent death is the target."
     }
   },
   "blind_check": {

@@ -111,6 +111,15 @@ def _fresh_runtime(runtime: Path, *, ts: datetime | None = None) -> None:
     })
     _write_json(runtime / "stop_bus.json", {"schema_version": "stop_bus.v1", "active": False})
     _write_json(runtime / "epoch_state.json", {"schema_version": "epoch_state.v1", "active_epoch": "Epoch_3"})
+    # W3B-1: the two 120s-cadence publisher artifacts gained EXS1 rows.
+    _write_json(runtime / "drawdown_state.json", {
+        "schema_version": "drawdown_state.v1", "ts_utc": _iso(ts), "ttl_seconds": 300,
+        "status": "ok", "drawdown_pct": -0.6, "halt": False, "enforcement_active": False,
+    })
+    _write_json(runtime / "ibkr_watchdog_last.json", {
+        "ts_unix": ts.timestamp(), "ok": True, "ttl_seconds": 120,
+        "consecutive_failures": 0,
+    })
 
 
 def _make(tmp_path: Path, clock, quiet_providers, **overrides):
