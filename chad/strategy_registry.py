@@ -67,6 +67,9 @@ from chad.types import StrategyName
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_PATH = REPO_ROOT / "config" / "strategy_weights.json"
 TIERS_PATH = REPO_ROOT / "config" / "tiers.json"
+# W3B-9 perimeter (invariants 7/8 — warn-tier)
+LOSS_LIMITS_PATH = REPO_ROOT / "config" / "per_strategy_loss_limits.json"
+REGIME_MATRIX_PATH = REPO_ROOT / "config" / "regime_activation_matrix.json"
 
 
 class Track(str, Enum):
@@ -243,7 +246,11 @@ def _load_tier_enabled_lists(tiers_path: Optional[Path]) -> dict:
 
 
 def assert_registry_consistency(
-    *, weights_path: Optional[Path] = None, tiers_path: Optional[Path] = None
+    *,
+    weights_path: Optional[Path] = None,
+    tiers_path: Optional[Path] = None,
+    loss_limits_path: Optional[Path] = None,
+    regime_matrix_path: Optional[Path] = None,
 ) -> None:
     """Fail LOUD if any consumer has drifted from the canonical registry.
 
@@ -374,5 +381,66 @@ def assert_registry_consistency(
                     f"strategy registry: tier {tier_name!r} enables dormant "
                     f"strategy {s!r} — enabled but will not trade (no weight) "
                     "until activated.",
+                    stacklevel=2,
+                )
+
+    # 7. per-strategy loss-limit keys ⊆ declared (W3B-9; WARN-tier by D6 —
+    #    config drift must never brick the engine build. The hard leg lives in
+    #    chad/tests/test_w3b_registry_perimeter.py.)
+    ll_path = Path(loss_limits_path) if loss_limits_path is not None else LOSS_LIMITS_PATH
+    try:
+        ll_doc = json.loads(ll_path.read_text(encoding="utf-8"))
+        ll_keys = set(ll_doc.get("limits_usd") or {})
+    except Exception:  # noqa: BLE001 — perimeter checks never brick startup
+        ll_keys = None
+        warnings.warn(
+            f"strategy registry: per-strategy loss-limits file unreadable at "
+            f"{ll_path} — perimeter invariant 7 skipped.",
+            stacklevel=2,
+        )
+    if ll_keys is not None:
+        unknown_ll = sorted(ll_keys - enum_vals)
+        if unknown_ll:
+            warnings.warn(
+                f"strategy registry: per_strategy_loss_limits.json declares "
+                f"limits for undeclared strategies {unknown_ll} — a typo'd key "
+                "silently guards nothing (its strategy falls to "
+                "default_limit_usd).",
+                stacklevel=2,
+            )
+        active_vals = {e.name.value for e in _REGISTRY if e.status is Status.ACTIVE}
+        uncovered = sorted(active_vals - ll_keys)
+        if uncovered:
+            warnings.warn(
+                f"strategy registry: ACTIVE strategies with no explicit loss "
+                f"limit {uncovered} — falling to default_limit_usd silently.",
+                stacklevel=2,
+            )
+
+    # 8. regime activation matrix names ⊆ declared (W3B-9; WARN-tier).
+    rm_path = Path(regime_matrix_path) if regime_matrix_path is not None else REGIME_MATRIX_PATH
+    try:
+        rm_doc = json.loads(rm_path.read_text(encoding="utf-8"))
+        rm_regimes = rm_doc.get("regimes") or {}
+    except Exception:  # noqa: BLE001
+        rm_regimes = None
+        warnings.warn(
+            f"strategy registry: regime activation matrix unreadable at "
+            f"{rm_path} — perimeter invariant 8 skipped.",
+            stacklevel=2,
+        )
+    if isinstance(rm_regimes, dict):
+        for regime_name, names in rm_regimes.items():
+            if not isinstance(names, list):
+                continue
+            unknown_rm = sorted(
+                {str(n) for n in names if isinstance(n, str)} - enum_vals
+            )
+            if unknown_rm:
+                warnings.warn(
+                    f"strategy registry: regime {regime_name!r} activates "
+                    f"undeclared strategies {unknown_rm} — the gate entry is "
+                    "inert (regime_activation fails open) but the config has "
+                    "drifted from the registry.",
                     stacklevel=2,
                 )

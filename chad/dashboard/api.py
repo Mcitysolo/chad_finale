@@ -72,6 +72,12 @@ STRATEGY_NAMES = {
     "alpha_options": "Options Strategy",
     "gamma_reversion": "Mean Reversion",
     "delta_pairs": "Pairs Strategy",
+    # W3B-9: complete the map — every declared StrategyName renders
+    # (pinned by test_w3b_registry_perimeter).
+    "alpha_intraday": "Intraday Strategy",
+    "omega_momentum_options": "Momentum Options",
+    "alpha_intraday_micro": "Intraday Micro (dormant)",
+    "alpha_forex": "Forex Strategy (dormant)",
 }
 
 SERVICES_TO_CHECK = [
