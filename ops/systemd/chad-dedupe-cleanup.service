@@ -1,0 +1,28 @@
+# W3B-10 — scheduled BOX-042 dedupe-state cleanup (repo-side design artifact).
+# NOT installed automatically: operator installs per docs/DEDUPE_CLEANUP_INSTALL.md
+# (CLAUDE.md governance #6/#7). BOX-042 built the tool but left scheduling
+# manual; last manual apply was 2026-05-22.
+[Unit]
+Description=CHAD Telegram dedupe-state cleanup (BOX-042 tool, scheduled)
+Documentation=file:///home/ubuntu/chad_finale/docs/DEDUPE_CLEANUP_INSTALL.md
+After=network-online.target
+OnFailure=chad-service-alert@%N.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 /home/ubuntu/chad_finale/ops/cleanup_telegram_dedupe.py --apply
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/home/ubuntu/chad_finale/runtime /home/ubuntu/chad_finale/_archive
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-dedupe-cleanup
+
+[Install]
+WantedBy=multi-user.target
