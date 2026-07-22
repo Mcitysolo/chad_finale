@@ -221,6 +221,40 @@ def _row_date(payload: Mapping[str, Any], record: Mapping[str, Any]) -> Optional
     return None
 
 
+def _parse_ts(value: Any) -> Optional[datetime.datetime]:
+    """Parse a UTC timestamp tolerating BOTH ``…Z`` and ``…+00:00`` offset forms (real ledger
+    rows mix them). Returns ``None`` when unparseable (never raises). A naive value is treated
+    as UTC so the walk-forward time axis (cli.py, W3A-4) has a single tz."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _hold_hours(payload: Mapping[str, Any]) -> tuple[Optional[float], bool]:
+    """``(hold_hours, inverted)`` from the entry/exit timestamps.
+
+    ``inverted`` is ``True`` when ``exit_time_utc`` precedes ``entry_time_utc`` — a
+    netting/clock artifact seen on genuine laps (e.g. a real 07-20 gamma close). Such a row is
+    KEPT (excluding a real lap over a sub-minute clock skew loses honest data), but the
+    inverted magnitude is reported and NOT trusted as a negative hold; ``hold_hours`` is the
+    absolute span and the walk-forward axis orders on the later of the two legs."""
+    e = _parse_ts(payload.get("entry_time_utc"))
+    x = _parse_ts(payload.get("exit_time_utc"))
+    if e is None or x is None:
+        return (None, False)
+    delta_h = (x - e).total_seconds() / 3600.0
+    return (abs(delta_h), delta_h < 0.0)
+
+
 # --------------------------------------------------------------------------- #
 # Instrument classification + placeholder fingerprint.
 # --------------------------------------------------------------------------- #
@@ -229,8 +263,18 @@ def classify_instrument(payload: Mapping[str, Any], extra: Mapping[str, Any]) ->
 
     Precedence: an explicit ``asset_class`` wins; else a ``kraken*`` broker ⇒ CRYPTO; else a
     known futures root ⇒ FUT; else a ``*-USD`` / ``*USD`` crypto pair ⇒ CRYPTO; else STK.
+
+    Real ``closed_trade.v1`` rows carry no top-level ``asset_class``; the reliable equity
+    signal is ``meta.raw_asset_class`` (e.g. ``"equity"``), so it is added to the explicit
+    precedence (W3A-1) — otherwise an equity with a futures-looking symbol could be misclassed.
     """
-    ac = str(payload.get("asset_class") or extra.get("asset_class") or "").strip().lower()
+    meta = _meta(payload)
+    ac = str(
+        payload.get("asset_class")
+        or extra.get("asset_class")
+        or meta.get("raw_asset_class")
+        or ""
+    ).strip().lower()
     if ac in {"crypto", "cryptocurrency", "coin"}:
         return InstrumentClass.CRYPTO
     if ac in {"future", "futures", "fut"}:
@@ -440,7 +484,19 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
 
     qty = _finite_number(payload.get("quantity") if payload.get("quantity") is not None else payload.get("size"))
     price = _finite_number(payload.get("fill_price"))
-    pnl = _finite_number(payload.get("pnl"))
+    # D3 (W3A-1): feed GROSS pnl to the harness cost model so the harness haircut is the SINGLE
+    # cost authority. Real fills today carry gross==net (commission/slippage=0), but PA-EP1
+    # fee-modeling is forward-only — once modeled costs land in the ledger, net_pnl != gross_pnl
+    # and feeding a net figure on top of the harness haircut would DOUBLE-CHARGE post-EP1 rows.
+    # Prefer gross_pnl; fall back to pnl (pre-EP1 rows, where they are equal). The field used is
+    # recorded in provenance + tallied in the manifest so the choice is auditable per row.
+    gross_raw = payload.get("gross_pnl")
+    if _finite_number(gross_raw) is not None:
+        pnl = _finite_number(gross_raw)
+        pnl_field = "gross_pnl"
+    else:
+        pnl = _finite_number(payload.get("pnl"))
+        pnl_field = "pnl"
     notional = _finite_number(payload.get("notional"))
     if notional is None and qty is not None and price is not None:
         notional = abs(qty * price)
@@ -454,12 +510,19 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
     if pnl is None:
         raise _MalformedRow("missing/non-finite pnl")
 
-    mult = _finite_number(extra.get("multiplier") if extra.get("multiplier") is not None
-                          else payload.get("multiplier"))
+    # multiplier: extra.multiplier → payload.multiplier → payload.contract_multiplier (the key
+    # real closed_trade.v1 rows actually carry, W3A-1) → default 1.0.
+    mult_raw = extra.get("multiplier")
+    if mult_raw is None:
+        mult_raw = payload.get("multiplier")
+    if mult_raw is None:
+        mult_raw = payload.get("contract_multiplier")
+    mult = _finite_number(mult_raw)
     if mult is None or mult <= 0.0:
         mult = 1.0
     inst = classify_instrument(payload, extra)
     strategy = str(payload.get("strategy") or "unattributed").strip() or "unattributed"
+    hold_h, inverted = _hold_hours(payload)
 
     provenance = {
         "symbol": payload.get("symbol"),
@@ -479,6 +542,10 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
         "sequence_id": record.get("sequence_id"),
         "record_hash": record.get("record_hash"),
         "source_file": source_file,
+        # W3A-1: schema-mapping provenance.
+        "pnl_field": pnl_field,
+        "hold_hours": hold_h,
+        "inverted_duration": inverted,
     }
     return AdmittedTrade(
         instrument_class=inst.value,
@@ -521,6 +588,11 @@ class AdapterManifest:
     # and by instrument_class. Defaults keep any other construction site valid.
     admitted_by_provenance: dict[str, int] = field(default_factory=dict)
     admitted_by_instrument_class: dict[str, int] = field(default_factory=dict)
+    # W3A-1 schema-mapping honesty: which pnl field each admitted row was costed from
+    # (gross_pnl vs pnl fallback, D3), and how many admitted rows carry an inverted
+    # exit<entry timestamp (kept but flagged; the walk-forward axis orders robustly).
+    admitted_pnl_field_counts: dict[str, int] = field(default_factory=dict)
+    inverted_duration_admitted: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -541,6 +613,8 @@ class AdapterManifest:
             "notes": list(self.notes),
             "admitted_by_provenance": dict(self.admitted_by_provenance),
             "admitted_by_instrument_class": dict(self.admitted_by_instrument_class),
+            "admitted_pnl_field_counts": dict(self.admitted_pnl_field_counts),
+            "inverted_duration_admitted": self.inverted_duration_admitted,
         }
 
 
@@ -616,6 +690,7 @@ def adapt_records(
         "malformed": 0,
         "duplicate": 0,
         "admitted": 0,
+        "inverted_duration": 0,
     }
     for reason in EXCLUSION_REASONS:
         counters[f"excluded:{reason}"] = 0
@@ -660,6 +735,8 @@ def adapt_records(
                 counters["duplicate"] += 1
                 continue
             seen_hashes.add(rh)
+        if trade.provenance.get("inverted_duration"):
+            counters["inverted_duration"] += 1
         admitted_pairs.append((trade, record))
 
     admitted_pairs.sort(key=lambda pair: _sort_key(pair[0]))
@@ -838,11 +915,14 @@ def run_adapter(
     strategies: dict[str, int] = {}
     by_provenance: dict[str, int] = {}
     by_instrument: dict[str, int] = {}
+    by_pnl_field: dict[str, int] = {}
     for t in admitted:
         strategies[t.strategy] = strategies.get(t.strategy, 0) + 1
         prov = str(t.provenance.get("provenance") or "unspecified")
         by_provenance[prov] = by_provenance.get(prov, 0) + 1
         by_instrument[t.instrument_class] = by_instrument.get(t.instrument_class, 0) + 1
+        pfld = str(t.provenance.get("pnl_field") or "pnl")
+        by_pnl_field[pfld] = by_pnl_field.get(pfld, 0) + 1
 
     if generated_at is None:
         generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -887,6 +967,8 @@ def run_adapter(
         notes=notes,
         admitted_by_provenance=dict(sorted(by_provenance.items())),
         admitted_by_instrument_class=dict(sorted(by_instrument.items())),
+        admitted_pnl_field_counts=dict(sorted(by_pnl_field.items())),
+        inverted_duration_admitted=counters.get("inverted_duration", 0),
     )
     result = AdapterResult(admitted=admitted, manifest=manifest)
 

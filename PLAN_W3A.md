@@ -10,6 +10,12 @@ stays locked (SSOT `docs/CHAD_EDGE_VALIDATION_HARNESS_DESIGN_v1.1.md` §1.3 / Pa
 **Constraints (binding):** worktree only, no `runtime/` mutation, no `live_loop` changes,
 set-diff test methodology, commits prefixed `W3A`.
 
+> **D1 accepted (2026-07-22) — framing correction:** the v4 checklist's "E6-B: build the
+> adapter" is amended to **"E6-B: *unstaple* the adapter"** — the adapter already exists; the
+> checklist bends to reality, not the reverse. Decisions D1–D8 answered GO (all as
+> recommended, with the confirmations recorded in the closure section). Build proceeds
+> W3A-1..7, set-diff green vs the 371-test baseline at each step, stopping at the push decision.
+
 ---
 
 ## HOUSEKEEPING — operator checklist

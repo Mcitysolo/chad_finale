@@ -457,3 +457,80 @@ def test_trust_constants_match_live_write_path():
     assert PLACEHOLDER_FILL_PRICE == _PLACEHOLDER_FILL_PRICE
     # Every canonical genuine-fill target must be an admissible trusted status.
     assert set(_STATUS_CANON.values()) <= TRUSTED_FILL_STATUSES
+
+
+# --------------------------------------------------------------------------- #
+# 15. W3A-1 — schema-mapping completeness (gross-pnl D3, multiplier, asset_class, holds).
+# --------------------------------------------------------------------------- #
+def test_gross_pnl_preferred_over_net(monkeypatch=None):
+    """D3: when a row carries gross_pnl, the harness is costed on GROSS (not the net `pnl`),
+    so the harness haircut is the single cost authority and post-EP1 rows are not double-charged."""
+    admitted, _ = adapt_records(_stream([_rec(pnl=8.0, gross_pnl=12.0)]))
+    assert len(admitted) == 1
+    assert admitted[0].gross_pnl == 12.0
+    assert admitted[0].provenance["pnl_field"] == "gross_pnl"
+
+
+def test_pnl_fallback_when_gross_absent():
+    """Pre-EP1 rows carry no gross_pnl → fall back to `pnl`, recorded as pnl_field='pnl'."""
+    admitted, _ = adapt_records(_stream([_rec(pnl=25.0)]))
+    assert admitted[0].gross_pnl == 25.0
+    assert admitted[0].provenance["pnl_field"] == "pnl"
+
+
+def test_contract_multiplier_is_used():
+    """A futures row's contract_multiplier (the key real rows carry) reaches the cost mapping."""
+    admitted, _ = adapt_records(
+        _stream([_rec(symbol="MESU6", asset_class="future", contract_multiplier=5.0)])
+    )
+    assert admitted[0].multiplier == 5.0
+    assert admitted[0].instrument_class == InstrumentClass.FUT.value
+
+
+def test_meta_raw_asset_class_classifies_equity():
+    """An equity with a futures-looking symbol but meta.raw_asset_class='equity' → STK, not FUT."""
+    rec = _rec(symbol="ZN", meta={"raw_asset_class": "equity"})
+    del rec["payload"]["asset_class"]  # force the meta path
+    admitted, _ = adapt_records(_stream([rec]))
+    assert admitted[0].instrument_class == InstrumentClass.STK.value
+
+
+def test_inverted_duration_is_kept_and_counted():
+    """A real netting/clock artifact (exit < entry) is KEPT (honest data) but flagged + counted;
+    hold_hours is the absolute span, never a negative hold."""
+    rec = _rec(
+        entry_time_utc="2026-07-20T13:51:10+00:00",
+        exit_time_utc="2026-07-20T13:50:56Z",  # 14s before entry — the real 07-20 artifact
+    )
+    admitted, counters = adapt_records(_stream([rec]))
+    assert len(admitted) == 1  # kept, not excluded
+    assert admitted[0].provenance["inverted_duration"] is True
+    assert admitted[0].provenance["hold_hours"] >= 0.0
+    assert counters["inverted_duration"] == 1
+
+
+def test_timestamp_tz_forms_both_parse():
+    """Both `…Z` and `…+00:00` forms yield a finite non-inverted hold (real rows mix them)."""
+    rec = _rec(
+        entry_time_utc="2026-07-20T10:00:00Z",
+        exit_time_utc="2026-07-20T12:00:00+00:00",
+    )
+    admitted, counters = adapt_records(_stream([rec]))
+    assert admitted[0].provenance["inverted_duration"] is False
+    assert abs(admitted[0].provenance["hold_hours"] - 2.0) < 1e-9
+    assert counters["inverted_duration"] == 0
+
+
+def test_manifest_carries_w3a1_fields(tmp_path):
+    """run_adapter's manifest exposes the pnl-field tally + inverted count for audit."""
+    d = tmp_path / "trades"
+    d.mkdir()
+    lines = [
+        json.dumps(_rec(pnl=1.0, gross_pnl=2.0, _hash="a", _seq=1)),
+        json.dumps(_rec(pnl=3.0, _hash="b", _seq=2)),
+    ]
+    (d / "trade_history_20260703.ndjson").write_text("\n".join(lines) + "\n")
+    result = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+    md = result.manifest.to_dict()
+    assert md["admitted_pnl_field_counts"] == {"gross_pnl": 1, "pnl": 1}
+    assert md["inverted_duration_admitted"] == 0
