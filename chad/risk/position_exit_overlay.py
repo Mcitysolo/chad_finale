@@ -1430,6 +1430,7 @@ def build_default_overlay(
     heartbeat_path: Optional[Path] = None,
     env: Optional[Mapping[str, str]] = None,
     logger: Optional[logging.Logger] = None,
+    price_loader: Optional[PriceLoader] = None,
 ) -> Optional["PositionExitOverlay"]:
     """Build the production overlay from ``config/position_exit_overlay.json``. FAIL-OPEN: on any
     config problem it logs ``EXIT_OVERLAY_ERROR`` and returns ``None`` (overlay not wired → the
@@ -1489,7 +1490,9 @@ def build_default_overlay(
         guard_loader=_default_guard_loader(),
         open_positions_loader=_default_open_positions_loader(),
         bars_loader=_default_bars_loader(repo_root),
-        price_loader=_default_price_loader(repo_root),
+        # W3B-7: an injected loader (portfolio-marks composition, flag-gated in
+        # live_loop) overrides the default; None keeps the price_cache loader.
+        price_loader=price_loader or _default_price_loader(repo_root),
         fifo_truth_loader=_default_fifo_truth_loader(repo_root),
         env=env,
         logger=log,
