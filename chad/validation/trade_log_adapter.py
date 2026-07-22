@@ -66,6 +66,8 @@ __all__ = [
     "REJECTED_STATUSES",
     "PLACEHOLDER_FILL_PRICE",
     "EXCLUSION_REASONS",
+    "EXIT_OVERLAY_BOUNDARY",
+    "era_of",
     "AdmittedTrade",
     "AdapterManifest",
     "AdapterResult",
@@ -153,6 +155,32 @@ _LEDGER_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
 # The canonical closed-round-trip schema (D6). Only rows carrying this schema_version are the
 # real FIFO-closed laps written by chad/execution/trade_closer.py:write_trade_history.
 _CLOSED_TRADE_SCHEMA: str = "closed_trade.v1"
+
+# D4: the FROZEN exit-overlay activation boundary. Laps before it are a DIFFERENT
+# data-generating process (pre-overlay reconciliation/adopt closes) than laps on/after it
+# (genuine engine-driven overlay closes). position_exit_overlay went SHADOW→ACTIVE here; the
+# first ACTIVE close was 2026-07-20T13:50:55Z (docs/ULTRA_CLOSE_AUDIT_2026-07-17.md). The two
+# eras are SEPARATE populations and must never be pooled into one headline verdict.
+EXIT_OVERLAY_BOUNDARY: str = "2026-07-20"
+
+
+def era_of(exit_date: Optional[str]) -> str:
+    """Sample-regime label for a lap's realization date vs the frozen overlay boundary (D4).
+
+    Returns ``"PRE_OVERLAY"`` (exit date < boundary), ``"POST_OVERLAY"`` (>= boundary), or
+    ``"UNKNOWN_ERA"`` when no usable ``YYYY-MM-DD`` date is present. The two eras are distinct
+    data-generating processes; a verdict must never silently pool them (the harness reports
+    them separately, pooling only as an explicitly-labeled sensitivity view)."""
+    if not (isinstance(exit_date, str) and len(exit_date) >= 10 and exit_date[4] == "-"):
+        return "UNKNOWN_ERA"
+    return "PRE_OVERLAY" if exit_date[:10] < EXIT_OVERLAY_BOUNDARY else "POST_OVERLAY"
+
+
+def _admitted_exit_date(t: "AdmittedTrade") -> Optional[str]:
+    for src in (t.provenance.get("exit_time_utc"), t.provenance.get("entry_time_utc")):
+        if isinstance(src, str) and len(src) >= 10 and src[4] == "-" and src[7] == "-":
+            return src[:10]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -625,6 +653,10 @@ class AdapterManifest:
     # None when the cross-check was not run; a dict surfacing the admitted-vs-effective delta
     # so a divergence between the two scorekeepers is loud, never silent.
     scr_reconciliation: Optional[dict[str, Any]] = None
+    # W3A-5 (D4): sample-regime partition at the frozen exit-overlay boundary. pre/post are
+    # DIFFERENT populations; stamped on every manifest so a report can never present a pooled
+    # cross-era count as if it were one population.
+    era_partition: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -648,6 +680,7 @@ class AdapterManifest:
             "admitted_pnl_field_counts": dict(self.admitted_pnl_field_counts),
             "inverted_duration_admitted": self.inverted_duration_admitted,
             "scr_reconciliation": self.scr_reconciliation,
+            "era_partition": dict(self.era_partition),
         }
 
 
@@ -1124,6 +1157,8 @@ def run_adapter(
     by_provenance: dict[str, int] = {}
     by_instrument: dict[str, int] = {}
     by_pnl_field: dict[str, int] = {}
+    by_era: dict[str, int] = {}
+    by_strategy_era: dict[str, int] = {}
     for t in admitted:
         strategies[t.strategy] = strategies.get(t.strategy, 0) + 1
         prov = str(t.provenance.get("provenance") or "unspecified")
@@ -1131,6 +1166,21 @@ def run_adapter(
         by_instrument[t.instrument_class] = by_instrument.get(t.instrument_class, 0) + 1
         pfld = str(t.provenance.get("pnl_field") or "pnl")
         by_pnl_field[pfld] = by_pnl_field.get(pfld, 0) + 1
+        era = era_of(_admitted_exit_date(t))
+        by_era[era] = by_era.get(era, 0) + 1
+        by_strategy_era[f"{t.strategy}|{era}"] = by_strategy_era.get(f"{t.strategy}|{era}", 0) + 1
+    era_partition = {
+        "boundary": EXIT_OVERLAY_BOUNDARY,
+        "counts_by_era": dict(sorted(by_era.items())),
+        "counts_by_strategy_era": dict(sorted(by_strategy_era.items())),
+        "pooled": False,
+        "note": (
+            "D4: pre/post exit-overlay eras are DIFFERENT data-generating processes "
+            "(pre = reconciliation/adopt closes; post = engine-driven overlay closes). They "
+            "are reported SEPARATELY and never pooled into one headline verdict; pooling is "
+            "only ever an explicitly-labeled sensitivity view."
+        ),
+    }
 
     if generated_at is None:
         generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1178,6 +1228,7 @@ def run_adapter(
         admitted_pnl_field_counts=dict(sorted(by_pnl_field.items())),
         inverted_duration_admitted=counters.get("inverted_duration", 0),
         scr_reconciliation=scr_reconciliation,
+        era_partition=era_partition,
     )
     result = AdapterResult(admitted=admitted, manifest=manifest)
 

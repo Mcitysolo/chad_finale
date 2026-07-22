@@ -77,7 +77,14 @@ from chad.validation.report_writer import (
 )
 from chad.validation.scoring_spine import score_returns
 from chad.validation.splits import generate_walk_forward
-from chad.validation.trade_log_adapter import AdmittedTrade, run_adapter
+from chad.validation.trade_log_adapter import (
+    EXIT_OVERLAY_BOUNDARY,
+    AdmittedTrade,
+    LedgerChainError,
+    ScrCrosscheckError,
+    era_of,
+    run_adapter,
+)
 from chad.validation.significance import (
     DEFAULT_TRIAL_MULTIPLE,
     RuinConfig,
@@ -916,6 +923,11 @@ def run_stage2_trade_log(
     generated_at: Optional[str] = None,
     code_commit: Optional[str] = None,
     trial_multiple: float = DEFAULT_TRIAL_MULTIPLE,
+    include_futures: bool = False,
+    verify_chain: bool = False,
+    scr_crosscheck: bool = False,
+    allow_era_pooling: bool = False,
+    runtime_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Run the Stage-2 real-trade-log validation end-to-end and return the SIGNED report.
 
@@ -933,6 +945,12 @@ def run_stage2_trade_log(
         generated_at = _now_iso()
     if code_commit is None:
         code_commit = current_code_commit(repo_root)
+    if runtime_dir is None:
+        runtime_dir = repo_root / "runtime"
+    # D6/D2: the real Stage-2 run verifies the ledger chain and reconciles vs SCR (both
+    # fail-loud). Library callers keep them off by default (synthetic fixtures); the CLI turns
+    # them on. scr_crosscheck reads runtime/scr_state.json read-only (never written).
+    scr_state_path = (runtime_dir / "scr_state.json") if scr_crosscheck else None
 
     result = run_adapter(
         trades_dir=trades_dir,
@@ -940,27 +958,35 @@ def run_stage2_trade_log(
         until=until,
         out_dir=out_dir / "stage2",
         generated_at=generated_at,
+        runtime_dir=runtime_dir,          # W3A-5: honour the operator quarantine manifest (was missing)
+        include_futures=include_futures,  # D2: futures excluded by default (Bug-B)
+        verify_chain=verify_chain,        # D6: fail-loud on a broken ledger chain
+        scr_state_path=scr_state_path,    # D2: read-only SCR reconciliation cross-check
     )
 
-    # Group admitted trusted fills by strategy attribution → one head each.
-    by_strategy: dict[str, list[AdmittedTrade]] = {}
+    # D4: group admitted laps by (strategy, ERA) — a head NEVER pools the pre/post exit-overlay
+    # eras (different data-generating processes). The era is stamped in every head name so a
+    # cross-era pooled count can never be mistaken for one population.
+    by_head: dict[str, list[AdmittedTrade]] = {}
     for t in result.admitted:
-        by_strategy.setdefault(t.strategy, []).append(t)
+        era = era_of(_exit_date(t))
+        by_head.setdefault(f"{t.strategy}|{era}", []).append(t)
 
-    n_heads = max(1, len(by_strategy))
+    n_heads = max(1, len(by_head))
     n_effective_trials = punitive_trial_count(n_heads, multiple=trial_multiple)
 
     heads_section: list[dict[str, Any]] = []
     head_verdicts: list[VerdictResult] = []
     counts: dict[str, int] = {v.value: 0 for v in Verdict}
-    pooled: list[float] = []  # portfolio track: pooled net returns (equal-weight), reused below
-    for strategy in sorted(by_strategy):
-        admitted = by_strategy[strategy]
+    pooled_by_era: dict[str, list[float]] = {}
+    for head_key in sorted(by_head):
+        admitted = by_head[head_key]
+        strategy, era = head_key.rsplit("|", 1)
         returns, trade_summary = _stage2_net_returns(admitted, cost_config)
-        pooled.extend(returns)  # reuse the per-head series — no second cost pass
+        pooled_by_era.setdefault(era, []).extend(returns)
         n_wf = _stage2_walk_forward_windows(admitted, strategy)  # W3A-4: exit-day windows
         metrics, om = _stage2_head_metrics(
-            strategy, returns, n_effective_trials=n_effective_trials, final_run=final_run,
+            head_key, returns, n_effective_trials=n_effective_trials, final_run=final_run,
             n_walk_forward_windows=n_wf,
         )
         verdict = decide_verdict(metrics, thresholds)
@@ -968,7 +994,9 @@ def run_stage2_trade_log(
         counts[verdict.verdict.value] += 1
         heads_section.append(
             {
-                "head": strategy,
+                "head": head_key,
+                "strategy": strategy,
+                "era": era,
                 "symbol": "(live fills)",
                 "metrics": metrics.to_dict(),
                 "verdict": verdict.to_dict(),
@@ -980,10 +1008,22 @@ def run_stage2_trade_log(
             }
         )
 
+    # D4: the HEADLINE portfolio is the POST_OVERLAY era only (the genuine engine-driven
+    # population). Pooling across eras is a heterogeneous mix and is offered ONLY as an
+    # explicitly-labeled sensitivity view (allow_era_pooling), never the headline.
+    if allow_era_pooling:
+        pooled = [r for rs in pooled_by_era.values() for r in rs]
+        portfolio_era = "POOLED_HETEROGENEOUS_POPULATION"
+        portfolio_admitted = list(result.admitted)
+    else:
+        portfolio_era = "POST_OVERLAY"
+        pooled = list(pooled_by_era.get("POST_OVERLAY", []))
+        portfolio_admitted = [t for t in result.admitted if era_of(_exit_date(t)) == "POST_OVERLAY"]
+
     surviving = sum(1 for v in head_verdicts if v.verdict is Verdict.PASS)
     total_heads = len(head_verdicts)
     capital_fraction = (surviving / total_heads) if total_heads else 0.0
-    portfolio_wf = _stage2_walk_forward_windows(result.admitted, "portfolio")
+    portfolio_wf = _stage2_walk_forward_windows(portfolio_admitted, "portfolio")
     portfolio_metrics, _pom = _stage2_head_metrics(
         "portfolio", pooled, n_effective_trials=n_effective_trials, final_run=final_run,
         n_walk_forward_windows=portfolio_wf,
@@ -998,12 +1038,16 @@ def run_stage2_trade_log(
     portfolio_block = {
         "verdict": portfolio_verdict.to_dict(),
         "metrics": portfolio_metrics.to_dict(),
+        "portfolio_era": portfolio_era,
         "surviving_heads": surviving,
         "total_heads": total_heads,
         "capital_fraction_in_surviving_heads": capital_fraction,
         "allocator_note": (
-            "Stage-2 portfolio track is an equal-weight pool of every admitted head's real "
-            "net-return stream (no live allocator imported under §1.2 isolation)."
+            "Stage-2 portfolio track is an equal-weight pool of the admitted heads' real "
+            "net-return streams (no live allocator imported under §1.2 isolation). Headline "
+            f"portfolio_era = {portfolio_era!r}: by default only POST_OVERLAY laps (the "
+            "engine-driven population) form the headline; --allow-era-pooling mixes eras and "
+            "is stamped POOLED_HETEROGENEOUS_POPULATION as a sensitivity view only (D4)."
         ),
     }
 
@@ -1067,6 +1111,11 @@ def run_stage2_trade_log(
             "for W_min; genuine per-window cross-consistency re-scoring is a documented future "
             "refinement, so >= W_min windows is necessary-but-not-sufficient. The machine never "
             "flips ready_for_live (Part 0).",
+            "D4: heads are split by (strategy, ERA) at the frozen exit-overlay boundary "
+            f"({EXIT_OVERLAY_BOUNDARY}); pre/post are DIFFERENT populations and are NEVER pooled "
+            "into a headline. The headline portfolio is POST_OVERLAY only; --allow-era-pooling "
+            "yields a POOLED_HETEROGENEOUS_POPULATION sensitivity view, never the headline. "
+            "Every report carries the adapter's era_partition + scr_reconciliation blocks.",
         ],
         # Stage 2 has neither a sealed OOS nor replayed heads — override the Stage-1 provenance
         # so the SIGNED artifact does not carry a hash-seal / replay claim that is false here.
@@ -1173,6 +1222,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--since", default=None, help="[stage2] earliest UTC date to admit (YYYY-MM-DD)")
     parser.add_argument("--until", default=None, help="[stage2] latest UTC date to admit (YYYY-MM-DD)")
     parser.add_argument("--trades-dir", default=None, help="[stage2] ledger dir (default: <repo>/data/trades)")
+    parser.add_argument("--include-futures", action="store_true",
+                        help="[stage2] admit futures rows (default excludes them as Bug-B-contaminated, D2)")
+    parser.add_argument("--no-verify-chain", action="store_true",
+                        help="[stage2] skip ledger hash-chain verification (default verifies + fails loud, D6)")
+    parser.add_argument("--no-scr-crosscheck", action="store_true",
+                        help="[stage2] skip the read-only SCR reconciliation cross-check (default on, D2)")
+    parser.add_argument("--allow-era-pooling", action="store_true",
+                        help="[stage2] pool pre/post exit-overlay eras as a labeled sensitivity view "
+                             "(default: POST_OVERLAY headline only — eras are never pooled, D4)")
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else Path(__file__).resolve().parents[2]
@@ -1200,6 +1258,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 final_run=bool(args.final_run),
                 generated_at=args.now,
                 code_commit=args.code_commit,
+                include_futures=bool(args.include_futures),
+                verify_chain=not bool(args.no_verify_chain),      # D6: on by default for real runs
+                scr_crosscheck=not bool(args.no_scr_crosscheck),  # D2: on by default for real runs
+                allow_era_pooling=bool(args.allow_era_pooling),   # D4: off by default (never pool)
             )
         else:
             signed = run_stage_historical(
@@ -1210,6 +1272,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 generated_at=args.now,
                 code_commit=args.code_commit,
             )
+    except (LedgerChainError, ScrCrosscheckError) as exc:
+        # D6/D2 fail-loud: refuse to render a verdict from a tampered ledger or without SCR truth.
+        print(f"error: {type(exc).__name__}: {exc}")
+        return 2
     except (ValueError, OSError) as exc:
         print(f"error: {type(exc).__name__}: {exc}")
         return 2

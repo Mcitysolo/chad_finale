@@ -78,10 +78,12 @@ def test_stage2_scores_admitted_fills_and_signs(tmp_path):
     assert verify_signature(signed) is True
 
     # Two strategy heads scored (alpha_a: 2 trusted, alpha_b: 1 trusted); untrusted excluded.
+    # D4: heads are era-split — day 03 is PRE_OVERLAY (< 2026-07-20).
     heads = {h["head"]: h for h in signed["heads"]}
-    assert set(heads) == {"alpha_a", "alpha_b"}
-    assert heads["alpha_a"]["metrics"]["n_oos_trades"] == 2
-    assert heads["alpha_b"]["metrics"]["n_oos_trades"] == 1
+    assert set(heads) == {"alpha_a|PRE_OVERLAY", "alpha_b|PRE_OVERLAY"}
+    assert heads["alpha_a|PRE_OVERLAY"]["metrics"]["n_oos_trades"] == 2
+    assert heads["alpha_b|PRE_OVERLAY"]["metrics"]["n_oos_trades"] == 1
+    assert heads["alpha_a|PRE_OVERLAY"]["era"] == "PRE_OVERLAY"
 
     # Every head has a verdict; thin data → INSUFFICIENT_DATA (never a fabricated pass).
     for h in signed["heads"]:
@@ -172,6 +174,7 @@ def test_cli_stage2_end_to_end(tmp_path, capsys):
         "--stage", "stage2", "--since", "2026-07-01", "--until", "2026-07-31",
         "--trades-dir", str(src), "--out-dir", str(out), "--repo-root", str(tmp_path),
         "--now", "2026-07-10T00:00:00Z", "--code-commit", "abc123",
+        "--no-verify-chain", "--no-scr-crosscheck",  # synthetic hashes / no runtime scr_state
     ])
     assert rc == 0
     stdout = capsys.readouterr().out
@@ -251,7 +254,7 @@ def test_stage2_walk_forward_windows_wired_e2e(tmp_path):
         since="2026-07-01", until="2026-07-31",
         generated_at="2026-07-20T00:00:00Z", code_commit="x",
     )
-    gamma = next(h for h in signed["heads"] if h["head"] == "gamma")
+    gamma = next(h for h in signed["heads"] if h["head"] == "gamma|PRE_OVERLAY")
     assert gamma["metrics"]["n_walk_forward_windows"] >= 6
     # Still honest: 15 < N_min=30 → INSUFFICIENT_DATA, never a fabricated pass.
     assert gamma["verdict"]["verdict"] == Verdict.INSUFFICIENT_DATA.value
@@ -265,5 +268,52 @@ def test_stage2_clustered_laps_zero_windows_e2e(tmp_path):
         repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
         generated_at="2026-07-20T00:00:00Z", code_commit="x",
     )
-    gamma = next(h for h in signed["heads"] if h["head"] == "gamma")
+    gamma = next(h for h in signed["heads"] if h["head"] == "gamma|PRE_OVERLAY")
     assert gamma["metrics"]["n_walk_forward_windows"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 6. W3A-5 — era split (D4): pre/post exit-overlay never pooled into the headline.
+# --------------------------------------------------------------------------- #
+def _pre_post_records():
+    return [
+        _fill(strategy="gamma", pnl=5.0, seq=1, hashv="a", day="13"),   # PRE_OVERLAY
+        _fill(strategy="gamma", pnl=6.0, seq=2, hashv="b", day="21"),   # POST_OVERLAY
+    ]
+
+
+def test_stage2_heads_split_by_era_headline_is_post(tmp_path):
+    src = _write_ledger(tmp_path, _pre_post_records(), day="20260721")
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-22T00:00:00Z", code_commit="x",
+    )
+    # A head NEVER pools eras — gamma becomes two era-scoped heads.
+    assert {h["head"] for h in signed["heads"]} == {"gamma|PRE_OVERLAY", "gamma|POST_OVERLAY"}
+    # Headline portfolio is POST_OVERLAY only (not a cross-era pool).
+    assert signed["portfolio"]["portfolio_era"] == "POST_OVERLAY"
+    # Manifest stamps the era partition.
+    ep = signed["data_quality"]["stage2_adapter_manifest"]["era_partition"]
+    assert ep["counts_by_era"] == {"POST_OVERLAY": 1, "PRE_OVERLAY": 1}
+    assert ep["pooled"] is False
+
+
+def test_stage2_allow_era_pooling_is_labeled_sensitivity(tmp_path):
+    src = _write_ledger(tmp_path, _pre_post_records(), day="20260721")
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-22T00:00:00Z", code_commit="x", allow_era_pooling=True,
+    )
+    # Pooling is only ever a labeled sensitivity view, never the default headline.
+    assert signed["portfolio"]["portfolio_era"] == "POOLED_HETEROGENEOUS_POPULATION"
+
+
+def test_stage2_verify_chain_fails_loud_through_run(tmp_path):
+    """D6: verify_chain=True on the Stage-2 path refuses a broken-chain synthetic ledger."""
+    from chad.validation.trade_log_adapter import LedgerChainError
+    src = _write_ledger(tmp_path, [_fill(seq=1, hashv="bad")])  # no prev_hash → broken chain
+    with pytest.raises(LedgerChainError):
+        run_stage2_trade_log(
+            repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+            generated_at="2026-07-22T00:00:00Z", code_commit="x", verify_chain=True,
+        )

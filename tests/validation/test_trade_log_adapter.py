@@ -674,3 +674,32 @@ def test_run_adapter_scr_crosscheck_fails_loud(tmp_path):
     with pytest.raises(ScrCrosscheckError):
         run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z",
                     scr_state_path=tmp_path / "absent_scr.json")
+
+
+# --------------------------------------------------------------------------- #
+# 18. W3A-5 — sample-regime (era) partition at the frozen exit-overlay boundary (D4).
+# --------------------------------------------------------------------------- #
+def test_era_of_boundary():
+    from chad.validation.trade_log_adapter import EXIT_OVERLAY_BOUNDARY, era_of
+    assert EXIT_OVERLAY_BOUNDARY == "2026-07-20"
+    assert era_of("2026-07-19") == "PRE_OVERLAY"
+    assert era_of("2026-07-20") == "POST_OVERLAY"   # first ACTIVE close day (inclusive)
+    assert era_of("2026-07-21") == "POST_OVERLAY"
+    assert era_of(None) == "UNKNOWN_ERA"
+
+
+def test_manifest_era_partition(tmp_path):
+    d = tmp_path / "trades"
+    d.mkdir()
+    lines = [
+        json.dumps(_rec(entry_time_utc="2026-07-13T10:00:00Z",
+                        exit_time_utc="2026-07-13T11:00:00Z", _hash="a", _seq=1)),   # PRE
+        json.dumps(_rec(entry_time_utc="2026-07-20T10:00:00Z",
+                        exit_time_utc="2026-07-20T11:00:00Z", _hash="b", _seq=2)),   # POST
+    ]
+    (d / "trade_history_20260720.ndjson").write_text("\n".join(lines) + "\n")
+    result = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+    ep = result.manifest.to_dict()["era_partition"]
+    assert ep["boundary"] == "2026-07-20"
+    assert ep["counts_by_era"] == {"POST_OVERLAY": 1, "PRE_OVERLAY": 1}
+    assert ep["pooled"] is False
