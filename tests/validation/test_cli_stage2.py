@@ -215,3 +215,55 @@ def test_cli_historical_still_works(tmp_path):
                "--now", "2026-07-10T00:00:00Z", "--code-commit", "x"])
     # No bars dir → historical run still completes (heads NOT_REPLAYABLE / no symbols); rc 0.
     assert rc == 0
+
+
+# --------------------------------------------------------------------------- #
+# 5. W3A-4 — walk-forward windows derived over the DISTINCT exit-day axis.
+# --------------------------------------------------------------------------- #
+def test_walk_forward_windows_over_exit_days_unit():
+    """Clustered laps (few separable days) → 0 windows; laps spanning many days → >= W_min.
+    Windowing over exit-DAYS (not trade indices) is what stops 2 bursts faking many windows."""
+    from chad.validation.cli import _stage2_walk_forward_windows
+    from chad.validation.trade_log_adapter import AdmittedTrade
+
+    def _adm(day):
+        return AdmittedTrade(
+            instrument_class="STK", quantity=1.0, fill_price=100.0, notional=100.0,
+            gross_pnl=1.0, liquidity_tier="MID", multiplier=1.0, strategy="gamma",
+            provenance={"exit_time_utc": f"2026-07-{day:02d}T12:00:00Z"},
+        )
+    clustered = [_adm(3), _adm(3), _adm(3), _adm(3)]  # 1 distinct exit-day
+    assert _stage2_walk_forward_windows(clustered, "gamma") == 0
+    spread = [_adm(d) for d in range(1, 16)]  # 15 distinct exit-days
+    assert _stage2_walk_forward_windows(spread, "gamma") >= 6
+
+
+def test_stage2_walk_forward_windows_wired_e2e(tmp_path):
+    """End-to-end: a gamma head whose laps span 15 distinct days reports >0 walk-forward
+    windows (proving the wiring replaced the hard-coded 0); still INSUFFICIENT_DATA at n<30."""
+    records = [
+        _fill(strategy="gamma", pnl=1.0, seq=i + 1, hashv=f"h{i}", day=f"{(i % 15) + 1:02d}")
+        for i in range(15)
+    ]
+    src = _write_ledger(tmp_path, records)
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        since="2026-07-01", until="2026-07-31",
+        generated_at="2026-07-20T00:00:00Z", code_commit="x",
+    )
+    gamma = next(h for h in signed["heads"] if h["head"] == "gamma")
+    assert gamma["metrics"]["n_walk_forward_windows"] >= 6
+    # Still honest: 15 < N_min=30 → INSUFFICIENT_DATA, never a fabricated pass.
+    assert gamma["verdict"]["verdict"] == Verdict.INSUFFICIENT_DATA.value
+
+
+def test_stage2_clustered_laps_zero_windows_e2e(tmp_path):
+    """A burst of laps all on one day → 0 windows (they cannot fake temporal separability)."""
+    records = [_fill(strategy="gamma", pnl=1.0, seq=i + 1, hashv=f"h{i}", day="03") for i in range(10)]
+    src = _write_ledger(tmp_path, records)
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-20T00:00:00Z", code_commit="x",
+    )
+    gamma = next(h for h in signed["heads"] if h["head"] == "gamma")
+    assert gamma["metrics"]["n_walk_forward_windows"] == 0

@@ -76,6 +76,7 @@ from chad.validation.report_writer import (
     write_report,
 )
 from chad.validation.scoring_spine import score_returns
+from chad.validation.splits import generate_walk_forward
 from chad.validation.trade_log_adapter import AdmittedTrade, run_adapter
 from chad.validation.significance import (
     DEFAULT_TRIAL_MULTIPLE,
@@ -773,6 +774,54 @@ def _finitize(obj: Any) -> Any:
     return obj
 
 
+# --------------------------------------------------------------------------- #
+# W3A-4 (D5) — day-bucketed walk-forward over the real trade-log time axis.
+# --------------------------------------------------------------------------- #
+# Per-strategy label horizon in TRADING DAYS, CITED from real observed holds (not guessed,
+# per D5): gamma median hold = 70.0h ≈ 2.9 trading days (measured over n=74 closed_trade.v1
+# laps, 2026-07-22) → 3. Strategies with no closed-lap history yet fall back to a conservative
+# default of 2. Static now; a horizon derived from live holds is the "derived later" refinement.
+_STRATEGY_LABEL_HORIZON_DAYS: dict[str, int] = {"gamma": 3}
+_DEFAULT_LABEL_HORIZON_DAYS: int = 2
+
+# Walk-forward sizing over the exit-DAY axis (units = distinct trading days): a 5-day train
+# block and a 1-day forward test block. Reaching W_min=6 windows therefore needs many
+# separable trading days — a corpus concentrated in a few bursts honestly yields 0 windows.
+_WF_TRAIN_DAYS: int = 5
+_WF_TEST_DAYS: int = 1
+
+
+def _exit_date(t: AdmittedTrade) -> Optional[str]:
+    """The YYYY-MM-DD realization date of an admitted lap (exit, fallback entry)."""
+    for src in (t.provenance.get("exit_time_utc"), t.provenance.get("entry_time_utc")):
+        if isinstance(src, str) and len(src) >= 10 and src[4] == "-" and src[7] == "-":
+            return src[:10]
+    return None
+
+
+def _stage2_walk_forward_windows(admitted: Sequence[AdmittedTrade], strategy: str) -> int:
+    """Count purged/embargoed walk-forward windows over the DISTINCT exit-day axis (W3A-4).
+
+    A trade log's laps cluster into bursts (gamma's 74 laps exit on only 2 distinct days), so
+    windowing over trade-INDICES would let a handful of time-points masquerade as many
+    "independent" windows — a leakage cheat. Windowing over DISTINCT EXIT DAYS makes
+    ">= W_min windows" mean ">= W_min separable forward time-periods", which clustered trades
+    cannot fabricate. The per-strategy ``label_horizon`` (days, D5) purges correlated adjacent
+    days. NOTE: this is the temporal-SEPARABILITY gate feeding the §4.3 W_min minimum; genuine
+    per-window cross-consistency re-scoring is a documented future refinement, so a window
+    count >= W_min is necessary-but-not-sufficient and never on its own a pass.
+    """
+    distinct_days = sorted({d for d in (_exit_date(t) for t in admitted) if d})
+    n_days = len(distinct_days)
+    if n_days < 1:
+        return 0
+    h = _STRATEGY_LABEL_HORIZON_DAYS.get(strategy, _DEFAULT_LABEL_HORIZON_DAYS)
+    windows = generate_walk_forward(
+        n_days, train_size=_WF_TRAIN_DAYS, test_size=_WF_TEST_DAYS, label_horizon=h
+    )
+    return len(windows)
+
+
 def _stage2_net_returns(
     admitted: Sequence[AdmittedTrade], cost_config: CostConfig
 ) -> tuple[list[float], dict[str, Any]]:
@@ -819,15 +868,17 @@ def _stage2_head_metrics(
     *,
     n_effective_trials: int,
     final_run: bool,
+    n_walk_forward_windows: int = 0,
 ) -> tuple[HeadMetrics, dict[str, Any]]:
     """Build a head's :class:`HeadMetrics` from a real-fill net-return series (DRY-reuse).
 
     Reuses the Phase-1/3 :func:`_oos_metrics` spine so a live-trade-log head is scored by the
-    IDENTICAL machinery as a Stage-1 head. Walk-forward windowing over a live log is a future
-    extension (Phase 6 delivers the ingest seam), so ``n_walk_forward_windows = 0`` — which,
-    with ``W_min = 6``, honestly yields ``INSUFFICIENT_DATA`` until the soak matures, never a
-    fabricated pass (SSOT Part 0). ``oos_source`` is ``"live_trade_log"``; there is no sealed
-    OOS box for a live log, so ``oos_access_count = 0`` (never CONTAMINATED by construction).
+    IDENTICAL machinery as a Stage-1 head. ``n_walk_forward_windows`` (W3A-4) is now derived
+    from the DISTINCT exit-day axis by :func:`_stage2_walk_forward_windows` — clustered laps
+    (few separable days) honestly yield few/zero windows, which with ``W_min = 6`` keeps the
+    verdict at ``INSUFFICIENT_DATA`` until the soak spans enough time (SSOT Part 0), never a
+    fabricated pass. ``oos_source`` is ``"live_trade_log"``; there is no sealed OOS box for a
+    live log, so ``oos_access_count = 0`` (never CONTAMINATED by construction).
     """
     # Finitize the WHOLE metrics block (incl. the nested seed_sweep sub-dict) so no non-finite
     # float can reach the allow_nan=False report signing via any nested value.
@@ -839,7 +890,7 @@ def _stage2_head_metrics(
         data_quality_status="CLEAN",  # Phase-0 audits BAR data, not live fills (noted in report)
         oos_access_count=0,
         n_oos_trades=int(om["n_oos_trades"]),
-        n_walk_forward_windows=0,
+        n_walk_forward_windows=n_walk_forward_windows,
         n_regimes_in_oos=int(om["n_regimes_in_oos"]),
         deflated_sharpe_worst=om["deflated_sharpe_worst"],
         cost_adj_cagr=om["cost_adj_cagr"],
@@ -907,8 +958,10 @@ def run_stage2_trade_log(
         admitted = by_strategy[strategy]
         returns, trade_summary = _stage2_net_returns(admitted, cost_config)
         pooled.extend(returns)  # reuse the per-head series — no second cost pass
+        n_wf = _stage2_walk_forward_windows(admitted, strategy)  # W3A-4: exit-day windows
         metrics, om = _stage2_head_metrics(
-            strategy, returns, n_effective_trials=n_effective_trials, final_run=final_run
+            strategy, returns, n_effective_trials=n_effective_trials, final_run=final_run,
+            n_walk_forward_windows=n_wf,
         )
         verdict = decide_verdict(metrics, thresholds)
         head_verdicts.append(verdict)
@@ -930,8 +983,10 @@ def run_stage2_trade_log(
     surviving = sum(1 for v in head_verdicts if v.verdict is Verdict.PASS)
     total_heads = len(head_verdicts)
     capital_fraction = (surviving / total_heads) if total_heads else 0.0
+    portfolio_wf = _stage2_walk_forward_windows(result.admitted, "portfolio")
     portfolio_metrics, _pom = _stage2_head_metrics(
-        "portfolio", pooled, n_effective_trials=n_effective_trials, final_run=final_run
+        "portfolio", pooled, n_effective_trials=n_effective_trials, final_run=final_run,
+        n_walk_forward_windows=portfolio_wf,
     )
     pm = PortfolioMetrics(
         portfolio=portfolio_metrics,
@@ -1005,9 +1060,13 @@ def run_stage2_trade_log(
             "Stage 2 (real trade-log validation, SSOT §1.3 / Part 6). Real paper fills pass "
             "the fail-closed trust gate, get the IDENTICAL S4 cost haircut, and are scored by "
             "the SAME spine + verdict as Stage 1 — only the input adapter differs.",
-            "n_walk_forward_windows = 0 for every head: walk-forward windowing over a live log "
-            "is a future extension, so heads honestly read INSUFFICIENT_DATA until it matures "
-            "(never a fabricated pass). The machine never flips ready_for_live (Part 0).",
+            "n_walk_forward_windows is derived (W3A-4) over the DISTINCT exit-day axis with a "
+            "per-strategy label horizon cited from real holds (D5): clustered laps span few "
+            "separable days → few/zero windows → INSUFFICIENT_DATA until the soak spans enough "
+            "time (never a fabricated pass). The window count is the temporal-separability gate "
+            "for W_min; genuine per-window cross-consistency re-scoring is a documented future "
+            "refinement, so >= W_min windows is necessary-but-not-sufficient. The machine never "
+            "flips ready_for_live (Part 0).",
         ],
         # Stage 2 has neither a sealed OOS nor replayed heads — override the Stage-1 provenance
         # so the SIGNED artifact does not carry a hash-seal / replay claim that is false here.
