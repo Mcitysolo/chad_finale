@@ -102,6 +102,16 @@ def quiet_providers():
         "systemctl_provider": lambda query: {"failed_units": [], "error": None, "query": list(query)},
         "git_provider": lambda: {"head": "abc123", "branch": "main", "entries": [], "error": None},
         "notifier": lambda message, dedupe_key: False,
+        # W3B-5 (EXS9): healthy stubs — started 1h ago, newest commit 2 days ago.
+        "service_uptime_provider": lambda unit: {
+            "unit": unit, "active_state": "active",
+            "active_enter_unix": NOW.timestamp() - 3600.0,
+            "main_pid": 4242, "error": None,
+        },
+        "code_timestamp_provider": lambda paths: {
+            "paths": list(paths), "commit_unix": NOW.timestamp() - 2 * 86400.0,
+            "commit_hash": "abc123def456", "error": None,
+        },
     }
 
 
@@ -133,4 +143,4 @@ def test_report_has_rollup_consistent_with_overall(tmp_path, clock, quiet_provid
     assert report["schema_version"] == "exterminator_sentinel.v1"
     assert report["read_only_confirmed"] is True
     assert report["runtime_files_modified"] == []
-    assert len(report["checks"]) == 8
+    assert len(report["checks"]) == 9

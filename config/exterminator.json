@@ -243,5 +243,47 @@
     "_doc": "Check 5 reads systemd state with a read-only query only. No start/stop/reset/enable is ever issued -- locked by the anti-auto-healing tests.",
     "unit_prefix": "chad-",
     "query": ["systemctl", "list-units", "--state=failed", "--no-pager", "--no-legend", "--plain"]
+  },
+  "stale_processes": {
+    "_doc": [
+      "Check 9 (EXS9, W3B-5): long-running services whose process started BEFORE",
+      "the newest commit touching their import-graph paths. The :9618 lesson --",
+      "chad-backend served month-old SCR math (2026-06-19 -> 07-20) behind fresh",
+      "scr_state.json timestamps; BOX-034A recorded the ~15-day orchestrator",
+      "variant and named this check as the missing ops item.",
+      "",
+      "WARN-CAPPED (D2): deploy-pending is a GOVERNED operator state (CLAUDE.md",
+      "governance #6/#7; BOX-059 gate 1 rewards MainPID stability). EXS9 reports,",
+      "it never fails a gate and never pages (maybe_notify fires on fail only).",
+      "",
+      "code_paths are per-service import-graph approximations (BOX-034A section 3:",
+      "a Python service reloads ONLY its own import graph). Curated lists (D1);",
+      "false-negatives are acceptable at warn tier -- extend paths as services grow.",
+      "grace_seconds absorbs the window where a merge lands seconds before the",
+      "sentinel scan while an operator restart is already in flight."
+    ],
+    "grace_seconds": 900,
+    "units": [
+      {"unit": "chad-backend.service", "code_paths": ["backend/", "chad/analytics/"],
+       "_note": "The :9618 origin case -- in-process trade_stats_engine SCR math."},
+      {"unit": "chad-live-loop.service",
+       "code_paths": ["chad/core/", "chad/risk/", "chad/execution/", "chad/portfolio/", "chad/market_data/", "chad/utils/"]},
+      {"unit": "chad-orchestrator.service",
+       "code_paths": ["chad/core/", "chad/risk/", "chad/portfolio/", "chad/strategies/", "chad/utils/"],
+       "_note": "BOX-034A: ran ~15 days on pre-fix source (BOOT 6abf16b vs HEAD d80f44b)."},
+      {"unit": "chad-telegram-bot.service", "code_paths": ["chad/utils/", "chad/intel/"]},
+      {"unit": "chad-metrics.service", "code_paths": ["chad/ops/metrics_server.py", "chad/analytics/"]},
+      {"unit": "chad-dashboard.service", "code_paths": ["chad/dashboard/"]},
+      {"unit": "chad-shadow-status.service", "code_paths": ["chad/web/"]},
+      {"unit": "chad-kraken-ws.service", "code_paths": ["chad/market_data/kraken_ws_client.py"]},
+      {"unit": "chad-ibkr-bar-provider.service", "code_paths": ["chad/market_data/"]}
+    ],
+    "excluded_units": [
+      {"unit": "chad-ibgateway.service", "reason": "non-repo code (IBC/Java) + nightly 03:15Z restart timer keeps it current"},
+      {"unit": "chad-xvfb.service", "reason": "X infrastructure, non-repo code"},
+      {"unit": "chad-x11vnc.service", "reason": "X infrastructure, non-repo code"},
+      {"unit": "chad-paper-shadow-runner.service", "reason": "masked (PR-06 Path A); re-arm requires its own PA"},
+      {"unit": "(all Type=oneshot timer services)", "reason": "re-exec'd every fire; code is fresh by construction"}
+    ]
   }
 }

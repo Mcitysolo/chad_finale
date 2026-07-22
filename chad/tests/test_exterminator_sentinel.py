@@ -52,6 +52,18 @@ def quiet_providers():
         "systemctl_provider": lambda query: {"failed_units": [], "error": None, "query": list(query)},
         "git_provider": lambda: {"head": "abc123", "branch": "main", "entries": [], "error": None},
         "notifier": lambda message, dedupe_key: False,
+        # W3B-5 (EXS9): every unit healthy — started 1h ago, newest relevant
+        # commit 2 days ago, so processes are current.
+        "service_uptime_provider": lambda unit: {
+            "unit": unit, "active_state": "active",
+            "active_enter_unix": (NOW - timedelta(hours=1)).timestamp(),
+            "main_pid": 4242, "error": None,
+        },
+        "code_timestamp_provider": lambda paths: {
+            "paths": list(paths),
+            "commit_unix": (NOW - timedelta(days=2)).timestamp(),
+            "commit_hash": "abc123def456", "error": None,
+        },
     }
 
 
@@ -236,7 +248,7 @@ def test_failing_check_does_not_trigger_any_repair(tmp_path, clock, quiet_provid
 # ---------------------------------------------------------------------------
 
 
-def test_report_schema_and_eight_checks(tmp_path, clock, quiet_providers):
+def test_report_schema_and_nine_checks(tmp_path, clock, quiet_providers):
     runtime = tmp_path / "runtime"
     _fresh_runtime(runtime)
     report = _make(tmp_path, clock, quiet_providers).run()
@@ -247,8 +259,8 @@ def test_report_schema_and_eight_checks(tmp_path, clock, quiet_providers):
     assert required <= set(report)
     assert report["schema_version"] == "exterminator_sentinel.v1"
     assert report["stage"] == 1
-    assert len(report["checks"]) == 8
-    assert [c["check_id"] for c in report["checks"]] == [f"EXS{i}" for i in range(1, 9)]
+    assert len(report["checks"]) == 9
+    assert [c["check_id"] for c in report["checks"]] == [f"EXS{i}" for i in range(1, 10)]
     for check in report["checks"]:
         assert {"check_id", "name", "status", "title", "summary", "evidence", "remedy_type"} <= set(check)
         assert check["status"] in ("ok", "warn", "fail")
@@ -268,7 +280,7 @@ def test_history_appends_one_line_per_run(tmp_path, clock, quiet_providers):
     assert len(lines) == 2
     row = json.loads(lines[0])
     assert row["schema_version"] == "exterminator_sentinel.v1"
-    assert set(row["checks"]) == {f"EXS{i}" for i in range(1, 9)}
+    assert set(row["checks"]) == {f"EXS{i}" for i in range(1, 10)}
 
 
 def test_latest_is_rewritten_not_appended(tmp_path, clock, quiet_providers):
@@ -287,7 +299,7 @@ def test_check_exception_is_contained(tmp_path, clock, quiet_providers):
     s = _make(tmp_path, clock, quiet_providers)
     s.check_failed_services = lambda: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[method-assign]
     report = s.run()
-    assert len(report["checks"]) == 8
+    assert len(report["checks"]) == 9
     self_checks = [c for c in report["checks"] if c["check_id"] == "EXS999"]
     assert self_checks and self_checks[0]["status"] == "warn"
 
@@ -968,9 +980,9 @@ def test_stable_identity_truncates_multi_digit_ids_but_stays_deterministic():
     """
     assert sentinel_mod.stable_identity("R14") == "R1"
     assert sentinel_mod.stable_identity("R14") == sentinel_mod.stable_identity("R14")
-    ids = [sentinel_mod.stable_identity(f"EXS{i}") for i in range(1, 9)]
-    assert ids == [f"EXS{i}" for i in range(1, 9)]
-    assert len(set(ids)) == 8, "check_id identities must never collide"
+    ids = [sentinel_mod.stable_identity(f"EXS{i}") for i in range(1, 10)]
+    assert ids == [f"EXS{i}" for i in range(1, 10)]
+    assert len(set(ids)) == 9, "check_id identities must never collide"
 
 
 def test_notifier_failure_does_not_raise(tmp_path, clock, quiet_providers):
