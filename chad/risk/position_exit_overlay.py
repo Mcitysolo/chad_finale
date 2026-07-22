@@ -92,7 +92,13 @@ MARKER_HEARTBEAT = "EXIT_OVERLAY_HEARTBEAT"
 MARKER_STAND_DOWN = "EXIT_OVERLAY_STAND_DOWN"
 MARKER_BACKOFF = "EXIT_OVERLAY_SUBMIT_BACKOFF"
 
-EVIDENCE_SCHEMA_VERSION = "exit_overlay.v1"
+# W3B-6: v2 adds mark provenance (mark_ts_utc / mark_age_s / mark_source) —
+# additive only. Before v2 the evidence carried price + eval wall-clock with no
+# way to see how stale the mark was; PA_SIM_MARK_freshness_2026-07-20
+# documented a 55.3s-stale ref ($1.88/sh divergence on a 273-sh UNH close)
+# that was invisible in these records because the loaders discard the mark's
+# own timestamp. v2 stamps it; it does not shrink it.
+EVIDENCE_SCHEMA_VERSION = "exit_overlay.v2"
 HEARTBEAT_SCHEMA_VERSION = "exit_overlay_heartbeat.v1"
 CONFIG_SCHEMA_VERSION = "position_exit_overlay_config.v1"
 SUBMIT_LEDGER_SCHEMA_VERSION = "position_exit_overlay_submit_ledger.v1"
@@ -266,6 +272,11 @@ class ExitOverlayVerdict:
     max_hold_days: Optional[float]
     broker_confirmed_qty: float
     ts_utc: str
+    # W3B-6 (exit_overlay.v2): mark provenance. None when the verdict carries
+    # no price (skips) or the caller supplied no mark metadata.
+    mark_ts_utc: Optional[str] = None
+    mark_age_s: Optional[float] = None
+    mark_source: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -290,6 +301,9 @@ class ExitOverlayVerdict:
             "age_days": self.age_days,
             "max_hold_days": self.max_hold_days,
             "broker_confirmed_qty": self.broker_confirmed_qty,
+            "mark_ts_utc": self.mark_ts_utc,
+            "mark_age_s": self.mark_age_s,
+            "mark_source": self.mark_source,
         }
 
     def marker_line(self, mode: str) -> str:
@@ -596,6 +610,7 @@ def evaluate_positions(
     now_utc: datetime,
     fifo_truth_by_key: Optional[Mapping[str, Mapping[str, Any]]] = None,
     excluded_symbols: Optional[AbstractSet[str]] = None,
+    price_meta_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> ExitOverlayResult:
     """Deterministic core. Given the position/guard/bars/price/anchor snapshot and the config,
     return verdicts, reduce-only close-intent dicts (for WOULD_CLOSE), and the anchors to
@@ -677,16 +692,29 @@ def evaluate_positions(
 
         price = _f(price_by_symbol.get(symbol))
         bars = bars_by_symbol.get(symbol) or []
+        # W3B-6: mark provenance travels with the price it describes.
+        meta = (price_meta_by_symbol or {}).get(symbol) or {}
+        mark_source: Optional[str] = str(meta.get("source")) if (price > 0.0 and meta.get("source")) else None
+        mark_ts_utc: Optional[str] = str(meta.get("ts_utc")) if (price > 0.0 and meta.get("ts_utc")) else None
         if price <= 0.0:
-            # last-resort: most-recent valid bar close
+            # last-resort: most-recent valid bar close — up to a day stale, so
+            # it must never masquerade as a live mark (mark_source says so).
             for b in reversed(list(bars)):
                 c = _f(b.get("close")) if isinstance(b, Mapping) else 0.0
                 if c > 0.0:
                     price = c
+                    mark_source = "bar_close_fallback"
+                    raw_bar_ts = b.get("ts_utc") or b.get("date")
+                    mark_ts_utc = str(raw_bar_ts) if raw_bar_ts else None
                     break
         if price <= 0.0:
             verdicts.append(_mk("SKIP_NO_DATA", "no_price", broker_confirmed_qty=broker_held))
             continue
+        mark_age_s: Optional[float] = None
+        if mark_ts_utc:
+            mark_dt = _parse_iso(mark_ts_utc)
+            if mark_dt is not None:
+                mark_age_s = round((now_utc - mark_dt).total_seconds(), 1)
 
         # Anchor (entry/peak/trough) — seed on first sight, otherwise trail the extreme.
         prior = anchors.get(key) if isinstance(anchors.get(key), Mapping) else None
@@ -748,6 +776,7 @@ def evaluate_positions(
             price=price, atr=atr, atr_stop=atr_stop, entry_price=entry_price,
             hard_stop_price=hard_stop_price, peak=peak, trough=trough, age_days=age,
             broker_confirmed_qty=broker_held,
+            mark_ts_utc=mark_ts_utc, mark_age_s=mark_age_s, mark_source=mark_source,
         )
 
         if fired is None:
@@ -866,7 +895,15 @@ class PositionExitOverlay:
                 and not k.startswith("_") and not k.startswith("broker_sync|")
             } - {""})
             bars = self._bars_loader(symbols) if symbols else {}
-            prices = self._price_loader(symbols) if symbols else {}
+            # W3B-6: a loader may return (prices, meta) — meta carries per-symbol
+            # mark provenance ({sym: {"ts_utc":..., "source":...}}). Plain-dict
+            # loaders (all pre-v2 injections) keep working; their marks are
+            # simply unstamped.
+            loaded = self._price_loader(symbols) if symbols else {}
+            if isinstance(loaded, tuple) and len(loaded) == 2:
+                prices, price_meta = (loaded[0] or {}), (loaded[1] or {})
+            else:
+                prices, price_meta = (loaded or {}), {}
             anchors = self._load_anchors()
             fifo_truth = {}
             if self._fifo_truth_loader is not None:
@@ -880,6 +917,7 @@ class PositionExitOverlay:
                 guard_state=guard_state,
                 bars_by_symbol=bars,
                 price_by_symbol=prices,
+                price_meta_by_symbol=price_meta,
                 anchors=anchors,
                 config=self._config,
                 now_utc=now,
@@ -1285,7 +1323,13 @@ def _default_price_loader(repo_root: Path) -> PriceLoader:
             v = _f(prices.get(sym))
             if v > 0.0:
                 out[sym] = v
-        return out
+        # W3B-6: the cache's ts_utc was parsed for the TTL check and then
+        # DISCARDED — the 55s-stale-mark class was invisible. Return it as
+        # per-symbol mark provenance (one file-level stamp; the cache has no
+        # per-symbol timestamps — that, too, is now honest in the evidence).
+        raw_ts = str(data.get("ts_utc") or "")
+        meta = {sym: {"ts_utc": raw_ts, "source": "price_cache"} for sym in out} if raw_ts else {}
+        return out, meta
 
     return _load
 

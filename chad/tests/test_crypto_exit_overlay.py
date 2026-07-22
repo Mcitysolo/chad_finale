@@ -195,7 +195,9 @@ def test_stale_tick_yields_no_mark_and_therefore_no_close(tmp_path):
     }))
     loader = cxo._default_marks_loader(prices, max_age_seconds=60.0)
     # now_epoch is real time, far past the embedded ts -> stale -> fail closed.
-    assert loader(["SOL-USD"]) == {}
+    # (W3B-6: loader now returns (marks, meta); the stale-tick contract is
+    # unchanged — no mark, no meta.)
+    assert loader(["SOL-USD"]) == ({}, {})
 
 
 def test_empty_book_yields_no_verdicts_and_no_closes():
@@ -390,7 +392,7 @@ def test_evidence_rows_are_lane_tagged_crypto(tmp_path):
     rows = [json.loads(l) for l in (tmp_path / "ev.ndjson").read_text().splitlines()]
     assert rows and all(r["lane"] == "crypto" for r in rows)
     assert rows[0]["asset_class"] == "crypto"
-    assert rows[0]["schema_version"] == "exit_overlay.v1"
+    assert rows[0]["schema_version"] == "exit_overlay.v2"
 
 
 def test_build_default_crypto_overlay_refuses_real_paths_under_pytest(tmp_path):

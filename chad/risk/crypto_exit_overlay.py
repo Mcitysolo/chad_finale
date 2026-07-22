@@ -220,6 +220,7 @@ def evaluate_crypto_positions(
     anchors: Mapping[str, Mapping[str, Any]],
     config: ExitOverlayConfig,
     now_utc: datetime,
+    marks_meta_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> ExitOverlayResult:
     """Deterministic core: lot snapshots + marks + bars + anchors -> verdicts + close intents.
 
@@ -259,6 +260,17 @@ def evaluate_crypto_positions(
             # Fail-closed: 24/7 tape ⇒ a missing mark is a broken feed, never a closed market.
             verdicts.append(_mk("SKIP_NO_DATA", "no_fresh_mark"))
             continue
+        # W3B-6 (exit_overlay.v2): mark provenance. The tick's own ts_utc was
+        # read for the freshness gate and then dropped at the loader boundary;
+        # now it travels into the evidence.
+        meta = (marks_meta_by_symbol or {}).get(symbol) or {}
+        mark_ts_utc = str(meta.get("ts_utc")) if meta.get("ts_utc") else None
+        mark_source = str(meta.get("source")) if meta.get("source") else None
+        mark_age_s: Optional[float] = None
+        if mark_ts_utc:
+            mark_dt = _parse_iso(mark_ts_utc)
+            if mark_dt is not None:
+                mark_age_s = round((now_utc - mark_dt).total_seconds(), 1)
 
         prior = anchors.get(key) if isinstance(anchors.get(key), Mapping) else None
         peak = max(_f(prior.get("peak")) if prior else 0.0, price)
@@ -289,6 +301,7 @@ def evaluate_crypto_positions(
             price=price, atr=atr, atr_stop=atr_stop, entry_price=snap.entry_price,
             hard_stop_price=hard_stop_price, peak=peak, trough=trough, age_days=age,
             broker_confirmed_qty=snap.qty,
+            mark_ts_utc=mark_ts_utc, mark_age_s=mark_age_s, mark_source=mark_source,
         )
         if fired is None:
             verdicts.append(_mk("HOLD", "no_condition_met", **common))
@@ -465,11 +478,16 @@ class CryptoExitOverlay:
             rows = self._lots_loader() or []
             snapshots = aggregate_lots(rows)
             symbols = sorted({s.symbol for s in snapshots})
-            marks = self._marks_loader(symbols) if symbols else {}
+            # W3B-6: loader may return (marks, meta); plain mappings still work.
+            loaded = self._marks_loader(symbols) if symbols else {}
+            if isinstance(loaded, tuple) and len(loaded) == 2:
+                marks, marks_meta = (loaded[0] or {}), (loaded[1] or {})
+            else:
+                marks, marks_meta = (loaded or {}), {}
             bars = self._bars_loader(symbols) if symbols else {}
             anchors = self._load_anchors()
             result = evaluate_crypto_positions(
-                snapshots=snapshots, marks_by_symbol=marks, bars_by_symbol=bars,
+                snapshots=snapshots, marks_by_symbol=marks, marks_meta_by_symbol=marks_meta, bars_by_symbol=bars,
                 anchors=anchors, config=self._config, now_utc=now,
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
@@ -707,13 +725,18 @@ def _default_marks_loader(prices_path: Path, max_age_seconds: float) -> MarksLoa
             return {}
         now = time.time()
         out: Dict[str, float] = {}
+        meta: Dict[str, Dict[str, Any]] = {}
         for sym in symbols:
             touch = read_touch_from_prices(
                 obj, sym, now_epoch=now, max_age_seconds=max_age_seconds
             )
             if touch is not None:
                 out[sym] = float(touch.mid)
-        return out
+                # W3B-6: per-symbol tick timestamp — read for the freshness
+                # gate, previously dropped here. Now stamped into evidence.
+                if touch.ts_utc:
+                    meta[sym] = {"ts_utc": str(touch.ts_utc), "source": "kraken_ws_tick"}
+        return out, meta
 
     return _load
 
