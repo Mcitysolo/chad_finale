@@ -88,16 +88,12 @@ FILL_SCHEMA_VERSION = "paper_exec_fill.v4"
 FEE_SCHEMA_VERSION = "paper_exec_fee.v4"
 EXEC_METRIC_SCHEMA_VERSION = "paper_exec_execution_metric.v4"
 
+# Attribution is DENYLIST-based: _is_real_strategy rejects the placeholder
+# channels below; any other non-empty name passes. (W3B-8 removed the dead
+# 7-name REAL_STRATEGIES allowlist that sat here unreferenced — it predated
+# 11 of the 18 declared strategies and misled auditors into assuming
+# whitelist semantics.)
 PLACEHOLDER_STRATEGIES = {"", "unknown", "manual", "paper_exec"}
-REAL_STRATEGIES = {
-    "alpha",
-    "beta",
-    "gamma",
-    "delta",
-    "omega",
-    "alpha_crypto",
-    "alpha_forex",
-}
 
 # IBKR paper-mode order statuses that mean "submitted but no synchronous fill".
 # In paper mode these MUST be translated to "paper_fill" before evidence is
