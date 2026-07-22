@@ -152,9 +152,23 @@ EXCLUSION_REASONS: tuple[str, ...] = (
 
 _LEDGER_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
 
-# The canonical closed-round-trip schema (D6). Only rows carrying this schema_version are the
-# real FIFO-closed laps written by chad/execution/trade_closer.py:write_trade_history.
+# The canonical FIFO-closed-round-trip schema (hash-chained by trade_closer.py:
+# write_trade_history). This exact value is what the chain recompute (verify_ledger_chain) is
+# valid for.
 _CLOSED_TRADE_SCHEMA: str = "closed_trade.v1"
+
+# D6 admit gate: the KNOWN closed-lap schema FAMILIES. trade_history carries closed round-trips
+# from two writers — closed_trade.v* (chad/execution/trade_closer.py) and paper_trade_result.v*
+# (chad/portfolio/ibkr_paper_trade_result_logger.py, used by the Kraken TrustedFillEngine). Both
+# are real laps with realized pnl + entry/exit; a row outside these families (raw fills, legacy
+# foreign-writer rows, bars/state files) is not a closed lap and is excluded (non_closed_trade).
+# Prefix-matched so a future minor version (…v2/v3) is accepted without a code change.
+_ADMISSIBLE_SCHEMA_PREFIXES: tuple[str, ...] = ("closed_trade.", "paper_trade_result.")
+
+
+def _is_closed_lap_schema(schema_version: str) -> bool:
+    """True iff ``schema_version`` names a known closed-lap family (D6 admit gate)."""
+    return any(schema_version.startswith(p) for p in _ADMISSIBLE_SCHEMA_PREFIXES)
 
 # D4: the FROZEN exit-overlay activation boundary. Laps before it are a DIFFERENT
 # data-generating process (pre-overlay reconciliation/adopt closes) than laps on/after it
@@ -769,10 +783,16 @@ def adapt_records(
             continue
 
         payload = _payload(record)
-        # D6 (W3A-2): only canonical closed round-trips enter — a row lacking
-        # schema_version == "closed_trade.v1" (legacy / foreign-writer) is excluded
-        # structurally, before the trust gate and the date window.
-        if str(payload.get("schema_version") or "") != _CLOSED_TRADE_SCHEMA:
+        # D6 (W3A-2, corrected W3A-7): exclude rows carrying an EXPLICIT non-lap schema
+        # (a raw-fill / bars / state schema pointed at by mistake). A row with NO schema_version
+        # is NOT excluded here — legitimate crypto laps written by
+        # chad/analytics/trade_result_logger.py carry no schema_version yet ARE real closed laps
+        # (verified: the Kraken TrustedFillEngine's realized rows). Those fall through to the
+        # trust + malformed gates, which are what actually distinguish a lap from a non-lap on
+        # the real ledger (the 2148 no-schema Kraken validate_only rows are caught there, not
+        # here). So this gate only fires on a PRESENT, non-closed-lap schema_version.
+        sv = str(payload.get("schema_version") or "")
+        if sv and not _is_closed_lap_schema(sv):
             counters["excluded:non_closed_trade"] += 1
             continue
         row_date = _row_date(payload, record)

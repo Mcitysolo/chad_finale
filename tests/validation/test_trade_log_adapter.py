@@ -567,15 +567,26 @@ def test_futures_excluded_by_default_bug_b():
     assert len(admitted2) == 1 and c2["excluded:futures_bug_b"] == 0
 
 
-def test_non_closed_trade_schema_excluded():
-    """D6: a legacy/foreign-writer row without schema_version=='closed_trade.v1' is excluded."""
+def test_explicit_non_lap_schema_excluded_no_schema_admitted():
+    """D6 (corrected): a row with an EXPLICIT non-lap schema is excluded; a row with NO
+    schema_version is admitted (deferred to the trust gate). Legitimate crypto laps written by
+    chad/analytics/trade_result_logger carry no schema_version, so requiring a lap schema would
+    wrongly reject them — the trust gate catches the real non-laps (validate_only, etc.)."""
+    wrong = _rec(schema_version="open_fill.v0")
+    _, c = adapt_records(_stream([wrong]))
+    assert c["excluded:non_closed_trade"] == 1
+    # No schema_version → NOT excluded by the schema gate (a trusted, lap-shaped row is admitted).
     legacy = _rec()
     del legacy["payload"]["schema_version"]
-    admitted, c = adapt_records(_stream([legacy]))
-    assert admitted == [] and c["excluded:non_closed_trade"] == 1
-    wrong = _rec(schema_version="open_fill.v0")
-    _, c2 = adapt_records(_stream([wrong]))
-    assert c2["excluded:non_closed_trade"] == 1
+    admitted, c2 = adapt_records(_stream([legacy]))
+    assert len(admitted) == 1 and c2["excluded:non_closed_trade"] == 0
+
+
+def test_paper_trade_result_schema_is_admitted():
+    """D6: paper_trade_result.v* (the Kraken TrustedFillEngine / IBKR paper logger) is a valid
+    closed-lap family and must ALSO be admitted — not only closed_trade.v1."""
+    admitted, c = adapt_records(_stream([_rec(schema_version="paper_trade_result.v2")]))
+    assert len(admitted) == 1 and c["excluded:non_closed_trade"] == 0
 
 
 def test_verify_ledger_chain_intact_and_tampered(tmp_path):
