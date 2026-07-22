@@ -1,0 +1,11 @@
+[Unit]
+Description=Run CHAD IBKR Watchdog every 2 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=120s
+RandomizedDelaySec=15s
+Unit=chad-ibkr-watchdog.service
+
+[Install]
+WantedBy=timers.target
