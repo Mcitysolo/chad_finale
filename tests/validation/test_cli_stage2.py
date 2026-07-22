@@ -32,6 +32,7 @@ def _fill(strategy="alpha_a", pnl=12.0, price=190.0, qty=10.0, day="03",
         extra["validate_only"] = True
         extra["pnl_untrusted"] = True
     payload = {
+        "schema_version": "closed_trade.v1",
         "broker": broker, "symbol": symbol, "asset_class": asset_class,
         "side": "BUY", "strategy": strategy, "quantity": qty, "fill_price": price,
         "notional": qty * price, "pnl": pnl, "is_live": False, "regime": "risk_on",
@@ -77,10 +78,12 @@ def test_stage2_scores_admitted_fills_and_signs(tmp_path):
     assert verify_signature(signed) is True
 
     # Two strategy heads scored (alpha_a: 2 trusted, alpha_b: 1 trusted); untrusted excluded.
+    # D4: heads are era-split — day 03 is PRE_OVERLAY (< 2026-07-20).
     heads = {h["head"]: h for h in signed["heads"]}
-    assert set(heads) == {"alpha_a", "alpha_b"}
-    assert heads["alpha_a"]["metrics"]["n_oos_trades"] == 2
-    assert heads["alpha_b"]["metrics"]["n_oos_trades"] == 1
+    assert set(heads) == {"alpha_a|PRE_OVERLAY", "alpha_b|PRE_OVERLAY"}
+    assert heads["alpha_a|PRE_OVERLAY"]["metrics"]["n_oos_trades"] == 2
+    assert heads["alpha_b|PRE_OVERLAY"]["metrics"]["n_oos_trades"] == 1
+    assert heads["alpha_a|PRE_OVERLAY"]["era"] == "PRE_OVERLAY"
 
     # Every head has a verdict; thin data → INSUFFICIENT_DATA (never a fabricated pass).
     for h in signed["heads"]:
@@ -171,6 +174,7 @@ def test_cli_stage2_end_to_end(tmp_path, capsys):
         "--stage", "stage2", "--since", "2026-07-01", "--until", "2026-07-31",
         "--trades-dir", str(src), "--out-dir", str(out), "--repo-root", str(tmp_path),
         "--now", "2026-07-10T00:00:00Z", "--code-commit", "abc123",
+        "--no-verify-chain", "--no-scr-crosscheck",  # synthetic hashes / no runtime scr_state
     ])
     assert rc == 0
     stdout = capsys.readouterr().out
@@ -214,3 +218,131 @@ def test_cli_historical_still_works(tmp_path):
                "--now", "2026-07-10T00:00:00Z", "--code-commit", "x"])
     # No bars dir → historical run still completes (heads NOT_REPLAYABLE / no symbols); rc 0.
     assert rc == 0
+
+
+# --------------------------------------------------------------------------- #
+# 5. W3A-4 — walk-forward windows derived over the DISTINCT exit-day axis.
+# --------------------------------------------------------------------------- #
+def test_walk_forward_windows_over_exit_days_unit():
+    """Clustered laps (few separable days) → 0 windows; laps spanning many days → >= W_min.
+    Windowing over exit-DAYS (not trade indices) is what stops 2 bursts faking many windows."""
+    from chad.validation.cli import _stage2_walk_forward_windows
+    from chad.validation.trade_log_adapter import AdmittedTrade
+
+    def _adm(day):
+        return AdmittedTrade(
+            instrument_class="STK", quantity=1.0, fill_price=100.0, notional=100.0,
+            gross_pnl=1.0, liquidity_tier="MID", multiplier=1.0, strategy="gamma",
+            provenance={"exit_time_utc": f"2026-07-{day:02d}T12:00:00Z"},
+        )
+    clustered = [_adm(3), _adm(3), _adm(3), _adm(3)]  # 1 distinct exit-day
+    assert _stage2_walk_forward_windows(clustered, "gamma") == 0
+    spread = [_adm(d) for d in range(1, 16)]  # 15 distinct exit-days
+    assert _stage2_walk_forward_windows(spread, "gamma") >= 6
+
+
+def test_stage2_walk_forward_windows_wired_e2e(tmp_path):
+    """End-to-end: a gamma head whose laps span 15 distinct days reports >0 walk-forward
+    windows (proving the wiring replaced the hard-coded 0); still INSUFFICIENT_DATA at n<30."""
+    records = [
+        _fill(strategy="gamma", pnl=1.0, seq=i + 1, hashv=f"h{i}", day=f"{(i % 15) + 1:02d}")
+        for i in range(15)
+    ]
+    src = _write_ledger(tmp_path, records)
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        since="2026-07-01", until="2026-07-31",
+        generated_at="2026-07-20T00:00:00Z", code_commit="x",
+    )
+    gamma = next(h for h in signed["heads"] if h["head"] == "gamma|PRE_OVERLAY")
+    assert gamma["metrics"]["n_walk_forward_windows"] >= 6
+    # Still honest: 15 < N_min=30 → INSUFFICIENT_DATA, never a fabricated pass.
+    assert gamma["verdict"]["verdict"] == Verdict.INSUFFICIENT_DATA.value
+
+
+def test_stage2_clustered_laps_zero_windows_e2e(tmp_path):
+    """A burst of laps all on one day → 0 windows (they cannot fake temporal separability)."""
+    records = [_fill(strategy="gamma", pnl=1.0, seq=i + 1, hashv=f"h{i}", day="03") for i in range(10)]
+    src = _write_ledger(tmp_path, records)
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-20T00:00:00Z", code_commit="x",
+    )
+    gamma = next(h for h in signed["heads"] if h["head"] == "gamma|PRE_OVERLAY")
+    assert gamma["metrics"]["n_walk_forward_windows"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 6. W3A-5 — era split (D4): pre/post exit-overlay never pooled into the headline.
+# --------------------------------------------------------------------------- #
+def _pre_post_records():
+    return [
+        _fill(strategy="gamma", pnl=5.0, seq=1, hashv="a", day="13"),   # PRE_OVERLAY
+        _fill(strategy="gamma", pnl=6.0, seq=2, hashv="b", day="21"),   # POST_OVERLAY
+    ]
+
+
+def test_stage2_heads_split_by_era_headline_is_post(tmp_path):
+    src = _write_ledger(tmp_path, _pre_post_records(), day="20260721")
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-22T00:00:00Z", code_commit="x",
+    )
+    # A head NEVER pools eras — gamma becomes two era-scoped heads.
+    assert {h["head"] for h in signed["heads"]} == {"gamma|PRE_OVERLAY", "gamma|POST_OVERLAY"}
+    # Headline portfolio is POST_OVERLAY only (not a cross-era pool).
+    assert signed["portfolio"]["portfolio_era"] == "POST_OVERLAY"
+    # Manifest stamps the era partition.
+    ep = signed["data_quality"]["stage2_adapter_manifest"]["era_partition"]
+    assert ep["counts_by_era"] == {"POST_OVERLAY": 1, "PRE_OVERLAY": 1}
+    assert ep["pooled"] is False
+
+
+def test_stage2_allow_era_pooling_is_labeled_sensitivity(tmp_path):
+    src = _write_ledger(tmp_path, _pre_post_records(), day="20260721")
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-22T00:00:00Z", code_commit="x", allow_era_pooling=True,
+    )
+    # Pooling is only ever a labeled sensitivity view, never the default headline.
+    assert signed["portfolio"]["portfolio_era"] == "POOLED_HETEROGENEOUS_POPULATION"
+
+
+def test_stage2_verify_chain_fails_loud_through_run(tmp_path):
+    """D6: verify_chain=True on the Stage-2 path refuses a broken-chain synthetic ledger."""
+    from chad.validation.trade_log_adapter import LedgerChainError
+    src = _write_ledger(tmp_path, [_fill(seq=1, hashv="bad")])  # no prev_hash → broken chain
+    with pytest.raises(LedgerChainError):
+        run_stage2_trade_log(
+            repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+            generated_at="2026-07-22T00:00:00Z", code_commit="x", verify_chain=True,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 7. W3A-6 — output hardening (D7): EVIDENCE banner + no bare PASS anywhere.
+# --------------------------------------------------------------------------- #
+def test_stage2_report_leads_with_evidence_banner(tmp_path):
+    from chad.validation.report_writer import render_markdown
+    src = _write_ledger(tmp_path, [_fill(seq=i, hashv=f"h{i}") for i in range(3)])
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-10T00:00:00Z", code_commit="x",
+    )
+    md = render_markdown(signed)
+    assert "EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE" in md
+    # The banner LEADS (before the verdict summary).
+    assert md.index("EVIDENCE — NOT AN AUTHORIZATION") < md.index("Verdict summary")
+    # And no bare 'PASS' verdict value can appear in the signed JSON (D7).
+    assert '"verdict": "PASS"' not in json.dumps(signed)
+
+
+def test_stage2_cli_stdout_leads_with_banner(tmp_path, capsys):
+    src = _write_ledger(tmp_path, [_fill(seq=i, hashv=f"h{i}") for i in range(3)])
+    rc = main([
+        "--stage", "stage2", "--trades-dir", str(src), "--out-dir", str(tmp_path / "out"),
+        "--repo-root", str(tmp_path), "--now", "2026-07-10T00:00:00Z", "--code-commit", "x",
+        "--no-verify-chain", "--no-scr-crosscheck",
+    ])
+    assert rc == 0
+    assert "EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE" in capsys.readouterr().out

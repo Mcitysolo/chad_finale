@@ -46,6 +46,7 @@ def _rec(**payload_over):
     """A wrapped ledger record with a trusted-by-default payload; overrides merge in."""
     extra = payload_over.pop("extra", {})
     payload = {
+        "schema_version": "closed_trade.v1",
         "broker": "paper_exec",
         "symbol": "AAPL",
         "asset_class": "equity",
@@ -387,7 +388,7 @@ def test_cli_writes_artifacts_and_returns_zero(tmp_path, capsys):
     out = tmp_path / "out"
     rc = main(["--since", "2026-07-01", "--until", "2026-07-31",
                "--trades-dir", str(src), "--out-dir", str(out),
-               "--now", "2026-07-10T00:00:00Z"])
+               "--now", "2026-07-10T00:00:00Z", "--no-verify-chain"])  # synthetic hashes
     assert rc == 0
     assert (out / "stage2_trades_2026-07-01_2026-07-31.ndjson").exists()
     assert (out / "stage2_manifest_2026-07-01_2026-07-31.json").exists()
@@ -457,3 +458,259 @@ def test_trust_constants_match_live_write_path():
     assert PLACEHOLDER_FILL_PRICE == _PLACEHOLDER_FILL_PRICE
     # Every canonical genuine-fill target must be an admissible trusted status.
     assert set(_STATUS_CANON.values()) <= TRUSTED_FILL_STATUSES
+
+
+# --------------------------------------------------------------------------- #
+# 15. W3A-1 — schema-mapping completeness (gross-pnl D3, multiplier, asset_class, holds).
+# --------------------------------------------------------------------------- #
+def test_gross_pnl_preferred_over_net(monkeypatch=None):
+    """D3: when a row carries gross_pnl, the harness is costed on GROSS (not the net `pnl`),
+    so the harness haircut is the single cost authority and post-EP1 rows are not double-charged."""
+    admitted, _ = adapt_records(_stream([_rec(pnl=8.0, gross_pnl=12.0)]))
+    assert len(admitted) == 1
+    assert admitted[0].gross_pnl == 12.0
+    assert admitted[0].provenance["pnl_field"] == "gross_pnl"
+
+
+def test_pnl_fallback_when_gross_absent():
+    """Pre-EP1 rows carry no gross_pnl → fall back to `pnl`, recorded as pnl_field='pnl'."""
+    admitted, _ = adapt_records(_stream([_rec(pnl=25.0)]))
+    assert admitted[0].gross_pnl == 25.0
+    assert admitted[0].provenance["pnl_field"] == "pnl"
+
+
+def test_contract_multiplier_is_used():
+    """A futures row's contract_multiplier (the key real rows carry) reaches the cost mapping.
+    (Futures are excluded by default under D2, so admit them explicitly here to test the map.)"""
+    admitted, _ = adapt_records(
+        _stream([_rec(symbol="MESU6", asset_class="future", contract_multiplier=5.0)]),
+        include_futures=True,
+    )
+    assert admitted[0].multiplier == 5.0
+    assert admitted[0].instrument_class == InstrumentClass.FUT.value
+
+
+def test_meta_raw_asset_class_classifies_equity():
+    """An equity with a futures-looking symbol but meta.raw_asset_class='equity' → STK, not FUT."""
+    rec = _rec(symbol="ZN", meta={"raw_asset_class": "equity"})
+    del rec["payload"]["asset_class"]  # force the meta path
+    admitted, _ = adapt_records(_stream([rec]))
+    assert admitted[0].instrument_class == InstrumentClass.STK.value
+
+
+def test_inverted_duration_is_kept_and_counted():
+    """A real netting/clock artifact (exit < entry) is KEPT (honest data) but flagged + counted;
+    hold_hours is the absolute span, never a negative hold."""
+    rec = _rec(
+        entry_time_utc="2026-07-20T13:51:10+00:00",
+        exit_time_utc="2026-07-20T13:50:56Z",  # 14s before entry — the real 07-20 artifact
+    )
+    admitted, counters = adapt_records(_stream([rec]))
+    assert len(admitted) == 1  # kept, not excluded
+    assert admitted[0].provenance["inverted_duration"] is True
+    assert admitted[0].provenance["hold_hours"] >= 0.0
+    assert counters["inverted_duration"] == 1
+
+
+def test_timestamp_tz_forms_both_parse():
+    """Both `…Z` and `…+00:00` forms yield a finite non-inverted hold (real rows mix them)."""
+    rec = _rec(
+        entry_time_utc="2026-07-20T10:00:00Z",
+        exit_time_utc="2026-07-20T12:00:00+00:00",
+    )
+    admitted, counters = adapt_records(_stream([rec]))
+    assert admitted[0].provenance["inverted_duration"] is False
+    assert abs(admitted[0].provenance["hold_hours"] - 2.0) < 1e-9
+    assert counters["inverted_duration"] == 0
+
+
+def test_manifest_carries_w3a1_fields(tmp_path):
+    """run_adapter's manifest exposes the pnl-field tally + inverted count for audit."""
+    d = tmp_path / "trades"
+    d.mkdir()
+    lines = [
+        json.dumps(_rec(pnl=1.0, gross_pnl=2.0, _hash="a", _seq=1)),
+        json.dumps(_rec(pnl=3.0, _hash="b", _seq=2)),
+    ]
+    (d / "trade_history_20260703.ndjson").write_text("\n".join(lines) + "\n")
+    result = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+    md = result.manifest.to_dict()
+    assert md["admitted_pnl_field_counts"] == {"gross_pnl": 1, "pnl": 1}
+    assert md["inverted_duration_admitted"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 16. W3A-2 — trust-gate alignment (manual/warmup_sim/futures) + integrity gates (D2/D6).
+# --------------------------------------------------------------------------- #
+def test_manual_hand_trade_is_excluded():
+    """D2: SCR excludes operator hand-trades; the adapter mirrors it (tag or strategy)."""
+    assert trust_exclusion(_rec(tags=["paper", "manual"])) == "manual"
+    assert trust_exclusion(_rec(strategy="manual")) == "manual"
+    admitted, c = adapt_records(_stream([_rec(strategy="manual")]))
+    assert admitted == [] and c["excluded:manual"] == 1
+
+
+def test_warmup_sim_is_excluded():
+    """D2: synthetic warmup rows must never reach the scorer (SCR parity)."""
+    assert trust_exclusion(_rec(tags=["warmup_sim"])) == "warmup_sim"
+    _, c = adapt_records(_stream([_rec(tags=["warmup_sim"])]))
+    assert c["excluded:warmup_sim"] == 1
+
+
+def test_futures_excluded_by_default_bug_b():
+    """D2: a futures row is Bug-B-contaminated → excluded by default, admitted with the flag."""
+    fut = _rec(symbol="MESU6", asset_class="future", contract_multiplier=5.0)
+    admitted, c = adapt_records(_stream([fut]))
+    assert admitted == [] and c["excluded:futures_bug_b"] == 1
+    admitted2, c2 = adapt_records(_stream([_rec(symbol="MESU6", asset_class="future",
+                                                contract_multiplier=5.0)]), include_futures=True)
+    assert len(admitted2) == 1 and c2["excluded:futures_bug_b"] == 0
+
+
+def test_explicit_non_lap_schema_excluded_no_schema_admitted():
+    """D6 (corrected): a row with an EXPLICIT non-lap schema is excluded; a row with NO
+    schema_version is admitted (deferred to the trust gate). Legitimate crypto laps written by
+    chad/analytics/trade_result_logger carry no schema_version, so requiring a lap schema would
+    wrongly reject them — the trust gate catches the real non-laps (validate_only, etc.)."""
+    wrong = _rec(schema_version="open_fill.v0")
+    _, c = adapt_records(_stream([wrong]))
+    assert c["excluded:non_closed_trade"] == 1
+    # No schema_version → NOT excluded by the schema gate (a trusted, lap-shaped row is admitted).
+    legacy = _rec()
+    del legacy["payload"]["schema_version"]
+    admitted, c2 = adapt_records(_stream([legacy]))
+    assert len(admitted) == 1 and c2["excluded:non_closed_trade"] == 0
+
+
+def test_paper_trade_result_schema_is_admitted():
+    """D6: paper_trade_result.v* (the Kraken TrustedFillEngine / IBKR paper logger) is a valid
+    closed-lap family and must ALSO be admitted — not only closed_trade.v1."""
+    admitted, c = adapt_records(_stream([_rec(schema_version="paper_trade_result.v2")]))
+    assert len(admitted) == 1 and c["excluded:non_closed_trade"] == 0
+
+
+def test_verify_ledger_chain_intact_and_tampered(tmp_path):
+    """D6: an intact synthetic chain yields no issues; a mutated payload / broken link is caught."""
+    import hashlib as _h, json as _j
+    from chad.validation.trade_log_adapter import verify_ledger_chain
+
+    def _hash(core):
+        return _h.sha256(_j.dumps(core, sort_keys=True, default=str).encode()).hexdigest()
+
+    rows, prev = [], "GENESIS"
+    for seq in (1, 2, 3):
+        core = {"payload": {"schema_version": "closed_trade.v1", "pnl": float(seq)},
+                "prev_hash": prev, "sequence_id": seq, "timestamp_utc": f"2026-07-20T0{seq}:00:00Z"}
+        core["record_hash"] = _hash({k: core[k] for k in ("payload", "prev_hash", "sequence_id", "timestamp_utc")})
+        rows.append(core)
+        prev = core["record_hash"]
+    p = tmp_path / "trade_history_20260720.ndjson"
+    p.write_text("\n".join(_j.dumps(r) for r in rows) + "\n")
+    assert verify_ledger_chain(p) == []  # intact
+
+    rows[1]["payload"]["pnl"] = 999.0  # tamper a payload without re-hashing
+    p.write_text("\n".join(_j.dumps(r) for r in rows) + "\n")
+    issues = verify_ledger_chain(p)
+    assert any("record_hash mismatch" in i for i in issues)
+
+
+def test_run_adapter_verify_chain_fails_loud(tmp_path):
+    """D6: run_adapter(verify_chain=True) refuses to admit from a broken-chain ledger."""
+    from chad.validation.trade_log_adapter import LedgerChainError
+    d = tmp_path / "trades"
+    d.mkdir()
+    # A row whose prev_hash is not GENESIS → broken link on the first row.
+    bad = {"payload": {"schema_version": "closed_trade.v1"}, "prev_hash": "NOTGENESIS",
+           "sequence_id": 1, "timestamp_utc": "2026-07-20T01:00:00Z", "record_hash": "x"}
+    (d / "trade_history_20260720.ndjson").write_text(json.dumps(bad) + "\n")
+    with pytest.raises(LedgerChainError):
+        run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z", verify_chain=True)
+    # default (verify_chain=False) does not raise — still admits/handles gracefully.
+    run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+
+
+# --------------------------------------------------------------------------- #
+# 17. W3A-3 — read-only SCR reconciliation cross-check (D2; fail-loud on absence).
+# --------------------------------------------------------------------------- #
+def _write_scr(tmp_path, effective, ts="2026-07-22T18:09:35Z"):
+    p = tmp_path / "scr_state.json"
+    p.write_text(json.dumps({"state": "WARMUP", "ts_utc": ts,
+                             "stats": {"effective_trades": effective}}))
+    return p
+
+
+def test_load_scr_effective_reads_effective_trades(tmp_path):
+    from chad.validation.trade_log_adapter import load_scr_effective
+    eff, ts = load_scr_effective(_write_scr(tmp_path, 67))
+    assert eff == 67 and ts == "2026-07-22T18:09:35Z"
+    assert load_scr_effective(None) == (None, None)  # disabled → no read
+
+
+def test_load_scr_effective_fails_loud_on_absence(tmp_path):
+    from chad.validation.trade_log_adapter import ScrCrosscheckError, load_scr_effective
+    with pytest.raises(ScrCrosscheckError):
+        load_scr_effective(tmp_path / "does_not_exist.json")
+    (tmp_path / "bad.json").write_text('{"no_stats": true}')
+    with pytest.raises(ScrCrosscheckError):
+        load_scr_effective(tmp_path / "bad.json")
+
+
+def test_run_adapter_reconciliation_block(tmp_path):
+    """The manifest surfaces the admitted-vs-SCR-effective delta (D2) when a path is supplied,
+    including the pnl==0 laps the adapter keeps but SCR drops."""
+    d = tmp_path / "trades"
+    d.mkdir()
+    lines = [
+        json.dumps(_rec(pnl=5.0, gross_pnl=5.0, _hash="a", _seq=1)),
+        json.dumps(_rec(pnl=0.0, gross_pnl=0.0, _hash="b", _seq=2)),  # 0-return: kept, SCR drops
+    ]
+    (d / "trade_history_20260703.ndjson").write_text("\n".join(lines) + "\n")
+    scr = _write_scr(tmp_path, 1)  # SCR scored 1; adapter admits 2
+    result = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z", scr_state_path=scr)
+    recon = result.manifest.to_dict()["scr_reconciliation"]
+    assert recon["scr_effective_trades"] == 1
+    assert recon["adapter_admitted"] == 2
+    assert recon["delta_admitted_minus_scr"] == 1
+    assert recon["adapter_admitted_pnl_zero"] == 1
+    # Disabled by default → no reconciliation block.
+    result2 = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+    assert result2.manifest.to_dict()["scr_reconciliation"] is None
+
+
+def test_run_adapter_scr_crosscheck_fails_loud(tmp_path):
+    from chad.validation.trade_log_adapter import ScrCrosscheckError
+    d = tmp_path / "trades"
+    d.mkdir()
+    (d / "trade_history_20260703.ndjson").write_text(json.dumps(_rec()) + "\n")
+    with pytest.raises(ScrCrosscheckError):
+        run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z",
+                    scr_state_path=tmp_path / "absent_scr.json")
+
+
+# --------------------------------------------------------------------------- #
+# 18. W3A-5 — sample-regime (era) partition at the frozen exit-overlay boundary (D4).
+# --------------------------------------------------------------------------- #
+def test_era_of_boundary():
+    from chad.validation.trade_log_adapter import EXIT_OVERLAY_BOUNDARY, era_of
+    assert EXIT_OVERLAY_BOUNDARY == "2026-07-20"
+    assert era_of("2026-07-19") == "PRE_OVERLAY"
+    assert era_of("2026-07-20") == "POST_OVERLAY"   # first ACTIVE close day (inclusive)
+    assert era_of("2026-07-21") == "POST_OVERLAY"
+    assert era_of(None) == "UNKNOWN_ERA"
+
+
+def test_manifest_era_partition(tmp_path):
+    d = tmp_path / "trades"
+    d.mkdir()
+    lines = [
+        json.dumps(_rec(entry_time_utc="2026-07-13T10:00:00Z",
+                        exit_time_utc="2026-07-13T11:00:00Z", _hash="a", _seq=1)),   # PRE
+        json.dumps(_rec(entry_time_utc="2026-07-20T10:00:00Z",
+                        exit_time_utc="2026-07-20T11:00:00Z", _hash="b", _seq=2)),   # POST
+    ]
+    (d / "trade_history_20260720.ndjson").write_text("\n".join(lines) + "\n")
+    result = run_adapter(trades_dir=d, generated_at="2026-07-22T00:00:00Z")
+    ep = result.manifest.to_dict()["era_partition"]
+    assert ep["boundary"] == "2026-07-20"
+    assert ep["counts_by_era"] == {"POST_OVERLAY": 1, "PRE_OVERLAY": 1}
+    assert ep["pooled"] is False

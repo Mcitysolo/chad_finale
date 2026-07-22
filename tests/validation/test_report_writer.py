@@ -110,7 +110,7 @@ def test_sign_and_verify() -> None:
 def test_signature_detects_tampering() -> None:
     signed = sign_report(_built())
     assert verify_signature(signed) is True
-    signed["heads"][0]["verdict"]["verdict"] = "PASS"  # forge a pass
+    signed["heads"][0]["verdict"]["verdict"] = "FORGED"  # tamper the signed content
     assert verify_signature(signed) is False
 
 

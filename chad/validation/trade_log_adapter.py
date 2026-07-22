@@ -66,6 +66,8 @@ __all__ = [
     "REJECTED_STATUSES",
     "PLACEHOLDER_FILL_PRICE",
     "EXCLUSION_REASONS",
+    "EXIT_OVERLAY_BOUNDARY",
+    "era_of",
     "AdmittedTrade",
     "AdapterManifest",
     "AdapterResult",
@@ -76,7 +78,11 @@ __all__ = [
     "adapt_records",
     "iter_ledger_files",
     "load_quarantine_pins",
+    "load_scr_effective",
+    "ScrCrosscheckError",
     "load_ndjson",
+    "verify_ledger_chain",
+    "LedgerChainError",
     "run_adapter",
     "main",
 ]
@@ -120,6 +126,19 @@ EXCLUSION_REASONS: tuple[str, ...] = (
     "pnl_untrusted",
     # B2 (FLIP-UNBLOCK): fabricated cost basis (Epoch-3 seed lot).
     "scoring_excluded",
+    # W3A-2 (D2): SCR-predicate parity. SCR's effective set excludes operator hand-trades
+    # (tag "manual") and synthetic warmup rows (tag "warmup_sim"); the adapter mirrors both so
+    # the two scorekeepers exclude the same kinds (see chad/analytics/trade_stats_engine.py
+    # _is_manual :107-108 / _is_warmup_sim :146-148).
+    "manual",
+    "warmup_sim",
+    # W3A-2 (D2): futures rows are Bug-B-contaminated (untrusted PnL) pending the Bug-B book
+    # disposition; excluded from scoring by default (re-enable with include_futures=True once
+    # Bug-B is resolved). SCR excludes futures for the same reason (is_futures_row).
+    "futures_bug_b",
+    # W3A-2 (D6): a row without schema_version == "closed_trade.v1" (legacy / foreign-writer)
+    # is not a canonical closed round-trip → excluded structurally, before the trust gate.
+    "non_closed_trade",
     # W2A-1: operator quarantine pin (runtime/quarantine_manifest_*.json). A row whose
     # ``record_hash`` / ``fill_id`` / ``fill_ids`` is pinned in an operator manifest is
     # dropped BEFORE the trust gate — the same authority SCR honours natively
@@ -132,6 +151,50 @@ EXCLUSION_REASONS: tuple[str, ...] = (
 )
 
 _LEDGER_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
+
+# The canonical FIFO-closed-round-trip schema (hash-chained by trade_closer.py:
+# write_trade_history). This exact value is what the chain recompute (verify_ledger_chain) is
+# valid for.
+_CLOSED_TRADE_SCHEMA: str = "closed_trade.v1"
+
+# D6 admit gate: the KNOWN closed-lap schema FAMILIES. trade_history carries closed round-trips
+# from two writers — closed_trade.v* (chad/execution/trade_closer.py) and paper_trade_result.v*
+# (chad/portfolio/ibkr_paper_trade_result_logger.py, used by the Kraken TrustedFillEngine). Both
+# are real laps with realized pnl + entry/exit; a row outside these families (raw fills, legacy
+# foreign-writer rows, bars/state files) is not a closed lap and is excluded (non_closed_trade).
+# Prefix-matched so a future minor version (…v2/v3) is accepted without a code change.
+_ADMISSIBLE_SCHEMA_PREFIXES: tuple[str, ...] = ("closed_trade.", "paper_trade_result.")
+
+
+def _is_closed_lap_schema(schema_version: str) -> bool:
+    """True iff ``schema_version`` names a known closed-lap family (D6 admit gate)."""
+    return any(schema_version.startswith(p) for p in _ADMISSIBLE_SCHEMA_PREFIXES)
+
+# D4: the FROZEN exit-overlay activation boundary. Laps before it are a DIFFERENT
+# data-generating process (pre-overlay reconciliation/adopt closes) than laps on/after it
+# (genuine engine-driven overlay closes). position_exit_overlay went SHADOW→ACTIVE here; the
+# first ACTIVE close was 2026-07-20T13:50:55Z (docs/ULTRA_CLOSE_AUDIT_2026-07-17.md). The two
+# eras are SEPARATE populations and must never be pooled into one headline verdict.
+EXIT_OVERLAY_BOUNDARY: str = "2026-07-20"
+
+
+def era_of(exit_date: Optional[str]) -> str:
+    """Sample-regime label for a lap's realization date vs the frozen overlay boundary (D4).
+
+    Returns ``"PRE_OVERLAY"`` (exit date < boundary), ``"POST_OVERLAY"`` (>= boundary), or
+    ``"UNKNOWN_ERA"`` when no usable ``YYYY-MM-DD`` date is present. The two eras are distinct
+    data-generating processes; a verdict must never silently pool them (the harness reports
+    them separately, pooling only as an explicitly-labeled sensitivity view)."""
+    if not (isinstance(exit_date, str) and len(exit_date) >= 10 and exit_date[4] == "-"):
+        return "UNKNOWN_ERA"
+    return "PRE_OVERLAY" if exit_date[:10] < EXIT_OVERLAY_BOUNDARY else "POST_OVERLAY"
+
+
+def _admitted_exit_date(t: "AdmittedTrade") -> Optional[str]:
+    for src in (t.provenance.get("exit_time_utc"), t.provenance.get("entry_time_utc")):
+        if isinstance(src, str) and len(src) >= 10 and src[4] == "-" and src[7] == "-":
+            return src[:10]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +284,40 @@ def _row_date(payload: Mapping[str, Any], record: Mapping[str, Any]) -> Optional
     return None
 
 
+def _parse_ts(value: Any) -> Optional[datetime.datetime]:
+    """Parse a UTC timestamp tolerating BOTH ``…Z`` and ``…+00:00`` offset forms (real ledger
+    rows mix them). Returns ``None`` when unparseable (never raises). A naive value is treated
+    as UTC so the walk-forward time axis (cli.py, W3A-4) has a single tz."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _hold_hours(payload: Mapping[str, Any]) -> tuple[Optional[float], bool]:
+    """``(hold_hours, inverted)`` from the entry/exit timestamps.
+
+    ``inverted`` is ``True`` when ``exit_time_utc`` precedes ``entry_time_utc`` — a
+    netting/clock artifact seen on genuine laps (e.g. a real 07-20 gamma close). Such a row is
+    KEPT (excluding a real lap over a sub-minute clock skew loses honest data), but the
+    inverted magnitude is reported and NOT trusted as a negative hold; ``hold_hours`` is the
+    absolute span and the walk-forward axis orders on the later of the two legs."""
+    e = _parse_ts(payload.get("entry_time_utc"))
+    x = _parse_ts(payload.get("exit_time_utc"))
+    if e is None or x is None:
+        return (None, False)
+    delta_h = (x - e).total_seconds() / 3600.0
+    return (abs(delta_h), delta_h < 0.0)
+
+
 # --------------------------------------------------------------------------- #
 # Instrument classification + placeholder fingerprint.
 # --------------------------------------------------------------------------- #
@@ -229,8 +326,18 @@ def classify_instrument(payload: Mapping[str, Any], extra: Mapping[str, Any]) ->
 
     Precedence: an explicit ``asset_class`` wins; else a ``kraken*`` broker ⇒ CRYPTO; else a
     known futures root ⇒ FUT; else a ``*-USD`` / ``*USD`` crypto pair ⇒ CRYPTO; else STK.
+
+    Real ``closed_trade.v1`` rows carry no top-level ``asset_class``; the reliable equity
+    signal is ``meta.raw_asset_class`` (e.g. ``"equity"``), so it is added to the explicit
+    precedence (W3A-1) — otherwise an equity with a futures-looking symbol could be misclassed.
     """
-    ac = str(payload.get("asset_class") or extra.get("asset_class") or "").strip().lower()
+    meta = _meta(payload)
+    ac = str(
+        payload.get("asset_class")
+        or extra.get("asset_class")
+        or meta.get("raw_asset_class")
+        or ""
+    ).strip().lower()
     if ac in {"crypto", "cryptocurrency", "coin"}:
         return InstrumentClass.CRYPTO
     if ac in {"future", "futures", "fut"}:
@@ -332,6 +439,13 @@ def trust_exclusion(record: Mapping[str, Any]) -> Optional[str]:
         or _truthy(meta.get("scoring_excluded"))
     ):
         return "scoring_excluded"
+
+    # 7. W3A-2 (D2): SCR-predicate parity — operator hand-trades and synthetic warmup rows are
+    # not strategy edge; SCR excludes them from its effective set, so the adapter does too.
+    if "manual" in tags or str(payload.get("strategy") or "").strip().lower() == "manual":
+        return "manual"
+    if "warmup_sim" in tags:
+        return "warmup_sim"
 
     return None
 
@@ -440,7 +554,19 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
 
     qty = _finite_number(payload.get("quantity") if payload.get("quantity") is not None else payload.get("size"))
     price = _finite_number(payload.get("fill_price"))
-    pnl = _finite_number(payload.get("pnl"))
+    # D3 (W3A-1): feed GROSS pnl to the harness cost model so the harness haircut is the SINGLE
+    # cost authority. Real fills today carry gross==net (commission/slippage=0), but PA-EP1
+    # fee-modeling is forward-only — once modeled costs land in the ledger, net_pnl != gross_pnl
+    # and feeding a net figure on top of the harness haircut would DOUBLE-CHARGE post-EP1 rows.
+    # Prefer gross_pnl; fall back to pnl (pre-EP1 rows, where they are equal). The field used is
+    # recorded in provenance + tallied in the manifest so the choice is auditable per row.
+    gross_raw = payload.get("gross_pnl")
+    if _finite_number(gross_raw) is not None:
+        pnl = _finite_number(gross_raw)
+        pnl_field = "gross_pnl"
+    else:
+        pnl = _finite_number(payload.get("pnl"))
+        pnl_field = "pnl"
     notional = _finite_number(payload.get("notional"))
     if notional is None and qty is not None and price is not None:
         notional = abs(qty * price)
@@ -454,12 +580,19 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
     if pnl is None:
         raise _MalformedRow("missing/non-finite pnl")
 
-    mult = _finite_number(extra.get("multiplier") if extra.get("multiplier") is not None
-                          else payload.get("multiplier"))
+    # multiplier: extra.multiplier → payload.multiplier → payload.contract_multiplier (the key
+    # real closed_trade.v1 rows actually carry, W3A-1) → default 1.0.
+    mult_raw = extra.get("multiplier")
+    if mult_raw is None:
+        mult_raw = payload.get("multiplier")
+    if mult_raw is None:
+        mult_raw = payload.get("contract_multiplier")
+    mult = _finite_number(mult_raw)
     if mult is None or mult <= 0.0:
         mult = 1.0
     inst = classify_instrument(payload, extra)
     strategy = str(payload.get("strategy") or "unattributed").strip() or "unattributed"
+    hold_h, inverted = _hold_hours(payload)
 
     provenance = {
         "symbol": payload.get("symbol"),
@@ -479,6 +612,10 @@ def _to_admitted(record: Mapping[str, Any], source_file: str) -> AdmittedTrade:
         "sequence_id": record.get("sequence_id"),
         "record_hash": record.get("record_hash"),
         "source_file": source_file,
+        # W3A-1: schema-mapping provenance.
+        "pnl_field": pnl_field,
+        "hold_hours": hold_h,
+        "inverted_duration": inverted,
     }
     return AdmittedTrade(
         instrument_class=inst.value,
@@ -521,6 +658,19 @@ class AdapterManifest:
     # and by instrument_class. Defaults keep any other construction site valid.
     admitted_by_provenance: dict[str, int] = field(default_factory=dict)
     admitted_by_instrument_class: dict[str, int] = field(default_factory=dict)
+    # W3A-1 schema-mapping honesty: which pnl field each admitted row was costed from
+    # (gross_pnl vs pnl fallback, D3), and how many admitted rows carry an inverted
+    # exit<entry timestamp (kept but flagged; the walk-forward axis orders robustly).
+    admitted_pnl_field_counts: dict[str, int] = field(default_factory=dict)
+    inverted_duration_admitted: int = 0
+    # W3A-3 (D2): read-only reconciliation vs SCR's effective set (runtime/scr_state.json).
+    # None when the cross-check was not run; a dict surfacing the admitted-vs-effective delta
+    # so a divergence between the two scorekeepers is loud, never silent.
+    scr_reconciliation: Optional[dict[str, Any]] = None
+    # W3A-5 (D4): sample-regime partition at the frozen exit-overlay boundary. pre/post are
+    # DIFFERENT populations; stamped on every manifest so a report can never present a pooled
+    # cross-era count as if it were one population.
+    era_partition: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -541,6 +691,10 @@ class AdapterManifest:
             "notes": list(self.notes),
             "admitted_by_provenance": dict(self.admitted_by_provenance),
             "admitted_by_instrument_class": dict(self.admitted_by_instrument_class),
+            "admitted_pnl_field_counts": dict(self.admitted_pnl_field_counts),
+            "inverted_duration_admitted": self.inverted_duration_admitted,
+            "scr_reconciliation": self.scr_reconciliation,
+            "era_partition": dict(self.era_partition),
         }
 
 
@@ -578,6 +732,7 @@ def adapt_records(
     until: Optional[str] = None,
     quarantined_hashes: "Optional[frozenset[str]]" = None,
     quarantined_fill_ids: "Optional[frozenset[str]]" = None,
+    include_futures: bool = False,
 ) -> tuple[list[AdmittedTrade], dict[str, int]]:
     """Filter + map an iterable of ``(record_or_None, source_file)`` into admitted trades.
 
@@ -616,6 +771,7 @@ def adapt_records(
         "malformed": 0,
         "duplicate": 0,
         "admitted": 0,
+        "inverted_duration": 0,
     }
     for reason in EXCLUSION_REASONS:
         counters[f"excluded:{reason}"] = 0
@@ -627,6 +783,18 @@ def adapt_records(
             continue
 
         payload = _payload(record)
+        # D6 (W3A-2, corrected W3A-7): exclude rows carrying an EXPLICIT non-lap schema
+        # (a raw-fill / bars / state schema pointed at by mistake). A row with NO schema_version
+        # is NOT excluded here — legitimate crypto laps written by
+        # chad/analytics/trade_result_logger.py carry no schema_version yet ARE real closed laps
+        # (verified: the Kraken TrustedFillEngine's realized rows). Those fall through to the
+        # trust + malformed gates, which are what actually distinguish a lap from a non-lap on
+        # the real ledger (the 2148 no-schema Kraken validate_only rows are caught there, not
+        # here). So this gate only fires on a PRESENT, non-closed-lap schema_version.
+        sv = str(payload.get("schema_version") or "")
+        if sv and not _is_closed_lap_schema(sv):
+            counters["excluded:non_closed_trade"] += 1
+            continue
         row_date = _row_date(payload, record)
         if (since is not None and (row_date is None or row_date < since)) or (
             until is not None and (row_date is None or row_date > until)
@@ -654,12 +822,21 @@ def adapt_records(
             counters["malformed"] += 1
             continue
 
+        # D2 (W3A-2): futures rows are Bug-B-contaminated (untrusted PnL) — excluded from
+        # scoring by default, mirroring SCR's is_futures_row exclusion. Re-enable only once the
+        # Bug-B book disposition lands (include_futures=True).
+        if not include_futures and trade.instrument_class == InstrumentClass.FUT.value:
+            counters["excluded:futures_bug_b"] += 1
+            continue
+
         rh = record.get("record_hash")
         if isinstance(rh, str) and rh:
             if rh in seen_hashes:
                 counters["duplicate"] += 1
                 continue
             seen_hashes.add(rh)
+        if trade.provenance.get("inverted_duration"):
+            counters["inverted_duration"] += 1
         admitted_pairs.append((trade, record))
 
     admitted_pairs.sort(key=lambda pair: _sort_key(pair[0]))
@@ -753,6 +930,69 @@ def load_quarantine_pins(
     return frozenset(hashes), frozenset(fill_ids), consulted
 
 
+class ScrCrosscheckError(RuntimeError):
+    """The SCR reconciliation cross-check was requested but ``runtime/scr_state.json`` is
+    absent / unreadable / malformed. The operator granted this read explicitly as READ-only,
+    **fail-loud on absence, never written** (D2) — so a missing SCR truth is an error, not a
+    silent skip."""
+
+
+def load_scr_effective(scr_state_path: Optional[Path]) -> tuple[Optional[int], Optional[str]]:
+    """Read ``runtime/scr_state.json`` as TEXT (read-only) → ``(effective_trades, ts_utc)``.
+
+    ``scr_state_path is None`` disables the cross-check → ``(None, None)`` (no read). When a
+    path IS given it is READ (never written) and a missing / unreadable / malformed file
+    raises :class:`ScrCrosscheckError` — fail-loud on absence (D2). This is the same one-way
+    text-read shape as :func:`load_quarantine_pins`; no ``chad`` runtime module is imported, so
+    the harness import-closure isolation (tests/validation/test_isolation.py) is preserved.
+    """
+    if scr_state_path is None:
+        return (None, None)
+    p = Path(scr_state_path)
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ScrCrosscheckError(f"scr_state.json unreadable at {p}: {exc}") from exc
+    if not isinstance(doc, Mapping):
+        raise ScrCrosscheckError(f"scr_state.json malformed at {p} (not a JSON object)")
+    stats = doc.get("stats")
+    eff = stats.get("effective_trades") if isinstance(stats, Mapping) else None
+    if not isinstance(eff, int) or isinstance(eff, bool):
+        raise ScrCrosscheckError(
+            f"scr_state.json at {p} has no integer stats.effective_trades"
+        )
+    ts = doc.get("ts_utc")
+    return (int(eff), str(ts) if ts is not None else None)
+
+
+def _scr_reconciliation(
+    admitted: Sequence[AdmittedTrade],
+    excluded_by_reason: Mapping[str, int],
+    scr_effective: int,
+    scr_ts: Optional[str],
+) -> dict[str, Any]:
+    """Build the read-only reconciliation block: adapter admissions vs SCR effective set (D2)."""
+    pnl_zero = sum(1 for t in admitted if t.gross_pnl == 0.0)
+    return {
+        "scr_effective_trades": scr_effective,
+        "scr_state_ts": scr_ts,
+        "adapter_admitted": len(admitted),
+        "delta_admitted_minus_scr": len(admitted) - scr_effective,
+        # SCR drops pnl==0 laps; the adapter keeps them as legitimate 0-return samples — a
+        # KNOWN, reported component of the delta (never silent).
+        "adapter_admitted_pnl_zero": pnl_zero,
+        "adapter_excluded_by_reason": dict(excluded_by_reason),
+        "note": (
+            "Two INDEPENDENT scorekeepers. The adapter re-derives admissions from "
+            "trade_history over [since, until] with its own fail-closed gate; SCR aggregates "
+            "its effective set its own way over its own window. A nonzero delta is EXPECTED "
+            "(differing windows; the adapter admits pnl==0 laps SCR drops and excludes "
+            "futures/manual SCR also excludes). A LARGE unexplained delta warrants "
+            "investigation — surfaced here so the two can never silently diverge."
+        ),
+    }
+
+
 def load_ndjson(path: Path) -> Iterable[tuple[Optional[Mapping[str, Any]], str]]:
     """Yield ``(parsed_record_or_None, path_name)`` for every non-blank line in ``path``.
 
@@ -773,6 +1013,77 @@ def load_ndjson(path: Path) -> Iterable[tuple[Optional[Mapping[str, Any]], str]]
             yield (obj if isinstance(obj, dict) else None), name
 
 
+class LedgerChainError(RuntimeError):
+    """A ledger file's hash chain is broken (linkage / sequence / recomputed record_hash) —
+    tamper or corruption. Raised fail-loud by :func:`run_adapter` when ``verify_chain=True``."""
+
+
+def verify_ledger_chain(path: Path) -> list[str]:
+    """Verify one daily ledger's per-file hash chain (D6). Returns a list of issue strings
+    (empty ⇒ intact). Read-only; never raises on I/O.
+
+    Each ``trade_history_YYYYMMDD.ndjson`` is its OWN chain starting at ``prev_hash="GENESIS"``
+    (chad/execution/trade_closer.py:1011). For every row in file order this checks:
+      * **linkage** — ``prev_hash`` equals the previous row's ``record_hash`` (first ==
+        ``"GENESIS"``); a break means an inserted / reordered / deleted row;
+      * **sequence** — ``sequence_id`` increments by exactly 1;
+      * **recomputed record_hash** — for ``closed_trade.v1`` rows only, ``sha256(json.dumps(
+        {payload, prev_hash, sequence_id, timestamp_utc}, sort_keys=True, default=str))`` must
+        equal the stored ``record_hash`` (verified byte-exact on the real ledgers, 2026-07-22).
+        Legacy/foreign-writer rows keep linkage but are NOT hash-recomputed (a different writer
+        core), so they never false-positive — matching the ``schema_version`` admit gate.
+    """
+    issues: list[str] = []
+    try:
+        raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:  # pragma: no cover - unreadable file
+        return [f"{path.name}: unreadable ({exc})"]
+    prev = "GENESIS"
+    prev_seq: Optional[int] = None
+    idx = 0
+    for line in raw_lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+        except ValueError:
+            issues.append(f"{path.name}[{idx}]: unparseable line")
+            idx += 1
+            continue
+        if not isinstance(rec, dict):
+            issues.append(f"{path.name}[{idx}]: not a JSON object")
+            idx += 1
+            continue
+        if rec.get("prev_hash") != prev:
+            issues.append(
+                f"{path.name}[{idx}]: prev_hash {rec.get('prev_hash')!r} != expected {prev!r} "
+                "(broken chain — inserted/reordered/deleted row)"
+            )
+        seq = rec.get("sequence_id")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            if prev_seq is not None and seq != prev_seq + 1:
+                issues.append(f"{path.name}[{idx}]: sequence_id {seq} != {prev_seq} + 1")
+            prev_seq = seq
+        payload = rec.get("payload")
+        rh = rec.get("record_hash")
+        if isinstance(payload, Mapping) and payload.get("schema_version") == _CLOSED_TRADE_SCHEMA:
+            core = {
+                "payload": payload,
+                "prev_hash": rec.get("prev_hash"),
+                "sequence_id": rec.get("sequence_id"),
+                "timestamp_utc": rec.get("timestamp_utc"),
+            }
+            recomputed = hashlib.sha256(
+                json.dumps(core, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            if recomputed != rh:
+                issues.append(f"{path.name}[{idx}]: record_hash mismatch (tampered payload)")
+        prev = rh if isinstance(rh, str) and rh else prev
+        idx += 1
+    return issues
+
+
 def _date_range(admitted: Sequence[AdmittedTrade]) -> Optional[str]:
     dates = sorted(
         d for d in (str(t.provenance.get("entry_time_utc") or "")[:10] for t in admitted) if d
@@ -790,6 +1101,9 @@ def run_adapter(
     out_dir: Optional[Path] = None,
     generated_at: Optional[str] = None,
     runtime_dir: Optional[Path] = None,
+    include_futures: bool = False,
+    verify_chain: bool = False,
+    scr_state_path: Optional[Path] = None,
 ) -> AdapterResult:
     """Read the on-box ledgers, apply the trust gate, and (optionally) write the artifacts.
 
@@ -806,6 +1120,20 @@ def run_adapter(
     """
     q_hashes, q_fill_ids, consulted_manifests = load_quarantine_pins(runtime_dir)
     files = iter_ledger_files(trades_dir)
+
+    # D6 (W3A-2): fail-loud on a broken hash chain before admitting anything from a
+    # tampered/corrupt ledger. Off by default (unit tests use synthetic hashes); the CLIs
+    # turn it on for real on-box ledgers.
+    if verify_chain:
+        chain_issues: list[str] = []
+        for fp in files:
+            chain_issues.extend(verify_ledger_chain(fp))
+        if chain_issues:
+            raise LedgerChainError(
+                "ledger hash-chain verification FAILED (D6) — refusing to admit from a "
+                "tampered/corrupt ledger:\n  " + "\n  ".join(chain_issues[:20])
+            )
+
     input_files: list[dict[str, Any]] = []
     per_file_rows: dict[str, int] = {}
 
@@ -823,6 +1151,7 @@ def run_adapter(
         until=until,
         quarantined_hashes=q_hashes,
         quarantined_fill_ids=q_fill_ids,
+        include_futures=include_futures,
     )
 
     for fp in files:
@@ -835,14 +1164,43 @@ def run_adapter(
     excluded_by_reason = {
         reason: counters[f"excluded:{reason}"] for reason in EXCLUSION_REASONS
     }
+    # W3A-3 (D2): read-only reconciliation vs SCR's effective set (fail-loud on absence when a
+    # path is supplied). None when the cross-check is disabled (scr_state_path is None).
+    scr_reconciliation: Optional[dict[str, Any]] = None
+    if scr_state_path is not None:
+        scr_eff, scr_ts = load_scr_effective(scr_state_path)
+        if scr_eff is not None:
+            scr_reconciliation = _scr_reconciliation(
+                admitted, excluded_by_reason, scr_eff, scr_ts
+            )
     strategies: dict[str, int] = {}
     by_provenance: dict[str, int] = {}
     by_instrument: dict[str, int] = {}
+    by_pnl_field: dict[str, int] = {}
+    by_era: dict[str, int] = {}
+    by_strategy_era: dict[str, int] = {}
     for t in admitted:
         strategies[t.strategy] = strategies.get(t.strategy, 0) + 1
         prov = str(t.provenance.get("provenance") or "unspecified")
         by_provenance[prov] = by_provenance.get(prov, 0) + 1
         by_instrument[t.instrument_class] = by_instrument.get(t.instrument_class, 0) + 1
+        pfld = str(t.provenance.get("pnl_field") or "pnl")
+        by_pnl_field[pfld] = by_pnl_field.get(pfld, 0) + 1
+        era = era_of(_admitted_exit_date(t))
+        by_era[era] = by_era.get(era, 0) + 1
+        by_strategy_era[f"{t.strategy}|{era}"] = by_strategy_era.get(f"{t.strategy}|{era}", 0) + 1
+    era_partition = {
+        "boundary": EXIT_OVERLAY_BOUNDARY,
+        "counts_by_era": dict(sorted(by_era.items())),
+        "counts_by_strategy_era": dict(sorted(by_strategy_era.items())),
+        "pooled": False,
+        "note": (
+            "D4: pre/post exit-overlay eras are DIFFERENT data-generating processes "
+            "(pre = reconciliation/adopt closes; post = engine-driven overlay closes). They "
+            "are reported SEPARATELY and never pooled into one headline verdict; pooling is "
+            "only ever an explicitly-labeled sensitivity view."
+        ),
+    }
 
     if generated_at is None:
         generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -887,6 +1245,10 @@ def run_adapter(
         notes=notes,
         admitted_by_provenance=dict(sorted(by_provenance.items())),
         admitted_by_instrument_class=dict(sorted(by_instrument.items())),
+        admitted_pnl_field_counts=dict(sorted(by_pnl_field.items())),
+        inverted_duration_admitted=counters.get("inverted_duration", 0),
+        scr_reconciliation=scr_reconciliation,
+        era_partition=era_partition,
     )
     result = AdapterResult(admitted=admitted, manifest=manifest)
 
@@ -963,6 +1325,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="runtime dir holding quarantine_manifest_*.json (default: <repo>/runtime)")
     parser.add_argument("--no-quarantine", action="store_true",
                         help="ignore operator quarantine manifests (admit pinned rows; default honours them)")
+    parser.add_argument("--include-futures", action="store_true",
+                        help="admit futures rows (default excludes them as Bug-B-contaminated, D2)")
+    parser.add_argument("--no-verify-chain", action="store_true",
+                        help="skip ledger hash-chain verification (default verifies + fails loud, D6)")
+    parser.add_argument("--scr-crosscheck", action="store_true",
+                        help="reconcile admitted count vs runtime/scr_state.json effective_trades "
+                             "(read-only; fails loud if absent, D2)")
+    parser.add_argument("--scr-state", default=None,
+                        help="scr_state.json path for --scr-crosscheck (default: <repo>/runtime/scr_state.json)")
     args = parser.parse_args(argv)
 
     for name in ("since", "until"):
@@ -984,14 +1355,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         runtime_dir = repo_root / "runtime"
 
-    result = run_adapter(
-        trades_dir=trades_dir,
-        since=args.since,
-        until=args.until,
-        out_dir=out_dir,
-        generated_at=args.now,
-        runtime_dir=runtime_dir,
-    )
+    if args.scr_crosscheck:
+        scr_state_path: Optional[Path] = (
+            Path(args.scr_state).resolve() if args.scr_state else repo_root / "runtime" / "scr_state.json"
+        )
+    else:
+        scr_state_path = None
+
+    try:
+        result = run_adapter(
+            trades_dir=trades_dir,
+            since=args.since,
+            until=args.until,
+            out_dir=out_dir,
+            generated_at=args.now,
+            runtime_dir=runtime_dir,
+            include_futures=args.include_futures,
+            verify_chain=not args.no_verify_chain,
+            scr_state_path=scr_state_path,
+        )
+    except LedgerChainError as exc:
+        # D6 fail-loud: refuse to emit an artifact from a tampered/corrupt ledger.
+        print(f"LEDGER CHAIN VERIFICATION FAILED (D6): {exc}")
+        return 2
+    except ScrCrosscheckError as exc:
+        # D2 fail-loud: the SCR cross-check was requested but SCR truth is absent/unreadable.
+        print(f"SCR CROSS-CHECK FAILED (D2): {exc}")
+        return 2
     _print_manifest(result.manifest)
     print(f"artifacts written under: {out_dir}")
     return 0

@@ -220,6 +220,13 @@ def render_markdown(signed: Mapping[str, Any]) -> str:
 
     ap(f"# CHAD Edge-Validation Report ({signed.get('schema_version', '?')})")
     ap("")
+    # D7 (W3A-6): every Stage-2 output LEADS with the evidence banner so a verdict can never be
+    # mistaken for a GO. The harness reports evidence; the operator alone decides.
+    if str(signed.get("stage") or "") == "stage2_trade_log":
+        ap("> **EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE.** This report is evidence for a "
+           "human decision only; the harness never flips `ready_for_live`. A pass is only ever "
+           "`PASS (candidate)` (SSOT Part 0 / §4.1).")
+        ap("")
     ap(f"- **generated_at:** {_fmt(signed.get('generated_at'))}")
     ap(f"- **stage:** {_fmt(signed.get('stage'))}")
     final_run = bool(signed.get("final_run"))
