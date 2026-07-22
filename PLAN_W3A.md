@@ -418,7 +418,74 @@ real ledger** (the house rule). W3A **extends**, never rebuilds these.
 
 ---
 
-## STATUS: Phase 1 (plan) complete — awaiting decisions D1–D8 before any build.
+## STATUS: Phase 1 (plan) complete — decisions D1–D8 answered GO (all as recommended).
 
-No adapter/CLI/test code has been written. The only change on this branch is this document
-(and, when supplied, the operator checklist). The live tree is untouched.
+---
+
+# PHASE-2 — CLOSURE RECORD (built 2026-07-22)
+
+Operator GO on all eight decisions (with the confirmations recorded below). Built W3A-1..7,
+set-diff green vs the 371-test validation baseline at each step; stopped at the push decision.
+
+### Decisions → confirmations → landing commits
+
+| # | Decision (as confirmed) | Landing commit(s) |
+|---|---|---|
+| **D1** | harden-and-extend ("unstaple the adapter"); checklist bends to reality | plan header (`565b478`) + all |
+| **D2** | re-derive + read-only scr cross-check (fail-loud on absence); exclude `manual`; quarantine futures (Bug-B); admit `pnl==0` (reported); align `warmup_sim` | `c61bb2a` (manual/warmup/futures), `84d9da2` (scr cross-check), `eec24c5` (schema fix) |
+| **D3** | feed `gross_pnl` (harness = single cost authority) | `7decbd0` |
+| **D4** | freeze boundary `2026-07-20` (first ACTIVE close 13:50:55Z); pre/post NEVER pooled — pooling only a labeled sensitivity view | `4c3eaa9` |
+| **D5** | static `label_horizon` map CITED from real holds (gamma 70.0h≈3d), derived later | `d298fd1` |
+| **D6** | schema gate + hash-chain verify, fail-loud | `c61bb2a` + `eec24c5` (correction) |
+| **D7** | binding banner "EVIDENCE — NOT AN AUTHORIZATION"; no bare `PASS` incl. JSON keys (→ `pass_candidate`) | `7eacec3` |
+| **D8** | `cli.py` Stage-2 handler is offline harness, in scope | `d298fd1` / `4c3eaa9` / `7eacec3` |
+
+### Commits (branch `goal/wave3-harness-adapter`, NOT pushed)
+`565b478` plan · `7decbd0` W3A-1 · `c61bb2a` W3A-2 · `84d9da2` W3A-3 · `d298fd1` W3A-4 ·
+`4c3eaa9` W3A-5 · `7eacec3` W3A-6 · `eec24c5` W3A-2 fix · `<this>` W3A-7 closure.
+(W3A-0 skipped per instruction — the v4 checklist lands separately.)
+
+### Gate result (definitive)
+- **Validation suite `tests/validation/` = 400 passed** (371 baseline + 29 new W3A tests), zero
+  regressions at every step.
+- **chad/tests adapter-consuming subset = 94 passed** (the only cross-suite coupling: 6 files
+  import `chad.validation.trade_log_adapter`). No `chad/tests` file imports the other modules
+  changed (`cli`/`verdict`/`report_writer`), so the blast radius is bounded to those 6 + the
+  isolation test (still green). The full `chad/tests/` suite was NOT run in the worktree because
+  `data/trades` + `runtime/` are gitignored (absent in the worktree), which would produce
+  environmental — not regression — noise; the coupling above is the complete real surface.
+
+### Load-bearing findings recorded during the build
+1. **The reframe held:** the adapter existed; W3A wired the inert seam. The single structural
+   blocker was `cli.py` hard-coding `n_walk_forward_windows = 0` (every Stage-2 head
+   INSUFFICIENT_DATA by construction) — fixed by the day-bucketed walk-forward (W3A-4).
+2. **The D6 schema gate was initially TOO STRICT (real bug, caught in cross-suite verify).**
+   Legitimate Kraken laps (`chad/analytics/trade_result_logger`) carry NO `schema_version`;
+   requiring `closed_trade.v1` wrongly rejected them. Corrected to exclude only an EXPLICIT
+   non-lap schema. Verified: of 2149 no-schema real rows, 2148 are `validate_only` + 1
+   `pnl_untrusted` — all already caught by the trust gate, so the schema requirement was never
+   load-bearing, only harmful (`eec24c5`).
+3. **The SCR reconciliation validated the whole design on real data:** wiring the operator
+   quarantine (a pre-existing Stage-2 gap) dropped admitted 73→67 and collapsed the
+   reconciliation delta to **0 (67==67)** — the two independent scorekeepers now agree exactly
+   because both honour the same manifest. Strong end-to-end correctness signal.
+4. **The real corpus is honestly INSUFFICIENT_DATA:** 67 admitted laps, all `PRE_OVERLAY`,
+   exiting on only 2 distinct days → 0 walk-forward windows, 2 regimes. The machine is now
+   *capable* of a stricter verdict; it manufactures none.
+
+### Phase-3 go/no-go (what the harness needs before a live conversation is even possible)
+`ready_for_live` stays **false**. The harness can now render a real-trade verdict, but a
+`PASS (candidate)` — the only thing that could justify a live conversation — requires, per the
+frozen minimums and D4:
+- **POST_OVERLAY** laps (the genuine engine-driven era) accumulating across **≥ ~14 separable
+  trading days** (to clear `W_min = 6` day-bucketed windows) — today there are **0** admitted
+  POST_OVERLAY laps (the 07-20 ones are operator-quarantined);
+- **≥ 30 laps per head** (`N_min`) and **≥ 3 distinct OOS regimes** (`R_min`);
+- the **documented future refinement** — genuine per-window cross-consistency re-scoring (the
+  current window count is the temporal-separability gate, necessary-but-not-sufficient);
+- and a **sealed-OOS discipline for the growing stream** if/when a head clears the minimums.
+
+Until then the honest verdict is `INSUFFICIENT_DATA`, and the operator alone decides — the
+harness reports evidence, never a GO.
+
+### Phase-2 status: COMPLETE. Stopped at the push decision (branch not pushed).
