@@ -170,7 +170,12 @@ def _dedupe_path(dedupe_key: str) -> Path:
     safe = "".join(ch for ch in dedupe_key if ch.isalnum() or ch in ("-", "_", ".")).strip("._-")
     if not safe:
         safe = "dedupe"
-    return RUNTIME_DIR / f"telegram_dedupe_{safe}.json"
+    # W3B-10: per-key state lives under runtime/dedupe/ (was loose in
+    # runtime/ — 65 files sprawled at the top level). Filename derivation is
+    # unchanged; _dedupe_mark creates the directory. Writers still on the old
+    # path (long-running services until their next gated restart) keep their
+    # loose files — the BOX-042 cleanup tool scans both locations.
+    return RUNTIME_DIR / "dedupe" / f"telegram_dedupe_{safe}.json"
 
 
 def _dedupe_allows(cfg: NotifyConfig, dedupe_key: str) -> bool:

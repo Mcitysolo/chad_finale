@@ -327,7 +327,187 @@ def _emit_position_guard_drift() -> int:
         "position_guard_drift emitted schema=v3 drift_count=%d info_count=%d by_kind=%s path=%s",
         drift_count, payload["info_count"], payload["counts_by_kind"], DRIFT_OUT_PATH,
     )
+    # W3B-4: drift-content transition alerting (appeared/resolved). The helper
+    # never raises; this belt-and-braces guard keeps reconciliation unblockable.
+    try:
+        _maybe_alert_drift_transitions(payload)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("drift transition alerting failed (non-blocking): %s", exc)
     return drift_count
+
+
+# ---------------------------------------------------------------------------
+# W3B-4: drift-content transition alerting
+#
+# Before this, a drift-only condition (reconciliation GREEN + drift_count>0)
+# flipped live-readiness RED with zero notification -- the publisher pages on
+# reconciliation_state RED (:478/:542) but nothing anywhere read the drift
+# file's CONTENT. This alerts on TRANSITIONS of the actionable drift set
+# (appeared / resolved), write-site pattern like check_and_send_scr_milestone.
+# ---------------------------------------------------------------------------
+
+DRIFT_ALERT_STATE_NAME = "position_guard_drift_last_alerted.json"
+
+# Actionable kinds only. mixed_ownership_info is EXCLUDED BY DESIGN: A5
+# (b27890a) reclassified operator-owned symbols out of drift_count precisely so
+# they never page; alerting on them here would resurrect that false-positive
+# class. Pinned by test_mixed_ownership_info_can_never_alert.
+_DRIFT_ALERT_KINDS = frozenset(
+    {"phantom_guard_entry", "broker_untracked_position", "qty_mismatch"}
+)
+
+
+def _drift_identity_set(payload: Dict[str, Any]) -> set:
+    """Stable identities for the actionable drift records: ``kind|SYMBOL``.
+
+    CTF-T2 rule: values belong in evidence, never in identity. Quantities,
+    deltas, snapshot_generation and guard_keys all fluctuate cycle-to-cycle;
+    a qty_mismatch whose delta drifts 5 -> 7 is the SAME condition and must
+    not re-alert.
+    """
+    out = set()
+    for d in payload.get("drifts") or []:
+        if not isinstance(d, dict):
+            continue
+        kind = str(d.get("drift_kind") or "").strip()
+        if kind not in _DRIFT_ALERT_KINDS:
+            continue
+        symbol = str(d.get("symbol") or "").strip().upper()
+        out.add(f"{kind}|{symbol}")
+    return out
+
+
+def _drift_set_dedupe_suffix(identities) -> str:
+    """Short stable digest of an identity set for the Telegram dedupe key.
+
+    A changed set mints a new key, so a genuinely new transition is never
+    TTL-suppressed; the transition state file remains the primary gate and
+    the 900s dedupe TTL is belt-and-braces against a crash-loop re-sending.
+    """
+    import hashlib
+
+    joined = "\n".join(sorted(str(i) for i in identities))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+
+
+def _coach_drift_message(kind: str, facts: Dict[str, Any], fallback: str) -> str:
+    """Coach-voiced rendering with plain-text fallback (presentation-only)."""
+    try:
+        from chad.utils.coach_voice import format_alert
+
+        text = format_alert(kind, facts)
+        if isinstance(text, str) and text.strip():
+            return text
+    except Exception as exc:  # noqa: BLE001 — presentation must never block
+        LOG.warning("coach_voice unavailable for %s: %s", kind, exc)
+    return fallback
+
+
+def _maybe_alert_drift_transitions(
+    payload: Dict[str, Any],
+    *,
+    state_path: "Path | None" = None,
+    notify_fn=None,
+) -> Dict[str, Any]:
+    """Alert on appeared/resolved transitions of the actionable drift set.
+
+    Never raises. State-file semantics: the last-alerted set is only advanced
+    when every attempted send was delivered (SENT) or suppressed by the
+    Telegram dedupe (an identical message just went out) -- a transport
+    failure leaves the state untouched so the next 5-min cycle retries.
+    """
+    disposition: Dict[str, Any] = {
+        "appeared": [], "resolved": [], "sent": [], "state_advanced": False,
+    }
+    try:
+        # Test-leak guard (mirrors ExterminatorSentinel's explicit-reports_dir
+        # rule): under pytest both the state path and the notifier must be
+        # injected, so an existing test that calls _emit_position_guard_drift
+        # can never write real runtime state or attempt a real Telegram send.
+        if "pytest" in sys.modules and (state_path is None or notify_fn is None):
+            disposition["skipped"] = "pytest_requires_explicit_injection"
+            return disposition
+        # Resolved at call time from the module attribute so tests that
+        # monkeypatch RUNTIME_DIR redirect this file with everything else.
+        state_path = state_path or (RUNTIME_DIR / DRIFT_ALERT_STATE_NAME)
+        current = _drift_identity_set(payload)
+
+        last: set = set()
+        try:
+            raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
+            last = {str(x) for x in raw.get("identities") or []}
+        except Exception:  # noqa: BLE001 — first run / corrupt state
+            last = set()
+
+        appeared = sorted(current - last)
+        resolved = sorted(last - current)
+        disposition["appeared"] = appeared
+        disposition["resolved"] = resolved
+
+        if notify_fn is None:
+            from chad.utils.telegram_notify import notify_detailed as notify_fn  # noqa: PLW2901
+
+        ok_statuses = {"sent", "suppressed_dedupe"}
+
+        def _delivered(outcome: Any) -> bool:
+            status = getattr(getattr(outcome, "status", None), "value", None)
+            if status is None:
+                status = str(getattr(outcome, "status", outcome))
+            return str(status).strip().lower() in ok_statuses
+
+        all_delivered = True
+        if appeared:
+            facts = {
+                "appeared": appeared,
+                "counts_by_kind": payload.get("counts_by_kind") or {},
+                "drift_count": payload.get("drift_count"),
+            }
+            fallback = (
+                "position drift appeared: " + ", ".join(appeared)
+                + f" (drift_count={payload.get('drift_count')})"
+            )
+            msg = _coach_drift_message("position_drift", facts, fallback)
+            outcome = notify_fn(
+                msg,
+                severity="warning",
+                dedupe_key=f"position_drift_appeared_{_drift_set_dedupe_suffix(appeared)}",
+            )
+            delivered = _delivered(outcome)
+            all_delivered = all_delivered and delivered
+            disposition["sent"].append({"event": "appeared", "delivered": delivered})
+        if resolved:
+            facts = {"resolved": resolved, "still_active": len(current)}
+            fallback = "position drift resolved: " + ", ".join(resolved)
+            msg = _coach_drift_message("position_drift_resolved", facts, fallback)
+            outcome = notify_fn(
+                msg,
+                severity="info",
+                dedupe_key=f"position_drift_resolved_{_drift_set_dedupe_suffix(resolved)}",
+            )
+            delivered = _delivered(outcome)
+            all_delivered = all_delivered and delivered
+            disposition["sent"].append({"event": "resolved", "delivered": delivered})
+
+        if (appeared or resolved) and not all_delivered:
+            # Transport failure: leave the last-alerted state untouched so the
+            # next publisher cycle retries (dedupe marks only on SENT, so the
+            # retry is not self-suppressed).
+            return disposition
+
+        state_payload = {
+            "schema_version": "position_guard_drift_alert_state.v1",
+            "ts_utc": _utc_now_iso(),
+            "identities": sorted(current),
+        }
+        sp = Path(state_path)
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = sp.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state_payload, indent=2), encoding="utf-8")
+        tmp.replace(sp)
+        disposition["state_advanced"] = True
+    except Exception as exc:  # noqa: BLE001 — alerting must never block reconciliation
+        LOG.warning("drift transition alerting failed (non-blocking): %s", exc)
+    return disposition
 
 
 def _flag_on(name: str) -> bool:

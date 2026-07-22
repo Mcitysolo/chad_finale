@@ -2269,8 +2269,24 @@ def run_once(logger: logging.Logger) -> None:
     try:
         from chad.risk.position_exit_overlay import build_default_overlay
 
+        # W3B-7 (CHAD_OVERLAY_PORTFOLIO_MARKS, default OFF): freshest-wins
+        # composition of price_cache with receipt-stamped updatePortfolio
+        # marks from the shared truth `ib` (zero new broker requests;
+        # XOV-2345 fail-closed on a dead connection). None -> byte-identical
+        # default loader. Fail-open: any error keeps the default.
+        _overlay_price_loader = None
+        try:
+            from chad.risk.portfolio_marks import maybe_build_overlay_price_loader
+
+            _overlay_price_loader = maybe_build_overlay_price_loader(
+                Path(__file__).resolve().parents[2], position_sync.ib
+            )
+        except Exception as _pmk_err:  # noqa: BLE001
+            logger.warning("portfolio marks loader unavailable (fail-open): %s", _pmk_err)
+
         _exit_overlay = build_default_overlay(
-            repo_root=Path(__file__).resolve().parents[2]
+            repo_root=Path(__file__).resolve().parents[2],
+            price_loader=_overlay_price_loader,
         )
         if _exit_overlay is not None:
             _exit_overlay.run_cycle(_paper_adapter)

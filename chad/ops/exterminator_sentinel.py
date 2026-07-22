@@ -171,6 +171,71 @@ def default_systemctl_provider(query: Sequence[str]) -> dict[str, Any]:
     return out
 
 
+def default_service_uptime_provider(unit: str) -> dict[str, Any]:
+    """W3B-5 (EXS9): read-only uptime probe for one systemd unit.
+
+    ``systemctl show`` is a pure query (locked by the anti-mutation tests).
+    ``--timestamp=unix`` yields ``ActiveEnterTimestamp=@<epoch>``; the pretty
+    fallback ("Tue 2026-07-22 14:08:03 UTC") is parsed as UTC — this host runs
+    UTC, and the unix form wins on any systemd new enough to support it.
+    """
+    out: dict[str, Any] = {
+        "unit": unit, "active_state": "", "active_enter_unix": None,
+        "main_pid": None, "error": None,
+    }
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", str(unit),
+             "-p", "ActiveState,ActiveEnterTimestamp,MainPID",
+             "--timestamp=unix", "--no-pager"],
+            capture_output=True, text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS, check=False,
+        )
+        props: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+        out["active_state"] = props.get("ActiveState", "")
+        pid_raw = props.get("MainPID", "")
+        out["main_pid"] = int(pid_raw) if pid_raw.isdigit() and pid_raw != "0" else None
+        ts_raw = props.get("ActiveEnterTimestamp", "")
+        if ts_raw.startswith("@"):
+            out["active_enter_unix"] = float(ts_raw[1:])
+        elif ts_raw:
+            parts = ts_raw.split()
+            if len(parts) >= 3:
+                dt = datetime.strptime(" ".join(parts[1:3]), "%Y-%m-%d %H:%M:%S")
+                out["active_enter_unix"] = dt.replace(tzinfo=timezone.utc).timestamp()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as err:
+        out["error"] = repr(err)
+    return out
+
+
+def default_code_timestamp_provider(repo_root: Path, paths: Sequence[str]) -> dict[str, Any]:
+    """W3B-5 (EXS9): newest commit epoch touching ``paths`` (read-only git log).
+
+    Import-graph scoping per BOX-034A §3 — the caller passes the paths a
+    service actually imports, never bare HEAD, so unrelated commits (docs,
+    other services) cannot mark a process stale.
+    """
+    out: dict[str, Any] = {
+        "paths": list(paths), "commit_unix": None, "commit_hash": "", "error": None,
+    }
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "-1", "--format=%ct %H", "--", *[str(p) for p in paths]],
+            capture_output=True, text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS, check=False,
+        )
+        tokens = result.stdout.strip().split()
+        if len(tokens) >= 2:
+            out["commit_unix"] = float(tokens[0])
+            out["commit_hash"] = tokens[1][:12]
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as err:
+        out["error"] = repr(err)
+    return out
+
+
 def default_git_provider(repo_root: Path) -> dict[str, Any]:
     """Return porcelain status + HEAD. Read-only: no add, commit, tag or push."""
     out: dict[str, Any] = {"head": "", "branch": "", "entries": [], "error": None}
@@ -227,6 +292,8 @@ class ExterminatorSentinel:
         systemctl_provider: Callable[[Sequence[str]], dict[str, Any]] | None = None,
         git_provider: Callable[[], dict[str, Any]] | None = None,
         notifier: Callable[[str, str], bool] | None = None,
+        service_uptime_provider: Callable[[str], dict[str, Any]] | None = None,
+        code_timestamp_provider: Callable[[Sequence[str]], dict[str, Any]] | None = None,
     ) -> None:
         self.repo_root = Path(repo_root)
         self.runtime_dir = Path(runtime_dir) if runtime_dir else self.repo_root / "runtime"
@@ -238,6 +305,10 @@ class ExterminatorSentinel:
         self.systemctl_provider = systemctl_provider or default_systemctl_provider
         self.git_provider = git_provider or (lambda: default_git_provider(self.repo_root))
         self.notifier = notifier or default_notifier
+        self.service_uptime_provider = service_uptime_provider or default_service_uptime_provider
+        self.code_timestamp_provider = code_timestamp_provider or (
+            lambda paths: default_code_timestamp_provider(self.repo_root, paths)
+        )
 
         # Test-write leak guard, mirroring build_default_overlay
         # (chad/risk/position_exit_overlay.py:964): under pytest the report
@@ -273,6 +344,14 @@ class ExterminatorSentinel:
 
     @staticmethod
     def _parse_ts(value: Any) -> datetime | None:
+        # W3B-1: numeric epoch support (ibkr_watchdog_last.json stamps ts_unix).
+        # Floor 1e9 (2001-09-09) rejects counters/durations masquerading as
+        # timestamps; ceiling 4e9 (2096) rejects millisecond epochs. bool is
+        # excluded explicitly because bool is an int subclass.
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if 1e9 <= float(value) < 4e9:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            return None
         if not isinstance(value, str) or not value:
             return None
         try:
@@ -1135,6 +1214,7 @@ class ExterminatorSentinel:
         _safe("dirty_git", self.check_dirty_git)
         _safe("schema_breaks", self.check_schema_breaks)
         _safe("ml_anomalies", self.check_ml_anomalies)
+        _safe("stale_processes", self.check_stale_processes)
 
         counts = {STATUS_OK: 0, STATUS_WARN: 0, STATUS_FAIL: 0}
         for check in checks:
@@ -1157,6 +1237,130 @@ class ExterminatorSentinel:
             "services_restarted": False,
             "remedy_type": REMEDY_NOTIFY_ONLY,
         }
+
+    # ---- check 9: stale processes (W3B-5) ------------------------------
+
+    def check_stale_processes(self) -> CheckResult:
+        """EXS9: long-running services whose process predates the newest commit
+        touching their import-graph paths — fresh artifact timestamps hiding
+        stale math. The :9618 lesson: chad-backend served pre-Q2 SCR numbers
+        for a month (2026-06-19 → 07-20) because the stats engine runs
+        in-process, so ``scr_state.json`` looked fresh while its math was
+        frozen at process start. BOX-034A recorded the ~15-day orchestrator
+        variant and left this check as a "candidate ops item"; this is it.
+
+        WARN-CAPPED BY DESIGN (W3B D2): code-newer-than-process is frequently
+        the GOVERNED deploy-pending state (CLAUDE.md #6/#7 forbid restarts
+        without instruction; BOX-059 gate 1 deliberately rewards MainPID
+        stability), so a fail would page on correct operator behaviour — and
+        ``maybe_notify`` pages only on fail, making EXS9 a report-surface
+        fact, never a page. Import-graph scoping per BOX-034A §3: a Python
+        service reloads ONLY its own import graph on restart, so each unit is
+        compared against ITS ``code_paths``, never bare HEAD (which would
+        over-alert on every unrelated commit).
+        """
+        cfg = (self.config.get("stale_processes") or {}) if self.config else {}
+        units = cfg.get("units") or []
+        if not units:
+            return CheckResult(
+                "EXS9", "stale_processes", STATUS_WARN,
+                "Stale-process table unavailable",
+                "config/exterminator.json declares no stale_processes.units; "
+                "process-vs-code lag cannot be judged.",
+                {"config_path": str(self.config_path)},
+            )
+
+        def _iso_from_unix(ts: float) -> str:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        grace = float(cfg.get("grace_seconds") or 0)
+        rows: list[dict[str, Any]] = []
+        statuses: list[str] = []
+        for entry in units:
+            if not isinstance(entry, dict):
+                continue
+            unit = str(entry.get("unit") or "")
+            paths = [str(p) for p in (entry.get("code_paths") or [])]
+            row: dict[str, Any] = {"unit": unit, "code_paths": paths}
+            if not unit or not paths:
+                row.update({"status": STATUS_WARN, "reason": "misconfigured_entry"})
+                rows.append(row)
+                statuses.append(STATUS_WARN)
+                continue
+
+            probe = self.service_uptime_provider(unit)
+            if probe.get("error"):
+                row.update({"status": STATUS_WARN, "reason": "uptime_probe_error",
+                            "error": probe.get("error")})
+                rows.append(row)
+                statuses.append(STATUS_WARN)
+                continue
+            state = str(probe.get("active_state") or "")
+            started = probe.get("active_enter_unix")
+            if state != "active" or not started:
+                # A stopped/failed service is EXS5's jurisdiction — a process
+                # that isn't running cannot be running stale code.
+                row.update({"status": STATUS_OK, "skipped": True,
+                            "reason": f"not_running:{state or 'unknown'}"})
+                rows.append(row)
+                statuses.append(STATUS_OK)
+                continue
+
+            code = self.code_timestamp_provider(paths)
+            commit_unix = code.get("commit_unix")
+            if code.get("error") or not commit_unix:
+                row.update({"status": STATUS_WARN, "reason": "code_timestamp_unavailable",
+                            "error": code.get("error")})
+                rows.append(row)
+                statuses.append(STATUS_WARN)
+                continue
+
+            lag = float(commit_unix) - float(started)
+            row.update({
+                "started_utc": _iso_from_unix(float(started)),
+                "newest_code_commit_utc": _iso_from_unix(float(commit_unix)),
+                "commit_hash": str(code.get("commit_hash") or ""),
+                "code_newer_by_seconds": round(lag, 1),
+                "main_pid": probe.get("main_pid"),
+            })
+            if lag > grace:
+                # NEVER escalate past warn — see docstring (D2).
+                row["status"] = STATUS_WARN
+                row["reason"] = "process_predates_code"
+            else:
+                row["status"] = STATUS_OK
+            rows.append(row)
+            statuses.append(row["status"])
+
+        status = worst_status(statuses)
+        stale = sorted(r["unit"] for r in rows if r.get("reason") == "process_predates_code")
+        degraded = sorted(
+            r["unit"] for r in rows
+            if r.get("status") == STATUS_WARN and r.get("reason") != "process_predates_code"
+        )
+        if status == STATUS_OK:
+            summary = (
+                f"All {len(rows)} tracked services run code at least as new as "
+                "their import-graph paths."
+            )
+            title = "Processes current"
+        elif stale:
+            summary = (
+                "Services running older code than the repo (deploy-pending or "
+                "forgotten): " + ", ".join(stale) + ". Ages in evidence."
+            )
+            title = "Service running older code than the repo"
+        else:
+            summary = "Stale-process probe degraded for: " + ", ".join(degraded) + "."
+            title = "Stale-process probe degraded"
+        return CheckResult(
+            "EXS9", "stale_processes", status, title, summary,
+            {
+                "services": rows,
+                "excluded_units": cfg.get("excluded_units") or [],
+                "grace_seconds": grace,
+            },
+        )
 
     # ---- writers -------------------------------------------------------
 

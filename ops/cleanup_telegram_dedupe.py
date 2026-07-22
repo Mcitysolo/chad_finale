@@ -123,9 +123,17 @@ def _is_dedupe_file(path: Path) -> bool:
 
 
 def _iter_dedupe_files(runtime_dir: Path) -> Iterable[Path]:
+    # W3B-10: telegram_notify writes to runtime/dedupe/ now; loose files in
+    # runtime/ remain valid state for not-yet-restarted writers (split-brain
+    # window, see docs/DEDUPE_CLEANUP_INSTALL.md) — scan BOTH.
+    nested = runtime_dir / "dedupe"
+    if nested.is_dir():
+        for p in sorted(q for q in nested.iterdir() if _is_dedupe_file(q)):
+            yield p
     if not runtime_dir.is_dir():
-        return []
-    return sorted(p for p in runtime_dir.iterdir() if _is_dedupe_file(p))
+        return
+    for p in sorted(q for q in runtime_dir.iterdir() if _is_dedupe_file(q)):
+        yield p
 
 
 def _archive_target(archive_base: Path, src: Path, mtime: float) -> Path:

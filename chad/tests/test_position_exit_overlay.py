@@ -309,7 +309,7 @@ def test_runner_shadow_writes_evidence_and_submits_nothing(tmp_path):
     ev = list((tmp_path / "evi").glob("exit_overlay_*.ndjson"))
     assert ev, "shadow evidence ndjson written"
     row = json.loads(ev[0].read_text().splitlines()[0])
-    assert row["schema_version"] == "exit_overlay.v1" and row["verdict"] == "WOULD_CLOSE"
+    assert row["schema_version"] == "exit_overlay.v2" and row["verdict"] == "WOULD_CLOSE"
     # anchors persisted
     saved = json.loads((tmp_path / "state.json").read_text())
     assert "gamma|BAC" in saved["anchors"]

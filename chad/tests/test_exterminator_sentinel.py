@@ -52,6 +52,18 @@ def quiet_providers():
         "systemctl_provider": lambda query: {"failed_units": [], "error": None, "query": list(query)},
         "git_provider": lambda: {"head": "abc123", "branch": "main", "entries": [], "error": None},
         "notifier": lambda message, dedupe_key: False,
+        # W3B-5 (EXS9): every unit healthy — started 1h ago, newest relevant
+        # commit 2 days ago, so processes are current.
+        "service_uptime_provider": lambda unit: {
+            "unit": unit, "active_state": "active",
+            "active_enter_unix": (NOW - timedelta(hours=1)).timestamp(),
+            "main_pid": 4242, "error": None,
+        },
+        "code_timestamp_provider": lambda paths: {
+            "paths": list(paths),
+            "commit_unix": (NOW - timedelta(days=2)).timestamp(),
+            "commit_hash": "abc123def456", "error": None,
+        },
     }
 
 
@@ -111,6 +123,15 @@ def _fresh_runtime(runtime: Path, *, ts: datetime | None = None) -> None:
     })
     _write_json(runtime / "stop_bus.json", {"schema_version": "stop_bus.v1", "active": False})
     _write_json(runtime / "epoch_state.json", {"schema_version": "epoch_state.v1", "active_epoch": "Epoch_3"})
+    # W3B-1: the two 120s-cadence publisher artifacts gained EXS1 rows.
+    _write_json(runtime / "drawdown_state.json", {
+        "schema_version": "drawdown_state.v1", "ts_utc": _iso(ts), "ttl_seconds": 300,
+        "status": "ok", "drawdown_pct": -0.6, "halt": False, "enforcement_active": False,
+    })
+    _write_json(runtime / "ibkr_watchdog_last.json", {
+        "ts_unix": ts.timestamp(), "ok": True, "ttl_seconds": 120,
+        "consecutive_failures": 0,
+    })
 
 
 def _make(tmp_path: Path, clock, quiet_providers, **overrides):
@@ -227,7 +248,7 @@ def test_failing_check_does_not_trigger_any_repair(tmp_path, clock, quiet_provid
 # ---------------------------------------------------------------------------
 
 
-def test_report_schema_and_eight_checks(tmp_path, clock, quiet_providers):
+def test_report_schema_and_nine_checks(tmp_path, clock, quiet_providers):
     runtime = tmp_path / "runtime"
     _fresh_runtime(runtime)
     report = _make(tmp_path, clock, quiet_providers).run()
@@ -238,8 +259,8 @@ def test_report_schema_and_eight_checks(tmp_path, clock, quiet_providers):
     assert required <= set(report)
     assert report["schema_version"] == "exterminator_sentinel.v1"
     assert report["stage"] == 1
-    assert len(report["checks"]) == 8
-    assert [c["check_id"] for c in report["checks"]] == [f"EXS{i}" for i in range(1, 9)]
+    assert len(report["checks"]) == 9
+    assert [c["check_id"] for c in report["checks"]] == [f"EXS{i}" for i in range(1, 10)]
     for check in report["checks"]:
         assert {"check_id", "name", "status", "title", "summary", "evidence", "remedy_type"} <= set(check)
         assert check["status"] in ("ok", "warn", "fail")
@@ -259,7 +280,7 @@ def test_history_appends_one_line_per_run(tmp_path, clock, quiet_providers):
     assert len(lines) == 2
     row = json.loads(lines[0])
     assert row["schema_version"] == "exterminator_sentinel.v1"
-    assert set(row["checks"]) == {f"EXS{i}" for i in range(1, 9)}
+    assert set(row["checks"]) == {f"EXS{i}" for i in range(1, 10)}
 
 
 def test_latest_is_rewritten_not_appended(tmp_path, clock, quiet_providers):
@@ -278,7 +299,7 @@ def test_check_exception_is_contained(tmp_path, clock, quiet_providers):
     s = _make(tmp_path, clock, quiet_providers)
     s.check_failed_services = lambda: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[method-assign]
     report = s.run()
-    assert len(report["checks"]) == 8
+    assert len(report["checks"]) == 9
     self_checks = [c for c in report["checks"] if c["check_id"] == "EXS999"]
     assert self_checks and self_checks[0]["status"] == "warn"
 
@@ -761,18 +782,33 @@ def test_dirty_production_path_warns(tmp_path, clock, quiet_providers):
     assert result.evidence["dirty_count"] == 2
 
 
-def test_archive_deletions_are_allowlisted(tmp_path, clock, quiet_providers):
-    """The 20 staged _archive deletions are documented, not drift."""
+def test_archive_deletions_production_filtered_not_allowlisted(tmp_path, clock, quiet_providers):
+    """W3B-12 disposition pin: the 20 disk-guard-purged _archive deletions
+    were committed and the allowlist entry removed per its own expiry note.
+    The allowlist is now EMPTY — _archive/ paths fall to the production_paths
+    filter (outside scope, not drift), so a future disk-guard purge of
+    tracked archives is neither dirty nor 'allowlisted noise' in every
+    report. The disposition lifecycle (archive by git-committed move → purge
+    → commit the deletions at the next hygiene pass) is convention, recorded
+    in docs/DYNAMIC_CAPS_DISPOSITION_2026-07-22.md; history keeps the bytes."""
     _fresh_runtime(tmp_path / "runtime")
     providers = {**quiet_providers, "git_provider": lambda: {
         "head": "a", "branch": "main", "error": None,
-        "entries": ["D  _archive/bak_purge_20260506/chad/intel/advisory_engine.py.bak",
+        "entries": ["D  _archive/bak_purge_20260722/chad/risk/dominance_strategy.py",
                     " D _archive/bak_quarantine_20260402/chad/utils/telegram_bot.py.bak"],
     }}
     result = _make(tmp_path, clock, providers).check_dirty_git()
     assert result.status == "ok"
-    assert result.evidence["allowlisted_count"] == 2
-    assert result.evidence["dirty_count"] == 0
+    assert result.evidence["allowlisted_count"] == 0  # the entry is GONE
+    assert result.evidence["dirty_count"] == 0  # production-filtered, not drift
+    # and a production-path deletion still flags exactly as before
+    providers2 = {**quiet_providers, "git_provider": lambda: {
+        "head": "a", "branch": "main", "error": None,
+        "entries": [" D chad/risk/somefile.py"],
+    }}
+    result2 = _make(tmp_path, clock, providers2).check_dirty_git()
+    assert result2.status == "warn"
+    assert result2.evidence["dirty_count"] == 1
 
 
 def test_untracked_files_are_not_dirty(tmp_path, clock, quiet_providers):
@@ -959,9 +995,9 @@ def test_stable_identity_truncates_multi_digit_ids_but_stays_deterministic():
     """
     assert sentinel_mod.stable_identity("R14") == "R1"
     assert sentinel_mod.stable_identity("R14") == sentinel_mod.stable_identity("R14")
-    ids = [sentinel_mod.stable_identity(f"EXS{i}") for i in range(1, 9)]
-    assert ids == [f"EXS{i}" for i in range(1, 9)]
-    assert len(set(ids)) == 8, "check_id identities must never collide"
+    ids = [sentinel_mod.stable_identity(f"EXS{i}") for i in range(1, 10)]
+    assert ids == [f"EXS{i}" for i in range(1, 10)]
+    assert len(set(ids)) == 9, "check_id identities must never collide"
 
 
 def test_notifier_failure_does_not_raise(tmp_path, clock, quiet_providers):

@@ -660,6 +660,63 @@ def _tpl_generic(facts: Dict[str, Any], mode: str) -> _Card:
     )
 
 
+def _drift_kind_phrase(identity: str) -> str:
+    """Human phrase for one 'kind|SYMBOL' drift identity (W3B-4)."""
+    kind, _, symbol = str(identity).partition("|")
+    sym = symbol or "a position"
+    phrases = {
+        "qty_mismatch": f"{sym} (share counts differ)",
+        "broker_untracked_position": f"{sym} (the broker holds it, CHAD isn't tracking it)",
+        "phantom_guard_entry": f"{sym} (CHAD tracks it, the broker shows none)",
+    }
+    return phrases.get(kind, f"{sym} ({kind})")
+
+
+def _tpl_position_drift(facts: Dict[str, Any], mode: str) -> _Card:
+    """W3B-4: new book-vs-broker drift appeared (transition alert)."""
+    appeared = [str(x) for x in (facts.get("appeared") or [])]
+    listed = "; ".join(_drift_kind_phrase(i) for i in appeared[:6]) or "one or more positions"
+    more = f" (+{len(appeared) - 6} more)" if len(appeared) > 6 else ""
+    n = len(appeared) or "some"
+    return _Card(
+        severity="warning",
+        happened=f"CHAD's book and the broker's book disagree on {n} position(s).",
+        why=f"Affected: {listed}{more}. This is a bookkeeping mismatch, not a trade loss.",
+        did=(
+            "CHAD recorded the mismatch in its reconciliation report; going live "
+            "stays blocked while any mismatch stands."
+        ),
+        act=(
+            "If you recently traded these symbols yourself, no action is needed — "
+            "CHAD reconciles them on its own. Otherwise this deserves a look."
+        ),
+        standard_context="CHAD re-checks every few minutes and will confirm when it clears.",
+        pro=f"raw: appeared={appeared} counts_by_kind={facts.get('counts_by_kind', {})} artifact=runtime/position_guard_drift.json",
+    )
+
+
+def _tpl_position_drift_resolved(facts: Dict[str, Any], mode: str) -> _Card:
+    """W3B-4: previously alerted book-vs-broker drift cleared (all-clear)."""
+    resolved = [str(x) for x in (facts.get("resolved") or [])]
+    listed = "; ".join(_drift_kind_phrase(i) for i in resolved[:6]) or "the earlier mismatch"
+    more = f" (+{len(resolved) - 6} more)" if len(resolved) > 6 else ""
+    still = int(facts.get("still_active") or 0)
+    act = (
+        "Nothing to do — this is the all-clear."
+        if still == 0
+        else f"Nothing to do for these; {still} other mismatch(es) still stand."
+    )
+    return _Card(
+        severity="info",
+        happened="Good news — a book-vs-broker mismatch CHAD flagged earlier has cleared.",
+        why=f"Now matching again: {listed}{more}.",
+        did="CHAD confirmed the books agree on these positions again.",
+        act=act,
+        standard_context="No trading was affected by the mismatch itself.",
+        pro=f"raw: resolved={resolved} artifact=runtime/position_guard_drift.json",
+    )
+
+
 _TEMPLATES: Dict[str, Callable[[Dict[str, Any], str], _Card]] = {
     "service_failure": _tpl_service_failure,
     "feed_stale": _tpl_feed_stale,
@@ -670,6 +727,8 @@ _TEMPLATES: Dict[str, Callable[[Dict[str, Any], str], _Card]] = {
     "health_autofix": _tpl_health_autofix,
     "health_analysis": _tpl_health_analysis,
     "market_closed": _tpl_market_closed,
+    "position_drift": _tpl_position_drift,
+    "position_drift_resolved": _tpl_position_drift_resolved,
 }
 
 

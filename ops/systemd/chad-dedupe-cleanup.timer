@@ -1,0 +1,15 @@
+# W3B-10 — weekly cadence. Dedupe-state cardinality is bounded since the
+# CTF-T2 stable-identity fix (~65 files / 2.8 KB steady state); the cleanup
+# only archives files stale past ttl*4, so weekly is generous. Persistent=true
+# catches missed windows after downtime.
+[Unit]
+Description=Weekly CHAD Telegram dedupe-state cleanup
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+Unit=chad-dedupe-cleanup.service
+
+[Install]
+WantedBy=timers.target

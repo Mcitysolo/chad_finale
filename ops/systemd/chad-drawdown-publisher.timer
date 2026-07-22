@@ -1,0 +1,12 @@
+[Unit]
+Description=CHAD Drawdown State Publisher Timer (every 120s; artifact ttl_seconds=300)
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=120
+AccuracySec=5s
+Persistent=true
+Unit=chad-drawdown-publisher.service
+
+[Install]
+WantedBy=timers.target

@@ -169,6 +169,13 @@ STRATEGY_NAMES: Dict[str, str] = {
     "crypto": "Crypto trades (Bitcoin, Ethereum, Solana)",
     "alpha_crypto": "Crypto trades (Bitcoin, Ethereum, Solana)",
     "delta": "Execution helper (makes our trades smarter)",
+    # W3B-9: complete the map — every declared StrategyName renders
+    # (pinned by test_w3b_registry_perimeter).
+    "alpha_intraday": "Quick same-day stock trades",
+    "delta_pairs": "Paired trades (one up, one down)",
+    "omega_momentum_options": "Options plays on strong movers",
+    "alpha_intraday_micro": "Small same-day test trades (not active yet)",
+    "alpha_forex": "Currency trades (not active yet)",
 }
 
 # ---------------------------------------------------------------------------

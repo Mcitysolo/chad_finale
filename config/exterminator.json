@@ -95,6 +95,28 @@
       "warn_after_seconds": 129600,
       "fail_after_seconds": null,
       "_note": "Appended daily by chad/ops/equity_history_publisher.py; no TTL is declared anywhere. 86400 reflects the documented daily cadence and 129600 (36h) allows one missed publish before warning. Capped at warn until ratified."
+    },
+    "drawdown_state": {
+      "path": "runtime/drawdown_state.json",
+      "format": "json",
+      "ts_field": "ts_utc",
+      "ttl_seconds": 300,
+      "ttl_verified": true,
+      "ttl_source": "artifact:ttl_seconds; publisher DEFAULT_TTL_SECONDS=300 at ops/drawdown_publisher.py:41",
+      "warn_after_seconds": 300,
+      "fail_after_seconds": 900,
+      "_note": "W3B-1. Written by chad-drawdown-publisher.timer every 120s (installed unit; repo copies under ops/systemd/). fail_after=3x TTL. The P1-3 'orphaned publisher' era (10-day-stale file, closed 2026-06-17) is exactly the outage this row exists to page on -- until W3B-1 neither freshness net watched this artifact."
+    },
+    "ibkr_watchdog_last": {
+      "path": "runtime/ibkr_watchdog_last.json",
+      "format": "json",
+      "ts_field": "ts_unix",
+      "ttl_seconds": 120,
+      "ttl_verified": true,
+      "ttl_source": "artifact:ttl_seconds (pass-through of runtime/ibkr_status.json ttl, stamped at chad/core/ibkr_watchdog.py:388); output cadence contract = 120s installed chad-ibkr-watchdog.timer",
+      "warn_after_seconds": 360,
+      "fail_after_seconds": 720,
+      "_note": "W3B-1. ts_unix is a NUMERIC epoch -- _parse_ts numeric support added in the same commit. warn_after=3x cadence mirrors the watchdog's own internal 3x-ttl staleness convention (chad/core/ibkr_watchdog.py:243-246); a bare 120s warn would flap against the 120s timer + RandomizedDelaySec=15s on a 5-min sentinel scan. The artifact is a self-heartbeat (zero code readers); its value is proving the IBKR-health alerter itself is alive -- the P1-4 44-day silent death is the target."
     }
   },
   "blind_check": {
@@ -112,14 +134,8 @@
   },
   "git": {
     "production_paths": ["chad/", "ops/", "config/", "scripts/", "shared/"],
-    "allowlist": [
-      {
-        "pattern": "_archive/",
-        "status_codes": ["D "," D","D"],
-        "reason": "Staged deletions of _archive/bak_purge_* and _archive/bak_quarantine_* backups, present in the working tree since before this sentinel existed. Documented allowlist entry pending disposition -- REMOVE this entry once the deletions are committed or reverted.",
-        "expires_action": "ops/pending_actions/EXTERMINATOR_stage1_deploy.md"
-      }
-    ]
+    "allowlist": [],
+    "_note": "W3B-12: the _archive/ deletion allowlist entry was removed per its own expiry note -- the 20 disk-guard-purged files' deletions are now committed (docs/DYNAMIC_CAPS_DISPOSITION_2026-07-22.md). From here on, a disk-guard purge of tracked _archive files surfaces as EXS6 warn until its own disposition commit: that is the correct signal, not noise."
   },
   "schema_contracts": {
     "_doc": [
@@ -221,5 +237,47 @@
     "_doc": "Check 5 reads systemd state with a read-only query only. No start/stop/reset/enable is ever issued -- locked by the anti-auto-healing tests.",
     "unit_prefix": "chad-",
     "query": ["systemctl", "list-units", "--state=failed", "--no-pager", "--no-legend", "--plain"]
+  },
+  "stale_processes": {
+    "_doc": [
+      "Check 9 (EXS9, W3B-5): long-running services whose process started BEFORE",
+      "the newest commit touching their import-graph paths. The :9618 lesson --",
+      "chad-backend served month-old SCR math (2026-06-19 -> 07-20) behind fresh",
+      "scr_state.json timestamps; BOX-034A recorded the ~15-day orchestrator",
+      "variant and named this check as the missing ops item.",
+      "",
+      "WARN-CAPPED (D2): deploy-pending is a GOVERNED operator state (CLAUDE.md",
+      "governance #6/#7; BOX-059 gate 1 rewards MainPID stability). EXS9 reports,",
+      "it never fails a gate and never pages (maybe_notify fires on fail only).",
+      "",
+      "code_paths are per-service import-graph approximations (BOX-034A section 3:",
+      "a Python service reloads ONLY its own import graph). Curated lists (D1);",
+      "false-negatives are acceptable at warn tier -- extend paths as services grow.",
+      "grace_seconds absorbs the window where a merge lands seconds before the",
+      "sentinel scan while an operator restart is already in flight."
+    ],
+    "grace_seconds": 900,
+    "units": [
+      {"unit": "chad-backend.service", "code_paths": ["backend/", "chad/analytics/"],
+       "_note": "The :9618 origin case -- in-process trade_stats_engine SCR math."},
+      {"unit": "chad-live-loop.service",
+       "code_paths": ["chad/core/", "chad/risk/", "chad/execution/", "chad/portfolio/", "chad/market_data/", "chad/utils/"]},
+      {"unit": "chad-orchestrator.service",
+       "code_paths": ["chad/core/", "chad/risk/", "chad/portfolio/", "chad/strategies/", "chad/utils/"],
+       "_note": "BOX-034A: ran ~15 days on pre-fix source (BOOT 6abf16b vs HEAD d80f44b)."},
+      {"unit": "chad-telegram-bot.service", "code_paths": ["chad/utils/", "chad/intel/"]},
+      {"unit": "chad-metrics.service", "code_paths": ["chad/ops/metrics_server.py", "chad/analytics/"]},
+      {"unit": "chad-dashboard.service", "code_paths": ["chad/dashboard/"]},
+      {"unit": "chad-shadow-status.service", "code_paths": ["chad/web/"]},
+      {"unit": "chad-kraken-ws.service", "code_paths": ["chad/market_data/kraken_ws_client.py"]},
+      {"unit": "chad-ibkr-bar-provider.service", "code_paths": ["chad/market_data/"]}
+    ],
+    "excluded_units": [
+      {"unit": "chad-ibgateway.service", "reason": "non-repo code (IBC/Java) + nightly 03:15Z restart timer keeps it current"},
+      {"unit": "chad-xvfb.service", "reason": "X infrastructure, non-repo code"},
+      {"unit": "chad-x11vnc.service", "reason": "X infrastructure, non-repo code"},
+      {"unit": "chad-paper-shadow-runner.service", "reason": "masked (PR-06 Path A); re-arm requires its own PA"},
+      {"unit": "(all Type=oneshot timer services)", "reason": "re-exec'd every fire; code is fresh by construction"}
+    ]
   }
 }

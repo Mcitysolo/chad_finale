@@ -45,6 +45,7 @@ Safety notes:
 
 import json
 import logging
+import logging.handlers
 import os
 import threading
 import time
@@ -163,7 +164,12 @@ def _get_logger() -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "gpt_client.log"
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    # W3B-11: the docstring above always promised "a dedicated rotating
+    # file"; the code shipped a plain FileHandler. Now it rotates for real
+    # (10MB x 5, the telegram_bot precedent).
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=10_000_000, backupCount=5, encoding="utf-8"
+    )
     file_handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
