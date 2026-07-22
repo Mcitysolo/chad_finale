@@ -29,6 +29,7 @@ Expected environment variables (after normalisation):
 
 import json
 import logging
+import logging.handlers
 import os
 import threading
 import time
@@ -192,7 +193,12 @@ def _get_logger() -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "claude_client.log"
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    # W3B-11: plain FileHandler grew unbounded (12.4MB and active at the
+    # 2026-07-22 inventory). Same 10MB x 5 bound as the telegram_bot
+    # precedent (chad/utils/telegram_bot.py).
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=10_000_000, backupCount=5, encoding="utf-8"
+    )
     file_handler.setLevel(logging.INFO)
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
