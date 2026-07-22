@@ -79,9 +79,15 @@ PASS_LABEL: Final[str] = "PASS (candidate)"
 
 
 class Verdict(Enum):
-    """The five verdict types (SSOT §4.1). ``PASS`` is always labeled a *candidate*."""
+    """The five verdict types (SSOT §4.1). ``PASS`` is always labeled a *candidate*.
 
-    PASS = "PASS"
+    D7 (W3A-6): the ``PASS`` member's serialized VALUE is ``"pass_candidate"``, never a bare
+    ``"PASS"`` — so no output surface (including the raw ``verdict`` JSON key) can be misread
+    as a live-trading authorization. The human-facing display label stays ``"PASS (candidate)"``
+    (:data:`PASS_LABEL`). Every code path references the ``Verdict.PASS`` member, not the string.
+    """
+
+    PASS = "pass_candidate"
     FAIL = "FAIL"
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
     NOT_REPLAYABLE = "NOT_REPLAYABLE"

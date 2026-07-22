@@ -1101,6 +1101,9 @@ def run_stage2_trade_log(
             "portfolio_verdict": portfolio_verdict.label,
         },
         extra_notes=[
+            "EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE. This report is evidence for a human "
+            "decision only; the harness never flips ready_for_live and a pass is only ever "
+            "'PASS (candidate)' (D7 / SSOT Part 0).",
             "Stage 2 (real trade-log validation, SSOT §1.3 / Part 6). Real paper fills pass "
             "the fail-closed trust gate, get the IDENTICAL S4 cost haircut, and are scored by "
             "the SAME spine + verdict as Stage 1 — only the input adapter differs.",
@@ -1143,6 +1146,11 @@ def _print_summary(signed: dict[str, Any], json_path: Path) -> None:
     print("=" * 72)
     print("CHAD Edge-Validation Harness — verdict summary (SSOT Part 4)")
     print("=" * 72)
+    # D7 (W3A-6): Stage-2 output LEADS with the evidence banner — never mistakable for a GO.
+    if str(signed.get("stage") or "") == "stage2_trade_log":
+        print("EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE. The harness reports evidence; the")
+        print("operator alone decides. The machine never flips ready_for_live (SSOT Part 0).")
+        print("-" * 72)
     fr = bool(signed.get("final_run"))
     oos = signed.get("oos", {})
     fc = signed.get("config_frozen", {})

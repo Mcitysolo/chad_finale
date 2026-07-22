@@ -317,3 +317,32 @@ def test_stage2_verify_chain_fails_loud_through_run(tmp_path):
             repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
             generated_at="2026-07-22T00:00:00Z", code_commit="x", verify_chain=True,
         )
+
+
+# --------------------------------------------------------------------------- #
+# 7. W3A-6 — output hardening (D7): EVIDENCE banner + no bare PASS anywhere.
+# --------------------------------------------------------------------------- #
+def test_stage2_report_leads_with_evidence_banner(tmp_path):
+    from chad.validation.report_writer import render_markdown
+    src = _write_ledger(tmp_path, [_fill(seq=i, hashv=f"h{i}") for i in range(3)])
+    signed = run_stage2_trade_log(
+        repo_root=tmp_path, out_dir=tmp_path / "out", trades_dir=src,
+        generated_at="2026-07-10T00:00:00Z", code_commit="x",
+    )
+    md = render_markdown(signed)
+    assert "EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE" in md
+    # The banner LEADS (before the verdict summary).
+    assert md.index("EVIDENCE — NOT AN AUTHORIZATION") < md.index("Verdict summary")
+    # And no bare 'PASS' verdict value can appear in the signed JSON (D7).
+    assert '"verdict": "PASS"' not in json.dumps(signed)
+
+
+def test_stage2_cli_stdout_leads_with_banner(tmp_path, capsys):
+    src = _write_ledger(tmp_path, [_fill(seq=i, hashv=f"h{i}") for i in range(3)])
+    rc = main([
+        "--stage", "stage2", "--trades-dir", str(src), "--out-dir", str(tmp_path / "out"),
+        "--repo-root", str(tmp_path), "--now", "2026-07-10T00:00:00Z", "--code-commit", "x",
+        "--no-verify-chain", "--no-scr-crosscheck",
+    ])
+    assert rc == 0
+    assert "EVIDENCE — NOT AN AUTHORIZATION TO TRADE LIVE" in capsys.readouterr().out

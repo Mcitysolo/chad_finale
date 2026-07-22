@@ -62,6 +62,16 @@ def test_pass_is_labeled_candidate() -> None:
     assert all(c.passed for c in res.checks)
 
 
+def test_pass_value_is_pass_candidate_never_bare_pass() -> None:
+    """D7 (W3A-6): the PASS member serializes as 'pass_candidate' — no output surface, incl.
+    the raw ``verdict`` JSON key, is ever a bare 'PASS' that could be misread as a live GO."""
+    assert Verdict.PASS.value == "pass_candidate"
+    d = decide_verdict(_passing_metrics()).to_dict()
+    assert d["verdict"] == "pass_candidate"
+    assert d["label"] == "PASS (candidate)"      # human display label unchanged
+    assert d["verdict"] != "PASS"                # bare PASS is gone from the JSON key
+
+
 # --------------------------------------------------------------------------- #
 # NOT_REPLAYABLE.
 # --------------------------------------------------------------------------- #

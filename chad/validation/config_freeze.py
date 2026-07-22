@@ -256,7 +256,7 @@ class FreezeLedger:
     def record_verdict(self, verdict: str) -> FreezeState:
         """Record the most recent run's verdict (raises if nothing is frozen yet).
 
-        The verdict string (e.g. ``"FAIL"`` / ``"INSUFFICIENT_DATA"`` / ``"PASS"``)
+        The verdict string (e.g. ``"FAIL"`` / ``"INSUFFICIENT_DATA"`` / ``"pass_candidate"``)
         determines whether the NEXT :meth:`amend` is penalised: only a ``"FAIL"`` makes
         a subsequent config change count as a new trial (SSOT §3.2).
         """
