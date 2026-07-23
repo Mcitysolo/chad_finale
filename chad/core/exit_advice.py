@@ -61,6 +61,15 @@ SITE_FULL_CYCLE = "full_cycle"
 # never grow the heartbeat without bound (values live in evidence rows).
 _STATE_KEY_CAP = 50
 
+# W4B-3: advice consumption tunables (config/exit_advice.json — D7: the frozen
+# overlay config is never amended; advice policy lives in its own file).
+CONFIG_SCHEMA_VERSION = "exit_advice_config.v1"
+_CONFIG_PATH_ENV = "CHAD_EXIT_ADVICE_CONFIG_PATH"
+# ~2 live-loop cycles (~72s each) + grace: stale advice must expire fast —
+# a strategy that has stopped urging is no longer advising.
+ADVICE_TTL_SECONDS_DEFAULT = 180
+MIN_CONFIDENCE_DEFAULT = 0.0
+
 
 def resolve_exit_advice_mode(env: Optional[Mapping[str, str]] = None) -> str:
     """``off | record | consume``; anything else (or unset) -> ``off``."""
@@ -299,3 +308,139 @@ def record_dropped_urges(
     except Exception as exc:  # pragma: no cover - absolute backstop
         (logger or LOG).warning("exit_advice recorder failed (non-fatal): %s", exc)
         return 0
+
+
+# --------------------------------------------------------------------------- #
+# W4B-3: aggregation — recorded rows -> fresh, consumable advice per symbol
+# --------------------------------------------------------------------------- #
+
+def _config_path(explicit: Optional[Any]) -> Optional[Path]:
+    if explicit is not None:
+        return Path(explicit)
+    env = os.getenv(_CONFIG_PATH_ENV)
+    if env:
+        return Path(env)
+    return Path.cwd() / "config" / "exit_advice.json"
+
+
+def load_advice_config(path: Optional[Any] = None) -> Dict[str, Any]:
+    """Advice policy tunables. Missing/corrupt file -> safe defaults (the
+    policy must be prewritten, but its absence must never invent behavior
+    beyond the conservative defaults)."""
+    defaults = {
+        "advice_ttl_seconds": ADVICE_TTL_SECONDS_DEFAULT,
+        "min_confidence": MIN_CONFIDENCE_DEFAULT,
+    }
+    p = _config_path(path)
+    if p is None:
+        return defaults
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return defaults
+        out = dict(defaults)
+        if isinstance(obj.get("advice_ttl_seconds"), (int, float)) and obj["advice_ttl_seconds"] > 0:
+            out["advice_ttl_seconds"] = float(obj["advice_ttl_seconds"])
+        if isinstance(obj.get("min_confidence"), (int, float)):
+            out["min_confidence"] = float(obj["min_confidence"])
+        return out
+    except Exception:
+        return defaults
+
+
+def _parse_row_ts(raw: Any) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(raw), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _iter_recent_rows(directory: Path, now: datetime):
+    """Yield rows from today's (and, near midnight, yesterday's) evidence file.
+    Corrupt lines are skipped — evidence is append-only best-effort."""
+    from datetime import timedelta
+    for day in (now, now - timedelta(days=1)):
+        fname = directory / f"exit_advice_{day.astimezone(timezone.utc).strftime('%Y%m%d')}.ndjson"
+        try:
+            with fname.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        yield obj
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+
+def load_advice_by_symbol(
+    *,
+    now: Optional[datetime] = None,
+    evidence_dir: Optional[Any] = None,
+    excluded_symbols: Optional[frozenset] = None,
+    config_path: Optional[Any] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Aggregate recorded urges into ``{SYMBOL: advice}`` of FRESH advice.
+
+    Consumability filters (each one a hard wall):
+      - row is a SELL urge (advice means "exit a long"; BUYs are never dropped
+        by D4, so no advice exists for shorts by construction);
+      - row is fresh: ``now - ts_utc <= advice_ttl_seconds``;
+      - row confidence >= min_confidence (None -> not consumable);
+      - symbol NOT operator-excluded (``excluded_symbols`` wall here, the
+        row's own ``excluded`` flag as belt-and-braces, and the overlay's
+        SKIP_EXCLUDED + apply_close_intents backstops downstream).
+
+    Advice shape: ``{"symbol", "strategies": [..], "latest_ts_utc",
+    "max_confidence", "reasons": [..], "count_fresh"}``. Never raises;
+    unreadable evidence -> {}.
+    """
+    try:
+        now = now or _utcnow()
+        directory = _evidence_dir(evidence_dir)
+        if directory is None:
+            return {}
+        cfg = load_advice_config(config_path)
+        ttl = float(cfg["advice_ttl_seconds"])
+        min_conf = float(cfg["min_confidence"])
+        if excluded_symbols is None:
+            excluded_symbols = _default_excluded_symbols() or frozenset()
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in _iter_recent_rows(directory, now):
+            if str(row.get("side", "")).upper() != "SELL":
+                continue
+            symbol = str(row.get("symbol", "") or "").upper()
+            if not symbol or symbol in excluded_symbols or row.get("excluded"):
+                continue
+            ts = _parse_row_ts(row.get("ts_utc"))
+            if ts is None or (now - ts).total_seconds() > ttl or ts > now:
+                continue
+            conf = row.get("confidence")
+            if conf is None or float(conf) < min_conf:
+                continue
+            strategy = row.get("strategy")
+            if not strategy:
+                continue
+            entry = out.setdefault(symbol, {
+                "symbol": symbol, "strategies": set(), "latest_ts_utc": row.get("ts_utc"),
+                "max_confidence": float(conf), "reasons": set(), "count_fresh": 0,
+            })
+            entry["strategies"].add(str(strategy))
+            entry["count_fresh"] += 1
+            entry["max_confidence"] = max(entry["max_confidence"], float(conf))
+            if row.get("ts_utc") and str(row["ts_utc"]) > str(entry["latest_ts_utc"]):
+                entry["latest_ts_utc"] = row["ts_utc"]
+            if row.get("reason"):
+                entry["reasons"].add(str(row["reason"]))
+        for entry in out.values():
+            entry["strategies"] = sorted(entry["strategies"])
+            entry["reasons"] = sorted(entry["reasons"])
+        return out
+    except Exception:  # pragma: no cover - aggregation must never break a cycle
+        return {}
