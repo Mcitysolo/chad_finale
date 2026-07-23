@@ -132,6 +132,10 @@ def _fresh_runtime(runtime: Path, *, ts: datetime | None = None) -> None:
         "ts_unix": ts.timestamp(), "ok": True, "ttl_seconds": 120,
         "consecutive_failures": 0,
     })
+    # W5A-5 (DQ2/EXS10): a healthy runtime has broker time ≈ box time (no skew).
+    _write_json(runtime / "ibkr_status.json", {
+        "ts_utc": _iso(ts), "server_time_iso": _iso(ts), "api_ms": 40.0,
+    })
     # W4A-1 (INCIDENT-0723 inheritance b): the fuse-box heartbeat gained an
     # EXS1 row — a healthy runtime includes it fresh, all-modes-off.
     _write_json(runtime / "fuse_box_state.json", {
@@ -266,8 +270,8 @@ def test_report_schema_and_nine_checks(tmp_path, clock, quiet_providers):
     assert required <= set(report)
     assert report["schema_version"] == "exterminator_sentinel.v1"
     assert report["stage"] == 1
-    assert len(report["checks"]) == 9
-    assert [c["check_id"] for c in report["checks"]] == [f"EXS{i}" for i in range(1, 10)]
+    assert len(report["checks"]) == 10
+    assert [c["check_id"] for c in report["checks"]] == [f"EXS{i}" for i in range(1, 11)]
     for check in report["checks"]:
         assert {"check_id", "name", "status", "title", "summary", "evidence", "remedy_type"} <= set(check)
         assert check["status"] in ("ok", "warn", "fail")
@@ -287,7 +291,7 @@ def test_history_appends_one_line_per_run(tmp_path, clock, quiet_providers):
     assert len(lines) == 2
     row = json.loads(lines[0])
     assert row["schema_version"] == "exterminator_sentinel.v1"
-    assert set(row["checks"]) == {f"EXS{i}" for i in range(1, 10)}
+    assert set(row["checks"]) == {f"EXS{i}" for i in range(1, 11)}
 
 
 def test_latest_is_rewritten_not_appended(tmp_path, clock, quiet_providers):
@@ -306,7 +310,7 @@ def test_check_exception_is_contained(tmp_path, clock, quiet_providers):
     s = _make(tmp_path, clock, quiet_providers)
     s.check_failed_services = lambda: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[method-assign]
     report = s.run()
-    assert len(report["checks"]) == 9
+    assert len(report["checks"]) == 10
     self_checks = [c for c in report["checks"] if c["check_id"] == "EXS999"]
     assert self_checks and self_checks[0]["status"] == "warn"
 
@@ -1002,9 +1006,16 @@ def test_stable_identity_truncates_multi_digit_ids_but_stays_deterministic():
     """
     assert sentinel_mod.stable_identity("R14") == "R1"
     assert sentinel_mod.stable_identity("R14") == sentinel_mod.stable_identity("R14")
+    # EXS1..EXS9 are single-digit and survive stable_identity intact.
     ids = [sentinel_mod.stable_identity(f"EXS{i}") for i in range(1, 10)]
     assert ids == [f"EXS{i}" for i in range(1, 10)]
-    assert len(set(ids)) == 9, "check_id identities must never collide"
+    assert len(set(ids)) == 9, "single-digit check_id identities must never collide"
+    # EXS10 (W5A DQ2) is the FIRST two-digit id: stable_identity strips the
+    # trailing "0" (preceded by "1") -> "EXS1", colliding with EXS1. This is
+    # harmless because EXS10 is WARN-ONLY (rider R3) and maybe_notify keys the
+    # dedupe ONLY on FAILED checks, so EXS10 can never enter the dedupe path
+    # where the collision would matter.
+    assert sentinel_mod.stable_identity("EXS10") == "EXS1"
 
 
 def test_notifier_failure_does_not_raise(tmp_path, clock, quiet_providers):

@@ -143,4 +143,4 @@ def test_report_has_rollup_consistent_with_overall(tmp_path, clock, quiet_provid
     assert report["schema_version"] == "exterminator_sentinel.v1"
     assert report["read_only_confirmed"] is True
     assert report["runtime_files_modified"] == []
-    assert len(report["checks"]) == 9
+    assert len(report["checks"]) == 10

@@ -304,5 +304,22 @@
       {"unit": "chad-paper-shadow-runner.service", "reason": "masked (PR-06 Path A); re-arm requires its own PA"},
       {"unit": "(all Type=oneshot timer services)", "reason": "re-exec'd every fire; code is fresh by construction"}
     ]
+  },
+  "clock_health": {
+    "_doc": [
+      "W5A DQ2 (EXS10). WARN-FIRST by rider R3: these tolerances are operator-",
+      "proposed, not ratified (ttl_verified:false), and the check NEVER fails --",
+      "maybe_notify pages only on FAIL, so EXS10 is a report surface until a week",
+      "of real skew data is watched and thresholds are ratified in a later wave.",
+      "Probe 1: |ibkr_status.server_time_iso - ts_utc| (broker vs box, already on",
+      "disk, never diffed today). Probe 2: FILLS sequence_id monotonic by write",
+      "order while fill_time_utc is broker exec time -> a later seq with an earlier",
+      "fill time (batch harvest / reconnect replay) is the anomaly verify_ledger_",
+      "chain does not catch."
+    ],
+    "ttl_verified": false,
+    "warn_skew_ms": 2000,
+    "warn_regression_ms": 1000,
+    "max_fill_rows_scanned": 5000
   }
 }

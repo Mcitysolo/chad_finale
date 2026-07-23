@@ -1215,6 +1215,7 @@ class ExterminatorSentinel:
         _safe("schema_breaks", self.check_schema_breaks)
         _safe("ml_anomalies", self.check_ml_anomalies)
         _safe("stale_processes", self.check_stale_processes)
+        _safe("clock_health", self.check_clock_health)
 
         counts = {STATUS_OK: 0, STATUS_WARN: 0, STATUS_FAIL: 0}
         for check in checks:
@@ -1237,6 +1238,139 @@ class ExterminatorSentinel:
             "services_restarted": False,
             "remedy_type": REMEDY_NOTIFY_ONLY,
         }
+
+    # ---- check 10: clock health (W5A DQ2) ------------------------------
+
+    def check_clock_health(self) -> CheckResult:
+        """EXS10 (DQ2): trading/data timestamps trace to divergent clocks that
+        nobody reconciles today (audit W5A §1-P12/P13). Two read-only probes:
+
+          1. broker-vs-box skew — ``runtime/ibkr_status.json`` already carries
+             ``server_time_iso`` (IBKR reqCurrentTime) beside box ``ts_utc``,
+             but no consumer diffs them. |server_time - ts_utc| above a
+             threshold is a finding.
+          2. fill-time vs sequence monotonicity — the FILLS chain's
+             ``sequence_id`` is monotonic by WRITE order while ``fill_time_utc``
+             is broker exec time, so a later sequence can carry an earlier fill
+             time (batch harvest / reconnect replay). ``verify_ledger_chain``
+             checks hash+sequence but NOT time — this catches the gap.
+
+        WARN-ONLY BY DESIGN (rider R3): skew tolerances are operator-proposed
+        (``ttl_verified`` honesty pattern), and the gate must not cry wolf on
+        NTP jitter before a week of real data is watched — so this check NEVER
+        returns FAIL, only OK/WARN. ``maybe_notify`` pages only on FAIL, so
+        EXS10 is a pure report surface until an operator ratifies thresholds
+        and lifts it to fail-tier in a later wave.
+        """
+        cfg = (self.config.get("clock_health") or {}) if self.config else {}
+        if not cfg:
+            return CheckResult(
+                "EXS10", "clock_health", STATUS_WARN,
+                "Clock-health thresholds unconfigured",
+                "config/exterminator.json declares no clock_health block; "
+                "broker-vs-box skew and fill-sequence monotonicity cannot be "
+                "judged. (DQ2 is warn-first — this is a report fact, not a page.)",
+                {"config_path": str(self.config_path)},
+            )
+
+        warn_skew_ms = float(cfg.get("warn_skew_ms") or 2000.0)
+        warn_regression_ms = float(cfg.get("warn_regression_ms") or 1000.0)
+        max_fill_rows = int(cfg.get("max_fill_rows_scanned") or 5000)
+        probes: list[dict[str, Any]] = []
+        statuses: list[str] = []
+
+        # --- probe 1: broker-vs-box skew ---
+        status_path = self.runtime_dir / "ibkr_status.json"
+        status, serr = self._read_json(status_path)
+        skew_row: dict[str, Any] = {"probe": "broker_vs_box_skew"}
+        if not isinstance(status, dict):
+            skew_row.update({"status": STATUS_WARN, "reason": serr or "unreadable"})
+        else:
+            server_ts = self._parse_ts(status.get("server_time_iso"))
+            box_ts = self._parse_ts(status.get("ts_utc"))
+            if server_ts is None:
+                skew_row.update({"status": STATUS_WARN,
+                                 "reason": "server_time_absent",
+                                 "_note": "broker clock never captured — the skew is unmeasurable, which is itself the finding"})
+            elif box_ts is None:
+                skew_row.update({"status": STATUS_WARN, "reason": "box_ts_absent"})
+            else:
+                skew_ms = abs((server_ts - box_ts).total_seconds()) * 1000.0
+                skew_row["skew_ms"] = round(skew_ms, 1)
+                skew_row["warn_skew_ms"] = warn_skew_ms
+                if skew_ms > warn_skew_ms:
+                    skew_row["status"] = STATUS_WARN
+                    skew_row["reason"] = "broker_box_skew_exceeds_threshold"
+                else:
+                    skew_row["status"] = STATUS_OK
+        probes.append(skew_row)
+        statuses.append(skew_row["status"])
+
+        # --- probe 2: fill-time vs sequence monotonicity (today's FILLS) ---
+        seq_row: dict[str, Any] = {"probe": "fill_time_sequence_monotonic"}
+        date = self.clock().strftime("%Y%m%d")
+        fills_path = self.data_dir / "fills" / f"FILLS_{date}.ndjson"
+        if not fills_path.exists():
+            seq_row.update({"status": STATUS_OK, "reason": "no_fills_today"})
+        else:
+            regressions: list[dict[str, Any]] = []
+            prev_seq: int | None = None
+            prev_ts: datetime | None = None
+            prev_fid: str | None = None
+            scanned = 0
+            try:
+                for line in fills_path.read_text(errors="ignore").splitlines():
+                    if not line.strip():
+                        continue
+                    scanned += 1
+                    if scanned > max_fill_rows:
+                        seq_row["truncated_at"] = max_fill_rows
+                        break
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = rec.get("payload", rec) if isinstance(rec, dict) else {}
+                    seq = rec.get("sequence_id") if isinstance(rec, dict) else None
+                    ts = self._parse_ts(payload.get("fill_time_utc"))
+                    fid = str(payload.get("fill_id") or "")[:12]
+                    if isinstance(seq, int) and ts is not None:
+                        if prev_seq is not None and prev_ts is not None and seq > prev_seq:
+                            regress_ms = (prev_ts - ts).total_seconds() * 1000.0
+                            if regress_ms > warn_regression_ms:
+                                regressions.append({
+                                    "seq_prev": prev_seq, "seq_curr": seq,
+                                    "fill_prev": prev_fid, "fill_curr": fid,
+                                    "regression_ms": round(regress_ms, 1),
+                                })
+                        prev_seq, prev_ts, prev_fid = seq, ts, fid
+            except OSError as exc:
+                seq_row.update({"status": STATUS_WARN, "reason": f"fills_unreadable: {exc}"})
+            if "status" not in seq_row:
+                seq_row["rows_scanned"] = scanned
+                if regressions:
+                    seq_row["status"] = STATUS_WARN
+                    seq_row["reason"] = "fill_time_regresses_vs_sequence"
+                    seq_row["regressions"] = regressions[:10]
+                    seq_row["regression_count"] = len(regressions)
+                else:
+                    seq_row["status"] = STATUS_OK
+        probes.append(seq_row)
+        statuses.append(seq_row["status"])
+
+        # WARN-ONLY: fold OK/WARN only; a FAIL can never originate here (R3).
+        worst = worst_status(statuses)
+        overall = STATUS_WARN if worst == STATUS_WARN else STATUS_OK
+        title = ("Clock divergence / sequencing finding"
+                 if overall == STATUS_WARN else "Clocks consistent")
+        return CheckResult(
+            "EXS10", "clock_health", overall, title,
+            "Broker-vs-box skew and fill-time-vs-sequence monotonicity "
+            "(DQ2, warn-first — never pages until thresholds are ratified).",
+            {"probes": probes, "warn_skew_ms": warn_skew_ms,
+             "warn_regression_ms": warn_regression_ms,
+             "ttl_verified": bool(cfg.get("ttl_verified", False))},
+        )
 
     # ---- check 9: stale processes (W3B-5) ------------------------------
 
