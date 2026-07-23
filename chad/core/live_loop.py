@@ -655,6 +655,23 @@ def _build_stop_bus_snapshot(
     except Exception:
         pass
 
+    # W4A-8 DQ (P18 site 2): loudness for the stop-bus inputs. A dead
+    # ibkr_status.json / pnl_state.json silently disarms the latency / daily-
+    # loss halts today. Under CHAD_DQ_POLICIES != off, read_with_policy emits
+    # DQ_INPUT_DEAD marker + coach alert + evidence when either is non-fresh.
+    # Behavior change beyond loudness: NONE in W4A (both policies are
+    # degrade_loud, should_block=False). Off: skipped entirely (byte-identical).
+    try:
+        from chad.risk.fuse_box import ENV_DQ as _ENV_DQ, fuse_mode as _fmode
+
+        if _fmode(_ENV_DQ) != "off":
+            from chad.utils.feed_policy import read_with_policy as _dq_read
+
+            _dq_read("runtime/ibkr_status.json")
+            _dq_read("runtime/pnl_state.json")
+    except Exception:  # noqa: BLE001 — loudness is best-effort, never fatal
+        pass
+
     # Reject-rate and data-staleness snapshots require windowed counters
     # that the current codebase does not yet publish; they are left
     # unpopulated and the aggregator skips them cleanly.
@@ -2047,6 +2064,23 @@ def run_once(logger: logging.Logger) -> None:
             "per_strategy_loss_guard failed (non-fatal): %s", _lg_err
         )
 
+    # ------------------------------------------------------------------
+    # W4A-5: fuse-box evaluator. Re-derives per-bucket session stats from
+    # the trusted ledger, emits edge-triggered trip/clear events, and
+    # publishes runtime/fuse_box_state.json — read fail-safe by the
+    # per-intent fuse gate at stage-3 later this cycle. Heartbeat doctrine:
+    # the state is written EVERY cycle including all-modes-off, so a silent
+    # fuse (the XOV lesson) is distinguishable from a dead one. Failure-soft:
+    # an evaluator exception never kills the cycle (loss-guard precedent).
+    # The evaluator NEVER blocks anything — enforcement is the gate below.
+    # ------------------------------------------------------------------
+    try:
+        from chad.risk.fuse_box import run_evaluator_cycle as _run_fuse_eval
+
+        _run_fuse_eval()
+    except Exception as _fuse_err:  # noqa: BLE001
+        logger.debug("fuse_box evaluator failed (non-fatal): %s", _fuse_err)
+
     # Signal throttle — apply trim AFTER routing decisions are made so
     # only submission is capped. Exits/risk-reducing signals are NEVER
     # trimmed; only fresh entries are capped at _max_signals_this_cycle.
@@ -2658,9 +2692,52 @@ def run_once(logger: logging.Logger) -> None:
     _futures_truth_loaded = False
     _futures_pending_adds: Dict[str, float] = {}
 
+    # W4A-5: per-intent fuse gate. Constructed once per cycle, reads the
+    # fuse_box_state.json the evaluator published earlier this cycle. Default
+    # off / fail-open: any construction failure yields a gate that blocks
+    # nothing. Entry-scoped by placement (below, beside the symbol blocker) —
+    # overlay/reconciler/flatten closes never reach here (they bypass stage-3).
+    _fuse_gate = None
+    try:
+        from chad.risk.fuse_gate import FuseGate as _FuseGate
+
+        _fuse_gate = _FuseGate()
+    except Exception as _fg_err:  # noqa: BLE001 — fail-open
+        logger.debug("fuse_gate construction failed (non-fatal): %s", _fg_err)
+
+    # W4A-8 (DQ, P18 site 1): SCR-freshness entry gate, evaluated once per
+    # cycle. The SCR hard-block below reads scr_state.json raw and fails OPEN;
+    # under CHAD_DQ_POLICIES=enforce a stale/corrupt/missing scr_state instead
+    # blocks NEW entries (fail-CLOSED — a frozen-PAUSED or dead governor
+    # becomes loud, not eternally-blocking or silently-disarmed). Exits bypass.
+    # Off/shadow: _dq_scr_block stays False → byte-identical behavior.
+    _dq_scr_block = False
+    try:
+        from chad.utils.feed_policy import read_with_policy as _dq_read
+
+        _, _dq_scr_verdict = _dq_read("runtime/scr_state.json")
+        _dq_scr_block = bool(_dq_scr_verdict.should_block)
+    except Exception as _dq_err:  # noqa: BLE001 — fail-open
+        logger.debug("dq scr gate eval failed (non-fatal): %s", _dq_err)
+
     for intent in intents:
         try:
             _attach_strategy_to_intent(intent, routed_signal_map)
+
+            # W4A-8 DQ (P18 site 1): fail-CLOSED on a dead SCR when DQ enforce
+            # says so. A stale/corrupt/missing scr_state can no longer silently
+            # disable the governor — new entries are refused; exits/flips pass.
+            if _dq_scr_block:
+                _dq_side = str(getattr(intent, "side", "") or "").upper()
+                if not (is_flip_signal(intent) or _dq_side in {"EXIT", "CLOSE"}):
+                    logger.warning(
+                        "DQ_SCR_BLOCK scr_state not fresh — new entry refused "
+                        "(fail-closed): symbol=%s side=%s strategy=%s",
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "strategy", None),
+                    )
+                    continue
 
             # --- SCR gate (P3-1: hard-block on PAUSED before any state mutation) ---
             try:
@@ -2728,6 +2805,47 @@ def run_once(logger: logging.Logger) -> None:
                 logger.warning("SCR_CAUTIOUS_SCALE_FAILED (skipped): %s", _p3_err)
             # --- end P3-2 ---
 
+            # W4A-7: LC5 progressive drawdown sizing (D4/D5). Composes AFTER
+            # SCR CAUTIOUS (multiplicative, order-independent, never > 1.0) and
+            # BEFORE the fuse/symbol gates. Emergency (−15%, D5) blocks new
+            # entries — deliberately NOT stop_bus (that halts the overlays
+            # too). Exits/flips/protectives bypass both legs. Enforce-only;
+            # shadow/off leave quantity untouched. Fail-open.
+            if _fuse_gate is not None and _fuse_gate.lc5_active:
+                try:
+                    _lc5_side = str(getattr(intent, "side", "") or "").upper()
+                    _lc5_is_exit = (
+                        is_flip_signal(intent) or _lc5_side in {"EXIT", "CLOSE"}
+                    )
+                    if not _lc5_is_exit and _fuse_gate.should_block_lc5_entry(intent):
+                        logger.warning(
+                            "SKIP suppression=lc5_emergency → %s %s strategy=%s",
+                            getattr(intent, "symbol", None),
+                            getattr(intent, "side", None),
+                            getattr(intent, "strategy", None),
+                        )
+                        continue
+                    _lc5_factor = _fuse_gate.lc5_factor()
+                    if not _lc5_is_exit and _lc5_factor < 1.0:
+                        from chad.risk.fuse_box import apply_lc5_factor as _apply_lc5
+                        _raw_q = float(getattr(intent, "quantity", 0.0) or 0.0)
+                        _new_q = _apply_lc5(
+                            _raw_q, _lc5_factor,
+                            str(getattr(intent, "sec_type", "") or ""),
+                        )
+                        if _new_q != _raw_q:
+                            logger.info(
+                                "LC5_SIZE_SCALE symbol=%s raw_qty=%.2f factor=%.3f scaled_qty=%.2f",
+                                getattr(intent, "symbol", None), _raw_q,
+                                _lc5_factor, _new_q,
+                            )
+                            try:
+                                object.__setattr__(intent, "quantity", _new_q)
+                            except (AttributeError, TypeError):
+                                intent.quantity = _new_q
+                except Exception as _lc5_err:  # noqa: BLE001 — fail-open
+                    logger.warning("LC5_ENFORCE_FAILED (skipped): %s", _lc5_err)
+
             class _IntentSignalAdapter:
                 def __init__(self, obj: object) -> None:
                     self.strategy = getattr(obj, "strategy", None)
@@ -2765,6 +2883,31 @@ def run_once(logger: logging.Logger) -> None:
                     getattr(intent, "side", None),
                 )
                 continue
+
+            # W4A-5: fuse gate (LC2/LC3). should_block() returns a verdict only
+            # when a covering bucket is tripped AND its flag is `enforce`;
+            # shadow emits would_block evidence and returns None (byte-identical
+            # behavior). Exit-like intents (flip/EXIT/CLOSE/protective/close-
+            # stamp) are bypassed inside the gate — a fuse never blocks a close.
+            # Fail-open: a None gate or any internal error lets the intent pass.
+            if _fuse_gate is not None:
+                try:
+                    _fuse_verdict = _fuse_gate.should_block(intent)
+                except Exception as _fg_eval_err:  # noqa: BLE001 — fail-open
+                    logger.warning(
+                        "FUSE_GATE_CALL_FAILED (fail-open): %s", _fg_eval_err
+                    )
+                    _fuse_verdict = None
+                if _fuse_verdict is not None:
+                    logger.warning(
+                        "SKIP suppression=fuse_%s fuse_id=%s → %s %s strategy=%s",
+                        _fuse_verdict.kind,
+                        _fuse_verdict.fuse_id,
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "strategy", None),
+                    )
+                    continue
 
             if not is_flip_signal(intent):
                 if not should_emit_signal(adapted):

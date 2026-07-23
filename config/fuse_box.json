@@ -1,0 +1,72 @@
+{
+  "schema_version": "fuse_box.v1",
+  "_notes": [
+    "W4A fuse box (PLAN_W4A + audits/W4A_GO_RECORD.md). Four flag-gated items,",
+    "ALL default-off: CHAD_FUSE_LC2 / CHAD_FUSE_LC3 / CHAD_FUSE_LC5 /",
+    "CHAD_DQ_POLICIES, each off|shadow|enforce (garbage -> off). This config",
+    "defines buckets and thresholds only — it grants no authority by itself;",
+    "mode flips are separate operator GOs per flag.",
+    "A missing/corrupt version of this file DISARMS the fuse box (no buckets,",
+    "no trips) — it can never invent a trip. Thresholds are negative USD",
+    "(session net PnL at-or-below trips) or consecutive trusted losing closes.",
+    "Counting substrate: trusted closed_trade.v1 rows only — see",
+    "chad/risk/fuse_box.py docstring for the full predicate chain, including",
+    "the INCIDENT-0723 provenance verification (drill/dry_run rows can never",
+    "move a counter). 'unknown' may never appear in a regimes scope (D2 rider:",
+    "unstamped rows count toward GLOBAL legs only; loader strips it, engine",
+    "refuses it).",
+    "families/setup_fuses land at W4A-2/3; symbol/sector buckets at W4A-4",
+    "(sector map: config/symbol_sectors.json); lc5_ladder at W4A-6/7."
+  ],
+  "defaults": {
+    "consecutive_losers": 3,
+    "session_net_pnl_usd": null
+  },
+  "families": {
+    "_note": "W4A-2 (D1): named groups over the 18 registry strategy_ids (chad.types.StrategyName). Union must stay within DECLARED and cover ACTIVE — pinned hard by chad/tests/test_w4a_fuse_config_parity.py (W3B-9 perimeter idiom), warn-tier at the runtime bucket builder. Per-family threshold overrides may be added as {'family_thresholds': {name: {...}}} later; defaults apply until then.",
+    "alpha": [
+      "alpha",
+      "alpha_crypto",
+      "alpha_forex",
+      "alpha_futures",
+      "alpha_intraday",
+      "alpha_intraday_micro",
+      "alpha_options"
+    ],
+    "beta": ["beta", "beta_trend"],
+    "delta": ["delta", "delta_pairs"],
+    "gamma": ["gamma", "gamma_futures", "gamma_reversion"],
+    "omega": ["omega", "omega_macro", "omega_momentum_options", "omega_vol"]
+  },
+  "setup_fuses": {
+    "_note": "W4A-2 (D1): sub-strategy grain for the setup_family-stamped strategies (PLAN_W4A P13). Buckets form as setup:<strategy>:<setup_family> from stamps observed in the trusted ledger — no fixed setup list to drift.",
+    "enabled_strategies": [
+      "alpha",
+      "alpha_futures",
+      "alpha_intraday",
+      "alpha_intraday_micro"
+    ]
+  },
+  "symbol_fuse": {
+    "consecutive_losers": 3,
+    "session_net_pnl_usd": null
+  },
+  "sector_fuse": {
+    "consecutive_losers": 3,
+    "session_net_pnl_usd": null
+  },
+  "lc5_ladder": {
+    "_note": "W4A-7 (LC5, D4/D5): progressive per-intent entry-size ladder keyed on the epoch-scoped 5d/20d drawdown budgets (drawdown_state.v2). Rungs are (at_pct<=0 -> factor in (0,1]); effective factor = min of every rung triggered across both windows, clamped (0,1]; entries only, exits/flips/protectives/overlay untouched. A window whose sample_count < its length REPORTS but never enforces (P7 depth guard). emergency_halt_pct BLOCKS new entries (NOT stop_bus, which would kill the overlays too) — exits stay free at every rung incl. emergency. stale_max_seconds: after this long stale, degrade to the worst rung reached this session (never upward) rather than trusting old data.",
+    "dd_5d": [
+      {"at_pct": -3.0, "factor": 0.75},
+      {"at_pct": -5.0, "factor": 0.50},
+      {"at_pct": -8.0, "factor": 0.25}
+    ],
+    "dd_20d": [
+      {"at_pct": -8.0, "factor": 0.50},
+      {"at_pct": -12.0, "factor": 0.25}
+    ],
+    "emergency_halt_pct": -15.0,
+    "stale_max_seconds": 3600
+  }
+}

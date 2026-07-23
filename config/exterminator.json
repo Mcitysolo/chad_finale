@@ -117,6 +117,17 @@
       "warn_after_seconds": 360,
       "fail_after_seconds": 720,
       "_note": "W3B-1. ts_unix is a NUMERIC epoch -- _parse_ts numeric support added in the same commit. warn_after=3x cadence mirrors the watchdog's own internal 3x-ttl staleness convention (chad/core/ibkr_watchdog.py:243-246); a bare 120s warn would flap against the 120s timer + RandomizedDelaySec=15s on a 5-min sentinel scan. The artifact is a self-heartbeat (zero code readers); its value is proving the IBKR-health alerter itself is alive -- the P1-4 44-day silent death is the target."
+    },
+    "fuse_box_state": {
+      "path": "runtime/fuse_box_state.json",
+      "format": "json",
+      "ts_field": "ts_utc",
+      "ttl_seconds": 180,
+      "ttl_verified": true,
+      "ttl_source": "artifact:ttl_seconds; publisher STATE_TTL_SECONDS=180 at chad/risk/fuse_box.py (live-loop cycle cadence ~60s x 3 grace)",
+      "warn_after_seconds": 180,
+      "fail_after_seconds": 600,
+      "_note": "W4A-1 (INCIDENT-0723 inheritance b, audits/W4A_GO_RECORD.md 5b). Heartbeat doctrine: the evaluator writes this EVERY live-loop cycle including all-modes-off, so evaluated=0 is distinguishable from dead -- a silent fuse is the XOV lesson wearing a new hat. WARN-on-missing is intended and stays until the W4A-5 wiring activates at the gated restart; do not 'fix' it by deleting this row."
     }
   },
   "blind_check": {
@@ -188,6 +199,20 @@
         "accepts": ["epoch_state.v1"],
         "required_keys": ["schema_version"],
         "pinned_at": "chad/utils/epoch.py:46"
+      },
+      "runtime/drawdown_state.json": {
+        "schema_version": "drawdown_state.v2",
+        "accepts": ["drawdown_state.v1", "drawdown_state.v2"],
+        "required_keys": ["schema_version", "ts_utc", "ttl_seconds", "status", "drawdown_pct", "halt"],
+        "pinned_at": "chad/risk/drawdown_guard.py:report_to_state_dict",
+        "_note": "W4A-6 (D6): bumped v1->v2 for additive dd_5d/dd_20d LC5 budgets. accepts BOTH so the still-v1 live file (before the drawdown-publisher restart that activates W4A) never trips a schema break -- the position_guard_drift v1|v2|v3 transition precedent. required_keys are the stable common set both versions carry (the new budget fields are additive/nullable, not required)."
+      },
+      "runtime/fuse_box_state.json": {
+        "schema_version": "fuse_box_state.v1",
+        "accepts": ["fuse_box_state.v1"],
+        "required_keys": ["schema_version", "ts_utc", "ttl_seconds", "modes", "fuses"],
+        "pinned_at": "chad/risk/fuse_box.py:build_state (STATE_SCHEMA_VERSION)",
+        "_note": "W4A-9. Heartbeat published every live-loop cycle by run_evaluator_cycle including all-modes-off (INCIDENT-0723 inheritance b). WARN-on-missing is intended and stays until the W4A-5 wiring activates at the gated restart. modes/fuses always present even at rest (empty fuses list)."
       }
     },
     "unpinned_known": {

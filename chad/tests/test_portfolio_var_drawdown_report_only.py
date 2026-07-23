@@ -310,7 +310,8 @@ def test_drawdown_publisher_writes_schema(tmp_path: Path) -> None:
 
     summary = _run_publisher(DRAWDOWN_PUBLISHER, rt)
     assert summary["ok"] is True
-    assert summary["schema_version"] == "drawdown_state.v1"
+    # W4A-6 (D6): bumped v1 -> v2 for the additive dd_5d/dd_20d LC5 budgets.
+    assert summary["schema_version"] == "drawdown_state.v2"
 
     state_path = rt / "drawdown_state.json"
     assert state_path.exists()
@@ -321,9 +322,11 @@ def test_drawdown_publisher_writes_schema(tmp_path: Path) -> None:
         "current_equity_cad", "hwm_cad", "drawdown_pct",
         "halt_threshold_pct", "halt", "enforcement_active",
         "sample_count", "lookback_days", "notes",
+        # W4A-6 additive budget fields.
+        "dd_5d_pct", "dd_20d_pct", "sample_count_5d", "sample_count_20d",
     }
     assert required_keys.issubset(state.keys())
-    assert state["schema_version"] == "drawdown_state.v1"
+    assert state["schema_version"] == "drawdown_state.v2"
     assert state["ttl_seconds"] == 300
     assert state["enforcement_active"] is False
     assert state["hwm_cad"] == 100000.0

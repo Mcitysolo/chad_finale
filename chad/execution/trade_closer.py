@@ -229,6 +229,57 @@ def _sanitize_meta(value: Any) -> Dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# W4A-2 (D2a, forward-only): live-regime stamp for closed_trade payloads.
+# The fuse box (chad/risk/fuse_box.py) buckets closes by regime; per the D2
+# rider (audits/W4A_GO_RECORD.md §2) an unstamped/unfresh row counts in the
+# "unknown" bucket — GLOBAL fuse legs only, never a regime-scoped leg. So the
+# stamp is fail-unknown: missing/stale/corrupt/unrecognised state → None,
+# never a guess. Mirrors the crypto lane's per-fill live-regime tagging (CEW1).
+# ---------------------------------------------------------------------------
+
+_REGIME_STATE_PATH = (
+    pathlib.Path(__file__).resolve().parents[2] / "runtime" / "regime_state.json"
+)
+# Live classifier vocabulary (chad/analytics/regime_classifier.py VALID_REGIMES).
+_REGIME_STAMP_VOCAB = frozenset(
+    {"trending_bull", "trending_bear", "ranging", "volatile", "unknown"}
+)
+# Read once per closer process (60s oneshot timer) — every close minted in one
+# run shares the same classifier snapshot, which is also the honest statement
+# (they all closed within one cycle of that snapshot).
+_regime_stamp_cache: Optional[Tuple[bool, Optional[str]]] = None
+
+
+def current_regime_stamp(
+    path: Optional[pathlib.Path] = None, *, refresh: bool = False
+) -> Optional[str]:
+    """Fresh live regime for the closed_trade.v1 ``regime`` stamp, or None.
+
+    Freshness-gated via the (ts_utc, ttl_seconds) canon — a stale classifier
+    must not stamp closes with a regime it no longer knows to be true.
+    Explicit *path* bypasses the process cache (tests).
+    """
+    global _regime_stamp_cache
+    if path is None and not refresh and _regime_stamp_cache is not None:
+        return _regime_stamp_cache[1]
+    target = pathlib.Path(path) if path is not None else _REGIME_STATE_PATH
+    value: Optional[str] = None
+    try:
+        from chad.utils.runtime_json import read_runtime_state_json
+
+        obj, freshness = read_runtime_state_json(target)
+        if obj is not None and freshness.ok:
+            raw = str(obj.get("regime") or "").strip().lower()
+            if raw in _REGIME_STAMP_VOCAB:
+                value = raw
+    except Exception:  # noqa: BLE001 — the stamp must never break a close
+        value = None
+    if path is None:
+        _regime_stamp_cache = (True, value)
+    return value
+
+
 @dataclasses.dataclass
 class ClosedTrade:
     strategy: str
@@ -311,6 +362,12 @@ class ClosedTrade:
             "is_live": False,
             "tags": tags,
             "pnl_breakdown": breakdown,
+            # W4A-2 (D2a): forward-only live-regime stamp. None = the
+            # classifier was stale/unavailable at close time (honest unknown —
+            # counts only toward GLOBAL fuse legs per the D2 rider). Rows
+            # minted before W4A-2 lack the key entirely; readers must treat
+            # absent and None identically (fuse_box._norm_regime does).
+            "regime": current_regime_stamp(),
             # Gap-4 (v9.1 audit): forwarded TradeSignal/position meta block.
             # setup_family_expectancy_updater reads payload["meta"]["setup_family"]
             # and payload["meta"]["stop_width_usd"] to bucket alpha_intraday_micro

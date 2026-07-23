@@ -64,6 +64,18 @@ class DrawdownReport:
     sample_count: int
     lookback_days: int
     notes: List[str]
+    # W4A-6 (LC5, drawdown_state.v2): short-horizon drawdown budgets vs the
+    # trailing 5/20 DATED equity rows, epoch-scoped (rows before the active
+    # epoch start are excluded — the H3 phantom-HWM guard, PLAN_W4A P7). dd_*
+    # is None when the horizon has zero epoch-eligible rows; sample_count_* is
+    # the number of rows the window actually used. LC5 enforcement (W4A-7)
+    # ignores any window whose sample_count < the window length — these fields
+    # REPORT always but only ENFORCE when deep enough. The 60d HWM fields above
+    # are unchanged (report-only as today).
+    dd_5d_pct: Optional[float] = None
+    dd_20d_pct: Optional[float] = None
+    sample_count_5d: int = 0
+    sample_count_20d: int = 0
 
 
 def _safe_load_json(path: Path) -> Optional[Any]:
@@ -185,6 +197,58 @@ def _resolve_halt_threshold(explicit: Optional[float]) -> Tuple[float, str]:
     return DEFAULT_HALT_PCT, "default"
 
 
+def _row_date_only(row: Dict[str, Any]) -> Optional[str]:
+    """YYYY-MM-DD from a row's date/ts field (date portion only)."""
+    raw = _row_date(row)
+    if not raw:
+        return None
+    return raw[:10]
+
+
+def _epoch_start_date(epoch_state_path: Optional[Path]) -> Optional[str]:
+    """YYYY-MM-DD of the active epoch start, or None. Rows dated before this
+    are excluded from the 5d/20d windows (H3 phantom-HWM guard, P7)."""
+    obj = _safe_load_json(
+        epoch_state_path or (RUNTIME_DIR / "epoch_state.json")
+    )
+    if not isinstance(obj, dict):
+        return None
+    v = obj.get("epoch_started_at_utc")
+    if isinstance(v, str) and len(v) >= 10:
+        return v[:10]
+    return None
+
+
+def _windowed_drawdown(
+    history: List[Dict[str, Any]],
+    current_eq: float,
+    window: int,
+    epoch_start_date: Optional[str],
+) -> Tuple[Optional[float], int]:
+    """Drawdown vs the max of the trailing *window* DATED, epoch-eligible
+    equity rows. Returns (dd_pct or None, sample_count_used). dd is measured
+    from current_eq against that window peak; can be positive (no drawdown).
+    None when the window has zero eligible rows or no current equity."""
+    dated: List[float] = []
+    for row in history:
+        d = _row_date_only(row)
+        if d is None:
+            continue
+        if epoch_start_date is not None and d < epoch_start_date:
+            continue
+        eq = _row_equity(row)
+        if eq is not None and eq > 0:
+            dated.append(eq)
+    trailing = dated[-window:] if window > 0 else list(dated)
+    n = len(trailing)
+    if n == 0 or current_eq <= 0:
+        return None, n
+    peak = max(trailing)
+    if peak <= 0:
+        return None, n
+    return (current_eq - peak) / peak * 100.0, n
+
+
 def compute_drawdown(
     *,
     equity_history_path: Optional[Path] = None,
@@ -192,6 +256,7 @@ def compute_drawdown(
     pnl_state_path: Optional[Path] = None,
     halt_threshold_pct: Optional[float] = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    epoch_state_path: Optional[Path] = None,
 ) -> DrawdownReport:
     """Compute report-only drawdown vs rolling HWM. Never raises."""
     notes: List[str] = []
@@ -222,6 +287,15 @@ def compute_drawdown(
     if current_eq > 0:
         equities.append(current_eq)
 
+    # W4A-6: short-horizon budgets (epoch-scoped). Computed from the FULL
+    # dated history (not the 60d window slice) so the 5/20d peaks are honest.
+    epoch_start_date = _epoch_start_date(epoch_state_path)
+    dd_5d, n_5d = _windowed_drawdown(history, current_eq, 5, epoch_start_date)
+    dd_20d, n_20d = _windowed_drawdown(history, current_eq, 20, epoch_start_date)
+    notes.append(f"dd_5d_samples={n_5d} dd_20d_samples={n_20d}")
+    if epoch_start_date:
+        notes.append(f"epoch_start_date={epoch_start_date}")
+
     if not equities:
         return DrawdownReport(
             status="insufficient_data",
@@ -234,6 +308,10 @@ def compute_drawdown(
             sample_count=0,
             lookback_days=int(lookback_days),
             notes=notes + ["no_usable_equity_samples"],
+            dd_5d_pct=dd_5d,
+            dd_20d_pct=dd_20d,
+            sample_count_5d=n_5d,
+            sample_count_20d=n_20d,
         )
 
     hwm = max(equities)
@@ -259,13 +337,23 @@ def compute_drawdown(
         sample_count=len(equities),
         lookback_days=int(lookback_days),
         notes=notes,
+        dd_5d_pct=dd_5d,
+        dd_20d_pct=dd_20d,
+        sample_count_5d=n_5d,
+        sample_count_20d=n_20d,
     )
 
 
 def report_to_state_dict(report: DrawdownReport, ts_utc: str, ttl_seconds: int = 300) -> Dict[str, Any]:
-    """Render a DrawdownReport into the drawdown_state.v1 schema."""
+    """Render a DrawdownReport into the drawdown_state.v2 schema.
+
+    W4A-6 (D6): bumped v1 → v2 for the additive dd_5d/dd_20d budget fields.
+    Transition-safe: the sentinel EXS7 contract accepts v1|v2 and the
+    exterminator feeds row is unchanged, so a still-v1 live file (before the
+    drawdown-publisher restart that activates this) never trips a schema break
+    (the position_guard_drift v1|v2|v3 precedent)."""
     return {
-        "schema_version": "drawdown_state.v1",
+        "schema_version": "drawdown_state.v2",
         "ts_utc": ts_utc,
         "ttl_seconds": int(ttl_seconds),
         "status": report.status,
@@ -277,6 +365,19 @@ def report_to_state_dict(report: DrawdownReport, ts_utc: str, ttl_seconds: int =
         "enforcement_active": False,
         "sample_count": int(report.sample_count),
         "lookback_days": int(report.lookback_days),
+        # W4A-6: additive short-horizon budgets (null when a horizon has no
+        # epoch-eligible rows). Rounded like the 60d field; sample counts let
+        # LC5 enforcement gate on depth.
+        "dd_5d_pct": (
+            round(float(report.dd_5d_pct), 4)
+            if report.dd_5d_pct is not None else None
+        ),
+        "dd_20d_pct": (
+            round(float(report.dd_20d_pct), 4)
+            if report.dd_20d_pct is not None else None
+        ),
+        "sample_count_5d": int(report.sample_count_5d),
+        "sample_count_20d": int(report.sample_count_20d),
         "notes": list(report.notes),
     }
 

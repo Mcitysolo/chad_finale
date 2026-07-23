@@ -1497,6 +1497,22 @@ def _read_crypto_scr_sizing_factor(path: Optional[object] = None) -> "tuple[floa
     return factor, False
 
 
+def _read_crypto_lc5_sizing() -> "tuple[float, bool]":
+    """(lc5_factor, emergency) for the crypto lane, from the published
+    fuse_box_state.json via the fuse gate. Enforce-only; shadow/off => (1.0,
+    False). Fail-open: any error => (1.0, False) — a broken fuse never starves
+    the crypto lane or invents an emergency."""
+    try:
+        from chad.risk.fuse_gate import FuseGate
+
+        gate = FuseGate()
+        if not gate.lc5_active:
+            return 1.0, False
+        return gate.lc5_factor(), gate.lc5_emergency()
+    except Exception:  # noqa: BLE001 — fail-open
+        return 1.0, False
+
+
 def _read_kraken_available_notional_usd(path: Optional[object] = None) -> Optional[float]:
     """Paper Kraken wallet size (usd_equivalent) for min-size affordability.
     None (unconstrained by wallet) on any read problem — the risk cap and the
@@ -1730,6 +1746,19 @@ def build_kraken_intents_from_routed_signals(
     if scr_paused:
         LOG.warning("CRYPTO_SCR_PAUSED — Kraken intent building skipped")
         return []
+
+    # W4A-7: LC5 drawdown sizing twin for the crypto lane. Composes
+    # multiplicatively with the SCR factor (LC5 × SCR, order-independent,
+    # never > 1.0); emergency (−15%, D5) skips the whole crypto ENTRY batch —
+    # exits run through the reduce-only overlay path, not here. Enforce-only /
+    # fail-open (1.0, no emergency on any error).
+    lc5_factor, lc5_emergency = _read_crypto_lc5_sizing()
+    if lc5_emergency:
+        LOG.warning("CRYPTO_LC5_EMERGENCY — Kraken entry building skipped "
+                    "(exits unaffected)")
+        return []
+    scr_factor = float(scr_factor) * float(lc5_factor)
+
     available_usd = _read_kraken_available_notional_usd()
 
     out: List[object] = []

@@ -1,0 +1,37 @@
+{
+  "schema_version": "symbol_sectors.v1",
+  "_notes": [
+    "W4A-2 (D3/LC3): static sector/theme map for sector:<name> fuse buckets.",
+    "Scope = config/universe.json (38 equities/ETFs + futures roots) + the",
+    "crypto lane pairs + the two extra micro-FX roots the harness recognises",
+    "(M6A/M6B, chad/validation/trade_log_adapter.py _FUTURES_ROOTS).",
+    "An unmapped symbol lands in the sector:unmapped bucket — count-only,",
+    "NEVER trippable (PLAN_W4A §4): a missing map row must not create a",
+    "blockable bucket nobody ratified. Coverage of the universe is pinned",
+    "hard by chad/tests/test_w4a_fuse_config_parity.py, so a symbol added to",
+    "universe.json without a row here fails CI instead of silently draining",
+    "into unmapped.",
+    "NOTE: futures symbols are mapped for completeness but futures rows are",
+    "currently excluded from fuse counting entirely (futures_bug_b predicate)",
+    "until the Bug-B book disposition — these rows become live when that",
+    "exclusion lifts."
+  ],
+  "sectors": {
+    "mega_tech": [
+      "AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "META", "AVGO", "AMD",
+      "ORCL", "CRM", "QCOM", "ADBE", "INTC", "NFLX"
+    ],
+    "index_etf": ["SPY", "QQQ", "IWM", "IEMG", "VWO"],
+    "inverse_etf": ["SH", "PSQ"],
+    "vol_etp": ["SVXY", "UVXY", "VIXY", "VXX"],
+    "rates": ["TLT", "ZN", "ZB"],
+    "metals": ["GLD", "MGC", "SIL"],
+    "energy": ["CVX", "MCL"],
+    "financials": ["BAC", "V", "MA"],
+    "healthcare": ["UNH", "LLY", "JNJ"],
+    "consumer": ["KO", "PEP", "WMT", "MCD"],
+    "equity_index_fut": ["MES", "MNQ", "MYM", "M2K"],
+    "fx": ["M6E", "M6A", "M6B"],
+    "crypto": ["BTC-USD", "ETH-USD", "SOL-USD"]
+  }
+}

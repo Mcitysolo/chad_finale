@@ -1,0 +1,73 @@
+{
+  "schema_version": "feed_policies.v1",
+  "_notes": [
+    "W4A-8 (DQ1/DQ3, D7): per-feed dependency class + PREWRITTEN stale policy.",
+    "Gated by CHAD_DQ_POLICIES (off|shadow|enforce, default off). Sentinel",
+    "keeps sole ownership of config/exterminator.json; this file is the",
+    "reader-side policy the P18 gaps were missing.",
+    "Policy vocabulary (all with existing production archetypes, PLAN_W4A P17):",
+    "  block_entries  - stale/corrupt/missing => refuse NEW entries; reduce-only",
+    "                   / exits still allowed (margin_block precedent, the XOV2",
+    "                   generalization). Fail-CLOSED.",
+    "  degrade_loud   - documented fallback + marker + alert; behavior otherwise",
+    "                   unchanged (price_cache bar-close precedent).",
+    "  hold_last_loud - retain the last-applied decision, loud (LC5 §5.4).",
+    "  ignore         - advisory feeds; today's fail-open, now DECLARED not",
+    "                   implicit.",
+    "The artifact's own ttl_seconds WINS over the value here (house rule); the",
+    "config value is the fallback + the citation of record.",
+    "INITIAL WIRED SITES (D7): exactly the two P18 gaps -- scr_state (SCR gate,",
+    "fail-open -> fail-closed under enforce) and the stop-bus inputs",
+    "(ibkr_status / pnl_state, DQ_INPUT_DEAD loudness). Every other row here is",
+    "config + shadow evidence only until a later consolidation."
+  ],
+  "feeds": {
+    "runtime/scr_state.json": {
+      "class": "execution_critical",
+      "ttl_seconds": 180,
+      "on_stale": "block_entries",
+      "on_corrupt": "block_entries",
+      "on_missing": "block_entries",
+      "ttl_source": "artifact_self_declared; fallback config value",
+      "wired_site": "chad/core/live_loop.py SCR gate (stage-3)",
+      "_note": "P18: the SCR hard-block gate reads scr_state.json raw, no ts/ttl check, fail-open -- a frozen PAUSED blocks forever and a corrupt file silently disables the governor. Under DQ enforce, stale/corrupt/missing => block NEW entries (exits free), making a dead SCR loud instead of silently disarming."
+    },
+    "runtime/ibkr_status.json": {
+      "class": "execution_critical",
+      "ttl_seconds": 120,
+      "on_stale": "degrade_loud",
+      "on_corrupt": "degrade_loud",
+      "on_missing": "degrade_loud",
+      "ttl_source": "artifact_self_declared; fallback config value",
+      "wired_site": "chad/core/live_loop.py stop-bus input snapshot",
+      "_note": "P18: a dead ibkr_status.json silently disables the stop-bus latency halt. Under DQ enforce the DQ_INPUT_DEAD marker + alert fire; behavior change beyond loudness: none in W4A."
+    },
+    "runtime/pnl_state.json": {
+      "class": "execution_critical",
+      "ttl_seconds": 120,
+      "on_stale": "degrade_loud",
+      "on_corrupt": "degrade_loud",
+      "on_missing": "degrade_loud",
+      "ttl_source": "fallback config value",
+      "wired_site": "chad/core/live_loop.py stop-bus input snapshot"
+    },
+    "runtime/drawdown_state.json": {
+      "class": "advisory_until_lc5",
+      "ttl_seconds": 300,
+      "on_stale": "hold_last_loud",
+      "on_corrupt": "hold_last_loud",
+      "on_missing": "hold_last_loud",
+      "ttl_source": "artifact_self_declared; fallback config value",
+      "wired_site": "handled natively by LC5 §5.4 (compute_lc5_state); DQ row is declarative"
+    },
+    "runtime/regime_state.json": {
+      "class": "advisory",
+      "ttl_seconds": 360,
+      "on_stale": "ignore",
+      "on_corrupt": "ignore",
+      "on_missing": "ignore",
+      "ttl_source": "artifact_self_declared; fallback config value",
+      "wired_site": "handled natively by the fuse regime stamp (fail-unknown); DQ row is declarative"
+    }
+  }
+}
