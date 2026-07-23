@@ -717,8 +717,70 @@ def _tpl_position_drift_resolved(facts: Dict[str, Any], mode: str) -> _Card:
     )
 
 
+def _tpl_allocator_reject_streak(facts: Dict[str, Any], mode: str) -> _Card:
+    """W5B-5: the portfolio allocator would-reject streak.
+
+    Fired only when the SAME limit dimension would-rejects N consecutive
+    entries — never per intent (that is the R13 flood CTF-T2 fixed). The
+    numbers live in the PRO line and the evidence file, never the headline.
+
+    The wording is careful about two things an operator could otherwise
+    misread: nothing was blocked (the allocator is shadow-only), and the
+    ceiling may be a derived shadow threshold rather than a ratified limit.
+    """
+    dimension = str(facts.get("dimension") or "an exposure limit").strip()
+    friendly = {
+        "gross": "total exposure across the whole book",
+        "net": "net directional exposure",
+        "per_symbol": "how much is concentrated in one symbol",
+        "per_sector": "how much is concentrated in one sector",
+        "venue": "how much is allocated to one venue",
+    }.get(dimension, dimension)
+    try:
+        streak = int(facts.get("streak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    streak_phrase = (
+        f"{streak} new trades in a row" if streak > 0 else "several new trades in a row"
+    )
+    ratified = bool(facts.get("ratified", False))
+    basis_note = (
+        "This ceiling is a ratified limit."
+        if ratified
+        else "Note: this particular ceiling is a working estimate CHAD derived "
+             "for observation, not a limit that's been signed off yet."
+    )
+    return _Card(
+        severity="warning",
+        happened=(
+            "CHAD noticed it would have turned down "
+            f"{streak_phrase} for the same reason: {friendly}."
+        ),
+        why=(
+            "Individually each trade looked fine, but added together with what "
+            "the account already holds, they'd pile more into the same bet."
+        ),
+        did=(
+            "Nothing was stopped — this check is only watching and taking notes "
+            "right now, so all those trades went ahead as normal."
+        ),
+        act="No action needed. It's worth knowing the book is leaning one way.",
+        standard_context=(
+            "CHAD is learning where a portfolio-wide limit would bite before "
+            f"any such limit is switched on. {basis_note}"
+        ),
+        pro=(
+            f"raw: dimension={dimension} streak={streak} "
+            f"cap_usd={facts.get('cap_usd')} basis={facts.get('basis')} "
+            f"ratified={ratified} book_gross_usd={facts.get('book_gross_usd')} "
+            f"mode=shadow"
+        ),
+    )
+
+
 _TEMPLATES: Dict[str, Callable[[Dict[str, Any], str], _Card]] = {
     "service_failure": _tpl_service_failure,
+    "allocator_reject_streak": _tpl_allocator_reject_streak,
     "feed_stale": _tpl_feed_stale,
     "stop_bus": _tpl_stop_bus,
     "drawdown": _tpl_drawdown,

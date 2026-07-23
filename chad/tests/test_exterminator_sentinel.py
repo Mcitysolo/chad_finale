@@ -143,6 +143,17 @@ def _fresh_runtime(runtime: Path, *, ts: datetime | None = None) -> None:
         "modes": {"lc2": "off", "lc3": "off", "lc5": "off", "dq": "off"},
         "fuses": [],
     })
+    # W5B-5: the allocator heartbeat gained an EXS1 row — a healthy runtime
+    # includes it fresh, flag-off (book/limits null; standing_findings always
+    # present, since they bound what the evidence may claim either way).
+    _write_json(runtime / "portfolio_allocator_state.json", {
+        "schema_version": "allocator_state.v1", "ts_utc": _iso(ts), "ttl_seconds": 180,
+        "mode": "off", "active": False,
+        "cycle": {"intents_evaluated": 0, "bypassed": 0, "would_approve": 0,
+                  "would_resize": 0, "would_reject": 0, "errors": 0, "by_limit": {}},
+        "book": None, "limits": None,
+        "standing_findings": [{"id": "W5B-SF1"}],
+    })
 
 
 def _make(tmp_path: Path, clock, quiet_providers, **overrides):
