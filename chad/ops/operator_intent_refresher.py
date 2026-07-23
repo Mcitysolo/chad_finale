@@ -342,6 +342,34 @@ def write_intent(
     return payload
 
 
+def _unexpired_hold(ctx: RuntimeContext) -> Optional[tuple[str, str, int]]:
+    """Return (mode, reason, remaining_ttl_s) when the CURRENT state is an
+    explicitly-set operator HOLD (EXIT_ONLY / DENY_ALL) whose own declared
+    TTL has not yet elapsed; None otherwise.
+
+    INCIDENT-0723 (D4a): the 10-minute auto-refresh timer used to rewrite
+    ALLOW_LIVE unconditionally, stomping an operator-granted EXIT_ONLY hold
+    within seconds of it being set. A hold is judged by the STATE's own
+    ts_utc + ttl_seconds (e.g. a 24h hold), NOT the store's default
+    freshness window (900s) — the whole point of a hold is to outlive it.
+    Unreadable/absent/malformed state -> None (normal refresh proceeds)."""
+    try:
+        st = build_store(ctx).load_fail_closed()
+        held = str(st.mode or "").strip().upper()
+        if held not in (OperatorMode.EXIT_ONLY, OperatorMode.DENY_ALL):
+            return None
+        ts = datetime.fromisoformat(str(st.ts_utc).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - ts).total_seconds()
+        remaining = int(float(st.ttl_seconds or 0) - age_s)
+        if remaining <= 0:
+            return None
+        return held, str(st.reason or ""), remaining
+    except Exception:
+        return None
+
+
 def cmd_refresh(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     try:
         mode = refresh_mode_for_execution(ctx.execution_mode)
@@ -352,6 +380,27 @@ def cmd_refresh(ctx: RuntimeContext, args: argparse.Namespace) -> int:
             str(exc),
         )
         return ExitCode.INVALID
+
+    hold = _unexpired_hold(ctx)
+    if hold is not None:
+        held_mode, held_reason, remaining = hold
+        payload = write_intent(
+            ctx,
+            mode=held_mode,
+            reason=held_reason or DEFAULT_REASON_EXIT_ONLY,
+            ttl_seconds=remaining,   # ts moves to now; expiry deadline holds
+            allow_live_write=False,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
+        LOG.info(
+            "operator_intent refresh PRESERVED operator hold mode=%s "
+            "remaining_ttl_s=%s (INCIDENT-0723 D4a: auto-refresh must not "
+            "widen an explicit hold) path=%s",
+            held_mode,
+            remaining,
+            ctx.runtime_path,
+        )
+        return ExitCode.SUCCESS
 
     reason = normalize_reason(
         getattr(args, "reason", "") or os.environ.get("CHAD_OPERATOR_INTENT_REASON", ""),
