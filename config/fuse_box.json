@@ -55,5 +55,18 @@
     "consecutive_losers": 3,
     "session_net_pnl_usd": null
   },
-  "lc5_ladder": {}
+  "lc5_ladder": {
+    "_note": "W4A-7 (LC5, D4/D5): progressive per-intent entry-size ladder keyed on the epoch-scoped 5d/20d drawdown budgets (drawdown_state.v2). Rungs are (at_pct<=0 -> factor in (0,1]); effective factor = min of every rung triggered across both windows, clamped (0,1]; entries only, exits/flips/protectives/overlay untouched. A window whose sample_count < its length REPORTS but never enforces (P7 depth guard). emergency_halt_pct BLOCKS new entries (NOT stop_bus, which would kill the overlays too) — exits stay free at every rung incl. emergency. stale_max_seconds: after this long stale, degrade to the worst rung reached this session (never upward) rather than trusting old data.",
+    "dd_5d": [
+      {"at_pct": -3.0, "factor": 0.75},
+      {"at_pct": -5.0, "factor": 0.50},
+      {"at_pct": -8.0, "factor": 0.25}
+    ],
+    "dd_20d": [
+      {"at_pct": -8.0, "factor": 0.50},
+      {"at_pct": -12.0, "factor": 0.25}
+    ],
+    "emergency_halt_pct": -15.0,
+    "stale_max_seconds": 3600
+  }
 }

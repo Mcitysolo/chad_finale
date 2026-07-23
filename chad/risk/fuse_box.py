@@ -1142,6 +1142,190 @@ def append_evidence(
 
 
 # --------------------------------------------------------------------------- #
+# W4A-7: LC5 progressive drawdown sizing (D4/D5)
+# --------------------------------------------------------------------------- #
+
+DRAWDOWN_STATE_PATH = REPO_ROOT / "runtime" / "drawdown_state.json"
+LC5_DEFAULT_STALE_MAX_SECONDS = 3600
+LC5_DEFAULT_EMERGENCY_PCT = -15.0
+
+
+def _ladder_factor(dd_pct: Optional[float], rungs: Any) -> float:
+    """Deepest triggered rung factor for one window. Rungs: [{at_pct<=0,
+    factor}]. dd_pct <= at_pct triggers (both negative). Returns 1.0 when the
+    window is None or no rung triggers. Malformed rungs are skipped."""
+    if dd_pct is None or not isinstance(rungs, list):
+        return 1.0
+    f = 1.0
+    for rung in rungs:
+        if not isinstance(rung, Mapping):
+            continue
+        try:
+            at = float(rung.get("at_pct"))
+            fac = float(rung.get("factor"))
+        except (TypeError, ValueError):
+            continue
+        if dd_pct <= at:
+            f = min(f, fac)
+    return f
+
+
+def _clamp_factor(f: float) -> float:
+    """Clamp to (0, 1] — a sizing factor may shrink but never invert or zero
+    (0 would be a silent halt; emergency handles halting explicitly)."""
+    if f <= 0.0:
+        return 0.01
+    return min(1.0, f)
+
+
+def compute_lc5_state(
+    now: Optional[datetime] = None,
+    *,
+    config: Optional[FuseBoxConfig] = None,
+    prior_lc5: Optional[Mapping[str, Any]] = None,
+    prior_session_window_start: Optional[str] = None,
+    session_window_start_utc: Optional[datetime] = None,
+    drawdown_state_path: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Compute the LC5 sizing factor + emergency flag from drawdown_state.v2.
+
+    Returns (lc5_dict, staleness_events). The factor is the min of every
+    ladder rung triggered across the 5d/20d windows (depth-gated: a window
+    with sample_count < its length never contributes). Staleness (§5.4):
+    - fresh: factor from the ladder; worst-rung memory updated.
+    - stale/missing/corrupt within stale_max_seconds: HOLD the prior factor
+      (never tighten or loosen on unknown data) — loud.
+    - stale beyond stale_max_seconds: degrade to the worst rung reached this
+      session (never upward).
+    Session roll (window start changed) resets the worst-rung memory.
+    """
+    cfg = config or FuseBoxConfig.load()
+    ladder = cfg.lc5_ladder or {}
+    stale_max = float(ladder.get("stale_max_seconds", LC5_DEFAULT_STALE_MAX_SECONDS))
+    emergency_pct = float(ladder.get("emergency_halt_pct", LC5_DEFAULT_EMERGENCY_PCT))
+    now_utc = now or datetime.now(timezone.utc)
+
+    prior = dict(prior_lc5) if isinstance(prior_lc5, Mapping) else {}
+    prior_factor = float(prior.get("factor", 1.0) or 1.0)
+    # Session-scoped worst (most conservative) factor reached. Reset on roll.
+    cur_window = (
+        session_window_start_utc.isoformat().replace("+00:00", "Z")
+        if session_window_start_utc else None
+    )
+    rolled = (
+        prior_session_window_start is not None
+        and cur_window is not None
+        and prior_session_window_start != cur_window
+    )
+    worst_prior = 1.0 if rolled else float(prior.get("worst_factor_session", 1.0) or 1.0)
+
+    events: List[Dict[str, Any]] = []
+
+    from chad.utils.runtime_json import read_runtime_state_json
+
+    path = drawdown_state_path or DRAWDOWN_STATE_PATH
+    obj, freshness = read_runtime_state_json(path)
+
+    if obj is None or not freshness.ok:
+        # Unknown data: never tighten/loosen. Hold last, unless stale too long.
+        reason = getattr(freshness, "reason", "unknown")
+        age = getattr(freshness, "age_seconds", None)
+        degraded = age is not None and age > stale_max
+        factor = _clamp_factor(worst_prior if degraded else prior_factor)
+        was_stale = str(prior.get("staleness") or "fresh") != "fresh"
+        if not was_stale:
+            events.append({
+                "event": "lc5_stale",
+                "marker": "FUSE_LC5_DRAWDOWN_STALE",
+                "reason": reason,
+                "held_factor": factor,
+                "degraded_to_worst": degraded,
+            })
+        LOG.warning(
+            "FUSE_LC5_DRAWDOWN_STALE reason=%s age=%s held_factor=%.3f "
+            "degraded_to_worst=%s", reason, age, factor, degraded,
+        )
+        lc5 = {
+            "factor": round(factor, 4),
+            "dd_5d_pct": prior.get("dd_5d_pct"),
+            "dd_20d_pct": prior.get("dd_20d_pct"),
+            "staleness": reason if reason in {"missing", "stale"} else "stale",
+            "emergency": bool(prior.get("emergency", False)),
+            "worst_factor_session": round(min(worst_prior, factor), 4),
+            "session_window_start": cur_window,
+        }
+        return lc5, events
+
+    # Fresh data.
+    if str(prior.get("staleness") or "fresh") != "fresh":
+        events.append({
+            "event": "lc5_restored",
+            "marker": "FUSE_LC5_DRAWDOWN_RESTORED",
+        })
+        LOG.warning("FUSE_LC5_DRAWDOWN_RESTORED fresh drawdown_state resumed")
+
+    def _win(dd_key: str, n_key: str, window: int, rungs_key: str) -> Optional[float]:
+        n = int(obj.get(n_key, 0) or 0)
+        if n < window:
+            return None  # depth guard: reports but does not enforce
+        v = obj.get(dd_key)
+        return float(v) if v is not None else None
+
+    dd5 = _win("dd_5d_pct", "sample_count_5d", 5, "dd_5d")
+    dd20 = _win("dd_20d_pct", "sample_count_20d", 20, "dd_20d")
+    f5 = _ladder_factor(dd5, ladder.get("dd_5d"))
+    f20 = _ladder_factor(dd20, ladder.get("dd_20d"))
+    factor = _clamp_factor(min(f5, f20))
+
+    # Emergency (D5): the existing −15% halt boolean OR an enforce-eligible
+    # window at/below emergency_halt_pct. Block only — exits stay free.
+    emergency = bool(obj.get("halt", False))
+    for dd in (dd5, dd20):
+        if dd is not None and dd <= emergency_pct:
+            emergency = True
+    prior_emergency = bool(prior.get("emergency", False))
+    if emergency and not prior_emergency:
+        events.append({
+            "event": "lc5_emergency", "marker": "FUSE_LC5_EMERGENCY",
+            "emergency_halt_pct": emergency_pct, "dd_5d_pct": dd5, "dd_20d_pct": dd20,
+        })
+        LOG.warning("FUSE_LC5_EMERGENCY dd_5d=%s dd_20d=%s pct=%s — new entries "
+                    "blocked (exits free)", dd5, dd20, emergency_pct)
+    elif prior_emergency and not emergency:
+        events.append({"event": "lc5_emergency_cleared",
+                       "marker": "FUSE_LC5_EMERGENCY_CLEARED"})
+
+    lc5 = {
+        "factor": round(factor, 4),
+        "dd_5d_pct": dd5,
+        "dd_20d_pct": dd20,
+        "staleness": "fresh",
+        "emergency": emergency,
+        "worst_factor_session": round(min(worst_prior, factor), 4),
+        "session_window_start": cur_window,
+    }
+    return lc5, events
+
+
+def apply_lc5_factor(quantity: float, factor: float, sec_type: str) -> float:
+    """Multiply an ENTRY quantity by the LC5 factor with the SCR-CAUTIOUS
+    rounding rules (live_loop.py:2708-2714): FUT rounds to whole contracts
+    min 1; equity floors to whole shares min 1. Never > input. Only the
+    caller decides this is an entry (exits never reach here)."""
+    import math
+
+    try:
+        raw = float(quantity)
+    except (TypeError, ValueError):
+        return quantity
+    if factor >= 1.0 or raw <= 0:
+        return quantity
+    if str(sec_type or "").upper() == "FUT":
+        return max(1.0, float(round(raw * factor)))
+    return max(1.0, float(math.floor(raw * factor)))
+
+
+# --------------------------------------------------------------------------- #
 # W4A-3: evaluator cycle — the single call live_loop makes (wired at W4A-5)
 # --------------------------------------------------------------------------- #
 
@@ -1176,6 +1360,7 @@ def run_evaluator_cycle(
     counting_active = (
         modes["lc2"] != MODE_OFF or modes["lc3"] != MODE_OFF
     )
+    window_start = session_window_start(now_utc, epoch_state_path)
     closes: List[TrustedClose] = []
     tally: Dict[str, int] = {}
     fuse_rows: List[Dict[str, Any]] = []
@@ -1215,6 +1400,28 @@ def run_evaluator_cycle(
                 now=now_utc,
             )
 
+    # W4A-7: LC5 sizing/emergency. Computed when LC5 is shadow/enforce; carried
+    # forward (hold-last) from prior state otherwise. Staleness/emergency
+    # events surface via the same evidence + coach path.
+    prior_lc5 = (prior or {}).get("lc5") if isinstance(prior, Mapping) else None
+    lc5_state: Optional[Dict[str, Any]] = prior_lc5 if isinstance(prior_lc5, dict) else None
+    if modes["lc5"] != MODE_OFF:
+        lc5_state, lc5_events = compute_lc5_state(
+            now_utc,
+            config=cfg,
+            prior_lc5=prior_lc5,
+            prior_session_window_start=(
+                (prior_lc5 or {}).get("session_window_start")
+                if isinstance(prior_lc5, Mapping) else None
+            ),
+            session_window_start_utc=window_start,
+        )
+        if lc5_events:
+            _emit_lc5_events(
+                lc5_events, mode=modes["lc5"],
+                evidence_dir=evidence_dir, notify_fn=notify_fn, now=now_utc,
+            )
+
     state = build_state(
         modes=modes,
         fuse_rows=fuse_rows,
@@ -1222,14 +1429,70 @@ def run_evaluator_cycle(
         trusted_count=len(closes),
         regime_unknown_rows=sum(1 for c in closes if c.regime == "unknown"),
         session_window_start_utc=(
-            session_window_start(now_utc, epoch_state_path)
-            if counting_active
-            else None
+            window_start if (counting_active or modes["lc5"] != MODE_OFF) else None
         ),
         epoch_started_at_utc=read_epoch_start(epoch_state_path),
-        lc5=(prior or {}).get("lc5") if isinstance(prior, Mapping) else None,
+        lc5=lc5_state,
     )
     return publish_state(state, state_path)
+
+
+def _emit_lc5_events(
+    events: Iterable[Mapping[str, Any]],
+    *,
+    mode: str,
+    evidence_dir: Optional[Path] = None,
+    notify_fn: Optional[Callable[..., Any]] = None,
+    now: Optional[datetime] = None,
+) -> None:
+    """LC5 staleness/emergency events: marker (already logged in compute),
+    evidence row, coach feed_stale-kind NOTIFY with value-free dedupe. Never
+    raises."""
+    for ev in events:
+        try:
+            append_evidence(
+                [{**ev, "mode": mode}], evidence_dir=evidence_dir, now=now
+            )
+            kind = str(ev.get("event") or "lc5")
+            is_emerg = "emergency" in kind
+            facts = {
+                "title": str(ev.get("marker") or f"LC5 {kind}"),
+                "summary": (
+                    "LC5 drawdown feed is stale — holding the last sizing "
+                    "factor, tightening nothing on unknown data."
+                    if "stale" in kind else
+                    "LC5 drawdown feed recovered — sizing resumes on fresh data."
+                    if "restored" in kind else
+                    "LC5 emergency drawdown reached — new entries blocked; "
+                    "exits, flips and the overlay stay free."
+                    if kind == "lc5_emergency" else
+                    "LC5 emergency cleared — entry sizing resumes."
+                ),
+            }
+            msg = None
+            try:
+                from chad.utils.coach_voice import format_alert
+
+                rendered = format_alert("feed_stale" if "stale" in kind else "drawdown", facts)
+                if isinstance(rendered, str) and rendered.strip():
+                    msg = rendered
+            except Exception:  # noqa: BLE001
+                msg = None
+            if not msg:
+                msg = facts["summary"]
+            send = notify_fn
+            if send is None:
+                from chad.utils.telegram_notify import notify as send  # type: ignore
+            send(
+                msg,
+                severity="critical" if is_emerg else "warning",
+                dedupe_key=f"fuse_{kind}",
+                raise_on_fail=False,
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("FUSE_LC5_EVENT_EMIT_FAILED err=%s", exc)
 
 
 __all__ = [
@@ -1252,10 +1515,12 @@ __all__ = [
     "TrustedClose",
     "UNMAPPED_SECTOR",
     "append_evidence",
+    "apply_lc5_factor",
     "build_lc2_buckets",
     "build_lc3_buckets",
     "build_state",
     "compute_bucket_stats",
+    "compute_lc5_state",
     "dedupe_identity",
     "emit_fuse_events",
     "evaluate_buckets",

@@ -40,6 +40,7 @@ from typing import Any, List, Mapping, Optional
 from chad.risk.fuse_box import (
     ENV_LC2,
     ENV_LC3,
+    ENV_LC5,
     MODE_ENFORCE,
     MODE_OFF,
     fuse_mode,
@@ -177,10 +178,53 @@ class FuseGate:
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("FUSE_GATE_MAP_LOAD_FAILED (fail-open): %s", exc)
 
+        self.lc5 = fuse_mode(ENV_LC5, self._env)
+        self._lc5 = self._state.get("lc5") if isinstance(self._state.get("lc5"), Mapping) else {}
+
     @property
     def any_active(self) -> bool:
-        """True iff at least one fuse flag is not off (shadow or enforce)."""
+        """True iff at least one entry-blocking fuse flag is not off
+        (LC2/LC3). LC5 is a separate sizing/emergency axis (lc5_active)."""
         return self.lc2 != MODE_OFF or self.lc3 != MODE_OFF
+
+    @property
+    def lc5_active(self) -> bool:
+        return self.lc5 != MODE_OFF
+
+    def lc5_factor(self) -> float:
+        """The published LC5 sizing factor (1.0 when LC5 is off, state absent,
+        or malformed). Enforcement multiplies an ENTRY quantity by this."""
+        if self.lc5 != MODE_ENFORCE:
+            return 1.0
+        try:
+            f = float(self._lc5.get("factor", 1.0))
+            return f if 0.0 < f <= 1.0 else 1.0
+        except (TypeError, ValueError):
+            return 1.0
+
+    def lc5_emergency(self) -> bool:
+        """True iff LC5 is ENFORCE and the published state flags emergency —
+        the caller must block a NEW ENTRY (exits/flips/protectives bypass)."""
+        if self.lc5 != MODE_ENFORCE:
+            return False
+        return bool(self._lc5.get("emergency", False))
+
+    def should_block_lc5_entry(self, intent: Any) -> bool:
+        """LC5 emergency entry-block for an IBKR-style intent. Never blocks an
+        exit-like intent (the prime invariant holds at −15% too). Fail-open."""
+        try:
+            if not self.lc5_emergency():
+                return False
+            if is_exit_like(intent):
+                return False
+            self._emit(intent, FuseVerdict(
+                blocked=True, would_block=True, fuse_id="lc5:emergency",
+                kind="lc5_emergency", reason="lc5_emergency", mode=self.lc5,
+            ))
+            return True
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            LOG.warning("FUSE_LC5_BLOCK_FAILED (fail-open): %s", exc)
+            return False
 
     def _mode_for_kind(self, kind: str) -> str:
         flag = _KIND_FLAG.get(kind)

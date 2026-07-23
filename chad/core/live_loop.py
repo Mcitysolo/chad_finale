@@ -2758,6 +2758,47 @@ def run_once(logger: logging.Logger) -> None:
                 logger.warning("SCR_CAUTIOUS_SCALE_FAILED (skipped): %s", _p3_err)
             # --- end P3-2 ---
 
+            # W4A-7: LC5 progressive drawdown sizing (D4/D5). Composes AFTER
+            # SCR CAUTIOUS (multiplicative, order-independent, never > 1.0) and
+            # BEFORE the fuse/symbol gates. Emergency (−15%, D5) blocks new
+            # entries — deliberately NOT stop_bus (that halts the overlays
+            # too). Exits/flips/protectives bypass both legs. Enforce-only;
+            # shadow/off leave quantity untouched. Fail-open.
+            if _fuse_gate is not None and _fuse_gate.lc5_active:
+                try:
+                    _lc5_side = str(getattr(intent, "side", "") or "").upper()
+                    _lc5_is_exit = (
+                        is_flip_signal(intent) or _lc5_side in {"EXIT", "CLOSE"}
+                    )
+                    if not _lc5_is_exit and _fuse_gate.should_block_lc5_entry(intent):
+                        logger.warning(
+                            "SKIP suppression=lc5_emergency → %s %s strategy=%s",
+                            getattr(intent, "symbol", None),
+                            getattr(intent, "side", None),
+                            getattr(intent, "strategy", None),
+                        )
+                        continue
+                    _lc5_factor = _fuse_gate.lc5_factor()
+                    if not _lc5_is_exit and _lc5_factor < 1.0:
+                        from chad.risk.fuse_box import apply_lc5_factor as _apply_lc5
+                        _raw_q = float(getattr(intent, "quantity", 0.0) or 0.0)
+                        _new_q = _apply_lc5(
+                            _raw_q, _lc5_factor,
+                            str(getattr(intent, "sec_type", "") or ""),
+                        )
+                        if _new_q != _raw_q:
+                            logger.info(
+                                "LC5_SIZE_SCALE symbol=%s raw_qty=%.2f factor=%.3f scaled_qty=%.2f",
+                                getattr(intent, "symbol", None), _raw_q,
+                                _lc5_factor, _new_q,
+                            )
+                            try:
+                                object.__setattr__(intent, "quantity", _new_q)
+                            except (AttributeError, TypeError):
+                                intent.quantity = _new_q
+                except Exception as _lc5_err:  # noqa: BLE001 — fail-open
+                    logger.warning("LC5_ENFORCE_FAILED (skipped): %s", _lc5_err)
+
             class _IntentSignalAdapter:
                 def __init__(self, obj: object) -> None:
                     self.strategy = getattr(obj, "strategy", None)
