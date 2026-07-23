@@ -380,6 +380,35 @@ class ClosedTrade:
         # payload keeps the exact shape it had before B2.
         if trust_extra:
             payload["extra"] = trust_extra
+
+        # W5A-2 (E2/E2-B): additive implementation_shortfall.v1 block, gated by
+        # CHAD_TCA_STAMP (default off ⇒ byte-identical payload; the ledger stays
+        # closed_trade.v1 — no top-level bump, per the hash-chain constraint in
+        # audits/W5A_BASELINE.md). Observer-class: reads the sibling fill
+        # evidence (both lanes — Kraken fills FIFO-close through here too),
+        # changes NO P&L number. R1 honest nulls live inside the block; a hard
+        # failure yields no key (absent == not-computed).
+        try:
+            from chad.analytics.implementation_shortfall import (
+                compute_is_for_lap,
+                tca_stamp_enabled,
+            )
+
+            if tca_stamp_enabled():
+                _is_block = compute_is_for_lap(
+                    fill_ids=list(self.fill_ids),
+                    entry_time_utc=self.entry_time_utc,
+                    exit_time_utc=self.exit_time_utc,
+                    quantity=self.quantity,
+                    contract_multiplier=self.contract_multiplier,
+                    broker="paper_exec",
+                    stop_width_usd=_safe_float(sanitized_meta.get("stop_width_usd")),
+                )
+                if _is_block is not None:
+                    payload["implementation_shortfall"] = _is_block
+        except Exception as _tca_err:  # noqa: BLE001 — observer, never break a mint
+            _LOG.warning("tca_stamp_skipped err=%s", _tca_err)
+
         return payload
 
 

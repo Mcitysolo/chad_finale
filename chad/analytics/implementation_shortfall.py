@@ -30,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -40,6 +41,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FILLS_DIR = REPO_ROOT / "data" / "fills"
 
 IS_SCHEMA_VERSION = "implementation_shortfall.v1"
+
+TCA_STAMP_ENV = "CHAD_TCA_STAMP"
+
+
+def tca_stamp_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """CHAD_TCA_STAMP=on enables the closed_trade IS stamp. Default (and any
+    non-'on' value) is off ⇒ byte-identical closed_trade rows."""
+    src = env if env is not None else os.environ
+    return str(src.get(TCA_STAMP_ENV, "")).strip().lower() == "on"
 
 _FILLS_RE = re.compile(r"^FILLS_(\d{8})\.ndjson$")
 _FEES_RE = re.compile(r"^FEES_(\d{8})\.ndjson$")
@@ -363,10 +373,83 @@ def compute_lap_is(
     }
 
 
+# --------------------------------------------------------------------------- #
+# Convenience for the mint-time stamp (memoized per date+dir, mtime-invalidated)
+# --------------------------------------------------------------------------- #
+
+_INDEX_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, FillCost]]] = {}
+
+
+def _date_of(iso_ts: Any) -> Optional[str]:
+    s = str(iso_ts or "")
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:4] + s[5:7] + s[8:10]
+    return None
+
+
+def _mtime_sig(date: str, fills_dir: Path) -> float:
+    sig = 0.0
+    for regex in (_FILLS_RE, _FEES_RE):
+        for p in _dated_files(fills_dir, regex, date):
+            try:
+                sig = max(sig, p.stat().st_mtime)
+            except OSError:
+                pass
+    return sig
+
+
+def _cached_index(date: str, fills_dir: Path) -> Dict[str, FillCost]:
+    key = (date, str(fills_dir))
+    sig = _mtime_sig(date, fills_dir)
+    hit = _INDEX_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    idx = build_fill_cost_index(date, fills_dir=fills_dir)
+    _INDEX_CACHE[key] = (sig, idx)
+    return idx
+
+
+def compute_is_for_lap(
+    *,
+    fill_ids: Iterable[str],
+    entry_time_utc: Any,
+    exit_time_utc: Any,
+    quantity: float,
+    contract_multiplier: float,
+    broker: str = "paper_exec",
+    stop_width_usd: Optional[float] = None,
+    fills_dir: Optional[Path] = None,
+    kraken_native: Optional[Mapping[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Mint-time convenience: build (memoized) the fill-cost index for the
+    lap's entry+exit dates and return the implementation_shortfall.v1 block.
+    Returns None only on hard failure (caller treats as absent). A lap whose
+    fills resolve nothing still returns a well-formed block with honest nulls
+    (R1) — that is DIFFERENT from None."""
+    try:
+        src = Path(fills_dir) if fills_dir is not None else DEFAULT_FILLS_DIR
+        dates = {d for d in (_date_of(entry_time_utc), _date_of(exit_time_utc)) if d}
+        merged: Dict[str, FillCost] = {}
+        for d in sorted(dates):
+            merged.update(_cached_index(d, src))
+        return compute_lap_is(
+            fill_ids=fill_ids, quantity=quantity,
+            contract_multiplier=contract_multiplier, broker=broker,
+            stop_width_usd=stop_width_usd, index=merged,
+            kraken_native=kraken_native,
+        )
+    except Exception as exc:  # noqa: BLE001 — observer-class, never break a mint
+        LOG.warning("compute_is_for_lap failed (skipped): %s", exc)
+        return None
+
+
 __all__ = [
     "IS_SCHEMA_VERSION",
+    "TCA_STAMP_ENV",
     "FillCost",
     "build_fee_index",
     "build_fill_cost_index",
+    "compute_is_for_lap",
     "compute_lap_is",
+    "tca_stamp_enabled",
 ]
