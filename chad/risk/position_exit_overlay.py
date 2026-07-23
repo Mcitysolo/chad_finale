@@ -56,6 +56,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+# W5A-3 (E3): true-watermark helper for the in-walk MAE/MFE extension (R4).
+# excursion_recorder is stdlib-only (no chad imports) — no cycle.
+from chad.analytics.excursion_recorder import (
+    e3_mode as _excursion_mode,
+    latest_bar_hilo as _latest_bar_hilo,
+    update_watermarks as _update_watermarks,
+)
+
 __all__ = [
     "MODE_OFF",
     "MODE_SHADOW",
@@ -613,6 +621,7 @@ def evaluate_positions(
     price_meta_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
     advice_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
     advice_mode: str = "off",
+    excursion_mode: str = "off",
 ) -> ExitOverlayResult:
     """Deterministic core. Given the position/guard/bars/price/anchor snapshot and the config,
     return verdicts, reduce-only close-intent dicts (for WOULD_CLOSE), and the anchors to
@@ -787,6 +796,19 @@ def evaluate_positions(
             # Persist the ratcheted stop so it survives to the next cycle and can only tighten.
             "atr_stop_ratchet": atr_stop if atr_stop is not None else prior_ratchet,
         }
+        # W5A-3 (E3, R4): extend THIS walk with true high/low watermarks for
+        # MAE/MFE — SEPARATE from peak/trough above (which drive the ATR stop
+        # and must not move). Gated: off ⇒ no extra fields (byte-identical
+        # anchor state). Folds the latest bar's high/low so an intracycle
+        # extreme between point marks is captured (observer-only).
+        if excursion_mode in ("sidecar", "stamp"):
+            _bar_hi, _bar_lo = _latest_bar_hilo(bars)
+            _wm = _update_watermarks(prior, price, _bar_hi, _bar_lo)
+            anchor["hwm"] = _wm["hwm"]
+            anchor["lwm"] = _wm["lwm"]
+            anchor["excursion_source"] = _wm["excursion_source"]
+            anchor["side"] = side
+            anchor["qty"] = open_qty
         updated_anchors[key] = anchor
 
         common = dict(
@@ -998,6 +1020,7 @@ class PositionExitOverlay:
                 excluded_symbols=self._excluded_symbols(),
                 advice_by_symbol=advice_map,
                 advice_mode=advice_mode,
+                excursion_mode=_excursion_mode(self._env),
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
             self._safe_error(exc)
@@ -1212,6 +1235,16 @@ class PositionExitOverlay:
         try:
             merged: Dict[str, Dict[str, Any]] = dict(self._load_anchors())
             if live_keys:
+                # W5A-3 (E3): a key on-disk, absent from live_keys, and not
+                # re-evaluated this cycle is a CONFIRMED close — snapshot its
+                # accumulated watermarks BEFORE the prune drops it. Best-effort,
+                # gated, and evidence-only: never affects the merge/prune.
+                if _excursion_mode(self._env) in ("sidecar", "stamp"):
+                    _closed_keys = set(merged) - set(live_keys) - set(updated_anchors)
+                    for _ck in _closed_keys:
+                        _anchor = merged.get(_ck)
+                        if isinstance(_anchor, Mapping) and _anchor.get("hwm"):
+                            self._safe_record_excursion(_ck, _anchor)
                 merged = {k: v for k, v in merged.items() if k in live_keys}
             merged.update(updated_anchors)
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1224,6 +1257,23 @@ class PositionExitOverlay:
             os.replace(tmp, self._state_path)
         except Exception:  # noqa: BLE001 - anchor persistence is best-effort
             pass
+
+    def _safe_record_excursion(self, position_key: str, anchor: Mapping[str, Any]) -> None:
+        """W5A-3 (E3): write the close-time MAE/MFE row to the excursion
+        sidecar next to the overlay evidence. Best-effort — never raises."""
+        try:
+            from chad.analytics.excursion_recorder import record_excursion_at_close
+
+            ev_dir = (
+                self._evidence_path.parent
+                if self._evidence_path is not None
+                else None
+            )
+            record_excursion_at_close(
+                position_key, anchor, lane="equity", evidence_dir=ev_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 — measurement is best-effort
+            self._log.warning("excursion_record_failed key=%s err=%s", position_key, exc)
 
     # -- observability -------------------------------------------------------- #
     def _safe_marker(self, verdict: ExitOverlayVerdict, mode: str) -> None:
