@@ -438,6 +438,17 @@ def _build_plan_and_intents(logger: logging.Logger) -> tuple[Any, Any, list[Any]
                 "(overlay is sole equity/ETF exit authority — D4)",
                 len(_dropped_exits),
             )
+            # W4B-1 (J16): record the dropped urges as advice evidence (rows
+            # only — the router site owns the every-cycle heartbeat). Note the
+            # RoutedSignal shape collapses identity into source_strategies.
+            # Observer-only: never breaks intent building.
+            try:
+                from chad.core.exit_advice import record_dropped_urges
+                record_dropped_urges(
+                    _dropped_exits, site="pipeline", view=_ctx_view, logger=logger,
+                )
+            except Exception as exc:  # pragma: no cover - non-fatal observability
+                logger.warning("exit_advice recorder failed (non-fatal): %s", exc)
 
     ibkr_signals, kraken_signals = split_signals_by_asset_class(routed_signals)
 
