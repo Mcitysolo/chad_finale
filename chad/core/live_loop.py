@@ -655,6 +655,23 @@ def _build_stop_bus_snapshot(
     except Exception:
         pass
 
+    # W4A-8 DQ (P18 site 2): loudness for the stop-bus inputs. A dead
+    # ibkr_status.json / pnl_state.json silently disarms the latency / daily-
+    # loss halts today. Under CHAD_DQ_POLICIES != off, read_with_policy emits
+    # DQ_INPUT_DEAD marker + coach alert + evidence when either is non-fresh.
+    # Behavior change beyond loudness: NONE in W4A (both policies are
+    # degrade_loud, should_block=False). Off: skipped entirely (byte-identical).
+    try:
+        from chad.risk.fuse_box import ENV_DQ as _ENV_DQ, fuse_mode as _fmode
+
+        if _fmode(_ENV_DQ) != "off":
+            from chad.utils.feed_policy import read_with_policy as _dq_read
+
+            _dq_read("runtime/ibkr_status.json")
+            _dq_read("runtime/pnl_state.json")
+    except Exception:  # noqa: BLE001 — loudness is best-effort, never fatal
+        pass
+
     # Reject-rate and data-staleness snapshots require windowed counters
     # that the current codebase does not yet publish; they are left
     # unpopulated and the aggregator skips them cleanly.
@@ -2688,9 +2705,39 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as _fg_err:  # noqa: BLE001 — fail-open
         logger.debug("fuse_gate construction failed (non-fatal): %s", _fg_err)
 
+    # W4A-8 (DQ, P18 site 1): SCR-freshness entry gate, evaluated once per
+    # cycle. The SCR hard-block below reads scr_state.json raw and fails OPEN;
+    # under CHAD_DQ_POLICIES=enforce a stale/corrupt/missing scr_state instead
+    # blocks NEW entries (fail-CLOSED — a frozen-PAUSED or dead governor
+    # becomes loud, not eternally-blocking or silently-disarmed). Exits bypass.
+    # Off/shadow: _dq_scr_block stays False → byte-identical behavior.
+    _dq_scr_block = False
+    try:
+        from chad.utils.feed_policy import read_with_policy as _dq_read
+
+        _, _dq_scr_verdict = _dq_read("runtime/scr_state.json")
+        _dq_scr_block = bool(_dq_scr_verdict.should_block)
+    except Exception as _dq_err:  # noqa: BLE001 — fail-open
+        logger.debug("dq scr gate eval failed (non-fatal): %s", _dq_err)
+
     for intent in intents:
         try:
             _attach_strategy_to_intent(intent, routed_signal_map)
+
+            # W4A-8 DQ (P18 site 1): fail-CLOSED on a dead SCR when DQ enforce
+            # says so. A stale/corrupt/missing scr_state can no longer silently
+            # disable the governor — new entries are refused; exits/flips pass.
+            if _dq_scr_block:
+                _dq_side = str(getattr(intent, "side", "") or "").upper()
+                if not (is_flip_signal(intent) or _dq_side in {"EXIT", "CLOSE"}):
+                    logger.warning(
+                        "DQ_SCR_BLOCK scr_state not fresh — new entry refused "
+                        "(fail-closed): symbol=%s side=%s strategy=%s",
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "strategy", None),
+                    )
+                    continue
 
             # --- SCR gate (P3-1: hard-block on PAUSED before any state mutation) ---
             try:
