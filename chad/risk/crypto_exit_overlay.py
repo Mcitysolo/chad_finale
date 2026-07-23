@@ -59,6 +59,13 @@ import json
 import logging
 import os
 import time
+
+from chad.analytics.excursion_recorder import (
+    e3_mode as _excursion_mode,
+    latest_bar_hilo as _latest_bar_hilo,
+    record_excursion_at_close as _record_excursion_at_close,
+    update_watermarks as _update_watermarks,
+)
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -221,6 +228,7 @@ def evaluate_crypto_positions(
     config: ExitOverlayConfig,
     now_utc: datetime,
     marks_meta_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    excursion_mode: str = "off",
 ) -> ExitOverlayResult:
     """Deterministic core: lot snapshots + marks + bars + anchors -> verdicts + close intents.
 
@@ -277,7 +285,7 @@ def evaluate_crypto_positions(
         trough_raw = _f(prior.get("trough")) if prior else 0.0
         trough = min(trough_raw, price) if trough_raw > 0.0 else price
         first_seen = (prior.get("first_seen_utc") if prior else None) or ts
-        updated_anchors[key] = {
+        _anchor_c = {
             # entry_price is NOT anchored here — it comes from the lot book every cycle, so it
             # cannot be fabricated or lost. Stored only for observability.
             "entry_price": snap.entry_price,
@@ -289,6 +297,17 @@ def evaluate_crypto_positions(
         }
 
         bars = bars_by_symbol.get(symbol) or []
+        # W5A-3 (E3, R4): true high/low watermarks for MAE/MFE — SEPARATE from
+        # peak/trough (which drive the ATR stop). Gated; off ⇒ byte-identical.
+        if excursion_mode in ("sidecar", "stamp"):
+            _bar_hi_c, _bar_lo_c = _latest_bar_hilo(bars)
+            _wm_c = _update_watermarks(prior, price, _bar_hi_c, _bar_lo_c)
+            _anchor_c["hwm"] = _wm_c["hwm"]
+            _anchor_c["lwm"] = _wm_c["lwm"]
+            _anchor_c["excursion_source"] = _wm_c["excursion_source"]
+            _anchor_c["side"] = side
+            _anchor_c["qty"] = snap.qty
+        updated_anchors[key] = _anchor_c
         atr = _atr(bars, config.atr_period) if len(list(bars)) >= config.min_bars_for_atr else None
         age = _age_days_from(snap.opened_at_utc, now_utc)
 
@@ -489,6 +508,7 @@ class CryptoExitOverlay:
             result = evaluate_crypto_positions(
                 snapshots=snapshots, marks_by_symbol=marks, marks_meta_by_symbol=marks_meta, bars_by_symbol=bars,
                 anchors=anchors, config=self._config, now_utc=now,
+                excursion_mode=_excursion_mode(self._env),
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
             self._safe_error(exc)
@@ -560,6 +580,14 @@ class CryptoExitOverlay:
         except Exception as exc:  # noqa: BLE001 - a submit error must not stop the loop
             self._safe_error(exc)
 
+    def _safe_record_excursion_crypto(self, position_key: str, anchor: Mapping[str, Any]) -> None:
+        """W5A-3 (E3): close-time MAE/MFE row for the crypto lane. Best-effort."""
+        try:
+            ev_dir = self._evidence_path.parent if self._evidence_path is not None else None
+            _record_excursion_at_close(position_key, anchor, lane="crypto", evidence_dir=ev_dir)
+        except Exception as exc:  # noqa: BLE001 — measurement is best-effort
+            self._log.warning("crypto_excursion_record_failed key=%s err=%s", position_key, exc)
+
     # -- anchors -------------------------------------------------------------- #
     def _load_anchors(self) -> Dict[str, Dict[str, Any]]:
         if self._state_path is None or not self._state_path.is_file():
@@ -589,7 +617,14 @@ class CryptoExitOverlay:
             merged = self._load_anchors()
             merged.update({k: dict(v) for k, v in updated.items()})
             if live_keys is not None:
+                _e3_on = _excursion_mode(self._env) in ("sidecar", "stamp")
                 for k in [k for k in merged if k not in live_keys]:
+                    # W5A-3 (E3): snapshot the closing lot's watermarks before
+                    # the prune drops it. Best-effort, gated, evidence-only.
+                    if _e3_on:
+                        _a = merged.get(k)
+                        if isinstance(_a, Mapping) and _a.get("hwm"):
+                            self._safe_record_excursion_crypto(k, _a)
                     merged.pop(k, None)
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
