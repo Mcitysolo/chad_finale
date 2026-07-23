@@ -159,6 +159,21 @@ DASHBOARD_API: int = 80
 # clientId=0 is the IB Gateway wildcard and is unsafe.
 LEDGER_WATCHER: int = 9040
 
+# ---------------------------------------------------------------------------
+# Operator emergency tools (terminal-only; chad-order-guard blocklisted)
+# ---------------------------------------------------------------------------
+
+# Futures flatten oneshot — the pre-existing emergency futures closer.
+# Source: scripts/flatten_futures_oneshot.py — `clientId=7715` (documented
+# existing reality, not a re-assignment).
+FUTURES_FLATTEN_ONESHOT: int = 7715
+
+# Emergency flatten-all CLI (W4B / LC6): cancel all open orders + close all
+# positions, both lanes. Own dedicated id so its fresh MainThread connection
+# never competes with a live service slot; 7715 stays reserved for the
+# futures oneshot. Source: scripts/flatten_all.py.
+FLATTEN_ALL: int = 7716
+
 
 # ---------------------------------------------------------------------------
 # Programmatic access
@@ -186,6 +201,8 @@ def client_id_map() -> Dict[str, int]:
         "ADVISORY_ENGINE": ADVISORY_ENGINE,
         "DASHBOARD_API": DASHBOARD_API,
         "LEDGER_WATCHER": LEDGER_WATCHER,
+        "FUTURES_FLATTEN_ONESHOT": FUTURES_FLATTEN_ONESHOT,
+        "FLATTEN_ALL": FLATTEN_ALL,
     }
 
 
