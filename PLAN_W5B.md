@@ -728,3 +728,40 @@ renumbered to stay contiguous:
 
 Set-diff methodology, `py_compile`, and the `full_cycle_preview` smoke at W5B-3/-4
 are unchanged from §9. **Same STOP as W4A/W4B/W5A: no push, no merge.**
+
+---
+
+## 15. Closure record
+
+Built 2026-07-23. Full record: **`audits/W5B_GO_RECORD.md`**.
+
+| Decision / ruling | Commit |
+|---|---|
+| Baseline + premise re-verification (§12) + GO (§13) | `76fd4f8` |
+| D1(a) beta=1.0, D2 futures reference, exposure spine | `43294f4` |
+| OPERATOR_VERIFY 1 + 2 (§13.1/§13.2), D3, D4-as-amended, D7 (§12.2) | `00223e1` |
+| Placement (§5), prime invariant, §13.4 standing findings, heartbeat | `52afefa` |
+| Coach streak + sentinel (§6c/§6d), D8-moot | `15b3b9c` |
+| Closure | *this commit* |
+
+**117 new tests.** Set-diff green at every commit — 16 failed / 4498 passed,
+failing set name-for-name identical to `audits/W5B_BASELINE.md`.
+`full_cycle_preview` exit 0. No live artifact written; flag defaults off.
+
+**Deviations, all four:** the correlation commit was cut (§13.3); W5B-3 and -4
+landed together (the heartbeat *is* the observer's state, so splitting would
+have shipped counters with no reader); D4 flipped to binding-in-shadow because
+OPERATOR_VERIFY 2 supplied a number; and one Lane-A **test** file was edited to
+fix a latent fragility that any 10th enforced contract would have tripped
+(W5B-F2) — no W5A production code, no frozen directory.
+
+**D6 partially unbuilt and named:** the thin Kraken mirror was not written. The
+book holds no crypto, the wallet cap is $184.58, and a second call site for zero
+current exposure is wiring without evidence. Firm gross/net already cover both
+venues through the book snapshot. Filed as a follow-up rather than dropped.
+
+**New findings:** W5B-SF1/SF2 (standing, on every heartbeat — they bound what
+the evidence may claim), W5B-F1 (no IBKR execution join key), W5B-F2 (EXS7
+evidence truncates breaks at 10).
+
+**STOPPED at the push/merge decision.**
