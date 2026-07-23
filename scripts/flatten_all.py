@@ -531,6 +531,321 @@ def residual_check(ib: Any, resolution: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Kraken paper lane (Phase 0/2/3 — the lane's broker truth is the FIFO book)
+# --------------------------------------------------------------------------- #
+
+def kraken_probe(db_path: Path) -> Dict[str, Any]:
+    """Open lots from the RoundTripBook table (read-only sqlite). The paper
+    lane structurally has no resting orders — asserted, not assumed silently.
+    A missing/unreadable book is a NAMED gap, never a guessed-flat."""
+    lots: List[Dict[str, Any]] = []
+    try:
+        import contextlib
+        import sqlite3
+        with contextlib.closing(sqlite3.connect(str(db_path), timeout=5.0)) as con:
+            rows = con.execute(
+                "SELECT strategy, symbol, direction, SUM(qty_remaining) "
+                "FROM kraken_trusted_lots GROUP BY strategy, symbol, direction "
+                "HAVING SUM(qty_remaining) > 0 ORDER BY strategy, symbol"
+            ).fetchall()
+        for strategy, symbol, direction, qty in rows:
+            lots.append({
+                "position_key": f"{strategy}|{symbol}",
+                "strategy": str(strategy), "symbol": str(symbol),
+                "direction": str(direction), "qty": float(qty),
+            })
+        return {"available": True, "open_lots": lots,
+                "resting_orders": 0,  # structural: paper lane has none
+                "error": None}
+    except Exception as exc:
+        return {"available": False, "open_lots": [], "resting_orders": None,
+                "error": f"kraken book unreadable: {exc}"}
+
+
+def kraken_close_intents(lots: List[Dict[str, Any]],
+                         pair_of: Callable[[str], str]) -> List[Dict[str, Any]]:
+    """Reduce-only close dicts per open (strategy,symbol) lot group. Side from
+    the BOOK direction (long->sell, short->buy); pair via the engine's own
+    inverse table (XBTUSD<-BTC-USD — the slash/identity forms do NOT round-trip
+    and would open a NEW position instead of reducing). Deterministic
+    no-timestamp idempotency keys (``flatten|<pair>|<side>|<qty>``)."""
+    intents: List[Dict[str, Any]] = []
+    for lot in lots:
+        qty = float(lot["qty"])
+        if qty <= 0.0:
+            continue
+        side = "sell" if lot["direction"] == "long" else "buy"
+        pair = pair_of(lot["symbol"])
+        intents.append({
+            "position_key": lot["position_key"],
+            "strategy": lot["strategy"],
+            "symbol": lot["symbol"],
+            "pair": pair,
+            "side": side,
+            "quantity": qty,
+            "reason": "flatten_all_kraken",
+            "idempotency_key": f"flatten|{pair}|{side}|{qty:.10f}",
+        })
+    return intents
+
+
+class _KrakenFlattenIntent:
+    """Duck-typed for TrustedFillEngine.process_intent (crypto overlay shape)."""
+
+    __slots__ = ("pair", "side", "volume", "strategy", "ordertype",
+                 "idempotency_key", "trace_id", "reduce_only")
+
+    def __init__(self, d: Mapping[str, Any]) -> None:
+        self.pair = str(d["pair"])
+        self.side = str(d["side"])
+        self.volume = float(d["quantity"])
+        self.strategy = str(d["strategy"])
+        self.ordertype = "market"
+        self.idempotency_key = str(d["idempotency_key"])
+        self.trace_id = str(d["idempotency_key"])
+        self.reduce_only = True
+
+
+def kraken_execute(intents: List[Dict[str, Any]], *,
+                   open_qty_reader: Callable[[str, str], float],
+                   process_intent: Callable[[Any], Dict[str, Any]],
+                   execute: bool) -> List[Dict[str, Any]]:
+    """Clamp-at-dispatch (the book FLIPS residuals — over-close = new short,
+    INCIDENT-0713's crypto twin) then dispatch. Drill builds, never dispatches."""
+    from chad.risk.crypto_exit_overlay import reduce_only_reclamp_crypto
+    fresh = {c["position_key"]: float(open_qty_reader(c["strategy"], c["symbol"]))
+             for c in intents}
+    clamped = reduce_only_reclamp_crypto(intents, fresh)
+    results: List[Dict[str, Any]] = []
+    for c in clamped:
+        row = dict(c)
+        if execute:
+            try:
+                row["result"] = process_intent(_KrakenFlattenIntent(c))
+            except Exception as exc:
+                row["result"] = {"trusted": False, "reason": f"dispatch error: {exc}"}
+        else:
+            row["result"] = {"status": "dry_run"}
+        results.append(row)
+    dropped = [c["position_key"] for c in intents
+               if c["position_key"] not in {r["position_key"] for r in results}]
+    if dropped:
+        results.append({"reclamp_dropped": dropped})  # named, never silent
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 submission — D2: through IbkrAdapter, coherence via apply_close_intents
+# --------------------------------------------------------------------------- #
+
+class RecordingAdapter:
+    """Pass-through proxy capturing every SubmittedOrder the wrapped adapter
+    returns. apply_close_intents keeps its evidence/guard coherence and we
+    still get the per-order objects for the Phase-3 SLA measurement."""
+
+    def __init__(self, adapter: Any) -> None:
+        self._adapter = adapter
+        self.submitted: List[Any] = []
+
+    def submit_strategy_trade_intents(self, intents: Any) -> List[Any]:
+        out = list(self._adapter.submit_strategy_trade_intents(intents) or [])
+        self.submitted.extend(out)
+        return out
+
+    def __getattr__(self, name: str) -> Any:  # delegate everything else
+        return getattr(self._adapter, name)
+
+
+def submit_closes(
+    *,
+    chad_closes: List[Dict[str, Any]],
+    operator_closes: List[Dict[str, Any]],
+    adapter: Any,
+) -> Dict[str, Any]:
+    """CHAD legs through ``apply_close_intents`` (GAP-001 exclusion chokepoint,
+    evidence writes, positive-confirmation guard mutation — the D2 coherence).
+    Operator/unattributed legs (broker-all, double-token authorized) bypass the
+    chokepoint BY DESIGN — its excluded-symbol refusal is correct for every
+    caller except this explicit override — but still go through the SAME
+    adapter (idempotency, exec-state evidence, dry_run short-circuit)."""
+    rec = RecordingAdapter(adapter)
+    errors: List[str] = []
+    if chad_closes:
+        from chad.core.position_reconciler import apply_close_intents
+        apply_close_intents(chad_closes, rec)
+    if operator_closes:
+        from chad.core.position_reconciler import _close_intent_to_ibkr
+        for close in operator_closes:
+            try:
+                rec.submit_strategy_trade_intents([_close_intent_to_ibkr(close)])
+            except Exception as exc:  # one leg must never stop the rest
+                errors.append(f"{close.get('symbol')}: {exc}")
+    return {"submitted": rec.submitted, "submit_errors": errors}
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration — the five phases, drill and execute on the SAME code path
+# --------------------------------------------------------------------------- #
+
+def run_flatten(
+    *,
+    execute: bool,
+    scope: str,
+    ib: Any,
+    adapter: Any,
+    guard_state: Mapping[str, Any],
+    excluded: List[str],
+    chad_client_ids: List[int],
+    snapshot_path: Optional[Path] = None,
+    kraken: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Probe -> cancel -> close -> confirm; returns the report payload.
+    ``kraken``, when supplied, carries the lane deps:
+    ``{"db_path", "pair_of", "open_qty_reader", "process_intent"}`` — absent
+    lane deps become a NAMED drill gap, never a silent skip. Raises
+    FlattenAbort only from the fail-closed probes."""
+    now = now or _utcnow()
+    drill_gaps: List[Dict[str, str]] = []
+
+    # -- Phase 0: PROBE (fail-closed) + scope resolution + preview ----------
+    probe = probe_broker(ib)
+    snapshot_diffs: List[Dict[str, Any]] = []
+    if snapshot_path is not None:
+        snapshot_diffs = crosscheck_snapshot(probe, snapshot_path)
+        if snapshot_diffs:
+            log(f"WARN: snapshot divergence (live probe wins): {snapshot_diffs}")
+    resolution = resolve_targets(probe=probe, guard_state=guard_state,
+                                 scope=scope, excluded=excluded)
+    k_probe = kraken_probe(kraken["db_path"]) if kraken else {
+        "available": False, "open_lots": [], "resting_orders": None,
+        "error": "kraken lane not wired"}
+    if not k_probe["available"]:
+        drill_gaps.append({"stage": "kraken_probe", "gap": str(k_probe["error"])})
+
+    # visibility-split proof (the 0/0 false-negative class)
+    visibility = {
+        "all_open_orders": len(probe.all_open_orders),
+        "own_scoped_count": probe.own_open_orders_count,
+    }
+    log(f"PROBE positions={len(probe.positions)} "
+        f"open_orders={visibility['all_open_orders']} "
+        f"(scoped={visibility['own_scoped_count']}) "
+        f"targets={len(resolution['targets'])} "
+        f"untouched={len(resolution['untouched'])} "
+        f"kraken_lots={len(k_probe['open_lots'])}")
+    for t in resolution["targets"]:
+        log(f"  CLOSE {t['position_key']:<28} {t['close_side']:<4} "
+            f"{t['quantity']:>10.2f} {t['symbol']} [{t['origin']}]")
+    for u in resolution["untouched"]:
+        log(f"  KEEP  {u['symbol']:<28} qty={u.get('broker_qty', 0):>10.2f} "
+            f"[{u['reason']}]")
+
+    # -- Phase 1: CANCEL ----------------------------------------------------
+    cancel = cancel_phase(ib, chad_client_ids=chad_client_ids,
+                          execute=execute, sleep=sleep)
+    for o in cancel["collateral_non_chad"]:
+        log(f"  CANCEL-COLLATERAL clientId={o['client_id']} "
+            f"{o['symbol']} {o['action']} {o['total_qty']} [{o['status']}]")
+    if execute and not cancel["verified_zero"]:
+        log(f"CANCEL_INCOMPLETE survivors={len(cancel['survivors'])}")
+
+    # -- Phase 2: CLOSE (both lanes) ----------------------------------------
+    chad_closes, operator_closes = close_dicts_from_targets(resolution["targets"])
+    submit = submit_closes(chad_closes=chad_closes,
+                           operator_closes=operator_closes, adapter=adapter)
+    for err in submit["submit_errors"]:
+        drill_gaps.append({"stage": "close_submit", "gap": err})
+    k_intents = kraken_close_intents(
+        k_probe["open_lots"], kraken["pair_of"]) if kraken else []
+    k_results = kraken_execute(
+        k_intents, open_qty_reader=kraken["open_qty_reader"],
+        process_intent=kraken["process_intent"], execute=execute,
+    ) if kraken and k_intents else []
+
+    # -- Phase 3: CONFIRM (SLA + residual re-probe, fail-closed again) ------
+    sla = measure_orders(submit["submitted"])
+    residuals = residual_check(ib, resolution)
+    k_residual: Dict[str, Any] = {"checked": False}
+    if kraken and execute:
+        k_after = kraken_probe(kraken["db_path"])
+        left = [l for l in k_after["open_lots"]]
+        k_residual = {"checked": k_after["available"],
+                      "open_lots_after": left,
+                      "flat": k_after["available"] and not left}
+    if execute:
+        overall = residuals["overall"]
+        if cancel["verified_zero"] is False:
+            overall = "INCOMPLETE"
+        if k_residual.get("checked") and not k_residual.get("flat"):
+            overall = "INCOMPLETE"
+    else:
+        # A drill deliberately closes nothing — its verdict is chain proof,
+        # never book state. Residual data stays in the payload for reading.
+        overall = "DRILL_COMPLETE" if not drill_gaps else "DRILL_GAPS"
+
+    # -- Phase 4: payload ----------------------------------------------------
+    return {
+        "generated_utc": _iso(now),
+        "mode": "execute" if execute else "drill",
+        "scope": scope,
+        "excluded_symbols": resolution["excluded_symbols"],
+        "gate_env": {
+            "rth_gate_disabled_for_process": True,   # set by main(), documented
+            "futures_trio": "unset (per-process env — futures closable here)",
+        },
+        "probe": {
+            "probed_at_utc": probe.probed_at_utc,
+            "positions": probe.positions,
+            "open_orders": probe.all_open_orders,
+            "visibility_split": visibility,
+            "snapshot_diffs": snapshot_diffs,
+        },
+        "kraken_probe": k_probe,
+        "resolution": resolution,
+        "cancel": cancel,
+        "closes": {
+            "chad": chad_closes,
+            "operator": operator_closes,
+            "kraken": k_results,
+            "submit_errors": submit["submit_errors"],
+        },
+        "sla": sla,
+        "residuals": residuals,
+        "kraken_residual": k_residual,
+        "overall": overall,
+        "drill_gaps": drill_gaps,
+    }
+
+
+def append_events(evidence_dir: Path, payload: Mapping[str, Any],
+                  now: Optional[datetime] = None) -> Optional[Path]:
+    """Append-only per-run event row under data/ (never runtime/)."""
+    try:
+        now = now or _utcnow()
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        out = evidence_dir / f"flatten_all_{now.strftime('%Y%m%d')}.ndjson"
+        row = {
+            "schema_version": "flatten_all_event.v1",
+            "ts_utc": _iso(now),
+            "mode": payload.get("mode"),
+            "scope": payload.get("scope"),
+            "overall": payload.get("overall"),
+            "targets": len((payload.get("resolution") or {}).get("targets", [])),
+            "cancelled_before": (payload.get("cancel") or {}).get("orders_before_count"),
+            "collateral_non_chad": len((payload.get("cancel") or {}).get("collateral_non_chad", [])),
+            "submitted": len((payload.get("sla") or {}).get("orders", [])),
+        }
+        with out.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+        return out
+    except Exception:
+        return None  # evidence is best-effort; the report is the record
+
+
+# --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
 
@@ -551,7 +866,7 @@ def write_report(out_dir: Path, payload: Dict[str, Any], *, drill: bool,
 
 
 # --------------------------------------------------------------------------- #
-# CLI (W4B-6 wires the act phases + Kraken lane + narration + hold)
+# CLI
 # --------------------------------------------------------------------------- #
 
 def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
@@ -566,7 +881,8 @@ def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
     ap.add_argument("--repo-root", type=Path, default=Path("/home/ubuntu/chad_finale"))
     ap.add_argument("--no-hold", action="store_true",
                     help="skip the post-flatten operator_intent EXIT_ONLY hold")
-    ap.add_argument("--no-telegram", action="store_true")
+    ap.add_argument("--no-telegram", action="store_true",
+                    help="skip coach narration sends")
     args = ap.parse_args(argv)
 
     import os
@@ -589,11 +905,146 @@ def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
         if resp.strip() != CONFIRM_TOKEN:
             print("REFUSED: interactive token mismatch", file=sys.stderr)
             return 2
-    # The act-phase orchestration (connect, probe, cancel, close, confirm,
-    # kraken lane, narration, hold, report) lands in W4B-6.
-    print("flatten_all core loaded; act-phase orchestration arrives in W4B-6",
-          file=sys.stderr)
-    return 0
+
+    # Emergency-close env, THIS process only (P4/P11): after-hours closes must
+    # not block on the RTH gate; the futures trio stays unset so a futures
+    # position IS closable here (unlike via the live loop). Documented in the
+    # report's gate_env block.
+    os.environ["CHAD_RTH_GATE"] = "0"
+
+    root: Path = args.repo_root
+    narrate = _make_narrator(enabled=not args.no_telegram)
+    narrate("flatten_started",
+            f"{'EXECUTE' if args.execute else 'DRILL'} scope={args.scope}")
+    ib = None
+    try:
+        # Fresh single-threaded MainThread connect on the dedicated id
+        # (L1-CLD: own process, own loop — never a shared/live slot).
+        from ib_async import IB
+        from chad.execution.ibkr_client_ids import FLATTEN_ALL, all_client_ids
+        from chad.execution.ibkr_adapter import IbkrAdapter, IbkrConfig
+        ib = IB()
+        ib.connect("127.0.0.1", 4002, clientId=FLATTEN_ALL, timeout=15)
+        adapter = IbkrAdapter(
+            IbkrConfig(client_id=FLATTEN_ALL, dry_run=not args.execute),
+            ib_factory=lambda: ib, margin_gate=None)
+        if args.execute:
+            adapter.ensure_connected()
+
+        guard_state: Dict[str, Any] = {}
+        try:
+            guard_state = json.loads(
+                (root / "runtime" / "position_guard.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"WARN: position_guard unreadable ({exc}) — chad scope will "
+                  f"resolve zero legs; broker truth still probed", file=sys.stderr)
+
+        from chad.core.kraken_trusted_fill_engine import (
+            RoundTripBook, TrustedFillEngine)
+        from chad.risk.crypto_exit_overlay import _canonical_to_pair
+        book = RoundTripBook()  # default runtime/exec_state_paper.sqlite3
+        engine = TrustedFillEngine(book=book) if args.execute else None
+        kraken = {
+            "db_path": book._db_path,  # noqa: SLF001 - book owns the path
+            "pair_of": _canonical_to_pair,
+            "open_qty_reader": book.open_qty,
+            "process_intent": (engine.process_intent if engine
+                               else (lambda intent: {"status": "dry_run"})),
+        }
+
+        payload = run_flatten(
+            execute=args.execute, scope=args.scope, ib=ib, adapter=adapter,
+            guard_state=guard_state,
+            excluded=load_excluded_symbols(
+                root / "config" / "reconciliation_exclusions.json"),
+            chad_client_ids=all_client_ids(),
+            snapshot_path=root / "runtime" / "positions_snapshot.json",
+            kraken=kraken,
+        )
+        payload["gates"] = gates
+        payload["tokens"] = {"confirm": bool(args.confirm),
+                             "scope_confirm": bool(args.scope_confirm),
+                             "interactive_confirmed": args.execute}
+    except FlattenAbort as exc:
+        narrate("flatten_aborted", str(exc))
+        print(f"ABORT: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # abort LOUD — an emergency tool never half-dies
+        narrate("flatten_aborted", f"{type(exc).__name__}: {exc}")
+        print(f"ABORT: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if ib is not None:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    narrate("flatten_cancel_done",
+            f"before={payload['cancel']['orders_before_count']} "
+            f"collateral={len(payload['cancel']['collateral_non_chad'])}")
+    narrate("flatten_closes_submitted",
+            f"ibkr={len(payload['sla']['orders'])} "
+            f"kraken={len(payload['closes']['kraken'])}")
+
+    out = write_report(root / "reports", payload, drill=not args.execute)
+    ev = append_events(root / "data" / "flatten_all", payload)
+    print(f"report -> {out}")
+    if ev:
+        print(f"evidence -> {ev}")
+    print(f"OVERALL: {payload['overall']}"
+          + (f" drill_gaps={len(payload['drill_gaps'])}" if not args.execute else ""))
+
+    if payload["overall"] == "FLAT" or not args.execute:
+        narrate("flatten_confirmed", f"overall={payload['overall']}")
+    else:
+        narrate("flatten_residuals", f"overall={payload['overall']}")
+
+    if args.execute and not args.no_hold:
+        _apply_exit_only_hold(root)
+
+    return 0 if (not args.execute or payload["overall"] == "FLAT") else 1
+
+
+def _make_narrator(*, enabled: bool) -> Callable[[str, str], None]:
+    """Staged coach narration: one send per stage, DISTINCT dedupe identity per
+    stage (a shared key eats messages 2..n for 15 min — P15), calm value-free
+    titles, numbers in the facts line. Best-effort: narration can never block
+    or fail a flatten."""
+    def _send(stage: str, detail: str) -> None:
+        if not enabled:
+            return
+        try:
+            from chad.utils.coach_voice import format_alert
+            from chad.utils.telegram_notify import notify_detailed
+            # Unknown kinds fall through safely to coach_voice's generic
+            # template (P15); registered _tpl_flatten_* cards are a cosmetic
+            # follow-up per the plan.
+            text = format_alert(stage, {
+                "title": f"Flatten-all: {stage.replace('flatten_', '').replace('_', ' ')}",
+                "detail": detail,
+            })
+            notify_detailed(text, severity="critical",
+                            dedupe_key=f"flatten_all.{stage}")
+        except Exception:
+            pass
+    return _send
+
+
+def _apply_exit_only_hold(root: Path) -> None:  # pragma: no cover - operator IO
+    """D5: post-flatten hold via operator_intent EXIT_ONLY, TTL 24h — entries
+    frozen at LiveGate, exits and overlays stay ALIVE (stop_bus/STOP would
+    freeze the close machinery too, P12). Failure prints the manual command."""
+    try:
+        from chad.ops.operator_intent_refresher import build_context, write_intent
+        write_intent(build_context(), mode="EXIT_ONLY",
+                     reason="post_flatten_hold", ttl_seconds=24 * 3600,
+                     allow_live_write=False)
+        print("hold -> operator_intent EXIT_ONLY (TTL 24h)")
+    except Exception as exc:
+        print(f"WARN: could not set EXIT_ONLY hold ({exc}); set it manually: "
+              f"python3 -m chad.ops.operator_intent_refresher set EXIT_ONLY "
+              f"--ttl-seconds 86400", file=sys.stderr)
 
 
 if __name__ == "__main__":  # pragma: no cover

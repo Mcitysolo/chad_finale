@@ -478,3 +478,252 @@ def test_flatten_all_client_id_registered_and_distinct():
     assert cmap["FUTURES_FLATTEN_ONESHOT"] == 7715
     assert reg.FLATTEN_ALL != reg.FUTURES_FLATTEN_ONESHOT
     reg.assert_no_collisions()
+
+
+# --------------------------------------------------------------------------- #
+# W4B-6: act-phase orchestration (drill/execute on the same code path)
+# --------------------------------------------------------------------------- #
+
+class ClosingFakeAdapter:
+    """Adapter double that behaves like the paper broker: a submitted close
+    reduces the FakeIB book and returns a filled SubmittedOrder-like. dry_run
+    short-circuits at the placeOrder boundary exactly like the real adapter."""
+
+    def __init__(self, ib, dry_run):
+        self._ib = ib
+        self._dry_run = dry_run
+        self.intents = []
+
+    def submit_strategy_trade_intents(self, intents):
+        out = []
+        for it in intents:
+            self.intents.append(it)
+            if self._dry_run:
+                out.append(SimpleNamespace(
+                    symbol=it.symbol, side=it.side, quantity=it.quantity,
+                    status="dry_run", idempotency_key="k", ib_order_id=None,
+                    submitted_at=NOW, raw={}))
+                continue
+            for p in self._ib._positions:
+                if p.contract.symbol == it.symbol:
+                    delta = it.quantity if str(it.side).upper() == "BUY" else -it.quantity
+                    p.position += delta
+            out.append(SimpleNamespace(
+                symbol=it.symbol, side=it.side, quantity=it.quantity,
+                status="paper_fill", idempotency_key="k", ib_order_id=11,
+                submitted_at=NOW, raw={}))
+        return out
+
+
+def _kraken_db(tmp_path, rows=()):
+    import sqlite3
+    db = tmp_path / "exec_state_paper.sqlite3"
+    con = sqlite3.connect(str(db))
+    con.execute("CREATE TABLE kraken_trusted_lots (strategy TEXT, symbol TEXT, "
+                "direction TEXT, qty_remaining REAL, entry_price REAL, "
+                "entry_fee_per_unit REAL, opened_at_utc TEXT, regime TEXT DEFAULT '')")
+    for r in rows:
+        con.execute("INSERT INTO kraken_trusted_lots (strategy, symbol, direction, "
+                    "qty_remaining, entry_price, entry_fee_per_unit, opened_at_utc) "
+                    "VALUES (?,?,?,?,?,?,?)", r)
+    con.commit()
+    con.close()
+    return db
+
+
+def _kraken_deps(tmp_path, rows=(), held=None, dispatched=None):
+    db = _kraken_db(tmp_path, rows)
+    held = held if held is not None else {}
+    dispatched = dispatched if dispatched is not None else []
+
+    def process(intent):
+        dispatched.append(intent)
+        return {"trusted": True}
+
+    return {
+        "db_path": db,
+        "pair_of": lambda sym: {"BTC-USD": "XBTUSD", "SOL-USD": "SOLUSD"}.get(sym, sym),
+        "open_qty_reader": lambda strat, sym: held.get(f"{strat}|{sym}", 0.0),
+        "process_intent": process,
+    }
+
+
+def test_kraken_probe_groups_lots_and_names_unreadable(tmp_path):
+    db = _kraken_db(tmp_path, [
+        ("alpha_crypto", "BTC-USD", "long", 0.3, 50000.0, 10.0, "t"),
+        ("alpha_crypto", "BTC-USD", "long", 0.2, 51000.0, 10.0, "t"),
+        ("alpha_crypto", "SOL-USD", "short", 5.0, 150.0, 0.1, "t"),
+    ])
+    probe = fa.kraken_probe(db)
+    assert probe["available"] is True and probe["resting_orders"] == 0
+    lots = {(l["position_key"], l["direction"]): l["qty"] for l in probe["open_lots"]}
+    assert lots[("alpha_crypto|BTC-USD", "long")] == pytest.approx(0.5)
+    assert lots[("alpha_crypto|SOL-USD", "short")] == 5.0
+    bad = fa.kraken_probe(tmp_path / "nope" / "missing.sqlite3")
+    assert bad["available"] is False and "unreadable" in bad["error"]
+
+
+def test_kraken_close_intents_side_pair_and_deterministic_key():
+    intents = fa.kraken_close_intents(
+        [{"position_key": "a|BTC-USD", "strategy": "a", "symbol": "BTC-USD",
+          "direction": "long", "qty": 0.5},
+         {"position_key": "a|SOL-USD", "strategy": "a", "symbol": "SOL-USD",
+          "direction": "short", "qty": 5.0}],
+        lambda sym: {"BTC-USD": "XBTUSD", "SOL-USD": "SOLUSD"}[sym])
+    btc, sol = intents
+    assert btc["side"] == "sell" and btc["pair"] == "XBTUSD"   # long -> sell
+    assert sol["side"] == "buy" and sol["pair"] == "SOLUSD"    # short -> buy
+    assert btc["idempotency_key"] == "flatten|XBTUSD|sell|0.5000000000"
+
+
+def test_kraken_execute_clamps_at_dispatch_and_drill_never_dispatches():
+    dispatched = []
+    intents = [{"position_key": "a|BTC-USD", "strategy": "a", "symbol": "BTC-USD",
+                "pair": "XBTUSD", "side": "sell", "quantity": 0.5,
+                "reason": "flatten_all_kraken", "idempotency_key": "k1"},
+               {"position_key": "a|SOL-USD", "strategy": "a", "symbol": "SOL-USD",
+                "pair": "SOLUSD", "side": "buy", "quantity": 5.0,
+                "reason": "flatten_all_kraken", "idempotency_key": "k2"}]
+
+    def process(intent):
+        dispatched.append(intent)
+        return {"trusted": True}
+
+    # book moved: BTC now 0.3 (clamp), SOL flat (drop, NAMED)
+    res = fa.kraken_execute(
+        intents, open_qty_reader=lambda s, sym: {"BTC-USD": 0.3}.get(sym, 0.0),
+        process_intent=process, execute=True)
+    rows = {r.get("position_key"): r for r in res if "position_key" in r}
+    assert rows["a|BTC-USD"]["quantity"] == pytest.approx(0.3)
+    assert rows["a|BTC-USD"]["result"] == {"trusted": True}
+    assert [r for r in res if "reclamp_dropped" in r] == [
+        {"reclamp_dropped": ["a|SOL-USD"]}]
+    assert len(dispatched) == 1 and dispatched[0].reduce_only is True
+
+    # drill: builds, clamps, NEVER dispatches
+    dispatched.clear()
+    res2 = fa.kraken_execute(
+        intents, open_qty_reader=lambda s, sym: 1.0,
+        process_intent=process, execute=False)
+    assert dispatched == []
+    assert all(r["result"] == {"status": "dry_run"}
+               for r in res2 if "position_key" in r)
+
+
+def test_submit_closes_chokepoint_vs_authorized_bypass():
+    ib = FakeIB(positions=[_pos("PSQ", 5.0), _pos("MSFT", 34.0)])
+    adapter = ClosingFakeAdapter(ib, dry_run=True)
+    # chad leg on an EXCLUDED symbol: apply_close_intents refuses (wall 3)
+    res = fa.submit_closes(
+        chad_closes=[{"symbol": "MSFT", "action": "CLOSE", "open_side": "BUY",
+                      "close_side": "SELL", "quantity": 34.0,
+                      "reason": "flatten_all_chad", "position_key": "x|MSFT",
+                      "strategy": "x"}],
+        operator_closes=[], adapter=adapter)
+    assert res["submitted"] == [] and adapter.intents == []
+    # operator leg (broker-all double-token): designed bypass, same adapter
+    res2 = fa.submit_closes(
+        chad_closes=[{"symbol": "PSQ", "action": "CLOSE", "open_side": "BUY",
+                      "close_side": "SELL", "quantity": 5.0,
+                      "reason": "flatten_all_chad", "position_key": "g|PSQ",
+                      "strategy": "g"}],
+        operator_closes=[{"symbol": "MSFT", "action": "CLOSE", "open_side": "BUY",
+                          "close_side": "SELL", "quantity": 34.0,
+                          "reason": "flatten_all_operator",
+                          "position_key": "operator|MSFT",
+                          "strategy": "operator_flatten"}],
+        adapter=adapter)
+    assert [s.symbol for s in res2["submitted"]] == ["PSQ", "MSFT"]
+    assert res2["submit_errors"] == []
+    # the W4B-2 provenance stamps ride every leg to the adapter boundary
+    assert all(i.meta["close_origin"] == "apply_close_intents"
+               for i in adapter.intents)
+
+
+def test_run_flatten_drill_end_to_end(tmp_path):
+    ib = FakeIB(positions=[_pos("PSQ", 5.0), _pos("MSFT", 34.0)],
+                trades=[_trade(1, 1234, "IEMG")])
+    adapter = ClosingFakeAdapter(ib, dry_run=True)
+    guard = {"gamma|PSQ": {"open": True, "symbol": "PSQ", "side": "BUY",
+                           "quantity": 8.0}}
+    dispatched = []
+    kraken = _kraken_deps(tmp_path,
+                          rows=[("a", "BTC-USD", "long", 0.5, 5e4, 1.0, "t")],
+                          held={"a|BTC-USD": 0.5}, dispatched=dispatched)
+    payload = fa.run_flatten(
+        execute=False, scope="chad", ib=ib, adapter=adapter,
+        guard_state=guard, excluded=["MSFT"], chad_client_ids=[99],
+        kraken=kraken, now=NOW, log=lambda s: None)
+    # drill: nothing cancelled, nothing dispatched, chain proven
+    assert ib.global_cancel_calls == 0
+    assert dispatched == []
+    assert payload["overall"] == "DRILL_COMPLETE"
+    assert payload["mode"] == "drill" and payload["drill_gaps"] == []
+    # the chad close went through the REAL chokepoint into the adapter dry_run
+    assert [i.symbol for i in adapter.intents] == ["PSQ"]
+    assert payload["sla"]["orders"][0]["status"] == "dry_run"
+    assert payload["closes"]["chad"][0]["quantity"] == 5.0    # broker-clamped
+    # named untouched + visibility split + kraken inventory all present
+    assert [u["symbol"] for u in payload["resolution"]["untouched"]] == ["MSFT"]
+    assert payload["probe"]["visibility_split"]["all_open_orders"] == 1
+    assert len(payload["kraken_probe"]["open_lots"]) == 1
+    assert [r["quantity"] for r in payload["closes"]["kraken"]
+            if "position_key" in r] == [0.5]
+
+
+def test_run_flatten_execute_end_to_end_flat(tmp_path):
+    ib = FakeIB(positions=[_pos("PSQ", 5.0), _pos("MSFT", 34.0)],
+                trades=[_trade(1, 99, "IEMG")])
+    adapter = ClosingFakeAdapter(ib, dry_run=False)
+    guard = {"gamma|PSQ": {"open": True, "symbol": "PSQ", "side": "BUY",
+                           "quantity": 5.0}}
+    dispatched = []
+    kraken = _kraken_deps(tmp_path,
+                          rows=[("a", "BTC-USD", "long", 0.5, 5e4, 1.0, "t")],
+                          held={"a|BTC-USD": 0.5}, dispatched=dispatched)
+    payload = fa.run_flatten(
+        execute=True, scope="chad", ib=ib, adapter=adapter,
+        guard_state=guard, excluded=["MSFT"], chad_client_ids=[99],
+        kraken=kraken, now=NOW, sleep=lambda s: None, log=lambda s: None)
+    assert ib.global_cancel_calls == 1
+    assert payload["cancel"]["verified_zero"] is True
+    # PSQ closed on the fake broker; MSFT untouched and restated by name
+    per = {r["symbol"]: r for r in payload["residuals"]["per_symbol"]}
+    assert per["PSQ"]["verdict"] == "FLAT"
+    (named,) = payload["residuals"]["untouched_named"]
+    assert named["symbol"] == "MSFT" and named["verdict"] == "EXCLUDED_UNTOUCHED"
+    assert len(dispatched) == 1                     # kraken lane dispatched
+    # kraken residual read is from the (unchanged) tmp book — flagged not flat,
+    # which drives the honest INCOMPLETE overall (test book has no engine)
+    assert payload["kraken_residual"]["checked"] is True
+    assert payload["overall"] == "INCOMPLETE"
+
+
+def test_run_flatten_probe_failure_aborts_loud(tmp_path):
+    with pytest.raises(fa.FlattenAbort):
+        fa.run_flatten(execute=False, scope="chad", ib=FakeIB(connected=False),
+                       adapter=None, guard_state={}, excluded=[],
+                       chad_client_ids=[], now=NOW, log=lambda s: None)
+
+
+def test_missing_kraken_lane_is_a_named_drill_gap():
+    ib = FakeIB(positions=[_pos("PSQ", 5.0)])
+    adapter = ClosingFakeAdapter(ib, dry_run=True)
+    payload = fa.run_flatten(
+        execute=False, scope="chad", ib=ib, adapter=adapter, guard_state={},
+        excluded=[], chad_client_ids=[99], kraken=None, now=NOW,
+        log=lambda s: None)
+    assert payload["overall"] == "DRILL_GAPS"
+    assert any(g["stage"] == "kraken_probe" for g in payload["drill_gaps"])
+
+
+def test_append_events_writes_ndjson(tmp_path):
+    out = fa.append_events(tmp_path / "flatten_all", {
+        "mode": "drill", "scope": "chad", "overall": "DRILL_COMPLETE",
+        "resolution": {"targets": [1, 2]}, "cancel": {"orders_before_count": 3,
+                                                      "collateral_non_chad": [1]},
+        "sla": {"orders": [1]},
+    }, now=NOW)
+    (row,) = [json.loads(l) for l in out.read_text().splitlines()]
+    assert row["schema_version"] == "flatten_all_event.v1"
+    assert row["targets"] == 2 and row["collateral_non_chad"] == 1
