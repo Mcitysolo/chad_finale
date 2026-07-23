@@ -1648,9 +1648,10 @@ _PROVENANCE_SIMULATED_AGAINST_LIVE_TICKS = "SIMULATED_AGAINST_LIVE_TICKS"
 
 # Genuine-fill statuses that incur a commission. Deliberately EXCLUDES
 # dry_run / duplicate_* / rejected / error / PendingSubmit — those never
-# traded, so they must carry fee_amount=0 and no fee_model stamp. This set is
-# intentionally NARROWER than trade_closer._TRUSTED_FILL_STATUSES (which
-# includes dry_run for FIFO purposes) — a dry-run order pays no commission.
+# traded, so they must carry fee_amount=0 and no fee_model stamp. Since
+# INCIDENT-0723 this matches trade_closer._TRUSTED_FILL_STATUSES (dry_run was
+# evicted from FIFO trust there too — a dry-run order never traded, so it
+# neither pays commission nor nets lots); "fill" is the harness legacy literal.
 _FEE_ELIGIBLE_FILL_STATUSES = frozenset({"paper_fill", "filled", "fill"})
 
 # IBKR Fixed schedule constants (USD).

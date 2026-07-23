@@ -344,7 +344,12 @@ def _safe_float(v: Any) -> Optional[float]:
 
 # Statuses we consider trusted enough to feed FIFO matching. Anything else
 # (pending, submitted, error, unknown, rejected, cancelled, ...) is skipped.
-_TRUSTED_FILL_STATUSES = frozenset({"filled", "paper_fill", "dry_run"})
+# INCIDENT-0723: "dry_run" was formerly blessed here — flatten-drill rehearsal
+# rows then netted real lots, minted fake trade_history round-trips, and
+# false-flatted the position guard (audits/INCIDENT_20260723_DRILL_EXHAUST_
+# FALSE_FLAT.md). A dry_run order never traded; it must NEVER enter FIFO
+# matching. Only genuine fill statuses are money truth.
+_TRUSTED_FILL_STATUSES = frozenset({"filled", "paper_fill"})
 
 # Keywords that — when found in a tag, source string, or extra marker —
 # indicate the fill is a placeholder/fallback/synthetic rather than a real

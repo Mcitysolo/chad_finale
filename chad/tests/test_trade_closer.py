@@ -43,7 +43,10 @@ def _fill(
             "entry_time_utc": ts,
             "is_live": False,
             "reject": False,
-            "status": "dry_run",
+            # INCIDENT-0723: fixtures use the canonical REAL fill status.
+            # "dry_run" (the old fixture default) is no longer FIFO-trusted —
+            # rehearsal rows must never net lots.
+            "status": "paper_fill",
         },
         "sequence_id": seq,
         "timestamp_utc": ts,

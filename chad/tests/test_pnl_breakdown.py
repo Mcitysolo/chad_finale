@@ -54,7 +54,8 @@ def _fill(
             "entry_time_utc": ts,
             "is_live": False,
             "reject": False,
-            "status": "dry_run",
+            # INCIDENT-0723: dry_run is no longer FIFO-trusted; use the real status.
+            "status": "paper_fill",
         },
         "sequence_id": seq,
         "timestamp_utc": ts,
