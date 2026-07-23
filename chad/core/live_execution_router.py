@@ -74,18 +74,32 @@ def _build_available_signals(logger: logging.Logger) -> Tuple[Dict[str, List], D
     # ZERO new SELL surface. INERT unless ON (filter returns the input unchanged),
     # so OFF stays byte-identical. Futures/crypto/options SELLs are untouched.
     _exits_filtered = 0
+    _dropped_urges: List = []
     if _mode == "on":
         for name in list(available_signals):
             kept, dropped = filter_overlay_owned_exits(available_signals[name], mode=_mode)
             if dropped:
                 available_signals[name] = kept
                 _exits_filtered += len(dropped)
+                _dropped_urges.extend(dropped)
         if _exits_filtered:
             logger.warning(
                 "CTX_POSITIONS_EXIT_FILTERED site=router dropped=%d "
                 "(overlay is sole equity/ETF exit authority — D4)",
                 _exits_filtered,
             )
+
+    # W4B-1 (J16): dropped urges become typed advice records instead of being
+    # discarded — zero information lost, one sell authority preserved (the
+    # recorder only writes evidence; consumption is the overlay's, W4B-3+).
+    # Called EVERY cycle (including OFF / no drops) so the state heartbeat can
+    # distinguish "installed but off/quiet" from "dead" (R25 doctrine).
+    # Observer-only: a recorder failure never breaks the cycle.
+    try:
+        from chad.core.exit_advice import record_dropped_urges
+        record_dropped_urges(_dropped_urges, site="router", view=_view, logger=logger)
+    except Exception as exc:  # pragma: no cover - non-fatal observability
+        logger.warning("exit_advice recorder failed (non-fatal): %s", exc)
 
     # W2B-3 + W2BS (Q4): shadow-compare + heartbeat. The HEARTBEAT is now written
     # EVERY cycle — including OFF — so the health monitor (R25) can distinguish

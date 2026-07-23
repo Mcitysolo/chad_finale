@@ -1,0 +1,6 @@
+{
+  "schema_version": "exit_advice_config.v1",
+  "_doc": "J16 (W4B-3) advice-consumption tunables — D7: the frozen position_exit_overlay.json is never amended; advice policy lives here. The owning-strategy rule itself is code (position_exit_overlay.evaluate_positions); these knobs shape which recorded urges count as fresh, consumable advice. The record->consume flip is CHAD_EXIT_ADVICE=consume — a SEPARATE operator GO gated on review of the ADVICE_WOULD_CLOSE corpus (D6 rider).",
+  "advice_ttl_seconds": 180,
+  "min_confidence": 0.0
+}

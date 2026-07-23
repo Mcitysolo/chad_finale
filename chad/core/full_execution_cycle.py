@@ -225,6 +225,24 @@ def _run_single_cycle() -> FullCycleSummary:
     _routed = list(getattr(pipeline_result, "routed_signals", []) or [])
     if _ctx_mode == "on":
         _routed, _dropped_exits = filter_overlay_owned_exits(_routed, mode=_ctx_mode)
+        if _dropped_exits:
+            # W4B-1 (J16): this site previously dropped SILENTLY (assigned,
+            # never used) — parity log with the other two sites, plus advice
+            # recording. Observer-only: never breaks the preview cycle.
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            _log.warning(
+                "CTX_POSITIONS_EXIT_FILTERED site=full_cycle dropped=%d "
+                "(overlay is sole equity/ETF exit authority — D4)",
+                len(_dropped_exits),
+            )
+            try:
+                from chad.core.exit_advice import record_dropped_urges
+                record_dropped_urges(
+                    _dropped_exits, site="full_cycle", view=_ctx_view, logger=_log,
+                )
+            except Exception as exc:  # pragma: no cover - non-fatal observability
+                _log.warning("exit_advice recorder failed (non-fatal): %s", exc)
 
     # Build execution plan
     plan: ExecutionPlan = build_execution_plan(

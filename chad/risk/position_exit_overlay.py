@@ -611,6 +611,8 @@ def evaluate_positions(
     fifo_truth_by_key: Optional[Mapping[str, Mapping[str, Any]]] = None,
     excluded_symbols: Optional[AbstractSet[str]] = None,
     price_meta_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    advice_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    advice_mode: str = "off",
 ) -> ExitOverlayResult:
     """Deterministic core. Given the position/guard/bars/price/anchor snapshot and the config,
     return verdicts, reduce-only close-intent dicts (for WOULD_CLOSE), and the anchors to
@@ -636,6 +638,21 @@ def evaluate_positions(
     fixes both: the cost basis comes from the lot ``fill_price``, and the age from the lot
     ``ts_utc`` (which the rebuild does not touch). Absent FIFO truth the code falls back to the
     prior behaviour so this is a strict superset. ``None`` → the map is empty.
+
+    W4B-3 (J16): ``advice_by_symbol`` is the aggregated exit-advice map
+    (``exit_advice.load_advice_by_symbol``) — the D4-dropped native urges, fresh
+    and exclusion-filtered. The advice rule runs ONLY when the kernel fires
+    nothing (hard_stop -> atr_trail -> max_hold keep absolute precedence), only
+    for long (BUY-side) positions, and only when the strategy that OWNS the leg
+    is among the advising strategies (D6: "the strategy that opened it wants
+    out"). ``advice_mode``:
+      off     -> rule skipped entirely (byte-identical pre-W4B-3);
+      record  -> a firing emits an ADVICE_WOULD_CLOSE verdict (evidence only —
+                 NO close intent, nothing submitted even in ACTIVE);
+      consume -> a firing emits WOULD_CLOSE + a reduce-only close intent
+                 (reason ``exit_overlay_strategy_advice``) through the same
+                 clamp/governor/backstops as every overlay close. The flip to
+                 consume is a SEPARATE operator GO (D6 rider).
     """
     ts = _iso(now_utc)
     fifo_truth = fifo_truth_by_key or {}
@@ -780,6 +797,36 @@ def evaluate_positions(
         )
 
         if fired is None:
+            # W4B-3 (J16): the advice rule — evaluated only when no kernel
+            # condition fired, long legs only, owning strategy only. Excluded
+            # symbols can never reach here (SKIP_EXCLUDED above) and the
+            # aggregator filters them independently (belt-and-braces).
+            advice = (advice_by_symbol or {}).get(symbol) if advice_mode in ("record", "consume") else None
+            if (
+                advice
+                and side == "BUY"
+                and strategy
+                and strategy in (advice.get("strategies") or ())
+            ):
+                advice_close_qty = min(open_qty, broker_held)
+                if advice_close_qty > 0.0:
+                    advice_common = dict(common)
+                    advice_common["close_qty"] = advice_close_qty
+                    if advice_mode == "consume":
+                        verdicts.append(_mk("WOULD_CLOSE", "strategy_advice", **advice_common))
+                        close_intents.append({
+                            "symbol": symbol,
+                            "action": "CLOSE",
+                            "open_side": side,
+                            "close_side": "SELL",
+                            "quantity": float(advice_close_qty),
+                            "reason": "exit_overlay_strategy_advice",
+                            "position_key": key,
+                            "strategy": strategy,
+                        })
+                    else:  # record: evidence only, never an intent
+                        verdicts.append(_mk("ADVICE_WOULD_CLOSE", "strategy_advice", **advice_common))
+                    continue
             verdicts.append(_mk("HOLD", "no_condition_met", **common))
             continue
 
@@ -821,6 +868,10 @@ OpenPositionsLoader = Callable[[], Dict[str, Dict[str, Any]]]
 # B-3: returns {"strategy|symbol": {"entry_price": float, "opened_at": iso}} from the FIFO
 # lot book. Optional — an overlay built without one behaves exactly as pre-B-3.
 FifoTruthLoader = Callable[[], Dict[str, Dict[str, Any]]]
+# W4B-3 (J16): returns the aggregated fresh-advice map for a given now. Optional —
+# an overlay built without one resolves the default aggregator lazily (and the
+# aggregator itself is inert unless CHAD_EXIT_ADVICE != off).
+AdviceLoader = Callable[[datetime], Dict[str, Dict[str, Any]]]
 
 
 class PositionExitOverlay:
@@ -842,6 +893,7 @@ class PositionExitOverlay:
         env: Optional[Mapping[str, str]] = None,
         logger: Optional[logging.Logger] = None,
         excluded_symbols: Optional[AbstractSet[str]] = None,
+        advice_loader: Optional[AdviceLoader] = None,
     ) -> None:
         self._config = config
         self._evidence_path = evidence_path
@@ -852,6 +904,7 @@ class PositionExitOverlay:
         self._bars_loader = bars_loader
         self._price_loader = price_loader
         self._fifo_truth_loader = fifo_truth_loader
+        self._advice_loader = advice_loader
         self._env = os.environ if env is None else env
         self._log = logger or LOGGER
         # B-6: operator-owned / non-CHAD exclusions. An explicit set (tests) wins; otherwise
@@ -912,6 +965,26 @@ class PositionExitOverlay:
                 except Exception:  # noqa: BLE001 - FIFO truth is an enrichment, never fatal
                     fifo_truth = {}
 
+            # W4B-3 (J16): advice is loaded only when CHAD_EXIT_ADVICE != off.
+            # A loader failure degrades to no-advice — never to a broken cycle.
+            advice_mode = "off"
+            advice_map: Dict[str, Dict[str, Any]] = {}
+            try:
+                from chad.core.exit_advice import (
+                    load_advice_by_symbol,
+                    resolve_exit_advice_mode,
+                )
+                advice_mode = resolve_exit_advice_mode(self._env)
+                if advice_mode != "off":
+                    if self._advice_loader is not None:
+                        advice_map = self._advice_loader(now) or {}
+                    else:
+                        advice_map = load_advice_by_symbol(
+                            now=now, excluded_symbols=self._excluded_symbols(),
+                        ) or {}
+            except Exception:  # noqa: BLE001 - advice is an enrichment, never fatal
+                advice_mode, advice_map = "off", {}
+
             result = evaluate_positions(
                 open_positions=open_positions,
                 guard_state=guard_state,
@@ -923,6 +996,8 @@ class PositionExitOverlay:
                 now_utc=now,
                 fifo_truth_by_key=fifo_truth,
                 excluded_symbols=self._excluded_symbols(),
+                advice_by_symbol=advice_map,
+                advice_mode=advice_mode,
             )
         except Exception as exc:  # noqa: BLE001 - never fatal; submits nothing on error
             self._safe_error(exc)
