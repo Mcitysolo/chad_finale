@@ -690,6 +690,219 @@ def evaluate_buckets(
 
 
 # --------------------------------------------------------------------------- #
+# W4A-3: LC2 bucket builders (family + setup grains, D1)
+# --------------------------------------------------------------------------- #
+
+def _bucket_thresholds(
+    config: FuseBoxConfig, overrides: Optional[Mapping[str, Any]]
+) -> Tuple[Optional[int], Optional[float], Optional[frozenset]]:
+    """(consecutive_losers, session_net_pnl_usd, regimes) for one bucket,
+    starting from config defaults. A null override disables that leg."""
+    n: Optional[int] = config.default_consecutive_losers
+    pnl: Optional[float] = config.default_session_net_pnl_usd
+    regimes: Optional[frozenset] = None
+    if isinstance(overrides, Mapping):
+        if "consecutive_losers" in overrides:
+            v = overrides.get("consecutive_losers")
+            try:
+                n = int(v) if v is not None else None
+            except (TypeError, ValueError):
+                pass
+        if "session_net_pnl_usd" in overrides:
+            v = overrides.get("session_net_pnl_usd")
+            try:
+                pnl = float(v) if v is not None else None
+            except (TypeError, ValueError):
+                pass
+        regimes = sanitize_regime_scope(overrides.get("regimes"))
+    return n, pnl, regimes
+
+
+def _warn_family_registry_parity(config: FuseBoxConfig) -> None:
+    """Runtime warn leg of the W3B-9 perimeter idiom (hard leg:
+    chad/tests/test_w4a_fuse_config_parity.py). Config drift must never
+    brick the engine — warn loud, keep going."""
+    try:
+        from chad.strategy_registry import active_strategy_values
+
+        union = set()
+        for members in config.families.values():
+            union |= set(members)
+        missing = set(active_strategy_values()) - union
+        if missing:
+            LOG.warning(
+                "FUSE_CONFIG_FAMILY_PARITY active strategies without a "
+                "family (uncovered by LC2): %s", sorted(missing),
+            )
+    except Exception:  # noqa: BLE001 — parity warning is best-effort
+        pass
+
+
+def build_lc2_buckets(
+    config: FuseBoxConfig,
+    closes: Iterable[TrustedClose],
+) -> List[BucketSpec]:
+    """Family buckets from the config map + setup buckets from the stamps
+    OBSERVED in the trusted session closes (no fixed setup list to drift —
+    a setup bucket exists exactly when the ledger shows that setup traded
+    this session)."""
+    _warn_family_registry_parity(config)
+    buckets: List[BucketSpec] = []
+    fam_overrides = (
+        config.raw.get("family_thresholds")
+        if isinstance(config.raw.get("family_thresholds"), Mapping)
+        else {}
+    )
+    for name in sorted(config.families):
+        members = config.families[name]
+        if not members:
+            continue
+        n, pnl, regimes = _bucket_thresholds(config, fam_overrides.get(name))
+        buckets.append(
+            BucketSpec(
+                fuse_id=f"family:{name}",
+                kind="family",
+                members=frozenset(members),
+                consecutive_losers=n,
+                session_net_pnl_usd=pnl,
+                regimes=regimes,
+            )
+        )
+    enabled = set(config.setup_fuse_strategies)
+    if enabled:
+        setup_defaults = (
+            config.raw.get("setup_fuse")
+            if isinstance(config.raw.get("setup_fuse"), Mapping)
+            else None
+        )
+        n, pnl, regimes = _bucket_thresholds(config, setup_defaults)
+        pairs = sorted(
+            {
+                f"{c.strategy}:{c.setup_family}"
+                for c in closes
+                if c.strategy in enabled and c.setup_family
+            }
+        )
+        for pair in pairs:
+            buckets.append(
+                BucketSpec(
+                    fuse_id=f"setup:{pair}",
+                    kind="setup",
+                    members=frozenset({pair}),
+                    consecutive_losers=n,
+                    session_net_pnl_usd=pnl,
+                    regimes=regimes,
+                )
+            )
+    return buckets
+
+
+# --------------------------------------------------------------------------- #
+# W4A-3: eventing — marker + coach NOTIFY + dedupe-stable identity (§7)
+# --------------------------------------------------------------------------- #
+
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def dedupe_identity(event: str, fuse_id: str) -> str:
+    """CTF-T2 stable identity: rule/bucket id + entity only, digits stripped,
+    values never in the key (they live in evidence/facts)."""
+    ident = _DIGITS_RE.sub("", str(fuse_id).strip().lower())
+    return f"fuse_{event}_{ident}"
+
+
+def emit_fuse_events(
+    events: Iterable[FuseEvent],
+    *,
+    mode: str,
+    evidence_dir: Optional[Path] = None,
+    notify_fn: Optional[Callable[..., Any]] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    """All four §7 surfaces per trip/clear: grep-able marker line, evidence
+    ndjson row, coach-voiced Telegram NOTIFY (sanctioned generic-kind path,
+    edge_decay_cleared precedent), dedupe-stable identity. Never raises —
+    eventing is presentation; the state write is the record of truth."""
+    emitted = 0
+    for ev in events:
+        try:
+            marker = "FUSE_TRIP" if ev.event == "trip" else "FUSE_CLEAR"
+            LOG.warning(
+                "%s kind=%s bucket=%s rule=%s streak=%d net=%.2f mode=%s",
+                marker, ev.kind, ev.fuse_id, ev.trip_rule,
+                ev.consecutive_losers, ev.session_net_pnl, mode,
+            )
+            append_evidence(
+                [
+                    {
+                        "event": ev.event,
+                        "fuse_id": ev.fuse_id,
+                        "kind": ev.kind,
+                        "trip_rule": ev.trip_rule,
+                        "consecutive_losers": ev.consecutive_losers,
+                        "session_net_pnl": ev.session_net_pnl,
+                        "mode": mode,
+                    }
+                ],
+                evidence_dir=evidence_dir,
+                now=now,
+            )
+            facts = {
+                "title": (
+                    f"Fuse {'tripped' if ev.event == 'trip' else 'cleared'}: "
+                    f"{ev.fuse_id}"
+                ),
+                "fuse_id": ev.fuse_id,
+                "kind": ev.kind,
+                "rule": ev.trip_rule,
+                "mode": mode,
+                "summary": (
+                    f"The {ev.kind} fuse {ev.fuse_id} "
+                    + (
+                        "tripped — no new entries for this bucket until the "
+                        "next session"
+                        if ev.event == "trip"
+                        else "cleared — the session window rolled or the "
+                        "streak resolved"
+                    )
+                    + (
+                        ". Shadow mode: recorded only, nothing was blocked."
+                        if mode == MODE_SHADOW and ev.event == "trip"
+                        else "."
+                    )
+                ),
+            }
+            msg: Optional[str] = None
+            try:
+                from chad.utils.coach_voice import format_alert
+
+                rendered = format_alert(f"fuse_{ev.event}", facts)
+                if isinstance(rendered, str) and rendered.strip():
+                    msg = rendered
+            except Exception:  # noqa: BLE001 — presentation is optional
+                msg = None
+            if not msg:
+                msg = facts["summary"]
+            send = notify_fn
+            if send is None:
+                from chad.utils.telegram_notify import notify as send  # type: ignore
+            send(
+                msg,
+                severity="warning",
+                dedupe_key=dedupe_identity(ev.event, ev.fuse_id),
+                raise_on_fail=False,
+            )
+            emitted += 1
+        except RuntimeError:
+            raise  # pytest leak guard must not be swallowed
+        except Exception as exc:  # noqa: BLE001 — NOTIFY is best-effort
+            LOG.warning(
+                "FUSE_EVENT_EMIT_FAILED fuse_id=%s err=%s", ev.fuse_id, exc
+            )
+    return emitted
+
+
+# --------------------------------------------------------------------------- #
 # State publisher + evidence (heartbeat doctrine: written every cycle incl. OFF)
 # --------------------------------------------------------------------------- #
 
@@ -807,6 +1020,92 @@ def append_evidence(
     return written
 
 
+# --------------------------------------------------------------------------- #
+# W4A-3: evaluator cycle — the single call live_loop makes (wired at W4A-5)
+# --------------------------------------------------------------------------- #
+
+def run_evaluator_cycle(
+    now: Optional[datetime] = None,
+    *,
+    config: Optional[FuseBoxConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    trades_dir: Optional[Path] = None,
+    fills_dir: Optional[Path] = None,
+    runtime_dir: Optional[Path] = None,
+    epoch_state_path: Optional[Path] = None,
+    state_path: Optional[Path] = None,
+    evidence_dir: Optional[Path] = None,
+    notify_fn: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    """One evaluator pass: modes → trusted counting → buckets → edge events →
+    state heartbeat. Called every live_loop cycle (W4A-5 wiring) inside the
+    loss-guard failure-soft envelope — an exception here must never kill the
+    cycle, and the state write happens even when every mode is off
+    (heartbeat doctrine: evaluated=0 ≠ dead).
+
+    Counting runs when LC2 or LC3 is shadow/enforce; all-off publishes the
+    bare heartbeat only (cheap). The GATE (W4A-5) is the only enforcement
+    point — this function never blocks anything; it derives and publishes.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    modes = read_modes(env)
+    cfg = config or FuseBoxConfig.load()
+    prior = read_prior_state(state_path)
+
+    counting_active = (
+        modes["lc2"] != MODE_OFF or modes["lc3"] != MODE_OFF
+    )
+    closes: List[TrustedClose] = []
+    tally: Dict[str, int] = {}
+    fuse_rows: List[Dict[str, Any]] = []
+    events: List[FuseEvent] = []
+    if counting_active:
+        closes, tally = load_trusted_session_closes(
+            now_utc,
+            trades_dir=trades_dir,
+            fills_dir=fills_dir,
+            runtime_dir=runtime_dir,
+            epoch_state_path=epoch_state_path,
+        )
+        buckets: List[BucketSpec] = []
+        if modes["lc2"] != MODE_OFF:
+            buckets.extend(build_lc2_buckets(cfg, closes))
+        # LC3 buckets join here (W4A-4).
+        fuse_rows, events = evaluate_buckets(
+            buckets, closes, prior_state=prior, now=now_utc
+        )
+        if events:
+            emit_fuse_events(
+                events,
+                # Mode label for evidence/alerts: enforce iff any counting
+                # fuse is enforcing; shadow otherwise.
+                mode=(
+                    MODE_ENFORCE
+                    if MODE_ENFORCE in (modes["lc2"], modes["lc3"])
+                    else MODE_SHADOW
+                ),
+                evidence_dir=evidence_dir,
+                notify_fn=notify_fn,
+                now=now_utc,
+            )
+
+    state = build_state(
+        modes=modes,
+        fuse_rows=fuse_rows,
+        counting_tally=tally,
+        trusted_count=len(closes),
+        regime_unknown_rows=sum(1 for c in closes if c.regime == "unknown"),
+        session_window_start_utc=(
+            session_window_start(now_utc, epoch_state_path)
+            if counting_active
+            else None
+        ),
+        epoch_started_at_utc=read_epoch_start(epoch_state_path),
+        lc5=(prior or {}).get("lc5") if isinstance(prior, Mapping) else None,
+    )
+    return publish_state(state, state_path)
+
+
 __all__ = [
     "ENV_DQ",
     "ENV_LC2",
@@ -826,10 +1125,14 @@ __all__ = [
     "FuseEvent",
     "TrustedClose",
     "append_evidence",
+    "build_lc2_buckets",
     "build_state",
     "compute_bucket_stats",
+    "dedupe_identity",
+    "emit_fuse_events",
     "evaluate_buckets",
     "fuse_mode",
+    "run_evaluator_cycle",
     "load_trusted_session_closes",
     "load_window_fill_statuses",
     "publish_state",
