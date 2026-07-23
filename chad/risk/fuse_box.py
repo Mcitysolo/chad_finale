@@ -798,6 +798,127 @@ def build_lc2_buckets(
 
 
 # --------------------------------------------------------------------------- #
+# W4A-4: LC3 bucket builders (symbol + sector, anti-revenge)
+# --------------------------------------------------------------------------- #
+
+SECTOR_MAP_PATH = REPO_ROOT / "config" / "symbol_sectors.json"
+UNMAPPED_SECTOR = "unmapped"
+
+
+def load_sector_map(path: Optional[Path] = None) -> Dict[str, str]:
+    """symbol → sector from config/symbol_sectors.json. Missing/corrupt →
+    empty map (warn): every symbol then drains into the never-trippable
+    unmapped bucket — a broken map can disarm LC3's sector grain but can
+    never invent a blockable bucket nobody ratified (PLAN_W4A §4)."""
+    target = Path(path) if path is not None else SECTOR_MAP_PATH
+    try:
+        obj = json.loads(target.read_text(encoding="utf-8"))
+        sectors = obj.get("sectors") if isinstance(obj, dict) else None
+        if not isinstance(sectors, dict):
+            raise ValueError("no sectors object")
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("FUSE_SECTOR_MAP_UNREADABLE path=%s err=%s", target, exc)
+        return {}
+    out: Dict[str, str] = {}
+    for sector, symbols in sectors.items():
+        if not isinstance(symbols, list):
+            continue
+        name = str(sector).strip()
+        if name == UNMAPPED_SECTOR:
+            LOG.warning(
+                "FUSE_SECTOR_MAP_RESERVED_NAME 'unmapped' row ignored — that "
+                "name is the runtime accounting bucket"
+            )
+            continue
+        for s in symbols:
+            out[str(s).strip().upper()] = name
+    return out
+
+
+def make_sector_lookup(
+    sector_map: Mapping[str, str],
+) -> Callable[[str], Optional[str]]:
+    """Lookup with the unmapped fallback — a symbol missing from the map
+    lands in the UNMAPPED_SECTOR accounting bucket, never nowhere."""
+    def _lookup(symbol: str) -> Optional[str]:
+        return sector_map.get(str(symbol).strip().upper(), UNMAPPED_SECTOR)
+
+    return _lookup
+
+
+def build_lc3_buckets(
+    config: FuseBoxConfig,
+    closes: Iterable[TrustedClose],
+    sector_map: Mapping[str, str],
+) -> List[BucketSpec]:
+    """Symbol + sector buckets from the symbols OBSERVED in the trusted
+    session closes (a bucket exists exactly when that symbol/sector traded
+    this session — no static bucket sprawl). The unmapped sector bucket is
+    COUNT-ONLY: both trip legs None ⇒ it can never trip (loud in state and
+    via the FUSE_SECTOR_UNMAPPED warning instead)."""
+    closes = list(closes)
+    buckets: List[BucketSpec] = []
+
+    sym_over = (
+        config.raw.get("symbol_fuse")
+        if isinstance(config.raw.get("symbol_fuse"), Mapping)
+        else None
+    )
+    n_sym, pnl_sym, reg_sym = _bucket_thresholds(config, sym_over)
+    for sym in sorted({c.symbol for c in closes if c.symbol}):
+        buckets.append(
+            BucketSpec(
+                fuse_id=f"symbol:{sym}",
+                kind="symbol",
+                members=frozenset({sym}),
+                consecutive_losers=n_sym,
+                session_net_pnl_usd=pnl_sym,
+                regimes=reg_sym,
+            )
+        )
+
+    sec_over = (
+        config.raw.get("sector_fuse")
+        if isinstance(config.raw.get("sector_fuse"), Mapping)
+        else None
+    )
+    n_sec, pnl_sec, reg_sec = _bucket_thresholds(config, sec_over)
+    lookup = make_sector_lookup(sector_map)
+    observed_sectors = sorted(
+        {lookup(c.symbol) or UNMAPPED_SECTOR for c in closes if c.symbol}
+    )
+    unmapped_syms = sorted(
+        {
+            c.symbol
+            for c in closes
+            if c.symbol and lookup(c.symbol) == UNMAPPED_SECTOR
+        }
+    )
+    if unmapped_syms:
+        LOG.warning(
+            "FUSE_SECTOR_UNMAPPED symbols=%s — counting under the "
+            "never-trippable '%s' bucket; add rows to "
+            "config/symbol_sectors.json to arm them",
+            unmapped_syms, UNMAPPED_SECTOR,
+        )
+    for sector in observed_sectors:
+        is_unmapped = sector == UNMAPPED_SECTOR
+        buckets.append(
+            BucketSpec(
+                fuse_id=f"sector:{sector}",
+                kind="sector",
+                members=frozenset({sector}),
+                # Unmapped: count-only, never trips — a missing map row must
+                # not create a blockable bucket nobody ratified.
+                consecutive_losers=None if is_unmapped else n_sec,
+                session_net_pnl_usd=None if is_unmapped else pnl_sec,
+                regimes=None if is_unmapped else reg_sec,
+            )
+        )
+    return buckets
+
+
+# --------------------------------------------------------------------------- #
 # W4A-3: eventing — marker + coach NOTIFY + dedupe-stable identity (§7)
 # --------------------------------------------------------------------------- #
 
@@ -1070,9 +1191,14 @@ def run_evaluator_cycle(
         buckets: List[BucketSpec] = []
         if modes["lc2"] != MODE_OFF:
             buckets.extend(build_lc2_buckets(cfg, closes))
-        # LC3 buckets join here (W4A-4).
+        sector_lookup: Optional[Callable[[str], Optional[str]]] = None
+        if modes["lc3"] != MODE_OFF:
+            sector_map = load_sector_map()
+            sector_lookup = make_sector_lookup(sector_map)
+            buckets.extend(build_lc3_buckets(cfg, closes, sector_map))
         fuse_rows, events = evaluate_buckets(
-            buckets, closes, prior_state=prior, now=now_utc
+            buckets, closes, prior_state=prior, now=now_utc,
+            sector_lookup=sector_lookup,
         )
         if events:
             emit_fuse_events(
@@ -1124,8 +1250,10 @@ __all__ = [
     "FuseBoxConfig",
     "FuseEvent",
     "TrustedClose",
+    "UNMAPPED_SECTOR",
     "append_evidence",
     "build_lc2_buckets",
+    "build_lc3_buckets",
     "build_state",
     "compute_bucket_stats",
     "dedupe_identity",
@@ -1133,8 +1261,10 @@ __all__ = [
     "evaluate_buckets",
     "fuse_mode",
     "run_evaluator_cycle",
+    "load_sector_map",
     "load_trusted_session_closes",
     "load_window_fill_statuses",
+    "make_sector_lookup",
     "publish_state",
     "read_modes",
     "read_prior_state",
