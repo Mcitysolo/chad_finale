@@ -1,0 +1,840 @@
+"""
+chad/risk/fuse_box.py — W4A fuse box core (LC2/LC3 trip engine + state publisher).
+
+One spine, four fuses (PLAN_W4A §2). This module is the CORE only: trusted-loss
+counting, the bucket trip/clear engine, and the sentinel-visible state publisher.
+Bucket builders (family/setup — W4A-3; symbol/sector — W4A-4), the per-intent
+gate (W4A-5), LC5 drawdown enforcement (W4A-6/7) and DQ policies (W4A-8) layer
+on top. Nothing here is wired into live_loop until W4A-5; nothing here ever
+blocks a close (fuses gate ENTRIES only — the prime invariant is enforced at
+the gate layer by predicate AND structurally by placement, PLAN_W4A §8.1).
+
+Counting doctrine (PLAN_W4A §3 + INCIDENT-0723 inheritance (a), GO record §5):
+a fuse counter may only ever move on a PROVEN-trusted closed trade. The engine
+re-derives per-bucket session stats from the trusted ledger every cycle (the
+stateless GAP-026 pattern — chad/risk/per_strategy_loss_guard.py) and diffs
+against the previously published state for edge-triggered trip/clear events.
+
+Trust predicates, in order (each exclusion is tallied under its reason):
+  non_closed_trade      — schema_version must start with "closed_trade."
+  out_of_window         — exit_time_utc outside [session window start, now]
+  quarantined           — chad.utils.quarantine exclusion sets (operator
+                          manifests + untrusted-fills scan + seed lots +
+                          sidecars), matched on record_hash / payload.fill_id /
+                          any element of payload.fill_ids (the
+                          trade_stats_engine idiom)
+  <trust_exclusion>     — chad.validation.trade_log_adapter.trust_exclusion:
+                          placeholder_100 / broker_rejected / non_fill_status /
+                          validate_only / pnl_untrusted / scoring_excluded /
+                          manual / warmup_sim (SCR-parity predicates)
+  strategy_excluded     — strategy ∈ {broker_sync, paper_exec, unknown, ""}
+                          (manual is caught upstream by trust_exclusion)
+  futures_bug_b         — instrument classifies FUT (Bug-B contamination;
+                          adapter/SCR precedent) until the Bug-B disposition
+  unverified_provenance — INCIDENT-0723, BY CONSTRUCTION: any cited fill_id
+                          that resolves in the session window's FILLS_*.ndjson
+                          files with a non-genuine status (∉ {paper_fill,
+                          fill, filled}) condemns the row. A drill/rehearsal
+                          (status=dry_run) exhaust row can therefore never
+                          move a fuse counter even if an upstream writer
+                          re-blesses it — the fuse re-verifies provenance
+                          itself. Covers both incident shapes: dry_run exit
+                          leg (the 8 fake 07-23 rows) and dry_run entry leg
+                          with a genuine exit fill (the 13:31:30 PSQ row).
+
+Regime scoping (D2 rider, GO record §2): a row's regime comes from the
+forward-only stamp (W4A-2); absent/unrecognised ⇒ "unknown". Unknown rows
+count toward GLOBAL bucket legs only — a regime-scoped leg matches exact
+stamps and can NEVER count an unknown row, even if a config lists "unknown"
+in a regimes scope (validation strips it, and the filter refuses it as a
+structural belt).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+
+LOG = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATH = REPO_ROOT / "config" / "fuse_box.json"
+DEFAULT_STATE_PATH = REPO_ROOT / "runtime" / "fuse_box_state.json"
+DEFAULT_EVIDENCE_DIR = REPO_ROOT / "data" / "fuse_box"
+DEFAULT_TRADES_DIR = REPO_ROOT / "data" / "trades"
+DEFAULT_FILLS_DIR = REPO_ROOT / "data" / "fills"
+DEFAULT_RUNTIME_DIR = REPO_ROOT / "runtime"
+EPOCH_STATE_PATH = DEFAULT_RUNTIME_DIR / "epoch_state.json"
+
+STATE_SCHEMA_VERSION = "fuse_box_state.v1"
+# Cycle cadence (~60s) × 3 grace — pinned in config/exterminator.json feeds row.
+STATE_TTL_SECONDS = 180
+
+# Tri-state mode flags (house convention: garbage → off).
+MODE_OFF = "off"
+MODE_SHADOW = "shadow"
+MODE_ENFORCE = "enforce"
+_VALID_MODES = frozenset({MODE_OFF, MODE_SHADOW, MODE_ENFORCE})
+
+ENV_LC2 = "CHAD_FUSE_LC2"
+ENV_LC3 = "CHAD_FUSE_LC3"
+ENV_LC5 = "CHAD_FUSE_LC5"
+ENV_DQ = "CHAD_DQ_POLICIES"
+
+# INCIDENT-0723 inheritance (a): the fuse box is consumer #7 of the W4B-8f
+# exclusion census. Lowercased statuses that count as a genuine executed fill —
+# the union of every pinned consumer allowlist (trade_closer:352,
+# position_guard:33, trade_log_adapter:95, ibkr_paper_ledger_watcher:315).
+# Must stay disjoint from position_reconciler._EVIDENCE_SKIP_FILL_STATUSES —
+# pinned in chad/tests/test_w4b8_exhaust_hygiene_sites.py.
+GENUINE_FILL_STATUSES = frozenset({"paper_fill", "fill", "filled"})
+
+# Predicate 4 (PLAN_W4A §3): non-strategy attribution rows are not edge
+# evidence. "manual" is excluded upstream by trust_exclusion (SCR parity).
+EXCLUDED_STRATEGIES = frozenset({"broker_sync", "paper_exec", "unknown", ""})
+
+# Live classifier vocabulary (chad/analytics/regime_classifier.py VALID_REGIMES).
+# "unknown" is the D2-rider bucket for unstamped/unrecognised rows.
+KNOWN_REGIMES = frozenset(
+    {"trending_bull", "trending_bear", "ranging", "volatile", "unknown"}
+)
+
+_TRADE_FILE_RE = re.compile(r"^trade_history_(\d{8})\.ndjson$")
+_FILLS_FILE_RE = re.compile(r"^FILLS_(\d{8})\.ndjson$")
+
+
+# --------------------------------------------------------------------------- #
+# Modes
+# --------------------------------------------------------------------------- #
+
+def fuse_mode(env_var: str, env: Optional[Mapping[str, str]] = None) -> str:
+    """Tri-state env parse: off | shadow | enforce; anything else → off."""
+    src = env if env is not None else os.environ
+    raw = str(src.get(env_var, "")).strip().lower()
+    return raw if raw in _VALID_MODES else MODE_OFF
+
+
+def read_modes(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    return {
+        "lc2": fuse_mode(ENV_LC2, env),
+        "lc3": fuse_mode(ENV_LC3, env),
+        "lc5": fuse_mode(ENV_LC5, env),
+        "dq": fuse_mode(ENV_DQ, env),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+@dataclasses.dataclass(frozen=True)
+class FuseBoxConfig:
+    """Parsed config/fuse_box.json. Missing/corrupt file → safe defaults
+    (no families, no thresholds overridden) — a broken config can disarm the
+    fuse box (report-only posture) but can never invent a trip."""
+
+    default_consecutive_losers: int
+    default_session_net_pnl_usd: Optional[float]
+    families: Dict[str, Tuple[str, ...]]
+    setup_fuse_strategies: Tuple[str, ...]
+    symbol_consecutive_losers: int
+    sector_consecutive_losers: int
+    lc5_ladder: Dict[str, Any]
+    raw: Dict[str, Any]
+
+    @classmethod
+    def load(cls, path: Optional[Path] = None) -> "FuseBoxConfig":
+        target = Path(path) if path is not None else CONFIG_PATH
+        try:
+            obj = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                obj = {}
+        except Exception:
+            obj = {}
+        defaults = obj.get("defaults") or {}
+        try:
+            n_default = int(defaults.get("consecutive_losers", 3))
+        except (TypeError, ValueError):
+            n_default = 3
+        pnl_default: Optional[float]
+        try:
+            v = defaults.get("session_net_pnl_usd")
+            pnl_default = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            pnl_default = None
+
+        families: Dict[str, Tuple[str, ...]] = {}
+        fam_raw = obj.get("families") or {}
+        if isinstance(fam_raw, dict):
+            for name, members in fam_raw.items():
+                if isinstance(members, list):
+                    families[str(name)] = tuple(
+                        str(m).strip().lower() for m in members if str(m).strip()
+                    )
+
+        setup_raw = (obj.get("setup_fuses") or {}).get("enabled_strategies") or []
+        setup_strategies = tuple(
+            str(s).strip().lower() for s in setup_raw if str(s).strip()
+        ) if isinstance(setup_raw, list) else ()
+
+        def _n(section: str, fallback: int) -> int:
+            try:
+                return int((obj.get(section) or {}).get("consecutive_losers", fallback))
+            except (TypeError, ValueError):
+                return fallback
+
+        ladder = obj.get("lc5_ladder") or {}
+        return cls(
+            default_consecutive_losers=n_default,
+            default_session_net_pnl_usd=pnl_default,
+            families=families,
+            setup_fuse_strategies=setup_strategies,
+            symbol_consecutive_losers=_n("symbol_fuse", n_default),
+            sector_consecutive_losers=_n("sector_fuse", n_default),
+            lc5_ladder=ladder if isinstance(ladder, dict) else {},
+            raw=obj,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Session window (GAP-026 pattern: max(UTC midnight, epoch start))
+# --------------------------------------------------------------------------- #
+
+def _parse_iso(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def read_epoch_start(epoch_state_path: Optional[Path] = None) -> Optional[datetime]:
+    target = Path(epoch_state_path) if epoch_state_path is not None else EPOCH_STATE_PATH
+    try:
+        obj = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return _parse_iso(obj.get("epoch_started_at_utc"))
+
+
+def session_window_start(
+    now: Optional[datetime] = None,
+    epoch_state_path: Optional[Path] = None,
+) -> datetime:
+    """max(UTC midnight today, epoch_started_at_utc) — the GAP-026 window."""
+    now_utc = now or datetime.now(timezone.utc)
+    midnight = datetime(
+        now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc
+    )
+    epoch_start = read_epoch_start(epoch_state_path)
+    if epoch_start is None:
+        return midnight
+    return max(midnight, epoch_start)
+
+
+# --------------------------------------------------------------------------- #
+# Trusted-close loading
+# --------------------------------------------------------------------------- #
+
+@dataclasses.dataclass(frozen=True)
+class TrustedClose:
+    strategy: str
+    symbol: str
+    side: str
+    pnl: float
+    exit_ts: datetime
+    regime: str          # normalized; "unknown" when unstamped/unrecognised
+    setup_family: Optional[str]
+    fill_ids: Tuple[str, ...]
+
+
+def _dates_in_window(window_start: datetime, now: datetime) -> List[str]:
+    """YYYYMMDD strings from window start through *now* (UTC), inclusive."""
+    out: List[str] = []
+    day = datetime(
+        window_start.year, window_start.month, window_start.day,
+        tzinfo=timezone.utc,
+    )
+    while day.date() <= now.date():
+        out.append(day.strftime("%Y%m%d"))
+        day = day + timedelta(days=1)
+    return out
+
+
+def load_window_fill_statuses(
+    window_start: datetime,
+    now: datetime,
+    fills_dir: Optional[Path] = None,
+) -> Dict[str, str]:
+    """Map fill_id → lowercased status from the session window's FILLS files.
+
+    INCIDENT-0723 inheritance (a): this is the provenance substrate. Only
+    window-dated files are read (bounded — entry fills older than the window
+    are vetted by the quarantine/trust belts instead, and cannot condemn).
+    """
+    src = Path(fills_dir) if fills_dir is not None else DEFAULT_FILLS_DIR
+    out: Dict[str, str] = {}
+    if not src.is_dir():
+        return out
+    wanted = set(_dates_in_window(window_start, now))
+    for path in sorted(src.iterdir()):
+        m = _FILLS_FILE_RE.match(path.name)
+        if not m or m.group(1) not in wanted:
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            payload = rec.get("payload", rec)
+            if not isinstance(payload, Mapping):
+                continue
+            fid = str(payload.get("fill_id") or "").strip()
+            if not fid:
+                continue
+            status = str(payload.get("status") or "").strip().lower()
+            # Last write wins — FILLS rows are append-only; a fill_id that
+            # appears twice (harvester double-write, incident D7) keeps the
+            # later row's status. Either copy of a genuine fill is genuine.
+            out[fid] = status
+    return out
+
+
+def _norm_regime(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    return s if s in KNOWN_REGIMES and s != "unknown" else "unknown"
+
+
+def load_trusted_session_closes(
+    now: Optional[datetime] = None,
+    *,
+    trades_dir: Optional[Path] = None,
+    fills_dir: Optional[Path] = None,
+    runtime_dir: Optional[Path] = None,
+    epoch_state_path: Optional[Path] = None,
+) -> Tuple[List[TrustedClose], Dict[str, int]]:
+    """Load session-window closed trades that pass EVERY trust predicate.
+
+    Returns (trusted closes sorted by exit ts, exclusion tally by reason).
+    Fail-safe: unreadable substrate yields an empty list — a fuse without
+    evidence stays untripped (counters only ever move on proven data).
+    """
+    end = now or datetime.now(timezone.utc)
+    window_start = session_window_start(end, epoch_state_path)
+    src_dir = Path(trades_dir) if trades_dir is not None else DEFAULT_TRADES_DIR
+    tally: Dict[str, int] = {}
+    closes: List[TrustedClose] = []
+
+    def _count(reason: str) -> None:
+        tally[reason] = tally.get(reason, 0) + 1
+
+    if not src_dir.is_dir():
+        return closes, tally
+
+    # Quarantine sets — the SCR idiom (loss-guard precedent: failure here must
+    # not raise; it degrades to manifest-less sets, never blocks the cycle).
+    try:
+        from chad.utils.quarantine import get_exclusion_sets, is_record_quarantined
+        bad_fills, bad_hashes = get_exclusion_sets(
+            runtime_dir=Path(runtime_dir) if runtime_dir is not None else DEFAULT_RUNTIME_DIR,
+            fills_dir=Path(fills_dir) if fills_dir is not None else DEFAULT_FILLS_DIR,
+            trades_dir=src_dir,
+        )
+    except Exception:
+        bad_fills, bad_hashes = set(), set()
+        is_record_quarantined = None  # type: ignore[assignment]
+
+    # SCR-parity trust gate + instrument classifier (import-isolated module).
+    from chad.validation.trade_log_adapter import (
+        InstrumentClass,
+        classify_instrument,
+        trust_exclusion,
+    )
+
+    fill_statuses = load_window_fill_statuses(window_start, end, fills_dir)
+
+    wanted_dates = set(_dates_in_window(window_start, end))
+    for path in sorted(src_dir.iterdir()):
+        m = _TRADE_FILE_RE.match(path.name)
+        if not m or m.group(1) not in wanted_dates:
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(rec, Mapping):
+                continue
+            payload = rec.get("payload", rec)
+            if not isinstance(payload, Mapping):
+                continue
+
+            # 1. Structural: canonical closed round-trip only.
+            schema = str(payload.get("schema_version") or "")
+            if not schema.startswith("closed_trade."):
+                _count("non_closed_trade")
+                continue
+
+            # 2. Window.
+            ts = _parse_iso(payload.get("exit_time_utc"))
+            if ts is None or ts < window_start or ts > end:
+                _count("out_of_window")
+                continue
+
+            # 3. Quarantine pins (record_hash / fill_id / fill_ids).
+            if is_record_quarantined is not None and is_record_quarantined(
+                rec, bad_fills, bad_hashes
+            ):
+                _count("quarantined")
+                continue
+
+            # 4. SCR-parity trust gate.
+            reason = trust_exclusion(rec)
+            if reason is not None:
+                _count(reason)
+                continue
+
+            # 5. Attribution.
+            strategy = str(payload.get("strategy") or "").strip().lower()
+            if strategy in EXCLUDED_STRATEGIES:
+                _count("strategy_excluded")
+                continue
+
+            # 6. Futures (Bug-B) — adapter/SCR precedent.
+            extra = payload.get("extra") if isinstance(payload.get("extra"), Mapping) else {}
+            if classify_instrument(payload, extra) is InstrumentClass.FUT:
+                _count("futures_bug_b")
+                continue
+
+            # 7. INCIDENT-0723: provenance verification, by construction.
+            fill_ids = tuple(
+                str(f).strip() for f in (payload.get("fill_ids") or []) if str(f).strip()
+            )
+            condemned = False
+            for fid in fill_ids:
+                status = fill_statuses.get(fid)
+                if status is not None and status not in GENUINE_FILL_STATUSES:
+                    condemned = True
+                    break
+            if condemned:
+                _count("unverified_provenance")
+                continue
+
+            meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+            setup_family = meta.get("setup_family")
+            pnl_raw = payload.get("net_pnl", payload.get("pnl"))
+            try:
+                pnl = float(pnl_raw)
+            except (TypeError, ValueError):
+                _count("malformed_pnl")
+                continue
+
+            closes.append(
+                TrustedClose(
+                    strategy=strategy,
+                    symbol=str(payload.get("symbol") or "").strip().upper(),
+                    side=str(payload.get("side") or "").strip().upper(),
+                    pnl=pnl,
+                    exit_ts=ts,
+                    regime=_norm_regime(payload.get("regime")),
+                    setup_family=(
+                        str(setup_family).strip() if setup_family else None
+                    ),
+                    fill_ids=fill_ids,
+                )
+            )
+
+    closes.sort(key=lambda c: c.exit_ts)
+    return closes, tally
+
+
+# --------------------------------------------------------------------------- #
+# Buckets + trip/clear engine
+# --------------------------------------------------------------------------- #
+
+@dataclasses.dataclass(frozen=True)
+class BucketSpec:
+    """One fuse bucket. `members` semantics per kind:
+      family — strategy ids; setup — "<strategy>:<setup_family>" pairs;
+      symbol — symbols; sector — sector names (resolved via sector_lookup).
+    `regimes=None` is the GLOBAL leg (counts every row incl. unknown);
+    a non-None frozenset is a regime-scoped leg (exact stamps only — the D2
+    rider forbids unknown rows from ever counting here)."""
+
+    fuse_id: str
+    kind: str
+    members: frozenset
+    consecutive_losers: Optional[int] = 3
+    session_net_pnl_usd: Optional[float] = None
+    regimes: Optional[frozenset] = None
+
+    def matches(
+        self,
+        close: TrustedClose,
+        sector_lookup: Optional[Callable[[str], Optional[str]]] = None,
+    ) -> bool:
+        if self.kind == "family":
+            hit = close.strategy in self.members
+        elif self.kind == "setup":
+            hit = (
+                close.setup_family is not None
+                and f"{close.strategy}:{close.setup_family}" in self.members
+            )
+        elif self.kind == "symbol":
+            hit = close.symbol in self.members
+        elif self.kind == "sector":
+            if sector_lookup is None:
+                return False
+            sector = sector_lookup(close.symbol)
+            hit = sector is not None and sector in self.members
+        else:
+            return False
+        if not hit:
+            return False
+        if self.regimes is None:
+            return True
+        # D2 rider: regime-scoped legs match exact stamps only; an unknown
+        # row can never count here (structural belt over config validation).
+        return close.regime != "unknown" and close.regime in self.regimes
+
+
+def sanitize_regime_scope(raw: Any) -> Optional[frozenset]:
+    """Config → regimes scope. None/empty → GLOBAL leg. "unknown" is stripped
+    (D2 rider — a scoped leg may never count unstamped rows) with a warning;
+    unrecognised names are dropped. All names stripped → GLOBAL leg (never
+    silently produce a leg that can't match anything)."""
+    if not raw:
+        return None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return None
+    cleaned = set()
+    for r in raw:
+        s = str(r).strip().lower()
+        if s == "unknown":
+            LOG.warning(
+                "FUSE_CONFIG_REGIME_UNKNOWN_STRIPPED — 'unknown' may not scope "
+                "a fuse leg (D2 rider); counting it belongs to the GLOBAL leg"
+            )
+            continue
+        if s in KNOWN_REGIMES:
+            cleaned.add(s)
+        else:
+            LOG.warning("FUSE_CONFIG_REGIME_UNRECOGNISED name=%s dropped", s)
+    return frozenset(cleaned) if cleaned else None
+
+
+@dataclasses.dataclass(frozen=True)
+class BucketStats:
+    fuse_id: str
+    kind: str
+    matched: int
+    consecutive_losers: int
+    session_net_pnl: float
+    tripped: bool
+    trip_rule: Optional[str]
+
+
+def compute_bucket_stats(
+    spec: BucketSpec,
+    closes: Iterable[TrustedClose],
+    sector_lookup: Optional[Callable[[str], Optional[str]]] = None,
+) -> BucketStats:
+    """Session stats for one bucket. A "loser" is a trusted close with
+    pnl < 0. pnl == 0 scratches neither extend nor reset the trailing streak
+    (edge-decay precedent)."""
+    rows = [c for c in closes if spec.matches(c, sector_lookup)]
+    net = sum(c.pnl for c in rows)
+    streak = 0
+    for c in reversed(rows):  # rows arrive exit-ts-sorted
+        if c.pnl < 0:
+            streak += 1
+        elif c.pnl > 0:
+            break
+        # pnl == 0 → scratch: skip, streak unbroken
+    trip_rule: Optional[str] = None
+    if spec.consecutive_losers is not None and streak >= spec.consecutive_losers:
+        trip_rule = "consecutive_losers"
+    elif (
+        spec.session_net_pnl_usd is not None
+        and rows
+        and net <= spec.session_net_pnl_usd
+    ):
+        trip_rule = "session_net_pnl"
+    return BucketStats(
+        fuse_id=spec.fuse_id,
+        kind=spec.kind,
+        matched=len(rows),
+        consecutive_losers=streak,
+        session_net_pnl=round(net, 4),
+        tripped=trip_rule is not None,
+        trip_rule=trip_rule,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class FuseEvent:
+    """Edge-triggered trip/clear event (state N-1 → state N diff)."""
+
+    event: str  # "trip" | "clear"
+    fuse_id: str
+    kind: str
+    trip_rule: Optional[str]
+    consecutive_losers: int
+    session_net_pnl: float
+
+
+def evaluate_buckets(
+    buckets: Iterable[BucketSpec],
+    closes: List[TrustedClose],
+    *,
+    prior_state: Optional[Mapping[str, Any]] = None,
+    now: Optional[datetime] = None,
+    sector_lookup: Optional[Callable[[str], Optional[str]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[FuseEvent]]:
+    """Evaluate every bucket; return (state fuse rows, edge-triggered events).
+
+    Trip/clear is EDGE-triggered against *prior_state* (the previously
+    published fuse_box_state.json): a bucket that stays tripped re-emits
+    nothing; `tripped_at_utc` is preserved across cycles while tripped.
+    Clearing is automatic at the session roll (counters re-derive empty) —
+    the tripped→untripped transition emits the clear event.
+    """
+    now_utc = now or datetime.now(timezone.utc)
+    prior_fuses: Dict[str, Mapping[str, Any]] = {}
+    if isinstance(prior_state, Mapping):
+        for row in prior_state.get("fuses") or []:
+            if isinstance(row, Mapping) and row.get("fuse_id"):
+                prior_fuses[str(row["fuse_id"])] = row
+
+    rows: List[Dict[str, Any]] = []
+    events: List[FuseEvent] = []
+    seen_ids = set()
+    for spec in buckets:
+        stats = compute_bucket_stats(spec, closes, sector_lookup)
+        seen_ids.add(spec.fuse_id)
+        prior = prior_fuses.get(spec.fuse_id)
+        was_tripped = bool(prior and prior.get("tripped"))
+        tripped_at: Optional[str] = None
+        if stats.tripped:
+            if was_tripped and prior is not None and prior.get("tripped_at_utc"):
+                tripped_at = str(prior["tripped_at_utc"])
+            else:
+                tripped_at = (
+                    now_utc.isoformat().replace("+00:00", "Z")
+                )
+                events.append(
+                    FuseEvent(
+                        event="trip",
+                        fuse_id=spec.fuse_id,
+                        kind=spec.kind,
+                        trip_rule=stats.trip_rule,
+                        consecutive_losers=stats.consecutive_losers,
+                        session_net_pnl=stats.session_net_pnl,
+                    )
+                )
+        elif was_tripped:
+            events.append(
+                FuseEvent(
+                    event="clear",
+                    fuse_id=spec.fuse_id,
+                    kind=spec.kind,
+                    trip_rule=None,
+                    consecutive_losers=stats.consecutive_losers,
+                    session_net_pnl=stats.session_net_pnl,
+                )
+            )
+        row: Dict[str, Any] = {
+            "fuse_id": spec.fuse_id,
+            "kind": spec.kind,
+            "tripped": stats.tripped,
+            "trip_rule": stats.trip_rule,
+            "matched": stats.matched,
+            "consecutive_losers": stats.consecutive_losers,
+            "session_net_pnl": stats.session_net_pnl,
+            "regime_scope": (
+                sorted(spec.regimes) if spec.regimes is not None else None
+            ),
+            "clears_at": "next_session",
+        }
+        if tripped_at is not None:
+            row["tripped_at_utc"] = tripped_at
+        rows.append(row)
+
+    # A bucket present in prior state but absent from the current spec set
+    # (config change) clears silently — by design: no spec, no fuse. Its
+    # disappearance is visible in the state diff; no event is invented for a
+    # bucket nobody ratified this cycle.
+    return rows, events
+
+
+# --------------------------------------------------------------------------- #
+# State publisher + evidence (heartbeat doctrine: written every cycle incl. OFF)
+# --------------------------------------------------------------------------- #
+
+def _under_pytest() -> bool:
+    """Margin-gate G3C-HF pattern: PYTEST_CURRENT_TEST is set per running
+    test; a test that reaches a default path without an explicit override
+    trips the leak guard."""
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
+def _guard_test_write(path: Path, default: Path, what: str) -> None:
+    if _under_pytest() and Path(path) == default:
+        raise RuntimeError(
+            f"FUSE_BOX_ERROR {what} is REQUIRED-explicit under pytest — pass "
+            f"an explicit tmp path (never the real {default}). "
+            "[W4A test-write leak guard, margin-gate G3C-HF pattern]"
+        )
+
+
+def build_state(
+    *,
+    modes: Mapping[str, str],
+    fuse_rows: List[Dict[str, Any]],
+    counting_tally: Mapping[str, int],
+    trusted_count: int,
+    regime_unknown_rows: int,
+    session_window_start_utc: Optional[datetime],
+    epoch_started_at_utc: Optional[datetime],
+    lc5: Optional[Mapping[str, Any]] = None,
+    dq: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Assemble fuse_box_state.v1. Identities are value-free (CTF-T2) — the
+    numbers live in rows/evidence, never in dedupe identities or titles."""
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "modes": dict(modes),
+        "session_window_start_utc": (
+            session_window_start_utc.isoformat().replace("+00:00", "Z")
+            if session_window_start_utc
+            else None
+        ),
+        "epoch_started_at_utc": (
+            epoch_started_at_utc.isoformat().replace("+00:00", "Z")
+            if epoch_started_at_utc
+            else None
+        ),
+        "counting": {
+            "trusted_closes": int(trusted_count),
+            "excluded": dict(counting_tally),
+            "regime_unknown_rows": int(regime_unknown_rows),
+        },
+        "fuses": fuse_rows,
+        "lc5": dict(lc5) if lc5 else {
+            "factor": 1.0,
+            "dd_5d_pct": None,
+            "dd_20d_pct": None,
+            "staleness": None,
+            "emergency": False,
+        },
+        "dq": dict(dq) if dq else {"verdicts": {}},
+    }
+
+
+def publish_state(
+    state: Dict[str, Any],
+    state_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Atomic ts_utc/ttl-stamped write (runtime_json canon). Heartbeat
+    doctrine: call this every evaluator cycle INCLUDING all-modes-off —
+    `evaluated=0` must be distinguishable from dead (XOV lesson)."""
+    from chad.utils.runtime_json import write_runtime_state_json
+
+    target = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
+    _guard_test_write(target, DEFAULT_STATE_PATH, "state_path")
+    return write_runtime_state_json(
+        target, state, ttl_seconds=STATE_TTL_SECONDS
+    )
+
+
+def read_prior_state(state_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    from chad.utils.runtime_json import read_json
+
+    target = Path(state_path) if state_path is not None else DEFAULT_STATE_PATH
+    return read_json(target)
+
+
+def append_evidence(
+    rows: Iterable[Mapping[str, Any]],
+    evidence_dir: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    """Append evidence rows (trips, clears, would_block, staleness) to
+    data/fuse_box/fuse_box_YYYYMMDD.ndjson. Never raises upward from the
+    caller's perspective beyond the pytest leak guard — evidence is
+    best-effort, the trip decision is not contingent on it."""
+    target_dir = Path(evidence_dir) if evidence_dir is not None else DEFAULT_EVIDENCE_DIR
+    _guard_test_write(target_dir, DEFAULT_EVIDENCE_DIR, "evidence_dir")
+    now_utc = now or datetime.now(timezone.utc)
+    written = 0
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"fuse_box_{now_utc.strftime('%Y%m%d')}.ndjson"
+        with open(path, "a", encoding="utf-8") as f:
+            for row in rows:
+                out = dict(row)
+                out.setdefault(
+                    "ts_utc", now_utc.isoformat().replace("+00:00", "Z")
+                )
+                f.write(json.dumps(out, sort_keys=True) + "\n")
+                written += 1
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — evidence is best-effort
+        LOG.warning("FUSE_EVIDENCE_WRITE_FAILED err=%s", exc)
+    return written
+
+
+__all__ = [
+    "ENV_DQ",
+    "ENV_LC2",
+    "ENV_LC3",
+    "ENV_LC5",
+    "EXCLUDED_STRATEGIES",
+    "GENUINE_FILL_STATUSES",
+    "KNOWN_REGIMES",
+    "MODE_ENFORCE",
+    "MODE_OFF",
+    "MODE_SHADOW",
+    "STATE_SCHEMA_VERSION",
+    "STATE_TTL_SECONDS",
+    "BucketSpec",
+    "BucketStats",
+    "FuseBoxConfig",
+    "FuseEvent",
+    "TrustedClose",
+    "append_evidence",
+    "build_state",
+    "compute_bucket_stats",
+    "evaluate_buckets",
+    "fuse_mode",
+    "load_trusted_session_closes",
+    "load_window_fill_statuses",
+    "publish_state",
+    "read_modes",
+    "read_prior_state",
+    "sanitize_regime_scope",
+    "session_window_start",
+]

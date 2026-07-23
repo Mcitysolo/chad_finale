@@ -110,11 +110,16 @@ def test_no_trusted_set_intersects_the_writer_skip_set():
     """The reconciler's skip-set is the canonical list of never-money
     statuses. No consumer's trusted set may re-admit any of them."""
     exhaust = pr._EVIDENCE_SKIP_FILL_STATUSES
+    # W4A-1: the fuse box is consumer #7 of this census (GO record §5a) — its
+    # provenance-verification allowlist joins the same invariant.
+    from chad.risk.fuse_box import GENUINE_FILL_STATUSES as fuse_trusted
+
     for name, trusted in (
         ("trade_closer", tc._TRUSTED_FILL_STATUSES),
         ("harness", harness.TRUSTED_FILL_STATUSES),
         ("guard_confirmation", _CONFIRMED_FILL_STATUSES),
         ("price_cascade", pr._PRICE_ELIGIBLE_FILL_STATUSES),
+        ("fuse_box_provenance", fuse_trusted),
     ):
         overlap = {s.lower() for s in trusted} & exhaust
         assert not overlap, f"{name} trusts exhaust statuses: {overlap}"

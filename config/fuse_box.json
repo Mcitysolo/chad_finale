@@ -1,0 +1,38 @@
+{
+  "schema_version": "fuse_box.v1",
+  "_notes": [
+    "W4A fuse box (PLAN_W4A + audits/W4A_GO_RECORD.md). Four flag-gated items,",
+    "ALL default-off: CHAD_FUSE_LC2 / CHAD_FUSE_LC3 / CHAD_FUSE_LC5 /",
+    "CHAD_DQ_POLICIES, each off|shadow|enforce (garbage -> off). This config",
+    "defines buckets and thresholds only — it grants no authority by itself;",
+    "mode flips are separate operator GOs per flag.",
+    "A missing/corrupt version of this file DISARMS the fuse box (no buckets,",
+    "no trips) — it can never invent a trip. Thresholds are negative USD",
+    "(session net PnL at-or-below trips) or consecutive trusted losing closes.",
+    "Counting substrate: trusted closed_trade.v1 rows only — see",
+    "chad/risk/fuse_box.py docstring for the full predicate chain, including",
+    "the INCIDENT-0723 provenance verification (drill/dry_run rows can never",
+    "move a counter). 'unknown' may never appear in a regimes scope (D2 rider:",
+    "unstamped rows count toward GLOBAL legs only; loader strips it, engine",
+    "refuses it).",
+    "families/setup_fuses land at W4A-2/3; symbol/sector buckets at W4A-4",
+    "(sector map: config/symbol_sectors.json); lc5_ladder at W4A-6/7."
+  ],
+  "defaults": {
+    "consecutive_losers": 3,
+    "session_net_pnl_usd": null
+  },
+  "families": {},
+  "setup_fuses": {
+    "enabled_strategies": []
+  },
+  "symbol_fuse": {
+    "consecutive_losers": 3,
+    "session_net_pnl_usd": null
+  },
+  "sector_fuse": {
+    "consecutive_losers": 3,
+    "session_net_pnl_usd": null
+  },
+  "lc5_ladder": {}
+}

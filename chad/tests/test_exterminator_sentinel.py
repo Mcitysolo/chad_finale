@@ -132,6 +132,13 @@ def _fresh_runtime(runtime: Path, *, ts: datetime | None = None) -> None:
         "ts_unix": ts.timestamp(), "ok": True, "ttl_seconds": 120,
         "consecutive_failures": 0,
     })
+    # W4A-1 (INCIDENT-0723 inheritance b): the fuse-box heartbeat gained an
+    # EXS1 row — a healthy runtime includes it fresh, all-modes-off.
+    _write_json(runtime / "fuse_box_state.json", {
+        "schema_version": "fuse_box_state.v1", "ts_utc": _iso(ts), "ttl_seconds": 180,
+        "modes": {"lc2": "off", "lc3": "off", "lc5": "off", "dq": "off"},
+        "fuses": [],
+    })
 
 
 def _make(tmp_path: Path, clock, quiet_providers, **overrides):

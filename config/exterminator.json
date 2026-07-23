@@ -117,6 +117,17 @@
       "warn_after_seconds": 360,
       "fail_after_seconds": 720,
       "_note": "W3B-1. ts_unix is a NUMERIC epoch -- _parse_ts numeric support added in the same commit. warn_after=3x cadence mirrors the watchdog's own internal 3x-ttl staleness convention (chad/core/ibkr_watchdog.py:243-246); a bare 120s warn would flap against the 120s timer + RandomizedDelaySec=15s on a 5-min sentinel scan. The artifact is a self-heartbeat (zero code readers); its value is proving the IBKR-health alerter itself is alive -- the P1-4 44-day silent death is the target."
+    },
+    "fuse_box_state": {
+      "path": "runtime/fuse_box_state.json",
+      "format": "json",
+      "ts_field": "ts_utc",
+      "ttl_seconds": 180,
+      "ttl_verified": true,
+      "ttl_source": "artifact:ttl_seconds; publisher STATE_TTL_SECONDS=180 at chad/risk/fuse_box.py (live-loop cycle cadence ~60s x 3 grace)",
+      "warn_after_seconds": 180,
+      "fail_after_seconds": 600,
+      "_note": "W4A-1 (INCIDENT-0723 inheritance b, audits/W4A_GO_RECORD.md 5b). Heartbeat doctrine: the evaluator writes this EVERY live-loop cycle including all-modes-off, so evaluated=0 is distinguishable from dead -- a silent fuse is the XOV lesson wearing a new hat. WARN-on-missing is intended and stays until the W4A-5 wiring activates at the gated restart; do not 'fix' it by deleting this row."
     }
   },
   "blind_check": {
