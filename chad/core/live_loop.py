@@ -2661,6 +2661,15 @@ def run_once(logger: logging.Logger) -> None:
 
     if not intents:
         logger.info("No executable IBKR intents.")
+        # W5B-4: heartbeat doctrine (fuse_box.publish_state, the XOV lesson) —
+        # a cycle with nothing to evaluate must still publish, so
+        # intents_evaluated=0 is distinguishable from a dead publisher.
+        try:
+            from chad.risk.allocator_shadow_gate import publish_cycle_state
+
+            publish_cycle_state(None)
+        except Exception as _ahb_err:  # noqa: BLE001 — never fatal
+            logger.debug("allocator heartbeat failed (non-fatal): %s", _ahb_err)
         return
 
     # ------------------------------------------------------------------
@@ -2704,6 +2713,23 @@ def run_once(logger: logging.Logger) -> None:
         _fuse_gate = _FuseGate()
     except Exception as _fg_err:  # noqa: BLE001 — fail-open
         logger.debug("fuse_gate construction failed (non-fatal): %s", _fg_err)
+
+    # W5B-3: per-intent portfolio allocator OBSERVER (R1, SHADOW ONLY).
+    # Constructed once per cycle with an open-book snapshot (positions_truth);
+    # called per intent beside the fuse gate below. It BLOCKS NOTHING — there
+    # is no enforce path in the code at all — it records what an aggregate
+    # portfolio limit WOULD have said about each entry's marginal exposure.
+    # Default off (CHAD_ALLOCATOR unset ⇒ off ⇒ construction returns an inert
+    # gate that reads nothing). Entry-scoped by placement: overlay/reconciler/
+    # flatten closes never reach stage-3, and exit-like intents bypass inside
+    # the observer via the shared fuse_gate.is_exit_like predicate.
+    _allocator_gate = None
+    try:
+        from chad.risk.allocator_shadow_gate import build_cycle_gate as _build_alloc
+
+        _allocator_gate = _build_alloc()
+    except Exception as _ag_err:  # noqa: BLE001 — fail-open
+        logger.debug("allocator gate construction failed (non-fatal): %s", _ag_err)
 
     # W4A-8 (DQ, P18 site 1): SCR-freshness entry gate, evaluated once per
     # cycle. The SCR hard-block below reads scr_state.json raw and fails OPEN;
@@ -2908,6 +2934,25 @@ def run_once(logger: logging.Logger) -> None:
                         getattr(intent, "strategy", None),
                     )
                     continue
+
+            # W5B-3: allocator observer. Placed beside the fuse gate (the
+            # ratified stage-3 slot) and AFTER it, so a fuse-blocked entry
+            # never enters the provisional book — a blocked intent adds no
+            # exposure. observe() never raises and never blocks; its return
+            # value is deliberately unused.
+            #
+            # BOUND (FINDING W5B-SF2): downstream gates below — cooldown, ML
+            # veto, the dynamic risk gate — can still suppress an intent the
+            # observer has already counted. The provisional book is therefore
+            # an UPPER BOUND on submitted exposure: it measures allocation
+            # DEMAND at the stage-3 chokepoint, not predicted fills.
+            if _allocator_gate is not None:
+                try:
+                    _allocator_gate.observe(intent)
+                except Exception as _ag_eval_err:  # noqa: BLE001 — fail-open
+                    logger.debug(
+                        "ALLOCATOR_OBSERVE_FAILED (non-fatal): %s", _ag_eval_err
+                    )
 
             if not is_flip_signal(intent):
                 if not should_emit_signal(adapted):
@@ -3460,6 +3505,24 @@ def run_once(logger: logging.Logger) -> None:
             continue
     if emitted == 0:
         logger.info("All intents skipped by signal/position guard.")
+
+    # W5B-4: allocator heartbeat. Published every cycle INCLUDING when the
+    # flag is off (all-off must be distinguishable from dead). Carries the
+    # cycle's would-verdict counts, the provisional-book summary, which
+    # binding limits are DERIVED-but-unratified, and the standing findings
+    # that bound what this evidence may claim (W5B-SF1/SF2). Never fatal.
+    try:
+        from chad.risk.allocator_shadow_gate import (
+            maybe_notify_reject_streak,
+            publish_cycle_state,
+        )
+
+        publish_cycle_state(_allocator_gate)
+        # W5B-5: NOTIFY only when the SAME dimension would-rejected N
+        # consecutive entries — never per intent (the R13 flood CTF-T2 fixed).
+        maybe_notify_reject_streak(_allocator_gate)
+    except Exception as _ahb_err:  # noqa: BLE001 — never fatal
+        logger.debug("allocator heartbeat failed (non-fatal): %s", _ahb_err)
 
     # ------------------------------------------------------------------
     # GAP-025: routing diagnostics. Pure observer — writes
