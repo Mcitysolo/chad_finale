@@ -612,6 +612,7 @@ def evaluate_buckets(
     prior_state: Optional[Mapping[str, Any]] = None,
     now: Optional[datetime] = None,
     sector_lookup: Optional[Callable[[str], Optional[str]]] = None,
+    manual_clears: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[FuseEvent]]:
     """Evaluate every bucket; return (state fuse rows, edge-triggered events).
 
@@ -628,6 +629,7 @@ def evaluate_buckets(
             if isinstance(row, Mapping) and row.get("fuse_id"):
                 prior_fuses[str(row["fuse_id"])] = row
 
+    cleared_ids = set(manual_clears or {})
     rows: List[Dict[str, Any]] = []
     events: List[FuseEvent] = []
     seen_ids = set()
@@ -637,6 +639,33 @@ def evaluate_buckets(
         prior = prior_fuses.get(spec.fuse_id)
         was_tripped = bool(prior and prior.get("tripped"))
         tripped_at: Optional[str] = None
+        # W4A-9: an operator manual-clear (scripts/clear_fuse.py) for THIS
+        # session window forces the bucket untripped even though the ledger
+        # still shows the streak — recorded honestly (real streak shown,
+        # manually_cleared=True). Emits a one-shot clear event on the
+        # tripped→cleared transition.
+        manually_cleared = spec.fuse_id in cleared_ids
+        if manually_cleared and stats.tripped:
+            if was_tripped:
+                events.append(
+                    FuseEvent(
+                        event="clear", fuse_id=spec.fuse_id, kind=spec.kind,
+                        trip_rule=None,
+                        consecutive_losers=stats.consecutive_losers,
+                        session_net_pnl=stats.session_net_pnl,
+                    )
+                )
+            rows.append({
+                "fuse_id": spec.fuse_id, "kind": spec.kind, "tripped": False,
+                "trip_rule": None, "matched": stats.matched,
+                "consecutive_losers": stats.consecutive_losers,
+                "session_net_pnl": stats.session_net_pnl,
+                "regime_scope": (
+                    sorted(spec.regimes) if spec.regimes is not None else None
+                ),
+                "clears_at": "next_session", "manually_cleared": True,
+            })
+            continue
         if stats.tripped:
             if was_tripped and prior is not None and prior.get("tripped_at_utc"):
                 tripped_at = str(prior["tripped_at_utc"])
@@ -1110,6 +1139,41 @@ def read_prior_state(state_path: Optional[Path] = None) -> Optional[Dict[str, An
     return read_json(target)
 
 
+MANUAL_CLEARS_PATH = REPO_ROOT / "runtime" / "fuse_manual_clears.json"
+
+
+def load_manual_clears(
+    session_window_start_utc: Optional[datetime],
+    path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Load operator manual-clears (scripts/clear_fuse.py) valid for the
+    CURRENT session window. A clear stamped against a prior window is ignored
+    (it auto-expires at the session roll — no cleanup needed). Missing/corrupt
+    → {} (a broken override file can never trip a fuse, only fail to clear
+    one)."""
+    from chad.utils.runtime_json import read_json
+
+    target = Path(path) if path is not None else MANUAL_CLEARS_PATH
+    obj = read_json(target)
+    if not isinstance(obj, dict):
+        return {}
+    cleared = obj.get("cleared")
+    if not isinstance(cleared, dict):
+        return {}
+    cur = (
+        session_window_start_utc.isoformat().replace("+00:00", "Z")
+        if session_window_start_utc else None
+    )
+    out: Dict[str, Any] = {}
+    for fuse_id, meta in cleared.items():
+        if not isinstance(meta, Mapping):
+            continue
+        if cur is not None and str(meta.get("session_window_start")) != cur:
+            continue
+        out[str(fuse_id)] = dict(meta)
+    return out
+
+
 def append_evidence(
     rows: Iterable[Mapping[str, Any]],
     evidence_dir: Optional[Path] = None,
@@ -1384,6 +1448,7 @@ def run_evaluator_cycle(
         fuse_rows, events = evaluate_buckets(
             buckets, closes, prior_state=prior, now=now_utc,
             sector_lookup=sector_lookup,
+            manual_clears=load_manual_clears(window_start),
         )
         if events:
             emit_fuse_events(
@@ -1526,6 +1591,7 @@ __all__ = [
     "evaluate_buckets",
     "fuse_mode",
     "run_evaluator_cycle",
+    "load_manual_clears",
     "load_sector_map",
     "load_trusted_session_closes",
     "load_window_fill_statuses",

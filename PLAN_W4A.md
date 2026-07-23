@@ -362,3 +362,52 @@ W3B (merge = live for oneshot timers).
   unnecessary for correctness now; smaller Wave-4 lane-B candidate).*
 
 — END PLAN (Phase 1). STOP here; Phase 2 requires D1–D8.
+
+---
+
+## 11. Phase-2 closure record (W4A-0..9)
+
+Phase 2 built and committed on `goal/wave4-fusebox` (worktree `chad_w4a`),
+rebased onto `main@5013893` (clean). GO + riders recorded in
+`audits/W4A_GO_RECORD.md`. Every commit set-diff-green vs the W4A-0 baseline
+(16-fail set = W3B baseline-15 + `test_w4b8_flatten_bare_terminal`, the latter
+a worktree-has-no-venv/ artifact). All four items ship flag-gated default-OFF;
+flag flips are separate operator GOs. **STOPPED at the push/merge decision**
+(same STOP as W3B/W4B — merge activates the wiring at the gated restart).
+
+| Commit | Item | Decision(s) |
+|---|---|---|
+| W4A-0 `baf4194` | baseline + GO record | rebase re-verify; D1–D8 + 3 riders + 2 INC-0723 inheritances |
+| W4A-1 `b73c63b` | fuse core + state + census + TTL row | INC-0723 (a) provenance-verify + census #7; (b) exterminator feeds row |
+| W4A-2 `db72507` | regime stamp + family/sector maps + parity | D1, D2(a)+rider, D3 |
+| W4A-3 `7e54e81` | LC2 buckets + eventing + evaluator cycle | D1 |
+| W4A-4 `798ae9c` | LC3 buckets + unmapped guard | D3 |
+| W4A-5 `deeccf4` | gate wiring (stage-3 + Kraken mirror) | D8-absorbed (W4B-2 stamp cited) |
+| W4A-6 `384be7d` | LC5 budgets 5d/20d + drawdown_state.v2 | D6 |
+| W4A-7 `a070de1` | LC5 enforcement + emergency + D5 named test | D4(A), D5+rider |
+| W4A-8 `ea73269` | DQ policies + 2 P18 sites | D7 |
+| W4A-9 (this) | EXS7 pin + clear_fuse CLI + manual-clear override + closure | — |
+
+**Riders delivered:** D2 unknown-bucket (`test_w4a_fuse_box`,
+`test_w4a_lc2_buckets` regime tests); D5 exits-always-free named regression
+(`test_w4a_lc5_emergency_exits_free` — overlay closes AND flatten-all proven
+free at −15%); D8 deferral absorbed (W4B-2 `88890af` close-stamp cited/composed,
+not rebuilt). INC-0723 (a) drill-never-trips (`test_w4a_fuse_box::
+test_drill_never_trips_a_fuse` + provenance-verify predicate + 8f census
+membership); (b) fuse_box_state joins the sentinel TTL table (W4A-1 feeds row)
+and now the EXS7 schema pin (W4A-9).
+
+**New flags (all default off, tri-state off|shadow|enforce):**
+`CHAD_FUSE_LC2` (family/setup), `CHAD_FUSE_LC3` (symbol/sector),
+`CHAD_FUSE_LC5` (drawdown sizing + emergency), `CHAD_DQ_POLICIES` (feed
+policies). Shadow is byte-identical (evidence-only); enforce is a separate GO
+each.
+
+**Post-merge activation order (recommendation, each a separate GO):** restart
+publishers/live-loop at the gated restart → confirm `fuse_box_state.json`
+heartbeats + EXS1/EXS7 green → run LC2/LC3 in `shadow`, review
+`data/fuse_box/` would_block corpus for a session → enforce LC2/LC3 →
+drawdown-publisher restart emits `drawdown_state.v2` → LC5 `shadow` →
+enforce → DQ `shadow` → enforce. Deferred (not W4A): PA-EP7v2-class crypto
+`paper_trade_result.` substrate for crypto fuse counting; the 4 `_is_stale`
+cut-paste consolidation; adapter-level fuse backstop (D8 remainder).

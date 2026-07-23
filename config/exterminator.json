@@ -206,6 +206,13 @@
         "required_keys": ["schema_version", "ts_utc", "ttl_seconds", "status", "drawdown_pct", "halt"],
         "pinned_at": "chad/risk/drawdown_guard.py:report_to_state_dict",
         "_note": "W4A-6 (D6): bumped v1->v2 for additive dd_5d/dd_20d LC5 budgets. accepts BOTH so the still-v1 live file (before the drawdown-publisher restart that activates W4A) never trips a schema break -- the position_guard_drift v1|v2|v3 transition precedent. required_keys are the stable common set both versions carry (the new budget fields are additive/nullable, not required)."
+      },
+      "runtime/fuse_box_state.json": {
+        "schema_version": "fuse_box_state.v1",
+        "accepts": ["fuse_box_state.v1"],
+        "required_keys": ["schema_version", "ts_utc", "ttl_seconds", "modes", "fuses"],
+        "pinned_at": "chad/risk/fuse_box.py:build_state (STATE_SCHEMA_VERSION)",
+        "_note": "W4A-9. Heartbeat published every live-loop cycle by run_evaluator_cycle including all-modes-off (INCIDENT-0723 inheritance b). WARN-on-missing is intended and stays until the W4A-5 wiring activates at the gated restart. modes/fuses always present even at rest (empty fuses list)."
       }
     },
     "unpinned_known": {
