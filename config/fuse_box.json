@@ -22,9 +22,30 @@
     "consecutive_losers": 3,
     "session_net_pnl_usd": null
   },
-  "families": {},
+  "families": {
+    "_note": "W4A-2 (D1): named groups over the 18 registry strategy_ids (chad.types.StrategyName). Union must stay within DECLARED and cover ACTIVE — pinned hard by chad/tests/test_w4a_fuse_config_parity.py (W3B-9 perimeter idiom), warn-tier at the runtime bucket builder. Per-family threshold overrides may be added as {'family_thresholds': {name: {...}}} later; defaults apply until then.",
+    "alpha": [
+      "alpha",
+      "alpha_crypto",
+      "alpha_forex",
+      "alpha_futures",
+      "alpha_intraday",
+      "alpha_intraday_micro",
+      "alpha_options"
+    ],
+    "beta": ["beta", "beta_trend"],
+    "delta": ["delta", "delta_pairs"],
+    "gamma": ["gamma", "gamma_futures", "gamma_reversion"],
+    "omega": ["omega", "omega_macro", "omega_momentum_options", "omega_vol"]
+  },
   "setup_fuses": {
-    "enabled_strategies": []
+    "_note": "W4A-2 (D1): sub-strategy grain for the setup_family-stamped strategies (PLAN_W4A P13). Buckets form as setup:<strategy>:<setup_family> from stamps observed in the trusted ledger — no fixed setup list to drift.",
+    "enabled_strategies": [
+      "alpha",
+      "alpha_futures",
+      "alpha_intraday",
+      "alpha_intraday_micro"
+    ]
   },
   "symbol_fuse": {
     "consecutive_losers": 3,
