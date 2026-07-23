@@ -18,10 +18,29 @@ REAL_CONFIG = __import__("pathlib").Path(__file__).resolve().parents[2] / "confi
 
 
 def _make(tmp_path):
+    """Sentinel over a tmp repo, using the REAL config but with the
+    file-keyed `enforced` map emptied.
+
+    Why empty it (W5B-5 fix): every enforced contract resolves to a missing
+    file under a tmp repo_root, so each one appends a `missing` break — and
+    `check_schema_breaks` truncates `evidence["breaks"]` to the first 10
+    (exterminator_sentinel.py:1128, `breaks[:10]`). With 9 enforced contracts
+    the EMBEDDED break landed 10th and just fit; adding a 10th file contract
+    pushed it out of the evidence and these tests failed on truncation rather
+    than on anything about embedded sub-schemas.
+
+    That was latent: ANY future enforced contract would have tripped it. The
+    embedded pins are what this module tests, so the file-keyed map is
+    emptied to isolate them. `embedded` and everything else are untouched.
+    """
     (tmp_path / "runtime").mkdir(parents=True, exist_ok=True)
+    cfg = json.loads(REAL_CONFIG.read_text())
+    cfg.setdefault("schema_contracts", {})["enforced"] = {}
+    cfg_path = tmp_path / "exterminator_embedded_only.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
     return ExterminatorSentinel(
         repo_root=tmp_path, runtime_dir=tmp_path / "runtime",
-        data_dir=tmp_path / "data", config_path=REAL_CONFIG,
+        data_dir=tmp_path / "data", config_path=cfg_path,
         reports_dir=tmp_path / "runtime" / "reports", clock=lambda: NOW,
     )
 

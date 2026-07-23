@@ -1,0 +1,170 @@
+{
+  "schema_version": "portfolio_limits.v1",
+  "_doc": [
+    "W5B R1 portfolio allocator limits (SHADOW ONLY).",
+    "",
+    "READ THIS BEFORE USING ANY NUMBER HERE. Two of these ceilings -- firm.gross_exposure",
+    "and firm.per_sector -- are DERIVED, not ratified. They carry basis:'shadow_derivation_2026-07'",
+    "and ratified:false. They exist to make would-reject evidence possible; they are NOT",
+    "risk limits anybody signed off on, and nothing in W5B enforces them (there is no",
+    "enforce path in the code at all). The enforce-era numbers get their own Pending Action.",
+    "",
+    "CURRENCY (PLAN_W5B §12.2). Every cap here is USD notional. The book is USD-priced",
+    "(positions_truth rows are all currency:USD; price_cache is USD) but the only",
+    "currency_ok account equity is CAD, and NO FX rate exists (portfolio_snapshot:",
+    "usd_ok=false, usdcad_rate_used=null). So caps are deliberately NOT expressed as a",
+    "multiple of equity -- gross/equity would be a mixed-unit ratio, wrong by roughly the",
+    "USDCAD spread (~0.68x vs ~0.93x). equity_basis below is context, never a divisor.",
+    "",
+    "BINDING vs REPORT-ONLY. A cap with binds:true produces WOULD_REJECT evidence. A cap",
+    "with binds:false is computed and reported but never would-rejected -- because",
+    "would-rejecting against a number nobody sourced would poison the corpus with",
+    "unfalsifiable verdicts."
+  ],
+
+  "equity_basis": {
+    "value_cad": 993000.30,
+    "currency": "CAD",
+    "source": "runtime/portfolio_snapshot.json::ibkr_equity (ibkr_equity_currency_ok=true)",
+    "source_note": "The same artifact and the same currency_ok gate tier_manager.py:587 reads, fail-closed. PLAN_W5B P13 originally cited pnl_state.json::account_equity as CAD/currency_ok -- corrected in §12 C4: pnl_state.json carries no currency key at all.",
+    "usd_note": "total_equity_usd_authoritative is null and usdcad_rate_used is null. There is no FX rate in the system, so this CAD figure CANNOT be compared to the USD caps below.",
+    "used_as_divisor": false,
+    "refresh": "read live each cycle; never hardcode the balance in code"
+  },
+
+  "firm": {
+    "gross_exposure": {
+      "cap_notional_usd": 750000,
+      "binds": true,
+      "basis": "shadow_derivation_2026-07",
+      "ratified": false,
+      "enforce_era_requires_pa": true,
+      "derivation": [
+        "OPERATOR_VERIFY 1, ruled 2026-07-23 (PLAN_W5B §13.1).",
+        "Anchor: policy.py:665 max_total_exposure = $500,000 USD -- the only",
+        "USD-denominated firm-level exposure number in the repo. It is ENFORCED today,",
+        "but at PER-ORDER grain, which is exactly why it cannot express a portfolio",
+        "ceiling: the live book gross is $671,037, already 1.34x it.",
+        "Tier headroom: live tier is SCALE (runtime/tier_state.json; band CAD 226,560",
+        "-> 14,160,000, demotion floor CAD 203,904). SCALE's risk_profile is ALL-NULL,",
+        "so the tier imposes no competing notional ceiling and the derivation must",
+        "supply its own discipline.",
+        "Chosen: 1.5 x the enforced per-order gross = $750,000. It sits ABOVE the live",
+        "book ($78,963 of headroom) so the corpus is not saturated on day one and every",
+        "row is a genuine MARGINAL verdict; and BELOW the only existing aggregate",
+        "reference (margin_block 2.0x NetLiq). A ceiling below the live book would",
+        "would-reject every intent forever and carry no information."
+      ],
+      "reference_only": {
+        "policy_per_order_gross_usd": 500000,
+        "policy_source": "chad/policy.py:665 max_total_exposure (ENFORCED, per-order grain)",
+        "margin_block_mult_netliq": 2.0,
+        "margin_block_source": "config/margin_block.json:11 aggregate gross (margin/NetLiq basis, shadow, a DIFFERENT lens from delta-dollars)"
+      }
+    },
+
+    "net_exposure": {
+      "cap_notional_usd": null,
+      "binds": false,
+      "basis": "operator_verify",
+      "ratified": false,
+      "note": "D3: NO net-exposure notional cap exists anywhere in the repo. Net is computed and reported every cycle but never would-rejected. Proposal for a future PA: 1.0x equity -- which requires an FX rate that does not exist yet.",
+      "live_observation": "Net == gross == $671,037 today: every one of the 11 positions is long. PSQ, the only genuinely short-beta ticket, is $265 (0.04% of gross), and SVXY is a LONG short-vol position, i.e. risk-ON rather than a hedge."
+    },
+
+    "per_symbol_concentration": {
+      "cap_notional_usd": 150000,
+      "binds": true,
+      "basis": "sourced",
+      "ratified": true,
+      "source": "chad/policy.py:666 max_symbol_exposure (ENFORCED today)",
+      "cap_pct_equity": 0.05,
+      "pct_source": "config/sizing_config.json:16 composite_cap.max_position_pct",
+      "pct_binds": false,
+      "pct_note": "The 5% leg is NOT applied: it would require dividing a USD exposure by a CAD equity. Recorded for the enforce-era PA, when an FX rate exists.",
+      "live_observation": "LLY ($215,488) and SPY ($182,637) ALREADY exceed this enforced cap, because it is per-ORDER and a position accumulated over several orders never meets it. This is the missing-aggregate-layer thesis on live data -- and it means day-one would-rejects come from a hard-sourced, already-ratified number."
+    },
+
+    "per_sector": {
+      "cap_notional_usd": 375000,
+      "binds": true,
+      "basis": "shadow_derivation_2026-07",
+      "ratified": false,
+      "enforce_era_requires_pa": true,
+      "derivation": [
+        "OPERATOR_VERIFY 2, ruled 2026-07-23 (PLAN_W5B §13.2).",
+        "Rule: no single sector may exceed half the firm gross ceiling.",
+        "0.5 x 750,000 = 375,000.",
+        "Against the live book that puts healthcare ($316,936) at 84.5% of its cap with",
+        "$58,064 of headroom -- inside the limit today, so the NEXT healthcare ticket is",
+        "what trips it. That is the marginal concentration signal R1 exists to produce."
+      ],
+      "superseded_source": {
+        "cap_notional_usd": 5000,
+        "source": "config/sizing_config.json:14 composite_cap.max_sector_exposure",
+        "why_not_used": "Small-account calibration. Against a $671k book all six live sectors breach it, which is saturation, not evidence. Retained here so the number is visibly superseded rather than quietly dropped."
+      },
+      "unmapped_bucket_binds": false,
+      "unmapped_note": "The 'unmapped' sector is count-only and NEVER binds -- the W4A LC3 idiom (PLAN_W4A §4). A symbol missing from config/symbol_sectors.json must not create a blockable bucket nobody ratified."
+    },
+
+    "per_venue": {
+      "KRAKEN": {
+        "cap_usd": 184.58,
+        "binds": true,
+        "basis": "sourced",
+        "ratified": true,
+        "source": "runtime/kraken_balances.json usd_equivalent -- the actual wallet",
+        "dynamic_cap_usd": 690.51,
+        "dynamic_source": "runtime/dynamic_caps.json:262 alpha_crypto",
+        "note": "The dynamic cap EXCEEDS the wallet, so the wallet is the true binding constraint. Cited from the artifacts; re-read live at evaluation."
+      },
+      "IBKR": {
+        "cap_usd": null,
+        "binds": false,
+        "basis": "operator_verify",
+        "ratified": false,
+        "note": "No IBKR-specific venue cap exists anywhere. IBKR exposure falls under firm.gross_exposure."
+      }
+    }
+  },
+
+  "correlation": {
+    "mode": "static_sector_buckets",
+    "rolling_deferred_to": "R2",
+    "note": [
+      "Ruled 2026-07-23 (PLAN_W5B §13.3): static sector buckets are ratified; rolling",
+      "correlation is deferred to R2 with real sample depth. NO rho is computed anywhere",
+      "in W5B and no numeric correlation appears in any artifact, so there is no fake",
+      "precision to mistake for a measurement.",
+      "The reason for deferral is NOT that correlation data is sparse (it is not -- all 11",
+      "book symbols carry ~251 daily bars) and NOT that no threshold is sourced (one IS:",
+      "see existing_per_order_reducer). It is that a second, independently-thresholded",
+      "correlation layer at portfolio grain would DOUBLE-COUNT the same effect through two",
+      "unreconciled numbers. R2's first task is to reconcile with the existing reducer,",
+      "not to duplicate it."
+    ],
+    "existing_per_order_reducer": {
+      "module": "chad/risk/correlation_monitor.py",
+      "threshold": 0.65,
+      "threshold_source": "config/sizing_config.json correlation_monitor.threshold",
+      "wired_at": "chad/execution/execution_pipeline.py:264 (live size multiplier)",
+      "measured_book_stat": "config/sizing_config.json notes: 'a book averaging 0.654 pairwise correlation'"
+    }
+  },
+
+  "scr_sizing_reference": {
+    "_doc": "Reference only. The allocator OBSERVES; it never re-applies SCR sizing.",
+    "WARMUP": 0.10,
+    "CAUTIOUS": 0.25,
+    "CONFIDENT": 1.00,
+    "PAUSED": 0.00,
+    "source": "chad/analytics/shadow_confidence_router.py:79-82"
+  },
+
+  "coach": {
+    "reject_streak_n": 3,
+    "reject_streak_n_verified": false,
+    "note": "operator_verify. Alert only on the Nth CONSECUTIVE would-reject on the SAME limit dimension -- never per intent (that is the R13 flood CTF-T2 fixed)."
+  }
+}
