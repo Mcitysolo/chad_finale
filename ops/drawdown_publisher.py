@@ -81,6 +81,9 @@ def publish_drawdown(
         pnl_state_path=rt / "pnl_state.json",
         halt_threshold_pct=halt_threshold_pct,
         lookback_days=lookback_days,
+        # W4A-6: epoch-scoped 5d/20d budgets — rows before the active epoch
+        # start are excluded from the short-horizon peaks (H3 guard, P7).
+        epoch_state_path=rt / "epoch_state.json",
     )
     state = report_to_state_dict(report, ts_utc=utc_now_iso(), ttl_seconds=ttl_seconds)
     atomic_write_json(out_path, state)
