@@ -363,6 +363,38 @@ class KrakenExecutor:
                 None,
             )
 
+    def _evaluate_fuse_gate(
+        self, intent: StrategyTradeIntent
+    ) -> Optional[Tuple[RiskGateResult, Optional[TradeResponse]]]:
+        """Fuse-gate chokepoint (W4A-5), mirroring the margin-gate template.
+        Returns None to proceed (always, when no fuse enforces or the intent
+        is a close); a blocking RiskGateResult only when a covering bucket is
+        tripped AND its flag is `enforce`. Fail-OPEN: any error → proceed
+        (an entry is never blocked on a broken fuse gate)."""
+        try:
+            from chad.risk.fuse_gate import FuseGate
+
+            gate = FuseGate()
+            if not gate.any_active:
+                return None
+            verdict = gate.should_block_kraken(intent)
+            if verdict is None:
+                return None  # shadow / no-trip / exit-like → proceed
+            LOGGER.warning(
+                "kraken.fuse_gate_blocked fuse_id=%s pair=%s strategy=%s",
+                verdict.fuse_id, getattr(intent, "pair", None),
+                getattr(intent, "strategy", None),
+            )
+            return (
+                RiskGateResult(
+                    allowed=False, reason="FUSE_BLOCKED", adjusted_notional=0.0
+                ),
+                None,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            LOGGER.error("kraken.fuse_gate_error detail=%s", exc)
+            return None
+
     def execute_with_risk(
         self,
         intent: StrategyTradeIntent,
@@ -374,6 +406,15 @@ class KrakenExecutor:
         margin_blocked = self._evaluate_margin_gate(intent)
         if margin_blocked is not None:
             return margin_blocked
+
+        # W4A-5: fuse-gate mirror (LC2/LC3). Blocks a crypto ENTRY only when a
+        # covering bucket (family:<alpha…>/symbol/sector) is tripped AND its
+        # flag is `enforce`; shadow writes would_block evidence and never
+        # blocks. reduce_only / overlay-marked / crypto_exit|-keyed closes are
+        # exempt (a fuse never blocks a close). Default off / fail-open.
+        fuse_blocked = self._evaluate_fuse_gate(intent)
+        if fuse_blocked is not None:
+            return fuse_blocked
 
         caps_data = load_dynamic_caps(self._caps_path)
         rr = check_risk(caps_data=caps_data, intent=intent)

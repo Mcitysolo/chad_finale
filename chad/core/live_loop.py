@@ -2047,6 +2047,23 @@ def run_once(logger: logging.Logger) -> None:
             "per_strategy_loss_guard failed (non-fatal): %s", _lg_err
         )
 
+    # ------------------------------------------------------------------
+    # W4A-5: fuse-box evaluator. Re-derives per-bucket session stats from
+    # the trusted ledger, emits edge-triggered trip/clear events, and
+    # publishes runtime/fuse_box_state.json — read fail-safe by the
+    # per-intent fuse gate at stage-3 later this cycle. Heartbeat doctrine:
+    # the state is written EVERY cycle including all-modes-off, so a silent
+    # fuse (the XOV lesson) is distinguishable from a dead one. Failure-soft:
+    # an evaluator exception never kills the cycle (loss-guard precedent).
+    # The evaluator NEVER blocks anything — enforcement is the gate below.
+    # ------------------------------------------------------------------
+    try:
+        from chad.risk.fuse_box import run_evaluator_cycle as _run_fuse_eval
+
+        _run_fuse_eval()
+    except Exception as _fuse_err:  # noqa: BLE001
+        logger.debug("fuse_box evaluator failed (non-fatal): %s", _fuse_err)
+
     # Signal throttle — apply trim AFTER routing decisions are made so
     # only submission is capped. Exits/risk-reducing signals are NEVER
     # trimmed; only fresh entries are capped at _max_signals_this_cycle.
@@ -2658,6 +2675,19 @@ def run_once(logger: logging.Logger) -> None:
     _futures_truth_loaded = False
     _futures_pending_adds: Dict[str, float] = {}
 
+    # W4A-5: per-intent fuse gate. Constructed once per cycle, reads the
+    # fuse_box_state.json the evaluator published earlier this cycle. Default
+    # off / fail-open: any construction failure yields a gate that blocks
+    # nothing. Entry-scoped by placement (below, beside the symbol blocker) —
+    # overlay/reconciler/flatten closes never reach here (they bypass stage-3).
+    _fuse_gate = None
+    try:
+        from chad.risk.fuse_gate import FuseGate as _FuseGate
+
+        _fuse_gate = _FuseGate()
+    except Exception as _fg_err:  # noqa: BLE001 — fail-open
+        logger.debug("fuse_gate construction failed (non-fatal): %s", _fg_err)
+
     for intent in intents:
         try:
             _attach_strategy_to_intent(intent, routed_signal_map)
@@ -2765,6 +2795,31 @@ def run_once(logger: logging.Logger) -> None:
                     getattr(intent, "side", None),
                 )
                 continue
+
+            # W4A-5: fuse gate (LC2/LC3). should_block() returns a verdict only
+            # when a covering bucket is tripped AND its flag is `enforce`;
+            # shadow emits would_block evidence and returns None (byte-identical
+            # behavior). Exit-like intents (flip/EXIT/CLOSE/protective/close-
+            # stamp) are bypassed inside the gate — a fuse never blocks a close.
+            # Fail-open: a None gate or any internal error lets the intent pass.
+            if _fuse_gate is not None:
+                try:
+                    _fuse_verdict = _fuse_gate.should_block(intent)
+                except Exception as _fg_eval_err:  # noqa: BLE001 — fail-open
+                    logger.warning(
+                        "FUSE_GATE_CALL_FAILED (fail-open): %s", _fg_eval_err
+                    )
+                    _fuse_verdict = None
+                if _fuse_verdict is not None:
+                    logger.warning(
+                        "SKIP suppression=fuse_%s fuse_id=%s → %s %s strategy=%s",
+                        _fuse_verdict.kind,
+                        _fuse_verdict.fuse_id,
+                        getattr(intent, "symbol", None),
+                        getattr(intent, "side", None),
+                        getattr(intent, "strategy", None),
+                    )
+                    continue
 
             if not is_flip_signal(intent):
                 if not should_emit_signal(adapted):
