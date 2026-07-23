@@ -340,3 +340,82 @@ same STOP as W4A/W4B.
   were unavailable — P16).
 
 — END PLAN (Phase 1). STOP here; Phase 2 requires D1–D10.
+
+---
+
+## 11. Phase-2 closure record (W5A-0..6)
+
+Phase 2 built and committed on `goal/wave5-measurement` (worktree `chad_w5a`),
+base `main@e86eaaf` (the merged W4A fuse box). GO: D1–D10 all as recommended,
+plus four binding riders (R1 honest nulls, R2 additive, R3 clock warn-only, R4
+no second walker). Every commit set-diff-green vs the W5A-0 baseline (16-fail =
+W3B baseline-15 + `test_w4b8_flatten_bare_terminal`). All items observer-class;
+the two payload-touching items flag-gated default-OFF. **STOPPED at push/merge.**
+
+| Commit | Item |
+|---|---|
+| W5A-0 `216ef16` | baseline + R2 schema blast-radius finding |
+| W5A-1 `f72b4f5` | IS joiner core (`implementation_shortfall.py`) |
+| W5A-2 `59ef685` | TCA stamp at mint (`CHAD_TCA_STAMP`, both lanes) |
+| W5A-3 `99779ee` | E3 watermark walk-extension + close sidecar (both lanes) |
+| W5A-4 `6d04d88` | E3 closed_trade mae_mfe stamp (`CHAD_E3_EXCURSION=stamp`) |
+| W5A-5 `8919dc2` | DQ2 EXS10 clock-health (warn-only) |
+| W5A-6 (this) | harness contract doc + EXS7 embedded pins + closure |
+
+### The R2 amendment (operator decision, logged per condition c)
+R2 directed a `closed_trade.v1→v2` bump "per the W4A/D6 precedent." The W5A-0
+audit found that precedent (`drawdown_state.v2`) does NOT transfer: `closed_trade`
+is **hash-chained** AND exact-matched (`== "closed_trade.v1"`) by ≥5 non-test
+readers — including the **execution-critical Bug-B-Fix-B fill-consumed dedup**
+(`trade_closer.py:853`, whose skip risks FIFO re-processing = the INCIDENT-0723
+re-entry class) and the frozen `verify_ledger_chain` hash recompute
+(`trade_log_adapter.py:1070`). A `.v2` bump would silently disable hash
+verification for new rows and require editing execution-critical + frozen code.
+**Operator ruled: Option 1 — additive with self-versioned sub-schemas
+(`implementation_shortfall.v1`, `mae_mfe.v1`), no top-level bump.** R2 amended:
+the versioning requirement is met by the sub-schemas; the literal bump is dropped
+as founded on a false analogy. Three conditions, all delivered:
+- **(a)** `docs/CONTRACT_W5A_harness_handoff.md` states `closed_trade.v1` rows may
+  carry the optional sub-schema blocks with null semantics (R1), so a reader
+  never treats absence as data loss (§1 of the contract).
+- **(b)** EXS7 pins both sub-schemas (`config/exterminator.json →
+  schema_contracts.embedded`) and validates them against the newest ledger row —
+  contract-enforced even without a top-level bump.
+- **(c)** this record + `audits/W5A_BASELINE.md` = the blast-radius map for any
+  future lane that DOES need a real `closed_trade.v2`.
+
+### Riders as delivered
+- **R1 honest nulls:** every uncomputable leg is `null` + a reason code
+  (`funding_reason=not_modeled_paper_lane`, `opportunity_cost_reason=
+  no_unfilled_qty_evidence`, `is_r_reason=no_stop_width_usd`, per-leg
+  `fill_not_found`/`non_genuine_fill_status`); `cost_basis_status` distinguishes
+  real/partial/unavailable. A genuine 0 is distinguishable from unknown
+  (`test_zero_cost_distinct_from_unknown`).
+- **R2 additive:** no top-level bump (above); blocks self-versioned; EXS7 +
+  sentinel row updated; old rows readable forever.
+- **R3 clock warn-only:** EXS10 never returns FAIL — only OK/WARN; `maybe_notify`
+  pages only on FAIL, so it can never cry wolf before thresholds are ratified.
+- **R4 no second walker:** MAE/MFE extends the overlay's EXISTING per-cycle walk
+  with SEPARATE `hwm`/`lwm` watermarks (true bar high/low); `peak`/`trough` (the
+  ATR-stop inputs) are untouched — proven observer-only by
+  `test_walk_on_is_observer_only_same_verdicts`. No parallel iterator.
+
+### New flags (default off; behavior-neutral until flipped)
+`CHAD_TCA_STAMP` (off|on) — the IS block. `CHAD_E3_EXCURSION` (off|sidecar|stamp)
+— watermark tracking + sidecar (`sidecar`) + closed_trade mae/mfe stamp (`stamp`).
+DQ2/EXS10 has no flag (warn-only, no behavior change) — config-gated
+(`clock_health` absent ⇒ warns "unconfigured").
+
+### Post-merge activation (recommendation, each a separate GO)
+Restart the trade-closer + overlays at the gated restart → run
+`CHAD_E3_EXCURSION=sidecar` and review the excursion corpus a session →
+`CHAD_TCA_STAMP=on` + `CHAD_E3_EXCURSION=stamp`, confirm EXS7 embedded checks
+stay green → ratify `clock_health` thresholds after a week of real skew data and
+consider lifting EXS10 to fail-tier in a later wave → Lane B wires the adapter
+(surface `fill_ids` into provenance; apply the D10 replace rule).
+
+### Deliberately NOT done (named follow-ups)
+Live-lane opportunity-cost capture (no data source — paper fills fully);
+funding/borrow modeling (greenfield); clock-source UNIFICATION (DQ2 detects only);
+any `chad/validation/` edit (the adapter wiring + `fill_ids` surfacing are Lane
+B's, per the contract).

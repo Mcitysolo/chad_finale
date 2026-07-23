@@ -1038,6 +1038,24 @@ class ExterminatorSentinel:
 
     # ---- check 7: schema breaks ---------------------------------------
 
+    def _newest_ledger_row(self) -> dict[str, Any]:
+        """The last payload of the newest data/trades/trade_history_*.ndjson,
+        for the W5A-6 embedded-sub-schema validation. Bounded (one row) and
+        best-effort — a missing/unreadable ledger yields {} (embedded checks
+        then simply pass, since the block is optional)."""
+        trades_dir = self.data_dir / "trades"
+        try:
+            files = sorted(trades_dir.glob("trade_history_*.ndjson"))
+        except Exception:
+            return {}
+        if not files:
+            return {}
+        row = self._last_ndjson_row(files[-1])
+        if not isinstance(row, dict):
+            return {}
+        payload = row.get("payload", row)
+        return payload if isinstance(payload, dict) else {}
+
     def check_schema_breaks(self) -> CheckResult:
         cfg = (self.config.get("schema_contracts") or {}) if self.config else {}
         enforced = cfg.get("enforced") or {}
@@ -1071,9 +1089,42 @@ class ExterminatorSentinel:
                 breaks.append({"file": rel_path, "break": "required_keys_missing",
                                "missing_keys": missing_keys, "pinned_at": contract.get("pinned_at")})
 
+        # W5A-6 (amended-R2 condition b): LEDGER-EMBEDDED sub-schema contracts.
+        # The W5A measurement blocks (implementation_shortfall.v1, mae_mfe.v1)
+        # ride INSIDE closed_trade.v1 rows, so they have no file of their own —
+        # they are pinned here and validated against the newest ledger row that
+        # carries each. Absent-everywhere is OK (the blocks are flag-gated and
+        # optional per the harness contract); a PRESENT block with the wrong
+        # shape is a break. This gives the sub-schemas contract enforcement even
+        # though closed_trade itself was (correctly) NOT bumped (see
+        # docs/CONTRACT_W5A_harness_handoff.md + audits/W5A_BASELINE.md).
+        embedded = {k: v for k, v in (cfg.get("embedded") or {}).items()
+                    if isinstance(v, dict)}
+        embedded_checked: list[str] = []
+        if embedded:
+            newest_row = self._newest_ledger_row()
+            for sub_schema, contract in sorted(embedded.items()):
+                field = str(contract.get("field") or "")
+                block = newest_row.get(field) if isinstance(newest_row, dict) else None
+                if not isinstance(block, dict):
+                    continue  # absent (flag off / older row) — OK, optional
+                embedded_checked.append(sub_schema)
+                actual = block.get("schema_version")
+                accepts = [str(a) for a in (contract.get("accepts") or [sub_schema])]
+                if actual is not None and str(actual) not in accepts:
+                    breaks.append({"file": f"closed_trade.{field}", "break": "schema_version_unrecognised",
+                                   "actual": actual, "expected_one_of": accepts,
+                                   "pinned_at": contract.get("pinned_at")})
+                miss = [k for k in (contract.get("required_keys") or []) if k not in block]
+                if miss:
+                    breaks.append({"file": f"closed_trade.{field}", "break": "required_keys_missing",
+                                   "missing_keys": miss, "pinned_at": contract.get("pinned_at")})
+
         evidence = {
             "enforced_contracts": len(enforced),
             "files_checked": checked,
+            "embedded_contracts": len(embedded),
+            "embedded_checked": embedded_checked,
             "breaks": breaks[:10],
             "break_count": len(breaks),
             "unpinned_known": unpinned_known,

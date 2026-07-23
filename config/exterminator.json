@@ -221,6 +221,29 @@
       "runtime/positions_snapshot.json": "No schema_version; publisher chad/portfolio/ibkr_portfolio_collector_v2.py emits source/ts_utc/ttl_seconds only.",
       "runtime/profit_lock_state.json": "No schema_version for THIS payload (chad/risk/profit_lock.py:842 pins pnl_state.v1, a different artifact).",
       "runtime/trade_closer_state.json": "No schema_version; keys are processed_fill_ids/queues/saved_at_utc."
+    },
+    "embedded": {
+      "_doc": [
+        "W5A-6 (amended-R2 condition b). Sub-schema blocks that ride INSIDE a",
+        "closed_trade.v1 ledger row (they have no file of their own because the",
+        "ledger is hash-chained and was correctly NOT bumped -- see",
+        "docs/CONTRACT_W5A_harness_handoff.md). EXS7 validates the newest ledger",
+        "row's block against these when present; absent (flag off / older row) is",
+        "OK -- the blocks are optional and flag-gated. A PRESENT block with a",
+        "wrong schema_version or missing required key is a break."
+      ],
+      "implementation_shortfall.v1": {
+        "field": "implementation_shortfall",
+        "accepts": ["implementation_shortfall.v1"],
+        "required_keys": ["schema_version", "is_usd", "is_bps", "is_r", "slippage_usd", "fees_usd", "funding_usd", "opportunity_cost_usd", "decision_price", "decision_price_source", "cost_basis_status", "legs"],
+        "pinned_at": "chad/analytics/implementation_shortfall.py:compute_lap_is"
+      },
+      "mae_mfe.v1": {
+        "field": "mae_mfe",
+        "accepts": ["mae_mfe.v1"],
+        "required_keys": ["schema_version", "mae_pct", "mae_usd", "mfe_pct", "mfe_usd", "excursion_source"],
+        "pinned_at": "chad/analytics/excursion_recorder.py:read_lap_excursion"
+      }
     }
   },
   "fills": {
