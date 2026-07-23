@@ -82,6 +82,11 @@ _EVIDENCE_SKIP_FILL_STATUSES = frozenset({
     "apipending",
 })
 
+# INCIDENT-0723 (D3): the tier-1 "broker-confirmed" price walk must only read
+# genuine fill rows. Lowercased comparison also admits the raw titlecase
+# "Filled" the status canon currently passes through (D6).
+_PRICE_ELIGIBLE_FILL_STATUSES = frozenset({"filled", "fill", "paper_fill"})
+
 
 def _iter_strategy_signal(routed_signals: Iterable) -> Iterable:
     """
@@ -299,8 +304,11 @@ def _load_recent_broker_fill_price(symbol: str) -> float:
                 continue
             if bool(p.get("reject", False)):
                 continue
+            # INCIDENT-0723 (D3): tier-1 means BROKER-CONFIRMED — require a
+            # genuine fill status. The old reject-only filter let dry_run /
+            # market_closed exhaust rows price real closes.
             status_norm = str(p.get("status", "")).strip().lower()
-            if status_norm in _REJECTED_FILL_STATUSES:
+            if status_norm not in _PRICE_ELIGIBLE_FILL_STATUSES:
                 continue
             extra = p.get("extra") if isinstance(p.get("extra"), dict) else {}
             if bool(extra.get("pnl_untrusted", False)):
