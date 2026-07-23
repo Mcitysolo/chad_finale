@@ -431,3 +431,300 @@ per changed file; `CHAD_SKIP_IB_CONNECT=1 full_cycle_preview` smoke at W5B-3/-4
   shadow-only.*
 
 — END PLAN (Phase 1). STOP here; Phase 2 requires D1–D8.
+
+---
+---
+
+# PHASE 2 — GO RECORD, REBASE ONTO W5A, AND PREMISE RE-VERIFICATION
+
+**Status: Phase 2 OPEN.** The Phase-1 plan was committed at `bca56e2` and the
+session ended before the GO arrived. This section records (§11) the merge of
+Lane A onto this branch, (§12) every Phase-1 premise that the merge or the
+passage of time invalidated, (§13) the operator's GO and its amendments, and
+(§14) the revised commit sequence actually built. Phase-1 text above is left
+**unedited** — corrections live here, so the diff between what was planned and
+what was true stays legible.
+
+## 11. Base move: `main@e86eaaf` → `main@b5d0ee2` (Lane A merged in)
+
+Phase 1 was written against `main@e86eaaf` (the W4A fuse-box merge). Lane A
+(W5A, the measurement layer) has since merged to main at `b5d0ee2`. This branch
+was moved forward by **merge, not rebase** (`7cfca0c`), deliberately: `bca56e2`
+is cited by name in the closure records of the prior session, and rebasing would
+have rewritten that hash. The merge was clean — **zero conflicts** — because the
+two lanes are genuinely disjoint (§11.1).
+
+### 11.1 What W5A actually touched, and what it means for W5B
+
+| W5A surface | Overlap with W5B | Consequence |
+|---|---|---|
+| `chad/analytics/implementation_shortfall.py`, `chad/analytics/excursion_recorder.py` (new) | none | Lane-A territory, untouched (§0) |
+| `chad/execution/trade_closer.py` (+51, the `to_payload` TCA/MAE-MFE stamp) | none | close-side; the allocator is entry-side |
+| `chad/risk/position_exit_overlay.py` (+50), `chad/risk/crypto_exit_overlay.py` (+37) | none | overlay watermark hooks; the allocator never evaluates overlay closes (§5) |
+| `chad/ops/exterminator_sentinel.py` (+185, EXS10 + embedded-schema validation) | **shared file, W5B-5** | additive; W5B adds a `feeds{}` row + an `enforced` pin |
+| `config/exterminator.json` (+40: `schema_contracts.embedded`, `clock_health`) | **shared file, W5B-5** | **D8 is now MOOT** — see below |
+| `chad/core/live_loop.py`, `chad/policy.py`, `config/sizing_config.json` | **not touched by W5A** | P9 and P14 survive intact |
+
+**D8 dissolves.** The Phase-1 concern was two worktrees editing
+`config/exterminator.json` concurrently and racing at merge. Lane A has already
+merged; this branch now *contains* its edits. There is no race left to sequence —
+W5B simply adds its keys on top of W5A's. The keys remain disjoint
+(W5A: `schema_contracts.embedded`, `clock_health`; W5B: a `feeds{}` row +
+`schema_contracts.enforced`). D8's second half (confirm shadow-only) is
+answered by the GO: confirmed, `off|shadow`, no enforce path.
+
+### 11.2 Should the allocator's evidence rows reference the W5A stamps? — **NO (values), YES (one soft handle)**
+
+The operator asked this explicitly. Ruling, with the reasoning that produced it:
+
+**The allocator must NOT carry `implementation_shortfall` or `mae_mfe` values.**
+Three independent reasons, any one sufficient:
+
+1. **Grain mismatch.** Both W5A blocks are *per-closed-lap realized* measures
+   stamped at `trade_closer.to_payload` onto a `closed_trade.v1` row. An
+   allocator row is a *pre-trade would-verdict on an intent*, emitted at stage-3.
+   At emission there is no lap, no fill, and no realized cost — in shadow the
+   intent may never even be submitted.
+2. **The join key does not exist yet at emission.** `CONTRACT_W5A_harness_handoff.md
+   §4` names `record_hash` — the closed-trade hash-chain identity — as the lap
+   join key. It is minted at close. Nothing at stage-3 can reference it.
+3. **It would be fake precision of exactly the kind this plan refuses
+   elsewhere.** An allocator row carrying an `is_usd` field would read as though
+   the shadow verdict were cost-aware. It is not, and no field should imply it.
+
+**What the allocator SHOULD carry is the join *handle*, not the values** — so a
+future lane can walk would-verdict → fill → closed lap → TCA without W5B having
+claimed anything. But this surfaced a real defect, so the handle is weaker than
+expected:
+
+> **FINDING W5B-F1 (new, verified).** `StrategyTradeIntent`
+> (`chad/execution/ibkr_executor.py:26-80`) is frozen and defines **neither
+> `idempotency_key` nor `trace_id`**. PA-EP3 threaded the canonical join key into
+> paper evidence via `execution_id=(getattr(intent,"idempotency_key","") or
+> getattr(intent,"trace_id","") or "")` at `live_loop.py:3288-3292` — on the
+> **IBKR lane both getattrs miss, so `execution_id` is always the empty string**.
+> PA-EP3's join spine is live on the Kraken lane and **empty on the IBKR lane**.
+> This is not W5B's to fix (it is an intent-schema change on a frozen dataclass
+> in the execution hot path), but it bounds what any future would-verdict →
+> realized-cost join can achieve, and it is filed as a follow-up.
+
+So the allocator stamps a **soft correlation tuple** — `(ts_utc, symbol, side,
+strategy, cycle_seq)` — and names it soft in the schema. It does not fabricate a
+hard key that the execution layer does not mint.
+
+One further honest note, recorded so a later reader does not assume identity:
+the allocator's price ladder is `limit_price → expected_price → price_cache`,
+while W5A's `decision_price_source` ladder is `submit_quote.ref_price →
+expected_price`. **They agree on the `expected_price` fallback and differ on the
+primary leg** — the allocator sits *upstream* of submit, so no `submit_quote`
+exists when it evaluates. A future comparison of assumed-vs-realized decision
+price must account for that, not treat the two as the same number.
+
+## 12. Premise re-verification — five Phase-1 claims corrected
+
+Re-audited against the post-merge tree and live runtime on 2026-07-23. Most of
+§1 survives; these five do not, and two of them change the design.
+
+| # | Phase-1 claim | Status now | Correction |
+|---|---|---|---|
+| **C1** | P10: copy the shadow-gate template from `chad/execution/margin_shadow_gate.py` (also cited at `fuse_gate.py:8`) | **FILE DOES NOT EXIST** | `margin_shadow_gate.py` is in **no ref of this repo** (`git log --all` empty; only `chad/risk/margin_block.py` + `config/margin_block.json` are in-tree). It is unpushed work in the `chad_finale` worktree ("3 commits push denied"). **Substitute template: `chad/risk/fuse_gate.py` + `chad/risk/fuse_box.py`** — W4A, in-tree, tested, and literally the neighbour at the call site. Strictly better: the allocator can *import* `fuse_gate.is_exit_like` instead of hand-rolling the §5 bypass predicate, so gate and allocator agree by construction on what a close is. `margin_block.json`'s 2.0×NetLiq citation (P14) is unaffected — that file is in-tree |
+| **C2** | P9: per-intent loop at `live_loop.py:2704`; fuse hook ~`:2759` | **line numbers wrong** | Verified post-merge: `for intent in intents:` is at **`:2723`**; `FuseGate()` constructed at `:2700-2706`; `_fuse_gate.should_block(intent)` called at **`:2893-2895`**. W5A did not touch `live_loop.py` — the Phase-1 numbers were simply off. The *structure* (P9) is exactly as claimed; only the anchors move |
+| **C3** | P2: 11-symbol book = AAPL, BAC, LLY, MA, MSFT, UNH, V, SPY, PSQ, SVXY (10 named for an 11-count) | **book moved; the count was one short** | Live `positions_truth.json` today: AAPL, BAC, LLY, MA, MSFT, UNH, V, SPY, **IWM**, PSQ, SVXY. IWM (a *second* long index ETF) was missing from the Phase-1 list. The disease is **worse** than described, not better — see §12.1 |
+| **C4** | P13: equity basis = `pnl_state.json::account_equity`, "CAD, `currency_ok=true`" | **wrong artifact** | `pnl_state.json` has **no `currency`/`currency_ok` key at all** (the dashboard reads `account_equity_currency_ok`, which is likewise absent). The keys the plan attributed to it live on `portfolio_snapshot.json`: `ibkr_equity=993000.30`, `ibkr_equity_currency=CAD`, `ibkr_equity_currency_ok=true`. **Use `portfolio_snapshot.json`** — it is also what `tier_manager.py:587` reads, fail-closed, so the allocator inherits a ratified precedent instead of inventing one |
+| **C5** | §7: "**No correlation threshold is sourced anywhere** in the repo" | **FALSE** | `config/sizing_config.json::correlation_monitor.threshold = **0.65**`, with `chad/risk/correlation_monitor.py` **WIRED** into `chad/execution/execution_pipeline.py:264` as a live size multiplier (the R6 correlation reducer). The config note even records the measured book statistic: *"a book averaging 0.654 pairwise correlation"*. §7's second argument was factually wrong — see §13.3 |
+
+### 12.1 The book today — the finding is sharper than Phase 1 claimed
+
+Computed from live `positions_truth.json` × `price_cache.json`, sectors from
+`config/symbol_sectors.json`:
+
+| Symbol | Qty | Price | delta_usd | Sector |
+|---|---:|---:|---:|---|
+| LLY | 182 | 1184.00 | **$215,488** | healthcare |
+| SPY | 247 | 739.42 | **$182,637** | index_etf |
+| UNH | 240 | 422.70 | $101,448 | healthcare |
+| V | 195 | 350.76 | $68,398 | financials |
+| IWM | 200 | 291.97 | $58,394 | index_etf |
+| BAC | 213 | 61.28 | $13,053 | financials |
+| MSFT | 34 | 381.65 | $12,976 | mega_tech |
+| SVXY | 163 | 56.60 | $9,226 | vol_etp |
+| MA | 10 | 530.06 | $5,301 | financials |
+| AAPL | 12 | 321.01 | $3,852 | mega_tech |
+| PSQ | 10 | 26.52 | $265 | inverse_etf |
+
+**GROSS = $671,037 · NET = $671,037 · every single position is LONG.**
+
+Three things follow, and all three strengthen the case for the allocator:
+
+- **Gross ≡ net.** Phase 1 described "eight long-beta tickets partially offset by
+  two inverse ETFs." There is no offset. PSQ — the *only* genuinely short-beta
+  ticket — is **$265**, i.e. 0.04% of gross: rounding error. And the "offsetting"
+  SVXY is a **long short-vol** position, which is *risk-on*: it adds to the
+  long-beta bet rather than hedging it. The book is a one-way levered long.
+- **Two positions already exceed the ENFORCED per-symbol cap.** `policy.py:666`
+  `max_symbol_exposure = $150,000` is enforced *today* — yet LLY sits at $215,488
+  and SPY at $182,637. Not a violation: the cap is **per-order**, and a position
+  accumulated over several orders never meets it. This is the missing-aggregate-layer
+  thesis demonstrated on live data, and it means the shadow corpus will produce
+  real would-rejects from a **hard-sourced, already-ratified** number on day one.
+- **Sector concentration is real:** healthcare $316,936 (47.2% of gross),
+  index_etf $241,031 (35.9%), financials $86,751 (12.9%), mega_tech $16,828,
+  vol_etp $9,226, inverse_etf $265.
+
+### 12.2 The currency problem is worse than D7 assumed — and it forces the derivation's units
+
+`portfolio_snapshot.json` reports `usd_ok=false`, `usdcad_rate_used=null`,
+`total_equity_usd_authoritative=null`. The book is **USD-priced**
+(`positions_truth` rows are all `currency:USD`; `price_cache` is USD); the only
+`currency_ok` equity is **CAD**. **No FX rate exists anywhere to bridge them.**
+
+Therefore `gross/equity = 671,037/993,000 = 0.676×` — the ratio Phase 1's D7
+would have used — is a **mixed-unit number and is meaningless**. At a plausible
+USDCAD it would be nearer 0.93×. A ceiling expressed as a multiple of equity
+would silently inherit that error and be wrong by ~37%.
+
+**Consequence for the GO's OPERATOR_VERIFY 1/2:** the derived shadow thresholds
+are denominated in **USD notional**, derived from USD-denominated sources only
+(`policy.py`'s USD caps and the USD-priced book). The CAD equity is recorded in
+the config as context and explicitly **not** used as a divisor. This keeps §4's
+no-invented-number rule honest about *units*, not just magnitudes.
+
+## 13. The GO — operator ruling, 2026-07-23
+
+All Phase-1 recommendations **accepted**: D1(a) `beta=1.0`/`beta_source:"default_1.0"`;
+D2 allocator-local futures reference, unmapped root ⇒ `null` + loud; D3
+net-exposure report-only; D5 static buckets bind; D6 IBKR observer + thin Kraken
+mirror; D7 as amended by §12.2; D8 moot per §11.1 + shadow-only **confirmed**.
+Plus four amendments:
+
+### 13.1 OPERATOR_VERIFY 1 — the gross-exposure ceiling
+
+> *Accept the derivation from current book shape + tier headroom as the SHADOW
+> threshold; stamp config `basis:"shadow_derivation_2026-07"` — it generates
+> would-reject evidence, it is NOT a ratified limit; the enforce-era number gets
+> its own PA.*
+
+**Derivation (auditable, USD, per §12.2):**
+
+- Only USD-denominated firm-level exposure number in the repo:
+  `policy.py:665 max_total_exposure = $500,000` (enforced, per-order grain).
+- Live book gross = **$671,037** — already 1.34× that number, which is precisely
+  why a per-order cap cannot express a portfolio ceiling.
+- **Tier headroom:** live tier is `SCALE` (`tier_state.json`, band
+  CAD 226,560 → 14,160,000, demotion floor CAD 203,904). SCALE's `risk_profile`
+  is **all-null** — the tier imposes *no* competing notional ceiling, so the
+  derivation is unconstrained from above and must supply its own discipline.
+- **Chosen: `gross_cap_notional_usd = 750,000` = 1.5 × the enforced per-order
+  gross.** It sits **above** the current book (headroom $78,963, so the corpus is
+  not saturated on day one and every row is a genuine *marginal* verdict) and
+  **below** the only existing aggregate reference (`margin_block` 2.0×NetLiq).
+  A ceiling *below* the live book would would-reject every intent forever and
+  the corpus would carry no information.
+
+Stamped `basis:"shadow_derivation_2026-07"`, `ratified:false`,
+`enforce_era_requires_pa:true`.
+
+### 13.2 OPERATOR_VERIFY 2 — the per-sector cap
+
+Same treatment, same stamp. The Phase-1 source (`sizing_config` `$5,000`) is
+small-account calibration and is **not** used: against this book every one of the
+six live sectors breaches it, which is saturation, not evidence.
+
+**Derivation: `per_sector_cap_notional_usd = 375,000 = 0.5 × the gross ceiling`** —
+"no single sector may exceed half the firm gross ceiling." Against the live book
+that puts healthcare ($316,936) at **84.5% of its sector cap with $58,064 of
+headroom** — inside the limit today, so the *next* healthcare ticket is what
+trips it. That is exactly the marginal concentration signal R1 exists to produce.
+Stamped identically; the `$5,000` figure is retained in the config as
+`superseded_source` with the reason, so nothing is quietly dropped.
+
+**D4 changes as a result:** Phase 1 recommended per-sector be report-only. Under
+the GO it **binds in shadow** against the derived number. "Binds in shadow" means
+only that it generates `WOULD_REJECT` evidence — there is still no enforce path
+anywhere in W5B.
+
+### 13.3 CORRELATION — rolling ρ deferred to R2; the plan's own reasoning was partly wrong
+
+> *Static sector buckets ratified; rolling correlation deferred to R2 with real
+> sample depth (your own fake-precision argument governs).*
+
+**Effect: the Phase-1 `W5B-5` commit (`allocator_correlation.py`) is CUT.** No
+rolling-correlation module is built in this wave.
+
+The ruling is right, but §7's stated reasons were not, and the record should say
+so. §7 argued "no correlation threshold is sourced anywhere" — **false** (C5):
+`sizing_config.correlation_monitor.threshold=0.65` is sourced *and wired* into
+live sizing at `execution_pipeline.py:264`. So the real argument for deferral is
+the **opposite** of the one Phase 1 gave: a correlation reducer already exists at
+per-order grain, and a second, independently-thresholded correlation layer at
+portfolio grain would **double-count the same effect** through two unreconciled
+thresholds. That is a stronger reason to defer than "unsourced" ever was, and it
+hands R2 a concrete first task: reconcile with `correlation_monitor`, don't
+duplicate it.
+
+The `allocator_state` heartbeat therefore carries a **declarative** correlation
+field — `{"mode":"static_sector_buckets","rolling_deferred_to":"R2",
+"existing_per_order_reducer":"chad/risk/correlation_monitor.py"}` — naming the
+regime and the deferral. **No ρ is computed and no numeric correlation appears
+anywhere in W5B**, so there is no fake precision to mistake for a measurement.
+
+### 13.4 BYPASS FINDING — a named standing finding
+
+> *The flip-executor/reconciler stage-3 bypass is a named standing finding — in
+> the plan, and as a sentinel-visible note in the allocator's first report. It
+> bounds what shadow evidence can claim and heads the agenda of any future
+> enforce-flip PA.*
+
+**FINDING W5B-SF1 (standing).** The same structural property that makes the
+allocator **safe** — overlay, crypto-overlay, reconciler and flatten closes go
+`apply_close_intents → adapter` direct and never traverse stage-3 (P9) — also
+makes it **partially blind**. Those paths can change the book without the
+allocator ever seeing the intent that changed it. Precisely:
+
+- The allocator's provisional book is *open book at cycle start + entries it saw
+  this cycle*. Any position change arriving through a bypassing path lands in the
+  next cycle's snapshot, not this one.
+- A **flip** is the sharp case: its closing leg bypasses, and it is the executor
+  and reconciler — not stage-3 — that move the book. A flip can therefore move
+  gross materially between two allocator evaluations, and the second evaluation
+  will be computed against a book that is one cycle stale.
+- INC-0723 is the live precedent for how much a bypassing path can move real
+  quantities without stage-3 participating.
+
+**What this bounds.** Shadow evidence supports claims of the form *"this entry
+would have breached the ceiling given the book as of cycle start."* It does
+**not** support *"gross never exceeded X"* — the allocator cannot see every
+mutation, only entries. Any future enforce-flip PA must open on this item: an
+enforcing allocator with a one-cycle-stale book could reject a legitimate entry
+or admit a breaching one, so enforce requires either book re-read at evaluation
+or explicit participation from the bypassing paths.
+
+**Surfacing.** Carried as `standing_findings[]` in every
+`allocator_state.v1` heartbeat (so the sentinel sees it on the very first report
+and on every subsequent one, not just once), and in the closure record.
+
+### 13.5 The exits-always-free invariant
+
+Unchanged and reaffirmed: the allocator never evaluates overlay closes,
+advice-fired closes, or flatten. Enforced structurally (placement) + by predicate
+(`fuse_gate.is_exit_like`, now **imported rather than re-implemented**, per C1) +
+by the absence of any enforce path. Pinned by
+`test_w5b_allocator_exits_always_free`.
+
+## 14. Revised Phase-2 commit sequence
+
+Phase-1 §9's sequence, with the correlation commit cut (§13.3) and the rest
+renumbered to stay contiguous:
+
+| # | Commit | Contents | Δ vs Phase 1 |
+|---|---|---|---|
+| W5B-0 | baseline + plan amendment | full-suite baseline → `audits/W5B_BASELINE.md`; this §11-§14 | expanded (premise corrections) |
+| W5B-1 | exposure core | `portfolio_allocator.py`: `ExposureVector`, book/intent normalization, futures reference (D2) | as planned |
+| W5B-2 | limits + evaluation | `config/portfolio_limits.json` (§13.1/§13.2 derivations) + loader + limit engine | thresholds now derived, not report-only |
+| W5B-3 | shadow gate + placement | `allocator_shadow_gate.py` + stage-3 hook at `:2723`/`:2893` + provisional book + `is_exit_like` bypass | anchors corrected (C2), predicate imported (C1) |
+| W5B-4 | evidence + heartbeat | `allocator_shadow.v1` rows + `allocator_state.v1` incl. OFF + `standing_findings` | + §13.4 surfacing |
+| W5B-5 | coach + sentinel | reject-streak `format_alert` + `exterminator.json` feeds row + EXS7 pin | was W5B-6; correlation commit cut |
+| W5B-6 | closure | closure record + follow-ups (W5B-F1, W5B-SF1) | was W5B-7 |
+
+Set-diff methodology, `py_compile`, and the `full_cycle_preview` smoke at W5B-3/-4
+are unchanged from §9. **Same STOP as W4A/W4B/W5A: no push, no merge.**
