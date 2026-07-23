@@ -409,6 +409,28 @@ class ClosedTrade:
         except Exception as _tca_err:  # noqa: BLE001 — observer, never break a mint
             _LOG.warning("tca_stamp_skipped err=%s", _tca_err)
 
+        # W5A-4 (E3): best-effort mae_mfe.v1 stamp when CHAD_E3_EXCURSION=stamp.
+        # Reads the overlay's close-time excursion sidecar (authoritative),
+        # joined on (strategy, symbol) temporally. Absent when the sidecar was
+        # not written yet (the D8 race) — the sidecar remains the source of
+        # truth for the harness join. Additive, observer-class, fail-open.
+        try:
+            from chad.analytics.excursion_recorder import (
+                e3_mode as _e3_mode,
+                read_lap_excursion,
+            )
+
+            if _e3_mode() == "stamp":
+                _mm = read_lap_excursion(
+                    strategy=self.strategy, symbol=self.symbol,
+                    entry_time_utc=self.entry_time_utc,
+                    exit_time_utc=self.exit_time_utc,
+                )
+                if _mm is not None:
+                    payload["mae_mfe"] = _mm
+        except Exception as _e3_err:  # noqa: BLE001 — observer, never break a mint
+            _LOG.warning("mae_mfe_stamp_skipped err=%s", _e3_err)
+
         return payload
 
 

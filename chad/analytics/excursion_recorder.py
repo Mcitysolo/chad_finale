@@ -226,6 +226,98 @@ def record_excursion_at_close(
         return None
 
 
+# --------------------------------------------------------------------------- #
+# W5A-4: read the sidecar back for the closed_trade stamp (temporal join)
+# --------------------------------------------------------------------------- #
+
+_EXCURSION_CACHE: Dict[Tuple[str, str], Tuple[float, list]] = {}
+
+
+def _parse_iso(v: Any) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _date_of(iso_ts: Any) -> Optional[str]:
+    s = str(iso_ts or "")
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:4] + s[5:7] + s[8:10]
+    return None
+
+
+def _load_excursion_rows(date: str, evidence_dir: Path) -> list:
+    path = evidence_dir / f"excursion_{date}.ndjson"
+    key = (date, str(evidence_dir))
+    try:
+        sig = path.stat().st_mtime
+    except OSError:
+        return []
+    hit = _EXCURSION_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    rows = []
+    try:
+        for line in path.read_text(errors="ignore").splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+    except Exception:
+        rows = []
+    _EXCURSION_CACHE[key] = (sig, rows)
+    return rows
+
+
+def read_lap_excursion(
+    *,
+    strategy: str,
+    symbol: str,
+    entry_time_utc: Any,
+    exit_time_utc: Any,
+    evidence_dir: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort read of the close-time excursion for one lap, joined on
+    (strategy, symbol) with the closest opened_at_utc to the lap's entry
+    (tie-break: closest closed_detect to exit). Returns a mae_mfe.v1 block, or
+    None when no matching sidecar row exists yet (the D8 race — the sidecar is
+    authoritative; this stamp is a convenience for the common case)."""
+    src = Path(evidence_dir) if evidence_dir is not None else DEFAULT_EVIDENCE_DIR
+    strat = str(strategy or "").strip().lower()
+    sym = str(symbol or "").strip().upper()
+    dates = {d for d in (_date_of(entry_time_utc), _date_of(exit_time_utc), _date_of(_now_iso())) if d}
+    cands = []
+    for d in dates:
+        for row in _load_excursion_rows(d, src):
+            if (str(row.get("strategy") or "").lower() == strat
+                    and str(row.get("symbol") or "").upper() == sym):
+                cands.append(row)
+    if not cands:
+        return None
+    entry_dt = _parse_iso(entry_time_utc)
+    exit_dt = _parse_iso(exit_time_utc)
+
+    def _score(row: Mapping[str, Any]) -> float:
+        oa = _parse_iso(row.get("opened_at_utc"))
+        cd = _parse_iso(row.get("closed_detect_utc"))
+        s1 = abs((oa - entry_dt).total_seconds()) if (oa and entry_dt) else 1e18
+        s2 = abs((cd - exit_dt).total_seconds()) if (cd and exit_dt) else 1e18
+        return s1 + s2
+
+    best = min(cands, key=_score)
+    return {
+        "schema_version": EXCURSION_SCHEMA_VERSION,
+        "mae_pct": best.get("mae_pct"), "mae_usd": best.get("mae_usd"),
+        "mfe_pct": best.get("mfe_pct"), "mfe_usd": best.get("mfe_usd"),
+        "mae_reason": best.get("mae_reason"), "mfe_reason": best.get("mfe_reason"),
+        "hwm": best.get("hwm"), "lwm": best.get("lwm"),
+        "excursion_source": best.get("excursion_source"),
+        "join": {"on": "strategy_symbol_temporal",
+                 "opened_at_utc": best.get("opened_at_utc"),
+                 "closed_detect_utc": best.get("closed_detect_utc")},
+    }
+
+
 __all__ = [
     "E3_EXCURSION_ENV",
     "EXCURSION_SCHEMA_VERSION",
@@ -237,6 +329,7 @@ __all__ = [
     "e3_mode",
     "excursion_tracking_enabled",
     "latest_bar_hilo",
+    "read_lap_excursion",
     "record_excursion_at_close",
     "update_watermarks",
 ]
