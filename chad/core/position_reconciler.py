@@ -371,6 +371,21 @@ def _close_intent_to_ibkr(close: dict):
         sec_type = "STK"
         asset_class_enum = AssetClass.EQUITY
 
+    # W4B-2 (J16 rider / Lane-A D8 absorption): thread close provenance into
+    # intent.meta so overlay/reconciler closes are distinguishable at the
+    # adapter boundary and in fill evidence — the forensic chain advice-fired
+    # closes (W4B-3+) need. Previously action/reason/position_key were dropped
+    # here, leaving an overlay close indistinguishable from a strategy SELL at
+    # _submit_intent. Additive only: the adapter's idempotency fingerprint
+    # excludes free-form meta (only per-sec_type contract keys are read), so
+    # these stamps can never change dedupe identity or ordering behavior.
+    meta["action"] = "CLOSE"
+    meta["close_origin"] = "apply_close_intents"
+    for _k in ("reason", "position_key", "open_side", "close_side"):
+        _v = close.get(_k)
+        if _v is not None:
+            meta[_k] = str(_v)
+
     class _ReconcilerIntent:
         __slots__ = (
             "symbol", "side", "quantity", "sec_type", "asset_class",

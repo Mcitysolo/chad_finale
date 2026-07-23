@@ -107,9 +107,13 @@ def test_reconciler_close_intent_equity_remains_stk(symbol):
     intent = _close_intent_to_ibkr(_close(symbol, side="SELL", qty=5.0))
     assert intent.sec_type == "STK"
     assert intent.asset_class == AssetClass.EQUITY
-    assert intent.meta == {}, (
+    # GAP-037 contract: no futures contract keys on the STK branch. (W4B-2
+    # added close-provenance stamps to ALL branches, so meta is no longer
+    # empty — the pin is the absence of contract keys, not emptiness.)
+    assert "contract_month" not in intent.meta, (
         "equity close intents must not carry futures contract_month meta"
     )
+    assert intent.meta["action"] == "CLOSE"            # W4B-2 stamp present
 
 
 @pytest.mark.parametrize("symbol", ["GLD", "TLT", "IEMG", "VWO"])
@@ -117,7 +121,8 @@ def test_reconciler_close_intent_etf_remains_stk(symbol):
     intent = _close_intent_to_ibkr(_close(symbol, side="BUY", qty=10.0))
     assert intent.sec_type == "STK"
     assert intent.asset_class == AssetClass.ETF
-    assert intent.meta == {}
+    assert "contract_month" not in intent.meta         # W4B-2: stamps only
+    assert intent.meta["action"] == "CLOSE"
 
 
 # ---------------------------------------------------------------------------
@@ -129,14 +134,14 @@ def test_reconciler_close_intent_empty_symbol_falls_back_to_stk():
     intent = _close_intent_to_ibkr(_close(""))
     assert intent.sec_type == "STK"
     assert intent.asset_class == AssetClass.EQUITY
-    assert intent.meta == {}
+    assert "contract_month" not in intent.meta         # W4B-2: stamps only
 
 
 def test_reconciler_close_intent_unknown_symbol_falls_back_to_stk():
     intent = _close_intent_to_ibkr(_close("ZZTOP"))
     assert intent.sec_type == "STK"
     assert intent.asset_class == AssetClass.EQUITY
-    assert intent.meta == {}
+    assert "contract_month" not in intent.meta         # W4B-2: stamps only
 
 
 # ---------------------------------------------------------------------------
