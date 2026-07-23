@@ -711,7 +711,9 @@ def run_flatten(
     drill_gaps: List[Dict[str, str]] = []
 
     # -- Phase 0: PROBE (fail-closed) + scope resolution + preview ----------
+    t0 = time.monotonic()
     probe = probe_broker(ib)
+    probe_ms = (time.monotonic() - t0) * 1000.0
     snapshot_diffs: List[Dict[str, Any]] = []
     if snapshot_path is not None:
         snapshot_diffs = crosscheck_snapshot(probe, snapshot_path)
@@ -798,6 +800,7 @@ def run_flatten(
         },
         "probe": {
             "probed_at_utc": probe.probed_at_utc,
+            "probe_ms": round(probe_ms, 1),   # SLA of the probe itself (§2.3)
             "positions": probe.positions,
             "open_orders": probe.all_open_orders,
             "visibility_split": visibility,
@@ -913,7 +916,8 @@ def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
     os.environ["CHAD_RTH_GATE"] = "0"
 
     root: Path = args.repo_root
-    narrate = _make_narrator(enabled=not args.no_telegram)
+    narrate = _make_narrator(enabled=not args.no_telegram,
+                             drill=not args.execute)
     narrate("flatten_started",
             f"{'EXECUTE' if args.execute else 'DRILL'} scope={args.scope}")
     ib = None
@@ -1006,17 +1010,17 @@ def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
     return 0 if (not args.execute or payload["overall"] == "FLAT") else 1
 
 
-def _make_narrator(*, enabled: bool) -> Callable[[str, str], None]:
+def _make_narrator(*, enabled: bool, drill: bool = False) -> Callable[[str, str], None]:
     """Staged coach narration: one send per stage, DISTINCT dedupe identity per
     stage (a shared key eats messages 2..n for 15 min — P15), calm value-free
-    titles, numbers in the facts line. Best-effort: narration can never block
-    or fail a flatten."""
+    titles, numbers in the facts line. DRILL formats-but-never-sends (§2.3):
+    the formatting chain is proven without paging anyone. Best-effort:
+    narration can never block or fail a flatten."""
     def _send(stage: str, detail: str) -> None:
         if not enabled:
             return
         try:
             from chad.utils.coach_voice import format_alert
-            from chad.utils.telegram_notify import notify_detailed
             # Unknown kinds fall through safely to coach_voice's generic
             # template (P15); registered _tpl_flatten_* cards are a cosmetic
             # follow-up per the plan.
@@ -1024,6 +1028,10 @@ def _make_narrator(*, enabled: bool) -> Callable[[str, str], None]:
                 "title": f"Flatten-all: {stage.replace('flatten_', '').replace('_', ' ')}",
                 "detail": detail,
             })
+            if drill:
+                print(f"[narration-drill formatted, not sent] {text.splitlines()[0]}")
+                return
+            from chad.utils.telegram_notify import notify_detailed
             notify_detailed(text, severity="critical",
                             dedupe_key=f"flatten_all.{stage}")
         except Exception:
