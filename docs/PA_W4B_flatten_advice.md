@@ -7,11 +7,24 @@ config mutation, no flag flips, no restarts.
 
 ## PA-W4B-1 — First flatten DRILL run (operator terminal, Channel 1)
 
+**Status: RUN 2026-07-23 (DRILL_COMPLETE at 10:26Z after five aborted
+bare-terminal attempts) — see `audits/INCIDENT_20260723_DRILL_EXHAUST_
+FALSE_FLAT.md` for what the early exhaust did and the W4B-8 fixes.**
+
 The drill is the default no-`--execute` invocation of the flatten CLI
 (`scripts/` — order-guard blocklisted; the operator runs it manually from
 the terminal). It performs real read-only probes and pushes every IBKR
 close through the adapter's `dry_run` short-circuit; it cancels nothing,
-closes nothing, sends nothing (narration is formatted-not-sent).
+closes nothing, sends nothing (narration is formatted-not-sent), and — since
+W4B-8b — **mints nothing into the money ledger** (dry_run is not a writable
+evidence status and not a FIFO-trusted one).
+
+**Canonical invocation (W4B-8: bare-terminal-proof — any cwd, no exports
+needed; a set `CHAD_EXECUTION_MODE` overrides the drop-in inference):**
+
+```
+/home/ubuntu/chad_finale/venv/bin/python3 /home/ubuntu/chad_finale/scripts/flatten_all.py
+```
 
 Review artifact: `reports/ratification/PROOF_FLATTEN_DRILL_<YYYYMMDD>.json`
 (`flatten_drill_proof.v1`).
@@ -24,7 +37,10 @@ Acceptance:
   run WOULD kill, by name (D3 rider);
 - `resolution.untouched` names every operator symbol that stays standing
   (D1 rider);
-- clamp check: every target `quantity` ≤ the broker qty in `probe.positions`.
+- clamp check: every target `quantity` ≤ the broker qty in `probe.positions`;
+- **exhaust hygiene (W4B-8, INCIDENT-0723): zero rows added to
+  `data/fills/FILLS_*.ndjson` by the drill** — the drill's only artifacts
+  are the proof JSON and `data/flatten_all/*.ndjson` event rows.
 
 ## PA-W4B-2 — CHAD_EXIT_ADVICE record→consume flip (SEPARATE operator GO)
 

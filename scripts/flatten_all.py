@@ -33,13 +33,25 @@ Operator-terminal-only by standing policy (chad-order-guard hook).
 from __future__ import annotations
 
 import argparse
+import glob as _glob
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# Bare-terminal self-location (W4B-8): `venv/bin/python3 scripts/flatten_all.py`
+# from ANY cwd must find the chad package without PYTHONPATH — sys.path[0] is
+# scripts/, so prepend the repo root (this file's parent's parent). An
+# emergency tool must not depend on the operator's shell setup.
+# --------------------------------------------------------------------------- #
+_SCRIPT_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_SCRIPT_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_REPO_ROOT))
 
 REPORT_SCHEMA = "flatten_all_report.v1"
 DRILL_SCHEMA = "flatten_drill_proof.v1"
@@ -77,19 +89,68 @@ def _iso(dt: datetime) -> str:
 # Gates (D4: minimal + typed; wrong token = hard error)
 # --------------------------------------------------------------------------- #
 
+# systemd drop-in trees consulted when the terminal env carries no
+# CHAD_EXECUTION_MODE (W4B-8 bare-terminal drill follow-up). Both execution
+# units are read; a DISAGREEMENT between them means a mode migration is in
+# flight and inference REFUSES (fail-closed — never guess a posture).
+_SYSTEMD_DROPIN_GLOBS: Tuple[str, ...] = (
+    "/etc/systemd/system/chad-live-loop.service.d/*.conf",
+    "/etc/systemd/system/chad-orchestrator.service.d/*.conf",
+)
+_ENV_MODE_RE = re.compile(
+    r"CHAD_EXECUTION_MODE=(?P<q>[\"']?)(?P<val>[A-Za-z_]+)(?P=q)")
+
+
+def infer_execution_mode_from_dropins(
+    dropin_globs: Tuple[str, ...] = _SYSTEMD_DROPIN_GLOBS,
+) -> Optional[str]:
+    """Bare-terminal fallback: read CHAD_EXECUTION_MODE from the live units'
+    systemd drop-ins. Returns the value ONLY when every declaration found
+    agrees; None when none found or on conflict. The env var, when set,
+    always wins — this is a fallback, never an override."""
+    found: set = set()
+    for pattern in dropin_globs:
+        for path in sorted(_glob.glob(pattern)):
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except Exception:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith("Environment="):
+                    continue
+                for m in _ENV_MODE_RE.finditer(line):
+                    found.add(m.group("val").strip().lower())
+    if len(found) == 1:
+        return next(iter(found))
+    return None  # absent or conflicting -> caller's gate refuses
+
+
 def check_gates(env: Mapping[str, str],
-                live_readiness_path: Optional[Path] = None) -> Dict[str, Any]:
+                live_readiness_path: Optional[Path] = None,
+                *,
+                inferred_mode: Optional[str] = None) -> Dict[str, Any]:
     """Fail-closed mode gate + live_readiness posture cross-check (plan §2.1).
 
     Only CHAD_EXECUTION_MODE paper|dry_run may pass (the ONLY modes that exist
     besides live — never accept invented variants); missing/unknown REFUSES: an
     emergency tool must still never touch a live posture without its own
-    separate authorization. Cross-check: a readable live_readiness publisher
-    state with ``ready_for_live: true`` REFUSES too (mid-transition mismatch —
-    a live-mode flatten is a separate authorization, out of W4B scope). An
-    unreadable file only WARNS: the env mode gate is the hard wall, and an
-    emergency in paper must not be blocked by a dead advisory publisher."""
-    raw = str(env.get("CHAD_EXECUTION_MODE", "") or "").strip().lower()
+    separate authorization. W4B-8: when the env var is ABSENT (bare operator
+    terminal), ``inferred_mode`` — the agreed CHAD_EXECUTION_MODE from the
+    systemd drop-ins — substitutes; a SET env var always wins (override), and
+    neither-source-available still REFUSES. Cross-check: a readable
+    live_readiness publisher state with ``ready_for_live: true`` REFUSES too
+    (mid-transition mismatch — a live-mode flatten is a separate
+    authorization, out of W4B scope). An unreadable file only WARNS: the mode
+    gate is the hard wall, and an emergency in paper must not be blocked by a
+    dead advisory publisher."""
+    env_raw = str(env.get("CHAD_EXECUTION_MODE", "") or "").strip().lower()
+    if env_raw:
+        raw, mode_source = env_raw, "env"
+    elif inferred_mode:
+        raw, mode_source = str(inferred_mode).strip().lower(), "systemd_dropin"
+    else:
+        raw, mode_source = "", None
     mode_ok = raw in ("paper", "dry_run")
     ready_for_live: Optional[bool] = None
     readiness_warn: Optional[str] = None
@@ -101,6 +162,7 @@ def check_gates(env: Mapping[str, str],
             readiness_warn = f"live_readiness unreadable (advisory): {exc}"
     return {
         "execution_mode_raw": raw or None,
+        "mode_source": mode_source,
         "mode_gate_ok": mode_ok,
         "ready_for_live": ready_for_live,
         "readiness_warn": readiness_warn,
@@ -895,8 +957,17 @@ def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
     except FlattenAbort as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
-    gates = check_gates(os.environ,
-                        args.repo_root / "runtime" / "live_readiness.json")
+    # W4B-8: on a bare terminal (no CHAD_EXECUTION_MODE exported) infer the
+    # mode from the live units' systemd drop-ins; a set env var always wins.
+    _env_mode_set = bool(str(os.environ.get("CHAD_EXECUTION_MODE", "") or "").strip())
+    gates = check_gates(
+        os.environ,
+        args.repo_root / "runtime" / "live_readiness.json",
+        inferred_mode=None if _env_mode_set else infer_execution_mode_from_dropins(),
+    )
+    if gates["mode_source"] == "systemd_dropin":
+        print(f"mode inferred from systemd drop-ins: "
+              f"{gates['execution_mode_raw']} (env absent; a set env overrides)")
     if gates["readiness_warn"]:
         print(f"WARN: {gates['readiness_warn']}", file=sys.stderr)
     if not gates["ok"]:
@@ -946,7 +1017,9 @@ def main(argv: List[str]) -> int:  # pragma: no cover - integration shell
         from chad.core.kraken_trusted_fill_engine import (
             RoundTripBook, TrustedFillEngine)
         from chad.risk.crypto_exit_overlay import _canonical_to_pair
-        book = RoundTripBook()  # default runtime/exec_state_paper.sqlite3
+        # W4B-8: honour --repo-root (identical to the engine default for the
+        # canonical root; a test/alt root gets its own book, never prod's).
+        book = RoundTripBook(root / "runtime" / "exec_state_paper.sqlite3")
         engine = TrustedFillEngine(book=book) if args.execute else None
         kraken = {
             "db_path": book._db_path,  # noqa: SLF001 - book owns the path
