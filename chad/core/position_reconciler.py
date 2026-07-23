@@ -65,6 +65,23 @@ _REJECTED_FILL_STATUSES = frozenset(
     {"rejected", "error", "failed", "cancelled", "inactive"}
 )
 
+# INCIDENT-0723 (D2): adapter pseudo-statuses that never reached the broker,
+# plus pending states — neither is a money event, so neither may produce a
+# FILLS_*.ndjson row from the reconciler close path. On 2026-07-23 this
+# writer spammed 465 market_closed + 15 dry_run rows (530/540 rows that day
+# were non-fill exhaust); the dry_run rows then fed FIFO netting and
+# false-flatted the position guard. Mirrors the hot-path executor's
+# SKIP_EVIDENCE_UNCONFIRMED_ORDER_STATUS refusal. Genuine broker terminal
+# answers (rejected/error/cancelled) still write their forensic row — the
+# defense-in-depth exclusions downstream already handle those.
+_EVIDENCE_SKIP_FILL_STATUSES = frozenset({
+    "dry_run", "market_closed", "duplicate_blocked", "duplicate_open_order",
+    "margin_blocked", "futures_execution_disabled",
+    "suppressed_open_orders_cap",
+    "pendingsubmit", "pendingcancel", "presubmitted", "submitted",
+    "apipending",
+})
+
 
 def _iter_strategy_signal(routed_signals: Iterable) -> Iterable:
     """
@@ -473,6 +490,26 @@ def apply_close_intents(close_intents: List[dict], paper_adapter: Any) -> None:
             # not pnl_untrusted) — not just absence-of-rejection.
             confirmed_fills: List[dict] = []
             for order in submitted:
+                # INCIDENT-0723 (D2): a close that never reached the broker
+                # (dry_run drill short-circuit, RTH market_closed, duplicate
+                # block, pending states) is NOT a money event — no ledger
+                # row, no price scan. Guard stays open (ISSUE-29 positive
+                # confirmation still required); next cycle retries.
+                _order_status_norm = str(
+                    getattr(order, "status", "") or ""
+                ).strip().lower()
+                if _order_status_norm in _EVIDENCE_SKIP_FILL_STATUSES:
+                    LOG.warning(
+                        "RECONCILER_SKIP_EVIDENCE_NONFILL_STATUS symbol=%s "
+                        "side=%s qty=%s status=%s — no money-ledger row for "
+                        "a non-fill adapter status (INCIDENT-0723); guard "
+                        "remains open, retry next cycle",
+                        getattr(order, "symbol", None),
+                        getattr(order, "side", None),
+                        getattr(order, "quantity", None),
+                        _order_status_norm,
+                    )
+                    continue
                 # PR-02b: never emit a synthesized close-fill at the legacy
                 # $100 placeholder fallback. Resolve a real price via the
                 # broker-fill → fresh-cache cascade; if neither tier yields
