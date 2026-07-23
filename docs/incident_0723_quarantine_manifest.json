@@ -1,0 +1,125 @@
+{
+ "schema_version": "fills_quarantine.v1",
+ "created_at_utc": "2026-07-23T14:00:00Z",
+ "window_start": "20260723",
+ "window_end": "20260723",
+ "reason": "incident_0723_drill_dry_run_exhaust",
+ "note": "INCIDENT-0723: flatten-drill dry_run rehearsal rows ingested as real closes (trade_closer._TRUSTED_FILL_STATUSES blessed dry_run). Sidecar quarantine \u2014 originals unmodified. Copy to BOTH runtime/quarantine_manifest_incident0723.json (SCR/expectancy) and data/fills/quarantine_incident0723.json (trade_closer sidecar).",
+ "invalid_fills": [
+  {
+   "fill_id": "0be6fb537b305ba602a84f87a00c5f1276c2d5616761f194f5b8392686bee486",
+   "symbol": "PSQ",
+   "strategy": "g",
+   "side": "SELL",
+   "quantity": 5.0
+  },
+  {
+   "fill_id": "196381915d41f59992079639ea9e5027fced7e935d47a4eacbc0010e4f2ff29c",
+   "symbol": "PSQ",
+   "strategy": "gamma",
+   "side": "SELL",
+   "quantity": 5.0
+  },
+  {
+   "fill_id": "6161fc2043c517da639c234d578f0a65ac4c61c1dd205a9bfe66e8d8e010e4c2",
+   "symbol": "MA",
+   "strategy": "gamma",
+   "side": "SELL",
+   "quantity": 10.0
+  },
+  {
+   "fill_id": "7be4b358c06d8fedc94773dadd8e9e745ecc61b1de283861cf3ee3f1aa749611",
+   "symbol": "SVXY",
+   "strategy": "gamma",
+   "side": "SELL",
+   "quantity": 156.0
+  },
+  {
+   "fill_id": "92ff0e8762a3e48520629416a0129293a93f41d33f66b35670f95433ebcd4ee4",
+   "symbol": "V",
+   "strategy": "gamma",
+   "side": "SELL",
+   "quantity": 190.0
+  },
+  {
+   "fill_id": "c9d9ee6707e17cdd43b4a68c0ddff4a4ab42e9fc5bb08fff4f3f3edfabb1eac5",
+   "symbol": "UNH",
+   "strategy": "gamma",
+   "side": "SELL",
+   "quantity": 228.0
+  },
+  {
+   "fill_id": "f2558419ff258602dbba81a73564db34b3ed0efd439a052203b9f2c098526396",
+   "symbol": "IWM",
+   "strategy": "gamma",
+   "side": "SELL",
+   "quantity": 200.0
+  }
+ ],
+ "invalid_trades": [
+  {
+   "record_hash": "a5244c6986d1fa96e984eabad76342b0e20461a864dd1d721a61cd185c24a886",
+   "symbol": "PSQ",
+   "strategy": "gamma",
+   "quantity": 5.0,
+   "pnl": 0.1,
+   "ts": "2026-07-23T04:01:34.644222Z"
+  },
+  {
+   "record_hash": "de4001663917fee89bf7df52fbf57728e8798f873f4a8bd3be6035bbb338c862",
+   "symbol": "IWM",
+   "strategy": "gamma",
+   "quantity": 200.0,
+   "pnl": 100.0,
+   "ts": "2026-07-23T10:26:30.353321Z"
+  },
+  {
+   "record_hash": "cb05ee6740a74030fb6defdc7eaa0252726a7428ed0b054770d9e3ed44b446c1",
+   "symbol": "MA",
+   "strategy": "gamma",
+   "quantity": 10.0,
+   "pnl": -107.6,
+   "ts": "2026-07-23T10:26:30.353566Z"
+  },
+  {
+   "record_hash": "2e10edc2d7a902506e766141e2c1c2e1249e3c5ffbcdad9321023453f3645ba7",
+   "symbol": "SVXY",
+   "strategy": "gamma",
+   "quantity": 156.0,
+   "pnl": -4.68,
+   "ts": "2026-07-23T10:26:30.353744Z"
+  },
+  {
+   "record_hash": "2a24739a1fc4bdcca68f75bc1d1f0e05172555885b8547d17a568263e0e03084",
+   "symbol": "UNH",
+   "strategy": "gamma",
+   "quantity": 228.0,
+   "pnl": 923.4,
+   "ts": "2026-07-23T10:26:30.353917Z"
+  },
+  {
+   "record_hash": "6bebf695ba802a9dd99c8cbda6b411d4a72db3279b3de28bbd78cfe05740e60c",
+   "symbol": "V",
+   "strategy": "gamma",
+   "quantity": 181.0,
+   "pnl": -964.73,
+   "ts": "2026-07-23T10:26:30.354089Z"
+  },
+  {
+   "record_hash": "96887144b39f150afa69325450a65ab0fd603468955b663bb8b61bf521abb3c1",
+   "symbol": "V",
+   "strategy": "gamma",
+   "quantity": 9.0,
+   "pnl": -24.3,
+   "ts": "2026-07-23T10:26:30.354301Z"
+  },
+  {
+   "record_hash": "9262bd1dc16a958060cfa850e46fac3c4a6f2975229da1a5b63a6a9646ba98ee",
+   "symbol": "PSQ",
+   "strategy": "g",
+   "quantity": 5.0,
+   "pnl": -0.0,
+   "ts": "2026-07-23T13:31:30.561791Z"
+  }
+ ]
+}
