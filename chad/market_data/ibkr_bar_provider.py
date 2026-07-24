@@ -501,13 +501,18 @@ class IBKRBarProvider:
     # Polling loop
     # --------------------------
 
-    def _filter_expired_futures(self) -> set:
+    def _filter_expired_futures(self, *, now: Optional[datetime] = None) -> set:
         """FUTURES-ROLL-1 — return the set of futures symbols whose front-month
         contract is expired or expires today, per runtime/futures_roll_state.json.
 
         Emits one structured warning per (symbol, session-day) so the journal
         does not flood with one log per cycle (stops the SILK6-class
         Error 162 spam noted in the 2026-05-27 audit).
+
+        W6A-5: ``now`` is threaded through to the gate (which has always
+        accepted it) so callers — tests especially — can pin the clock. Without
+        it, any test that stubs a roll state with literal dates silently rots
+        into a failure the moment those dates fall into the past.
         """
         try:
             from chad.market_data.futures_expiry_gate import filter_universe
@@ -529,7 +534,7 @@ class IBKRBarProvider:
                 },
             )
 
-        _kept, skipped = filter_universe(futures_only, log_callback=_warn)
+        _kept, skipped = filter_universe(futures_only, now=now, log_callback=_warn)
         return {v.symbol for v in skipped}
 
     def poll_once(
@@ -537,6 +542,8 @@ class IBKRBarProvider:
         duration: str = "3600 S",
         bar_size: str = "1 min",
         per_symbol_delay_s: float = PER_SYMBOL_DELAY_S,
+        *,
+        now: Optional[datetime] = None,
     ) -> Dict[str, int]:
         """Fetch fresh bars for every symbol in the universe and write 1m files.
 
@@ -548,9 +555,12 @@ class IBKRBarProvider:
         today (per runtime/futures_roll_state.json). One warning is emitted
         per (symbol, session-day) — not per cycle — to stop the SILK6-class
         Error 162 spam.
+
+        W6A-5: ``now`` is injectable purely so the expiry gate can be tested
+        against a pinned clock. Production callers omit it.
         """
         results: Dict[str, int] = {}
-        expired_skipped = self._filter_expired_futures()
+        expired_skipped = self._filter_expired_futures(now=now)
         for sym in self._universe:
             if sym in expired_skipped:
                 results[sym] = 0
