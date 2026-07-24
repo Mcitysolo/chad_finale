@@ -42,6 +42,11 @@ RUNTIME_DIR = REPO_ROOT / "runtime"
 CACHE_PATH = RUNTIME_DIR / "options_chains_cache.json"
 BARS_1D_DIR = REPO_ROOT / "data" / "bars" / "1d"
 
+# W6B-11 (D6): the refresh universe is config-declared with an asserted
+# expected count. See config/options_universe.json for the full rationale.
+UNIVERSE_CONFIG_PATH = REPO_ROOT / "config" / "options_universe.json"
+FALLBACK_SYMBOLS: Tuple[str, ...] = ("SPY",)
+
 IBKR_HOST = "127.0.0.1"
 IBKR_PORT = 4002
 IBKR_CLIENT_ID = 88
@@ -609,6 +614,96 @@ def _atomic_write(cache_path: Path, cache_doc: Dict[str, Any]) -> None:
     os.replace(tmp, cache_path)
 
 
+class UniverseContradiction(ValueError):
+    """config/options_universe.json declares a symbol list and an expected
+    count that disagree. Deliberately fatal — see _load_declared_universe."""
+
+
+def _load_declared_universe() -> Tuple[List[str], int, str]:
+    """Return (symbols, expected_count, source) for the refresh universe.
+
+    W6B-11 (D6). Three outcomes, and the difference between them is the whole
+    point of this function:
+
+      * config present and self-consistent -> (declared symbols, count, "config")
+      * config absent/unreadable/malformed -> (["SPY"], 1, "fallback:<reason>")
+        Absence must never harden into an outage; the historical hardcoded
+        default is reproduced exactly and the fallback is logged.
+      * config present but symbols/expected_count CONTRADICT each other ->
+        raises UniverseContradiction.
+
+    The third case is deliberately fatal rather than falling back. The two
+    fields restate the same fact on purpose, so a disagreement means someone
+    edited one and not the other — most dangerously, emptied `symbols` while
+    leaving `expected_count` at 1. Falling back there would silently paper over
+    the exact drift this check exists to catch, and would let a zero-coverage
+    run report success. A loud refusal is the safe reading of an ambiguous
+    declaration.
+    """
+    try:
+        raw = json.loads(UNIVERSE_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        _log(
+            f"universe_config absent path={UNIVERSE_CONFIG_PATH} — "
+            f"falling back to historical default {list(FALLBACK_SYMBOLS)}"
+        )
+        return list(FALLBACK_SYMBOLS), len(FALLBACK_SYMBOLS), "fallback:absent"
+    except Exception as exc:
+        _log(
+            f"WARNING universe_config unreadable path={UNIVERSE_CONFIG_PATH} "
+            f"err={exc} — falling back to historical default "
+            f"{list(FALLBACK_SYMBOLS)}"
+        )
+        return list(FALLBACK_SYMBOLS), len(FALLBACK_SYMBOLS), "fallback:unreadable"
+
+    if not isinstance(raw, dict):
+        _log(
+            f"WARNING universe_config is not a JSON object — falling back to "
+            f"{list(FALLBACK_SYMBOLS)}"
+        )
+        return list(FALLBACK_SYMBOLS), len(FALLBACK_SYMBOLS), "fallback:not_an_object"
+
+    declared = raw.get("symbols")
+    expected = raw.get("expected_count")
+
+    # bool is a subclass of int, so `True` would otherwise pass as a count of 1.
+    if (
+        not isinstance(declared, list)
+        or isinstance(expected, bool)
+        or not isinstance(expected, int)
+    ):
+        _log(
+            "WARNING universe_config missing or mistyped symbols/expected_count "
+            f"— falling back to {list(FALLBACK_SYMBOLS)}"
+        )
+        return list(FALLBACK_SYMBOLS), len(FALLBACK_SYMBOLS), "fallback:malformed"
+
+    symbols = [str(s).strip().upper() for s in declared if str(s).strip()]
+    if len(symbols) != expected:
+        raise UniverseContradiction(
+            f"config/options_universe.json declares symbols={symbols} "
+            f"(usable count {len(symbols)}) but expected_count={expected}. "
+            "These two fields restate the same fact and must agree. Refusing "
+            "to run rather than guess which one is current — update both "
+            "together, and never lower expected_count to silence a coverage "
+            "shortfall."
+        )
+    return symbols, expected, "config"
+
+
+def _coverage_shortfall(
+    declared: Sequence[str], fetched: Dict[str, Any]
+) -> List[str]:
+    """Declared symbols that produced no chain at all.
+
+    Distinct from `symbol_errors`, which records symbols that were ATTEMPTED
+    and failed. A symbol missing from both is one that was never attempted —
+    the silent-shrink case that exits 0 today.
+    """
+    got = {str(k).strip().upper() for k in fetched.keys()}
+    return [s for s in declared if s not in got]
+
+
 def run(symbols: Sequence[str]) -> int:
     try:
         from ib_async import IB
@@ -805,15 +900,51 @@ def run(symbols: Sequence[str]) -> int:
             )
             return 1
 
+        # W6B-11 (D6): coverage assertion against the DECLARED universe.
+        #
+        # R17 already promotes an empty chains map or a non-empty `error` field
+        # to CRITICAL, and `symbol_errors` covers every symbol that was tried
+        # and failed. The hole is a symbol that is never tried at all — the
+        # universe shrinks, `chains` is smaller but non-empty, no error is set,
+        # the unit exits 0, and coverage has silently dropped. That is what
+        # this block closes, and it is why the shortfall is folded into the
+        # SAME `error` field R17 already watches rather than a new surface
+        # nothing reads yet.
+        declared_symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
+        missing = _coverage_shortfall(declared_symbols, chains)
+        never_attempted = [s for s in missing if s not in symbol_errors]
+
         cache_doc = {
             "schema_version": OPTIONS_CHAIN_CACHE_SCHEMA,
             "ts_utc": _utc_now_iso(),
             "chains": chains,
+            "coverage": {
+                "declared": declared_symbols,
+                "expected_count": len(declared_symbols),
+                "fetched_count": len(chains),
+                "missing": missing,
+                "never_attempted": never_attempted,
+            },
         }
+        error_parts: List[str] = []
         if symbol_errors:
-            cache_doc["error"] = "partial: " + "; ".join(
-                f"{s}={r}" for s, r in symbol_errors.items()
+            error_parts.append(
+                "partial: " + "; ".join(f"{s}={r}" for s, r in symbol_errors.items())
             )
+        if never_attempted:
+            error_parts.append(
+                f"coverage_shortfall: declared={declared_symbols} "
+                f"fetched={sorted(chains.keys())} "
+                f"never_attempted={never_attempted} "
+                f"({len(chains)} < {len(declared_symbols)} expected)"
+            )
+            _log(
+                f"ERROR coverage_shortfall never_attempted={never_attempted} "
+                f"fetched={len(chains)} expected={len(declared_symbols)}"
+            )
+            failure += len(never_attempted)
+        if error_parts:
+            cache_doc["error"] = " | ".join(error_parts)
 
         try:
             _atomic_write(CACHE_PATH, cache_doc)
@@ -849,13 +980,42 @@ def main() -> int:
     parser.add_argument(
         "--symbols",
         nargs="+",
-        default=["SPY"],
-        help="Underlying symbols to refresh (default: SPY)",
+        default=None,
+        help=(
+            "Underlying symbols to refresh. Default: the universe declared in "
+            "config/options_universe.json (falls back to SPY if that file is "
+            "absent or unreadable)."
+        ),
     )
     args = parser.parse_args()
 
+    # W6B-11 (D6): resolve the universe from config, not from a hardcoded
+    # argparse default. An explicit --symbols still wins — operators must be
+    # able to refresh one symbol ad hoc — but that is an override, and it is
+    # logged as one so an ad-hoc run is never mistaken for the declared
+    # universe in the journal.
     try:
-        return run(args.symbols)
+        declared, expected, source = _load_declared_universe()
+    except UniverseContradiction as exc:
+        _log(f"ERROR universe_config contradiction: {exc}")
+        return 1
+
+    if args.symbols:
+        symbols = [str(s).strip().upper() for s in args.symbols if str(s).strip()]
+        _log(
+            f"universe OVERRIDE via --symbols={symbols} "
+            f"(declared universe was {declared}, source={source})"
+        )
+    else:
+        symbols = declared
+        _log(f"universe={symbols} expected_count={expected} source={source}")
+
+    if not symbols:
+        _log("ERROR resolved universe is empty — nothing to refresh")
+        return 1
+
+    try:
+        return run(symbols)
     except Exception as exc:
         _log(f"ERROR unhandled exception: {exc}")
         return 1

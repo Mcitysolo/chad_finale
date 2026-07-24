@@ -1,0 +1,40 @@
+{
+  "schema_version": "options_universe.v1",
+  "_doc": {
+    "purpose": "Declare the options-chain refresh universe explicitly, with an asserted expected count, so that a SILENTLY SHRINKING universe is distinguishable from a healthy run.",
+    "why_this_exists": [
+      "Before W6B-11 the universe was an argparse default (['SPY']) inside",
+      "chad/market_data/options_chain_refresh.py. The live unit invokes the module",
+      "with no --symbols argument, so that hardcoded default WAS the production",
+      "universe -- undeclared and unversioned.",
+      "",
+      "The health rule R17 already catches two failure shapes: an empty chains map,",
+      "and a non-empty `error` field (which the refresher sets for any symbol it",
+      "ATTEMPTED and failed). What neither R17 nor the refresher caught is a symbol",
+      "that is never attempted at all -- if the universe shrinks, chains is smaller",
+      "but non-empty, no error is set, the unit exits 0, and every downstream check",
+      "reports green while coverage has quietly dropped.",
+      "",
+      "Operator ruling 2026-07-24 (D6): SPY-only is CONFIRMED correct. This file",
+      "does not change the universe; it declares the universe that already exists",
+      "and makes any future drift from it loud."
+    ],
+    "expected_count_is_deliberately_redundant": [
+      "`symbols` and `expected_count` restate the same fact on purpose. Editing one",
+      "without the other is a contradiction the refresher REFUSES to run on. That is",
+      "what makes 'exit 0 with 1 symbol' permanently distinguishable from 'exit 0",
+      "with nothing': emptying the symbol list can no longer silently become a",
+      "zero-coverage green run -- it becomes a loud config error."
+    ],
+    "how_to_change_the_universe": [
+      "Update `symbols` AND `expected_count` together, in a single Pending Action.",
+      "Never lower expected_count to silence a coverage alert -- a shortfall means",
+      "the fetch failed, not that the expectation was wrong."
+    ],
+    "fallback": "If this file is absent, unreadable, or malformed, the refresher falls back to its historical ['SPY'] default and logs the fallback. Absence must never harden into an outage."
+  },
+  "symbols": ["SPY"],
+  "expected_count": 1,
+  "declared_at": "2026-07-24",
+  "declared_by": "W6B-11 (D6 operator ruling)"
+}
