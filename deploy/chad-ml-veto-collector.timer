@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the CHAD ML veto shadow collector every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=chad-ml-veto-collector.service
+
+[Install]
+WantedBy=timers.target
