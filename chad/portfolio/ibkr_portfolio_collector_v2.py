@@ -360,6 +360,11 @@ class IBKRPortfolioCollector:
                 cash = {}
 
             payload: Dict[str, Any] = {
+                # W6B-2: pinned so EXS7 can validate this contract. Purely
+                # additive — this payload has a FIXED top-level schema (no
+                # free key space), so a new key cannot be mistaken for data
+                # the way it could in position_guard.json.
+                "schema_version": "positions_snapshot.v1",
                 "positions": pos_list,
                 "positions_count": len(pos_list),
                 "cash": cash,

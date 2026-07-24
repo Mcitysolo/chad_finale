@@ -274,6 +274,114 @@ def default_notifier(message: str, dedupe_key: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# W6B-2 (D1): envelope contracts
+# ---------------------------------------------------------------------------
+
+
+def _check_envelope(
+    rel_path: str,
+    payload: dict[str, Any],
+    envelope: dict[str, Any],
+    pinned_at: Any = None,
+) -> list[dict[str, Any]]:
+    """Validate a free-keyspace runtime contract without touching its keys.
+
+    WHY THIS SHAPE (D1 ruling, 2026-07-24)
+    --------------------------------------
+    ``position_guard.json`` is a flat mapping of ``"<strategy>|<SYMBOL>"`` to an
+    entry dict, plus the reserved meta keys ``_version`` / ``_written_by``. The
+    top-level KEY SPACE is position identity. That rules out the obvious pin —
+    adding a ``schema_version`` key would insert a pseudo-position into a
+    namespace that readers iterate.
+
+    So we pin the ENVELOPE instead: the top-level contract and the per-entry
+    value shape. The key space stays entirely free — this function never
+    enumerates, pattern-matches, or counts identity keys, and an empty guard is
+    valid.
+
+    WHY THE ENTRY RULE IS CONDITIONAL
+    ---------------------------------
+    The rule mirrors the writer's own already-declared invariant at
+    ``chad/core/position_guard.py::_validate_position_guard_schema``:
+
+        "Entries that claim to be open must carry the minimum identification
+         the rest of CHAD relies on. Closed entries can be sparse."
+
+    That distinction is load-bearing and was nearly missed. All 39 live entries
+    happen to carry ``opened_at``, but the reset-from-broker-truth constructor
+    (``position_guard.py:459``) builds closed entries without it. An envelope
+    inferred from today's data — rather than from the writer's contract — would
+    have gone red the first time that path ran.
+
+    Pinning the writer's invariant on the READ side is the actual value here:
+    the writer enforces it on write and refuses bad writes, but nothing checked
+    the file afterwards. This catches corruption introduced by a writer bypass,
+    a manual edit, or a partial/interrupted write.
+
+    Envelope grammar (all fields optional):
+      required_keys          — top-level keys that must be present
+      reserved_key_prefix    — keys starting with this are meta, not entries
+      entry_value_type       — "object": every non-reserved value must be a dict
+      entry_required_keys    — keys every entry must carry (unconditional)
+      entry_required_keys_when — {"field": F, "equals": V, "required_keys": [...]}
+                                 applied only to entries where entry[F] == V
+    """
+    breaks: list[dict[str, Any]] = []
+
+    missing = [k for k in (envelope.get("required_keys") or []) if k not in payload]
+    if missing:
+        breaks.append({
+            "file": rel_path, "break": "envelope_required_keys_missing",
+            "missing_keys": missing, "pinned_at": pinned_at,
+        })
+
+    prefix = str(envelope.get("reserved_key_prefix") or "")
+    entry_type = envelope.get("entry_value_type")
+    unconditional = list(envelope.get("entry_required_keys") or [])
+    conditional = envelope.get("entry_required_keys_when")
+    if not (entry_type or unconditional or isinstance(conditional, dict)):
+        return breaks
+
+    # Bounded: a structurally broken file must not emit hundreds of rows into
+    # the sentinel report. The count is reported in full; the detail is capped.
+    bad_type: list[str] = []
+    bad_keys: list[dict[str, Any]] = []
+
+    for key, value in payload.items():
+        if prefix and str(key).startswith(prefix):
+            continue  # reserved meta key, not an entry
+        if entry_type == "object" and not isinstance(value, dict):
+            bad_type.append(str(key))
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        needed = list(unconditional)
+        if isinstance(conditional, dict):
+            field = conditional.get("field")
+            if field is not None and value.get(field) == conditional.get("equals"):
+                needed.extend(conditional.get("required_keys") or [])
+        absent = [k for k in needed if k not in value]
+        if absent:
+            bad_keys.append({"entry": str(key), "missing_keys": absent})
+
+    if bad_type:
+        breaks.append({
+            "file": rel_path, "break": "envelope_entry_not_an_object",
+            "entry_count": len(bad_type), "entries": sorted(bad_type)[:10],
+            "pinned_at": pinned_at,
+        })
+    if bad_keys:
+        breaks.append({
+            "file": rel_path, "break": "envelope_entry_keys_missing",
+            "entry_count": len(bad_keys),
+            "entries": sorted(bad_keys, key=lambda e: e["entry"])[:10],
+            "pinned_at": pinned_at,
+        })
+    return breaks
+
+
+# ---------------------------------------------------------------------------
 # Sentinel
 # ---------------------------------------------------------------------------
 
@@ -1075,19 +1183,41 @@ class ExterminatorSentinel:
                 breaks.append({"file": rel_path, "break": "unreadable_or_not_an_object", "error": err})
                 continue
             checked.append(rel_path)
-            accepts = [str(a) for a in (contract.get("accepts") or [contract.get("schema_version")])]
-            actual = payload.get("schema_version")
-            if actual is None:
-                breaks.append({"file": rel_path, "break": "schema_version_absent",
-                               "expected_one_of": accepts, "pinned_at": contract.get("pinned_at")})
-            elif str(actual) not in accepts:
-                breaks.append({"file": rel_path, "break": "schema_version_unrecognised",
-                               "actual": actual, "expected_one_of": accepts,
-                               "pinned_at": contract.get("pinned_at")})
+
+            # W6B-2 (D1): schema_version validation is now OPT-IN.
+            #
+            # Some load-bearing runtime files carry no `schema_version` and must
+            # not be made to. `position_guard.json` is the case that forced this:
+            # its top-level KEY SPACE is position identity ("<strategy>|<SYMBOL>"),
+            # so adding a schema_version key inserts a pseudo-position into a
+            # namespace that readers iterate. The reserved "_" prefix convention
+            # (_version / _written_by) means a well-behaved reader would skip it,
+            # but "would" is not a guarantee worth betting money truth on.
+            #
+            # A contract that declares neither `schema_version` nor `accepts` is
+            # therefore validated on its ENVELOPE alone (below) — top-level shape
+            # and per-entry value shape — leaving the key space entirely free.
+            if contract.get("schema_version") is not None or contract.get("accepts"):
+                accepts = [str(a) for a in (contract.get("accepts") or [contract.get("schema_version")])]
+                actual = payload.get("schema_version")
+                if actual is None:
+                    breaks.append({"file": rel_path, "break": "schema_version_absent",
+                                   "expected_one_of": accepts, "pinned_at": contract.get("pinned_at")})
+                elif str(actual) not in accepts:
+                    breaks.append({"file": rel_path, "break": "schema_version_unrecognised",
+                                   "actual": actual, "expected_one_of": accepts,
+                                   "pinned_at": contract.get("pinned_at")})
+
             missing_keys = [k for k in (contract.get("required_keys") or []) if k not in payload]
             if missing_keys:
                 breaks.append({"file": rel_path, "break": "required_keys_missing",
                                "missing_keys": missing_keys, "pinned_at": contract.get("pinned_at")})
+
+            envelope = contract.get("envelope")
+            if isinstance(envelope, dict):
+                breaks.extend(
+                    _check_envelope(rel_path, payload, envelope, contract.get("pinned_at"))
+                )
 
         # W5A-6 (amended-R2 condition b): LEDGER-EMBEDDED sub-schema contracts.
         # The W5A measurement blocks (implementation_shortfall.v1, mae_mfe.v1)
