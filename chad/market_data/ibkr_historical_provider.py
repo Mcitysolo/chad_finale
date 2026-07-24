@@ -28,7 +28,7 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -157,28 +157,17 @@ class IBKRHistoricalProvider:
             pass
 
     # ---------------------------------------------------------------------------
-    # Deterministic front-month expiry table
+    # Front-month expiry resolution
     # ---------------------------------------------------------------------------
-    # Each entry is a list of YYYYMM strings covering the next ~18 months,
-    # ordered ascending. Resolver picks the first entry >= today + 5 days.
-    # Update annually or when roll schedule changes.
-    # Source: confirmed from live IBKR contract data 2026-04-10.
-    _EXPIRY_SCHEDULE: dict = {
-        "MES":  ["202606", "202609", "202612", "202703", "202706"],
-        "MNQ":  ["202606", "202609", "202612", "202703", "202706"],
-        # NYMEX crude-oil contracts expire in the calendar month BEFORE their
-        # delivery month: MCLM6 (June delivery) last traded 2026-05-18 per
-        # IBKR truth. Drop "202606" from the schedule so the resolver advances
-        # to "202607". Mirror of chad.market_data.futures_contract_resolver.
-        "MCL":  ["202607", "202608", "202609", "202610", "202611", "202612", "202701"],
-        "MGC":  ["202604", "202606", "202608", "202610", "202612", "202702", "202704"],
-        "ZN":   ["202606", "202609", "202612", "202703"],
-        "ZB":   ["202606", "202609", "202612", "202703"],
-        "M6E":  ["202606", "202609", "202612", "202703"],
-        "SIL":  ["202605", "202606", "202607", "202608", "202609", "202610", "202611", "202612"],
-        "MYM":  ["202606", "202609", "202612", "202703", "202706"],
-        "M2K":  ["202606", "202609", "202612", "202703", "202706"],
-    }
+    # W6A-2: the private ``_EXPIRY_SCHEDULE`` mirror that used to live here has
+    # been DELETED. It was a byte-identical hand-maintained copy of
+    # chad.market_data.futures_contract_resolver.EXPIRY_SCHEDULE, self-documented
+    # as a "mirror copy" — two calendars that nothing kept in sync. Resolution
+    # now delegates to that module, which is the single source of truth.
+    #
+    # Do not reintroduce a schedule table here; a named test
+    # (test_w6a_no_private_expiry_schedule) asserts this class has no private
+    # expiry table so the mirror cannot silently come back.
 
     # Per-symbol contract specs for explicit futures resolution.
     # ibkr_symbol: the root symbol IBKR uses (may differ from logical name, e.g. SIL->SI)
@@ -199,31 +188,29 @@ class IBKRHistoricalProvider:
     }
 
     @staticmethod
-    def _resolve_front_month(symbol: str) -> Optional[str]:
+    def _resolve_front_month(symbol: str, *, now: Optional[datetime] = None) -> Optional[str]:
         """
-        Return the nearest active front-month expiry string (YYYYMM) for
-        the given symbol from the deterministic expiry schedule.
+        Return the nearest active front-month expiry (YYYYMM) for ``symbol``.
 
-        Selects the first expiry that is at least 5 days from today.
-        Returns None if no valid expiry is found (caller must handle).
+        W6A-2: delegates to chad.market_data.futures_contract_resolver, the
+        single source of truth. Returns None for symbols that module does not
+        model, and None (not a stale month) when the resolver reports
+        exhaustion — the caller treats None as "cannot resolve" and skips the
+        symbol, which per-symbol error isolation then reports. The old
+        behaviour returned an EXPIRED month in that case.
         """
-        schedule = IBKRHistoricalProvider._EXPIRY_SCHEDULE.get(symbol)
-        if not schedule:
+        from chad.market_data.futures_contract_resolver import (
+            ExpiryScheduleExhausted,
+            resolve_contract_month,
+        )
+
+        try:
+            return resolve_contract_month(symbol, now=now)
+        except ExpiryScheduleExhausted as exc:
+            LOGGER.error(
+                "ibkr_historical.expiry_schedule_exhausted symbol=%s err=%s", symbol, exc
+            )
             return None
-        today = datetime.now(timezone.utc)
-        cutoff = today + timedelta(days=5)
-        cutoff_str = cutoff.strftime("%Y%m")
-        # Also require day-of-month check for same-month cutoffs
-        cutoff_day = cutoff.day
-        for expiry in schedule:
-            if expiry > cutoff_str:
-                return expiry
-            if expiry == cutoff_str:
-                # Same month — only valid if expiry month has remaining days
-                # Conservative: skip same month if we are past the 20th
-                if cutoff_day <= 20:
-                    return expiry
-        return schedule[-1]  # fallback to last known expiry
 
     def _make_contract(self, symbol: str, sec_type: str = "STK") -> Any:
         from ib_async import Stock, Future

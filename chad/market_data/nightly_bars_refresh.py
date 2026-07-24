@@ -166,6 +166,138 @@ def _write_kraken_bars_state(crypto_results: Dict[str, bool]) -> None:
         _log("KRAKEN_BARS_STATE", f"state write FAILED {e}")
 
 
+def _read_last_bar_utc(symbol: str) -> Optional[str]:
+    """Newest bar date recorded for ``symbol``, or None if unreadable.
+
+    Read from the file on disk (not the in-memory result) so a symbol that
+    FAILED this run still reports the age of whatever it last managed to
+    write. A failed symbol with a fresh file and a failed symbol that has been
+    dark for a week are very different problems.
+    """
+    try:
+        with open(BARS_1D_DIR / f"{symbol}.json") as f:
+            bars = json.load(f).get("bars") or []
+        return str(bars[-1]["ts_utc"]) if bars else None
+    except Exception:  # noqa: BLE001 — observability only
+        return None
+
+
+def _age_days(last_bar_utc: Optional[str], today: Optional[Any] = None) -> Optional[int]:
+    if not last_bar_utc:
+        return None
+    try:
+        last = datetime.strptime(last_bar_utc[:10], "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        return None
+    ref = today or datetime.now(timezone.utc).date()
+    return (ref - last).days
+
+
+def _write_bars_refresh_state(
+    results: Dict[str, bool],
+    futures_symbols: List[str],
+    *,
+    today: Optional[Any] = None,
+) -> None:
+    """W6A-3 — per-symbol status + age, so partial success is never silent.
+
+    D1: the unit's exit code no longer reddens on a single bad symbol, so the
+    per-symbol truth has to surface somewhere the sentinel can read. This is
+    that surface.
+
+    Carries ``age_vs_cohort_days`` — a symbol's bar age minus the FRESHEST age
+    achieved in its group. That relative signature is what exposed the MCL
+    defect: on 2026-07-23 MCL sat at age 2 while all nine peers were at 1,
+    because it was pinned to a contract that had stopped trading. An absolute
+    staleness threshold would have missed it (age 2 is well inside any sane
+    weekend allowance); the +1 versus its peers is the tell.
+
+    The reference is the group MINIMUM, deliberately not the median: a median
+    is dragged along by the stale symbols themselves, so if several symbols go
+    dark together the median moves with them and the lag silently vanishes —
+    exactly when detection matters most. The freshest symbol in a group is the
+    honest statement of "what was achievable this run".
+
+    Grouping matters because cadences differ: Kraken crypto bars land same-day
+    (age 0) while IBKR equity/futures bars are a day behind. Comparing across
+    those sources would mark every IBKR symbol as lagging. Groups are scoped
+    to crypto / futures / equity so only like is compared with like.
+
+    Purely observability — a write failure is logged and swallowed so it can
+    never fail the refresh or block bar writes.
+    """
+    try:
+        # `today` is injectable so tests can pin it — a test that reads the wall
+        # clock is a time bomb, which is exactly the defect W6A-5 converts.
+        today = today or datetime.now(timezone.utc).date()
+        futures_set = set(futures_symbols)
+
+        def _group(sym: str) -> str:
+            if sym in KRAKEN_PAIRS:
+                return "crypto"
+            if sym == "VIX":
+                return "index"
+            return "future" if sym in futures_set else "equity"
+
+        rows: Dict[str, Dict[str, Any]] = {}
+        for sym, ok in sorted(results.items()):
+            last = _read_last_bar_utc(sym)
+            rows[sym] = {
+                "status": "ok" if ok else "fail",
+                "last_bar_utc": last,
+                "age_days": _age_days(last, today),
+                "group": _group(sym),
+            }
+
+        # Freshest age per group — the reference every symbol is measured against.
+        group_min: Dict[str, int] = {}
+        for row in rows.values():
+            age = row["age_days"]
+            if age is None:
+                continue
+            g = row["group"]
+            group_min[g] = age if g not in group_min else min(group_min[g], age)
+
+        for row in rows.values():
+            ref = group_min.get(row["group"])
+            row["group_min_age_days"] = ref
+            row["age_vs_cohort_days"] = (
+                None if (row["age_days"] is None or ref is None)
+                else row["age_days"] - ref
+            )
+
+        ok_count = sum(1 for v in results.values() if v)
+        fail_count = len(results) - ok_count
+        lagging = sorted(
+            s for s, r in rows.items()
+            if r["age_vs_cohort_days"] is not None and r["age_vs_cohort_days"] > 0
+        )
+        no_data = sorted(s for s, r in rows.items() if r["age_days"] is None)
+
+        payload = {
+            "schema_version": "bars_refresh_state.v1",
+            "ts_utc": _ts_now(),
+            # 25h — 1h grace over the 24h refresh cadence (mirrors kraken_bars_state.v1)
+            "ttl_seconds": 90000,
+            "ok": ok_count,
+            "fail": fail_count,
+            "total": len(results),
+            "group_min_age_days": dict(sorted(group_min.items())),
+            "lagging_symbols": lagging,
+            "no_data_symbols": no_data,
+            "symbols": rows,
+        }
+        _atomic_write_json(REPO_ROOT / "runtime" / "bars_refresh_state.json", payload)
+        print(
+            f"[{_ts_now()}] BARS_REFRESH_STATE ok={ok_count} fail={fail_count} "
+            f"group_min_age={group_min} lagging={','.join(lagging) or '-'} "
+            f"no_data={','.join(no_data) or '-'}",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001 — observability must never fail the refresh
+        _log("BARS_REFRESH_STATE", f"state write FAILED {e}")
+
+
 def _run_kraken(results: Dict[str, bool]) -> None:
     crypto_results: Dict[str, bool] = {}
     for symbol, pair_key in KRAKEN_PAIRS.items():
@@ -279,9 +411,30 @@ def main() -> int:
     failure = sum(1 for v in results.values() if not v)
     print(f"[{_ts_now()}] SUMMARY success={success} failure={failure}", flush=True)
 
+    _write_bars_refresh_state(results, [f["symbol"] for f in futures])
+
+    # W6A-3 (D1): per-symbol exit-status isolation.
+    #
+    # Per-symbol WORK was already isolated (one bad contract cannot abort the
+    # loop), but the exit code was not: `failure > 0 -> return 1` reddened the
+    # whole unit — and EXS5 — whenever a single symbol out of ~52 failed.
+    #
+    # The unit now fails only on SYSTEMIC failure: nothing attempted, the IBKR
+    # connection dead, or every symbol failing. A partial failure exits 0 and
+    # is reported through bars_refresh_state.v1 (per-symbol status, age, and
+    # cohort-relative lag) rather than through a red unit.
+    #
+    # Partial success must never be SILENT — that is why the state row and the
+    # BARS_REFRESH_STATE marker line are written unconditionally above. Exit 0
+    # here means "the unit ran"; it does not mean "every symbol is healthy",
+    # and the state row is the place that distinction is recorded.
+    if not results:
+        print(f"[{_ts_now()}] SUMMARY systemic=no_symbols_attempted", flush=True)
+        return 1
     if not ib_connected and failure > 0:
         return 2
-    if failure > 0:
+    if failure == len(results):
+        print(f"[{_ts_now()}] SUMMARY systemic=all_symbols_failed", flush=True)
         return 1
     return 0
 

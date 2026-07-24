@@ -145,10 +145,21 @@ def test_silk6_pattern_produces_zero_polls_in_filtered_universe():
 def test_bar_provider_skips_expired_in_polling_loop(monkeypatch):
     """Integration: IBKRBarProvider._filter_expired_futures returns the
     expired symbols, and poll_once short-circuits without invoking
-    fetch_historical_bars on them."""
+    fetch_historical_bars on them.
+
+    W6A-5: this test used to read the real wall clock. It stubs MES with
+    current_expiry=2026-06-19 and asserts MES is still polled — true when the
+    test was written, false from 2026-06-20 onward, at which point the gate
+    correctly skipped MES too and the assertion failed. The defect was in the
+    test, not the product: poll_once threaded no ``now`` down to the gate,
+    even though the gate has always accepted one. The clock is now pinned to
+    NOW, the same instant the rest of this module already uses.
+    """
     from chad.market_data import ibkr_bar_provider as ibp
 
-    # Stub roll state
+    # Stub roll state. Dates are relative to NOW (2026-05-27):
+    #   SIL expired the day before -> must be skipped
+    #   MES expires three weeks out -> must still be polled
     fake_state = _state({
         "SIL": {"current_expiry": "2026-05-26", "next_expiry": "2026-07-29"},
         "MES": {"current_expiry": "2026-06-19", "next_expiry": "2026-09-18"},
@@ -176,9 +187,54 @@ def test_bar_provider_skips_expired_in_polling_loop(monkeypatch):
     provider = _Provider(_StubIB(), universe=["MES", "SIL", "M2K"])
     # The future-roll state knows SIL but not M2K; M2K should still be polled
     # (no_roll_mapping = no skip).
-    results = provider.poll_once(per_symbol_delay_s=0.0)
+    results = provider.poll_once(per_symbol_delay_s=0.0, now=NOW)
 
     assert "SIL" not in fetched, f"SIL must be skipped; fetched={fetched}"
     assert "MES" in fetched
+    assert "M2K" in fetched, "no_roll_mapping must not cause a skip"
     # results dict still contains SIL with bar_count=0 (skipped)
     assert results.get("SIL") == 0
+
+
+def test_poll_once_gate_is_not_wall_clock_dependent(monkeypatch):
+    """Regression guard for the time-bomb class itself.
+
+    The same stubbed state must produce opposite verdicts at two pinned
+    instants. If ``now`` ever stops being threaded through poll_once, the gate
+    silently falls back to the real clock and this test fails.
+    """
+    from datetime import datetime, timezone
+
+    from chad.market_data import ibkr_bar_provider as ibp
+
+    fake_state = _state({"MES": {"current_expiry": "2026-06-19", "next_expiry": "2026-09-18"}})
+    monkeypatch.setattr(
+        "chad.market_data.futures_expiry_gate._load_roll_state",
+        lambda *a, **kw: fake_state,
+    )
+    monkeypatch.setattr("chad.market_data.futures_expiry_gate.reset_warning_dedupe", lambda: None)
+
+    class _StubIB:
+        def isConnected(self):
+            return True
+        def sleep(self, _s):
+            pass
+
+    def _poll(now):
+        fetched: list = []
+
+        class _Provider(ibp.IBKRBarProvider):
+            def fetch_historical_bars(self, sym, **kw):
+                fetched.append(sym)
+                return []
+            def write_1m_bars_file(self, sym, bars):
+                pass
+
+        _Provider(_StubIB(), universe=["MES"]).poll_once(per_symbol_delay_s=0.0, now=now)
+        return fetched
+
+    before = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    after = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+    assert "MES" in _poll(before), "live contract must be polled"
+    assert "MES" not in _poll(after), "expired contract must be skipped"
