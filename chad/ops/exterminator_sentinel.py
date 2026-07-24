@@ -1438,6 +1438,22 @@ class ExterminatorSentinel:
         evidence["manifest_stale_days"] = stale_days
         evidence["manifest_stale_days_source"] = cfg.get("manifest_stale_days_source")
 
+        # W6B-7 (D3): surface WHY the manifest is stale. Staleness is a symptom;
+        # the cause is that chad-xgb-train has been declining for want of trusted
+        # rows. Without this, an operator sees "manifest 74.9 days old" and has
+        # no way to tell a broken trainer from one that is correctly refusing.
+        train_state, _ = self._read_json(self.repo_root / "runtime" / "xgb_train_state.json")
+        if isinstance(train_state, dict):
+            evidence["trainability"] = {
+                "outcome": train_state.get("outcome"),
+                "reason": train_state.get("reason"),
+                "usable_rows": train_state.get("usable_rows"),
+                "required_rows": train_state.get("required_rows"),
+                "rows_short": train_state.get("rows_short"),
+                "ts_utc": train_state.get("ts_utc"),
+                "exclusions": train_state.get("exclusions"),
+            }
+
         if version is None:
             return CheckResult(
                 "EXS8", "ml_anomalies", STATUS_WARN, "ML model version missing",

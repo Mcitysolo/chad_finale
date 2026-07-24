@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -121,6 +122,95 @@ class TrainingResult:
     model_version: str = ""
     manifest_path: Optional[Path] = None
     backup_path: Optional[Path] = None
+
+
+# --------------------------------------------------------------------------
+# W6B-7 (D3): loud-but-green refusal
+# --------------------------------------------------------------------------
+#
+# chad-xgb-train.service has sat in systemd `failed` since 2026-07-19, which is
+# EXS5's only red. It is not crashing — it is REFUSING, correctly: the Epoch-3
+# book yields 72 trusted closed trades against a required 100, because 2153 rows
+# are untrusted and 6 quarantined. Fail-closed behaviour working as designed.
+#
+# The operator ruling (D3) is that refusing to train on untrusted rows is the
+# system honouring its own rules, so it should exit 0 — but LOUDLY. Lowering
+# MIN_TRAINING_SAMPLES is explicitly NOT the fix: training a live-money veto
+# model on a book we have already declared untrustworthy is the worst available
+# outcome. Leaving it red is not the fix either, because a permanently-red
+# sentinel is one operators learn to ignore.
+#
+# Note the module's own docstring at main() ALREADY declared this contract:
+#   "Returns 0 on: no trade data, no usable samples, training completed
+#    successfully. Returns 1 only on hard training/model errors."
+# `return 0 if result.ok else 1` contradicted it — an insufficient-samples
+# refusal is not a "hard training/model error". So this is the code being made
+# to honour an intent it had already written down, not a policy change.
+
+XGB_TRAIN_STATE_PATH = ROOT / "runtime" / "xgb_train_state.json"
+XGB_TRAIN_STATE_SCHEMA = "xgb_train_state.v1"
+XGB_TRAIN_STATE_TTL_SECONDS = 30 * 60 * 60  # daily timer + slack
+
+# Refusals are data-quality outcomes: the job ran correctly and declined. Any
+# other failure is a genuine error and must stay exit 1.
+DECLINE_REASONS = (
+    "Not enough samples for training",
+    "No trade rows",
+    "No usable samples",
+)
+
+
+def _is_decline(reason: str) -> bool:
+    return any(reason.startswith(p) for p in DECLINE_REASONS)
+
+
+def _write_train_state(
+    *,
+    outcome: str,
+    reason: str,
+    usable_rows: int,
+    excluded: Optional[Dict[str, int]] = None,
+    model_version: str = "",
+    dataset_hash: str = "",
+    exclusions_loaded: bool = True,
+) -> None:
+    """Publish xgb_train_state.v1 so a refusal is visible without journal
+    archaeology.
+
+    The countdown fields are the point: `usable_rows` / `required_rows` /
+    `rows_short` make "how far are we from being able to train?" a number an
+    operator can watch, rather than a fact buried in a log line on a unit that
+    reads as broken. Best-effort — a state-write failure must never turn a
+    successful training run into a failed one.
+    """
+    payload: Dict[str, Any] = {
+        "schema_version": XGB_TRAIN_STATE_SCHEMA,
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ttl_seconds": XGB_TRAIN_STATE_TTL_SECONDS,
+        "outcome": outcome,                 # trained | declined | error
+        "reason": reason,
+        "usable_rows": int(usable_rows),
+        "required_rows": int(MIN_TRAINING_SAMPLES),
+        "rows_short": max(0, int(MIN_TRAINING_SAMPLES) - int(usable_rows)),
+        "exclusions": dict(excluded or {}),
+        # False means the run could not tell trusted rows from untrusted ones.
+        # A `trained` outcome with exclusions_loaded=false would be a red flag.
+        "exclusions_loaded": bool(exclusions_loaded),
+        "model_version": model_version,
+        "dataset_hash": dataset_hash,
+        "threshold_policy": (
+            "MIN_TRAINING_SAMPLES is a trust floor, not a tuning knob. Lowering it "
+            "to clear this state would train a live-money veto model on rows the "
+            "system has already declared untrusted."
+        ),
+    }
+    try:
+        XGB_TRAIN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = XGB_TRAIN_STATE_PATH.with_suffix(f".json.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, XGB_TRAIN_STATE_PATH)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("could not write %s: %s", XGB_TRAIN_STATE_PATH, exc)
 
 
 def _setup_logging() -> None:
@@ -669,27 +759,43 @@ def _train_model(
     )
 
 
-def _load_exclusion_sets() -> Tuple[Set[str], Set[str]]:
+def _load_exclusion_sets() -> Tuple[Set[str], Set[str], bool]:
     """Load the canonical (invalid_fill_ids, invalid_trade_hashes) sets
-    used by every CHAD publisher. Failures are logged and degrade to
-    empty sets — training must keep running rather than crash, but
-    the manifest will then record zero exclusions for all reasons.
+    used by every CHAD publisher, plus whether the load actually SUCCEEDED.
+
+    W6B-7: the third element is new, and it matters. This function has always
+    degraded to empty sets on failure and logged a WARNING — its own docstring
+    admitted "the manifest will then record zero exclusions for all reasons".
+    But a training run with empty exclusion sets is not a slightly-degraded
+    run: it is a run that CANNOT TELL untrusted rows from trusted ones, and
+    would happily train a live-money veto model on the whole contaminated
+    book (2153 untrusted rows at time of writing) while reporting zero
+    exclusions.
+
+    That silently inverts the very principle D3 rests on — "refusing to train
+    on untrusted rows is the system honouring its own rules". So the caller now
+    treats a failed load as a DECLINE rather than proceeding, and the outcome
+    is stamped into xgb_train_state.v1 as `exclusions_loaded`.
+
+    Degrading to empty sets is kept (rather than raising) so the caller decides
+    the policy in one place.
     """
     try:
         from chad.utils.quarantine import get_exclusion_sets
     except Exception:  # noqa: BLE001
         LOG.warning(
-            "quarantine helper unavailable — training without exclusion sets"
+            "quarantine helper unavailable — cannot distinguish untrusted rows"
         )
-        return set(), set()
+        return set(), set(), False
     try:
-        return get_exclusion_sets(
+        fill_ids, trade_hashes = get_exclusion_sets(
             runtime_dir=ROOT / "runtime",
             fills_dir=ROOT / "data" / "fills",
         )
+        return fill_ids, trade_hashes, True
     except Exception as exc:  # noqa: BLE001
-        LOG.warning("get_exclusion_sets failed err=%s — using empty sets", exc)
-        return set(), set()
+        LOG.warning("get_exclusion_sets failed err=%s — cannot filter the book", exc)
+        return set(), set(), False
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -699,19 +805,45 @@ def main(argv: List[str] | None = None) -> int:
     Returns 0 on:
     - no trade data,
     - no usable samples,
+    - insufficient TRUSTED samples (a decline, not a failure — W6B-7/D3),
     - training completed successfully.
 
     Returns 1 only on hard training/model errors (xgboost missing, etc.).
+
+    Every outcome publishes runtime/xgb_train_state.json (xgb_train_state.v1)
+    carrying outcome/reason/usable_rows/required_rows/rows_short, so a decline
+    is visible and its countdown to trainability is watchable.
     """
     _setup_logging()
     LOG.info("Starting XGB training job (trade history)")
 
     rows = _load_trade_rows()
     if not rows:
-        LOG.warning("No trade rows loaded; aborting XGB training")
+        LOG.warning("No trade rows loaded; DECLINED (not an error)")
+        _write_train_state(
+            outcome="declined", reason="No trade rows available", usable_rows=0,
+        )
         return 0
 
-    invalid_fill_ids, invalid_trade_hashes = _load_exclusion_sets()
+    invalid_fill_ids, invalid_trade_hashes, exclusions_loaded = _load_exclusion_sets()
+    if not exclusions_loaded:
+        # W6B-7: fail closed. Without the exclusion sets we cannot tell trusted
+        # rows from untrusted ones, so ANY training here would be training on
+        # the unfiltered book — the exact outcome the sample threshold exists
+        # to prevent. Decline (exit 0, loudly) rather than proceed.
+        LOG.warning(
+            "XGB_TRAIN_DECLINED reason='exclusion sets unavailable' — cannot "
+            "distinguish untrusted rows, so training would use the unfiltered "
+            "book. Exiting 0. See runtime/xgb_train_state.json."
+        )
+        _write_train_state(
+            outcome="declined",
+            reason="Exclusion sets unavailable — cannot filter untrusted rows",
+            usable_rows=0,
+            exclusions_loaded=False,
+        )
+        return 0
+
     if invalid_fill_ids or invalid_trade_hashes:
         LOG.info(
             "Training will exclude %d untrusted fill_ids and %d quarantined trade hashes",
@@ -722,7 +854,13 @@ def main(argv: List[str] | None = None) -> int:
     X, y, excluded = _build_dataset(rows, invalid_fill_ids, invalid_trade_hashes)
     LOG.info("Training set: %d usable rows, exclusions=%s", len(y), excluded)
     if X.size == 0 or y.size == 0:
-        LOG.warning("No usable samples after feature building; aborting")
+        LOG.warning("No usable samples after feature building; DECLINED (not an error)")
+        _write_train_state(
+            outcome="declined",
+            reason="No usable samples after feature building",
+            usable_rows=0,
+            excluded=excluded,
+        )
         return 0
 
     result = _train_model(X, y, excluded)
@@ -737,7 +875,39 @@ def main(argv: List[str] | None = None) -> int:
         result.model_version,
     )
 
-    return 0 if result.ok else 1
+    # W6B-7 (D3): declined (data quality) vs error (genuine failure).
+    if result.ok:
+        _write_train_state(
+            outcome="trained", reason=result.reason or "ok",
+            usable_rows=result.n_samples, excluded=result.excluded,
+            model_version=result.model_version, dataset_hash=result.dataset_hash,
+        )
+        return 0
+
+    if _is_decline(result.reason):
+        short = max(0, MIN_TRAINING_SAMPLES - int(result.n_samples))
+        LOG.warning(
+            "XGB_TRAIN_DECLINED reason=%r usable_rows=%d required_rows=%d "
+            "rows_short=%d exclusions=%s — exiting 0. The refusal is the system "
+            "honouring its own trust rules; MIN_TRAINING_SAMPLES is a trust "
+            "floor, not a tuning knob. See runtime/xgb_train_state.json.",
+            result.reason, int(result.n_samples), MIN_TRAINING_SAMPLES,
+            short, result.excluded,
+        )
+        _write_train_state(
+            outcome="declined", reason=result.reason,
+            usable_rows=result.n_samples, excluded=result.excluded,
+            dataset_hash=result.dataset_hash,
+        )
+        return 0
+
+    LOG.error("XGB_TRAIN_ERROR reason=%r — exiting 1", result.reason)
+    _write_train_state(
+        outcome="error", reason=result.reason,
+        usable_rows=result.n_samples, excluded=result.excluded,
+        dataset_hash=result.dataset_hash,
+    )
+    return 1
 
 
 if __name__ == "__main__":  # pragma: no cover

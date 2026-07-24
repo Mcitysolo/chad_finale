@@ -1,0 +1,14 @@
+[Unit]
+Description=CHAD XGBoost Model Retraining
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/chad.env
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 /home/ubuntu/chad_finale/chad/analytics/train_xgb_model.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-xgb-train
