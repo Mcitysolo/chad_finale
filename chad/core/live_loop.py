@@ -2746,6 +2746,49 @@ def run_once(logger: logging.Logger) -> None:
     except Exception as _dq_err:  # noqa: BLE001 — fail-open
         logger.debug("dq scr gate eval failed (non-fatal): %s", _dq_err)
 
+    # TIER1-B (PRE-LIVE BLOCKING): SCR sizing application binding + once-per-
+    # cycle evidence marker. The published SCR sizing_factor must be applied to
+    # intent quantity in EVERY non-PAUSED throttled state (WARMUP, CAUTIOUS,
+    # ...), not only CAUTIOUS. scr_sizing_should_apply is the single policy
+    # predicate: the in-loop scaler below AND this marker both consume it, so a
+    # published-but-unapplied (decorative) factor cannot recur silently — the
+    # Exterminator EX021 check reads runtime/scr_sizing_application.json and
+    # asserts the throttle is genuinely applied.
+    from chad.risk.scr_sizing import (
+        apply_scr_sizing as _apply_scr_sizing,
+        scr_sizing_apply_enabled as _scr_apply_enabled,
+        scr_sizing_should_apply as _scr_should_apply,
+    )
+    try:
+        from chad.utils.runtime_json import write_runtime_state_json as _scr_write_marker
+
+        _scr_m_raw = json.loads(
+            Path("/home/ubuntu/chad_finale/runtime/scr_state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        _scr_m_state = str(_scr_m_raw.get("state", "")).upper()
+        _scr_m_factor = float(_scr_m_raw.get("sizing_factor", 0.0) or 0.0)
+        _scr_m_enabled = _scr_apply_enabled()
+        _scr_write_marker(
+            Path("/home/ubuntu/chad_finale/runtime/scr_sizing_application.json"),
+            {
+                "schema_version": "scr_sizing_application.v1",
+                "scr_state": _scr_m_state,
+                "published_sizing_factor": _scr_m_factor,
+                "application_enabled": bool(_scr_m_enabled),
+                "applied": bool(
+                    _scr_should_apply(
+                        _scr_m_state, _scr_m_factor, enabled=_scr_m_enabled
+                    )
+                ),
+                "intents_in_cycle": int(len(intents)),
+            },
+            ttl_seconds=300,
+        )
+    except Exception as _scr_m_err:  # noqa: BLE001 — evidence only, never break loop
+        logger.debug("scr sizing marker write failed (non-fatal): %s", _scr_m_err)
+
     for intent in intents:
         try:
             _attach_strategy_to_intent(intent, routed_signal_map)
@@ -2800,24 +2843,24 @@ def run_once(logger: logging.Logger) -> None:
                 logger.warning("SCR_GATE_READ_FAILED (fail-open): %s", _scr_err)
             # --- end SCR gate ---
 
-            # P3-2: CAUTIOUS scaling — apply sizing_factor to quantity when SCR
-            # is CAUTIOUS. Respects minimum quantity per market type.
-            # Futures: minimum 1 contract (no fractional). Equities: minimum 1 share.
+            # TIER1-B (PRE-LIVE BLOCKING): SCR sizing — apply the published
+            # sizing_factor to intent quantity in ANY non-PAUSED, throttled
+            # state (WARMUP=0.10, CAUTIOUS=0.25, ...), not only CAUTIOUS. PAUSED
+            # is hard-blocked above; a factor of 1.0 (CONFIDENT) is a no-op.
+            # Policy (scr_sizing_should_apply) and math (apply_scr_sizing) live
+            # in chad.risk.scr_sizing — the SAME predicate the once-per-cycle
+            # EX021 marker consumes, so the applied path and the observability
+            # evidence cannot drift. Applying in CAUTIOUS is byte-identical to
+            # the former block. Respects the per-market minimum quantity.
             try:
-                if _scr_state_val == "CAUTIOUS" and _scr_sizing > 0.0:
+                if _scr_should_apply(_scr_state_val, _scr_sizing):
                     _raw_qty = float(getattr(intent, "quantity", 0.0) or 0.0)
                     _sec_type = str(getattr(intent, "sec_type", "") or "").upper()
-                    _scaled_qty: float
-                    if _sec_type == "FUT":
-                        # Futures: round to nearest whole contract, minimum 1
-                        _scaled_qty = max(1.0, round(_raw_qty * _scr_sizing))
-                    else:
-                        # Equities and other: floor to whole shares, minimum 1
-                        import math as _math
-                        _scaled_qty = max(1.0, float(_math.floor(_raw_qty * _scr_sizing)))
+                    _scaled_qty = _apply_scr_sizing(_raw_qty, _scr_sizing, _sec_type)
                     if _scaled_qty != _raw_qty:
                         logger.info(
-                            "SCR_CAUTIOUS_SCALE symbol=%s raw_qty=%.2f sizing_factor=%.3f scaled_qty=%.2f",
+                            "SCR_SIZE_SCALE state=%s symbol=%s raw_qty=%.2f sizing_factor=%.3f scaled_qty=%.2f",
+                            _scr_state_val,
                             getattr(intent, "symbol", None),
                             _raw_qty,
                             _scr_sizing,
@@ -2828,8 +2871,8 @@ def run_once(logger: logging.Logger) -> None:
                         except (AttributeError, TypeError):
                             intent.quantity = _scaled_qty
             except Exception as _p3_err:
-                logger.warning("SCR_CAUTIOUS_SCALE_FAILED (skipped): %s", _p3_err)
-            # --- end P3-2 ---
+                logger.warning("SCR_SIZE_SCALE_FAILED (skipped): %s", _p3_err)
+            # --- end TIER1-B SCR sizing ---
 
             # W4A-7: LC5 progressive drawdown sizing (D4/D5). Composes AFTER
             # SCR CAUTIOUS (multiplicative, order-independent, never > 1.0) and

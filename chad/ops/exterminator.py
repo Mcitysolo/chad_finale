@@ -748,6 +748,92 @@ class Exterminator:
                 ))
         return out
 
+    def check_scr_sizing_applied(self, scr: dict[str, Any] | None) -> list[Finding]:
+        """EX021 (TIER1-B, PRE-LIVE BLOCKING): a published sub-unity SCR
+        sizing_factor must be APPLIED to intent quantity. A factor that is
+        published to scr_state but applied by no code path is a decorative
+        control. Reads the scr_sizing_application.v1 marker the live loop
+        writes each cycle (mirroring scr_sizing_should_apply) and asserts the
+        throttle is genuinely applied for the current state.
+        """
+        out: list[Finding] = []
+        published = float((scr or {}).get("sizing_factor", 0.0) or 0.0)
+        state = str((scr or {}).get("state", "") or "").upper()
+        # Only a real throttle 0 < f < 1.0 must be applied; 1.0 is a no-op and
+        # 0.0 (PAUSED) is a hard-block — neither is a sizing application.
+        if not (0.0 < published < 1.0):
+            return out
+        marker, marker_err = self._read_json("scr_sizing_application.json")
+        if marker is None:
+            out.append(Finding(
+                id="EX021", severity=SEVERITY_WARNING, category="scr",
+                title="SCR sizing application unverifiable",
+                summary=(
+                    f"scr_state publishes sizing_factor={published} (state={state}) but "
+                    f"the scr_sizing_application marker is {marker_err or 'absent'} — "
+                    f"cannot confirm the throttle is applied to intents."
+                ),
+                evidence={"published_sizing_factor": published, "scr_state": state,
+                          "marker_read": marker_err or "absent"},
+                recommended_next_action=(
+                    "Confirm the live loop is running TIER1-B (it writes the marker each "
+                    "cycle). PRE-LIVE BLOCKING: verify before ready_for_live."
+                ),
+            ))
+            return out
+        enabled = bool(marker.get("application_enabled", False))
+        applied = bool(marker.get("applied", False))
+        if not enabled:
+            out.append(Finding(
+                id="EX021", severity=SEVERITY_CRITICAL, category="scr",
+                title="SCR sizing factor is DECORATIVE (application disabled)",
+                summary=(
+                    f"scr_state publishes sizing_factor={published} (state={state}) but "
+                    f"CHAD_SCR_SIZING_APPLY is OFF — the throttle is applied to no intent."
+                ),
+                evidence={"published_sizing_factor": published, "scr_state": state,
+                          "application_enabled": enabled},
+                recommended_next_action=(
+                    "Re-enable CHAD_SCR_SIZING_APPLY (default on). A published-but-"
+                    "unapplied factor is a decorative control. PRE-LIVE BLOCKING."
+                ),
+            ))
+            return out
+        if not applied:
+            out.append(Finding(
+                id="EX021", severity=SEVERITY_CRITICAL, category="scr",
+                title="SCR sizing factor published but NOT applied",
+                summary=(
+                    f"scr_state publishes sizing_factor={published} (state={state}) yet the "
+                    f"application policy did not apply it — a published-but-unapplied factor."
+                ),
+                evidence={"published_sizing_factor": published, "scr_state": state,
+                          "marker": {k: marker.get(k) for k in (
+                              "scr_state", "published_sizing_factor",
+                              "applied", "application_enabled")}},
+                recommended_next_action=(
+                    "Investigate scr_sizing_should_apply / the live_loop scaling gate. "
+                    "PRE-LIVE BLOCKING."
+                ),
+            ))
+            return out
+        # Applied + enabled — cross-check the marker's factor matches canonical.
+        marker_pub = float(marker.get("published_sizing_factor", 0.0) or 0.0)
+        if abs(marker_pub - published) > 1e-9:
+            out.append(Finding(
+                id="EX021", severity=SEVERITY_WARNING, category="scr",
+                title="SCR sizing marker stale vs scr_state",
+                summary=(
+                    f"scr_sizing_application marker factor={marker_pub} disagrees with "
+                    f"scr_state sizing_factor={published}; application evidence may be stale."
+                ),
+                evidence={"marker_published": marker_pub, "scr_published": published},
+                recommended_next_action=(
+                    "Confirm the live loop cycle is fresh; the marker is rewritten each cycle."
+                ),
+            ))
+        return out
+
     # ---- assembly ------------------------------------------------------
 
     def _build_runtime_posture(
@@ -804,6 +890,7 @@ class Exterminator:
         _safe_extend("placeholder_fills", self.check_placeholder_fills)
         _safe_extend("untrusted_spike", lambda: self.check_untrusted_spike(scr))
         _safe_extend("scr_raw_effective_gap", lambda: self.check_scr_raw_effective_gap(scr))
+        _safe_extend("scr_sizing_applied", lambda: self.check_scr_sizing_applied(scr))
         _safe_extend("reconciliation", lambda: self.check_reconciliation(recon))
         _safe_extend("halt_boost_contradiction", lambda: self.check_halt_boost_contradiction(strategy_health, winner_scaling))
         _safe_extend("bar_freshness", self.check_bar_freshness_log_spam)
