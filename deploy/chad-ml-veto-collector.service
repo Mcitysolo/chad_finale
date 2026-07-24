@@ -1,0 +1,19 @@
+[Unit]
+Description=CHAD ML veto shadow collector (W6B-4/5) — durable ML_SHADOW history + baseline
+After=network.target
+OnFailure=chad-service-alert@%N.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/chad_finale
+EnvironmentFile=-/etc/chad/chad.env
+Environment=PYTHONPATH=/home/ubuntu/chad_finale
+# Collect first (journald here retains only the current boot, so anything not
+# collected before a restart is lost), then recompute the baseline from the
+# durable store. Collection is idempotent — overlapping windows dedupe on row_key.
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.analytics.ml_veto_shadow_collector collect --since=-2h
+ExecStart=/home/ubuntu/chad_finale/venv/bin/python3 -m chad.analytics.ml_veto_shadow_collector baseline
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chad-ml-veto-collector

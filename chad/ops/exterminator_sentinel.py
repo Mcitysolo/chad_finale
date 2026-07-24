@@ -40,6 +40,7 @@ same-source legs claim GREEN while the independent leg disagrees.
 """
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
@@ -271,6 +272,195 @@ def default_notifier(message: str, dedupe_key: str) -> bool:
         return bool(notify(message, severity="critical", dedupe_key=dedupe_key))
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# W6B-2 (D1): envelope contracts
+# ---------------------------------------------------------------------------
+
+
+def _check_envelope(
+    rel_path: str,
+    payload: dict[str, Any],
+    envelope: dict[str, Any],
+    pinned_at: Any = None,
+) -> list[dict[str, Any]]:
+    """Validate a free-keyspace runtime contract without touching its keys.
+
+    WHY THIS SHAPE (D1 ruling, 2026-07-24)
+    --------------------------------------
+    ``position_guard.json`` is a flat mapping of ``"<strategy>|<SYMBOL>"`` to an
+    entry dict, plus the reserved meta keys ``_version`` / ``_written_by``. The
+    top-level KEY SPACE is position identity. That rules out the obvious pin —
+    adding a ``schema_version`` key would insert a pseudo-position into a
+    namespace that readers iterate.
+
+    So we pin the ENVELOPE instead: the top-level contract and the per-entry
+    value shape. The key space stays entirely free — this function never
+    enumerates, pattern-matches, or counts identity keys, and an empty guard is
+    valid.
+
+    WHY THE ENTRY RULE IS CONDITIONAL
+    ---------------------------------
+    The rule mirrors the writer's own already-declared invariant at
+    ``chad/core/position_guard.py::_validate_position_guard_schema``:
+
+        "Entries that claim to be open must carry the minimum identification
+         the rest of CHAD relies on. Closed entries can be sparse."
+
+    That distinction is load-bearing and was nearly missed. All 39 live entries
+    happen to carry ``opened_at``, but the reset-from-broker-truth constructor
+    (``position_guard.py:459``) builds closed entries without it. An envelope
+    inferred from today's data — rather than from the writer's contract — would
+    have gone red the first time that path ran.
+
+    Pinning the writer's invariant on the READ side is the actual value here:
+    the writer enforces it on write and refuses bad writes, but nothing checked
+    the file afterwards. This catches corruption introduced by a writer bypass,
+    a manual edit, or a partial/interrupted write.
+
+    Envelope grammar (all fields optional):
+      required_keys          — top-level keys that must be present
+      reserved_key_prefix    — keys starting with this are meta, not entries
+      entry_value_type       — "object": every non-reserved value must be a dict
+      entry_required_keys    — keys every entry must carry (unconditional)
+      entry_required_keys_when — {"field": F, "equals": V, "required_keys": [...]}
+                                 applied only to entries where entry[F] == V
+    """
+    breaks: list[dict[str, Any]] = []
+
+    missing = [k for k in (envelope.get("required_keys") or []) if k not in payload]
+    if missing:
+        breaks.append({
+            "file": rel_path, "break": "envelope_required_keys_missing",
+            "missing_keys": missing, "pinned_at": pinned_at,
+        })
+
+    prefix = str(envelope.get("reserved_key_prefix") or "")
+    entry_type = envelope.get("entry_value_type")
+    unconditional = list(envelope.get("entry_required_keys") or [])
+    conditional = envelope.get("entry_required_keys_when")
+    if not (entry_type or unconditional or isinstance(conditional, dict)):
+        return breaks
+
+    # Bounded: a structurally broken file must not emit hundreds of rows into
+    # the sentinel report. The count is reported in full; the detail is capped.
+    bad_type: list[str] = []
+    bad_keys: list[dict[str, Any]] = []
+
+    for key, value in payload.items():
+        if prefix and str(key).startswith(prefix):
+            continue  # reserved meta key, not an entry
+        if entry_type == "object" and not isinstance(value, dict):
+            bad_type.append(str(key))
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        needed = list(unconditional)
+        if isinstance(conditional, dict):
+            field = conditional.get("field")
+            if field is not None and value.get(field) == conditional.get("equals"):
+                needed.extend(conditional.get("required_keys") or [])
+        absent = [k for k in needed if k not in value]
+        if absent:
+            bad_keys.append({"entry": str(key), "missing_keys": absent})
+
+    if bad_type:
+        breaks.append({
+            "file": rel_path, "break": "envelope_entry_not_an_object",
+            "entry_count": len(bad_type), "entries": sorted(bad_type)[:10],
+            "pinned_at": pinned_at,
+        })
+    if bad_keys:
+        breaks.append({
+            "file": rel_path, "break": "envelope_entry_keys_missing",
+            "entry_count": len(bad_keys),
+            "entries": sorted(bad_keys, key=lambda e: e["entry"])[:10],
+            "pinned_at": pinned_at,
+        })
+    return breaks
+
+
+def _classify_unpinned(
+    runtime_dir: Path,
+    unpinned_known: dict[str, Any],
+    unpinned_classes: dict[str, Any],
+    enforced: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe the REAL unpinned surface, not a hand-curated sample.
+
+    W6B-3. The pre-existing `unpinned_known` is an exact-path dict with 5
+    entries. A full enumeration of runtime/ on 2026-07-24 found **127** files
+    with no `schema_version` plus 4 that are not parseable as JSON at all — so
+    the sentinel's WARN was describing 5 of 131.
+
+    Enumerating the rest is not the fix. 65 of the 127 are
+    `telegram_dedupe_*.json`, per-alert markers whose filenames are generated
+    from alert text (`telegram_dedupe_health_R13_SCRgap214rawvs67effecti.json`).
+    That namespace is UNBOUNDED — it grows one file per new alert string, so a
+    path list would be stale on arrival and would need a commit per alert.
+
+    So coverage is declared by PATTERN CLASS, each with a stated reason, and
+    the warn is driven by what remains **undocumented**. That inverts the
+    signal usefully: today the warn is permanent and describes a curated list;
+    after this it fires exactly when a genuinely new unpinned artifact appears
+    that nobody has ruled on — which is the actionable event.
+
+    Unreadable files are reported as their own class. They are currently
+    invisible to EXS7 entirely: not enforced, so never opened; not
+    schema-bearing, so never counted.
+    """
+    documented: list[dict[str, str]] = []
+    undocumented: list[str] = []
+    unreadable: list[dict[str, str]] = []
+    by_class: dict[str, int] = {}
+
+    try:
+        files = sorted(runtime_dir.glob("*.json"))
+    except Exception:
+        return {"documented_count": 0, "undocumented": [], "undocumented_count": 0,
+                "unreadable": [], "by_class": {}, "scanned": 0}
+
+    for path in files:
+        rel = f"runtime/{path.name}"
+        if rel in enforced:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            unreadable.append({"file": rel, "error": str(exc)[:100]})
+            continue
+        if isinstance(payload, dict) and payload.get("schema_version"):
+            continue  # pinned (enforced or not) — not this check's business
+
+        if rel in unpinned_known:
+            documented.append({"file": rel, "via": "exact", "reason": str(unpinned_known[rel])[:200]})
+            by_class["exact:unpinned_known"] = by_class.get("exact:unpinned_known", 0) + 1
+            continue
+
+        matched = None
+        for pattern, meta in sorted(unpinned_classes.items()):
+            if fnmatch.fnmatch(path.name, pattern):
+                matched = (pattern, meta)
+                break
+        if matched:
+            pattern, meta = matched
+            reason = meta.get("reason") if isinstance(meta, dict) else str(meta)
+            documented.append({"file": rel, "via": pattern, "reason": str(reason)[:200]})
+            by_class[pattern] = by_class.get(pattern, 0) + 1
+        else:
+            undocumented.append(rel)
+
+    return {
+        "scanned": len(files),
+        "documented_count": len(documented),
+        "by_class": by_class,
+        "undocumented": sorted(undocumented)[:25],
+        "undocumented_count": len(undocumented),
+        "unreadable": unreadable[:10],
+        "unreadable_count": len(unreadable),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1075,19 +1265,41 @@ class ExterminatorSentinel:
                 breaks.append({"file": rel_path, "break": "unreadable_or_not_an_object", "error": err})
                 continue
             checked.append(rel_path)
-            accepts = [str(a) for a in (contract.get("accepts") or [contract.get("schema_version")])]
-            actual = payload.get("schema_version")
-            if actual is None:
-                breaks.append({"file": rel_path, "break": "schema_version_absent",
-                               "expected_one_of": accepts, "pinned_at": contract.get("pinned_at")})
-            elif str(actual) not in accepts:
-                breaks.append({"file": rel_path, "break": "schema_version_unrecognised",
-                               "actual": actual, "expected_one_of": accepts,
-                               "pinned_at": contract.get("pinned_at")})
+
+            # W6B-2 (D1): schema_version validation is now OPT-IN.
+            #
+            # Some load-bearing runtime files carry no `schema_version` and must
+            # not be made to. `position_guard.json` is the case that forced this:
+            # its top-level KEY SPACE is position identity ("<strategy>|<SYMBOL>"),
+            # so adding a schema_version key inserts a pseudo-position into a
+            # namespace that readers iterate. The reserved "_" prefix convention
+            # (_version / _written_by) means a well-behaved reader would skip it,
+            # but "would" is not a guarantee worth betting money truth on.
+            #
+            # A contract that declares neither `schema_version` nor `accepts` is
+            # therefore validated on its ENVELOPE alone (below) — top-level shape
+            # and per-entry value shape — leaving the key space entirely free.
+            if contract.get("schema_version") is not None or contract.get("accepts"):
+                accepts = [str(a) for a in (contract.get("accepts") or [contract.get("schema_version")])]
+                actual = payload.get("schema_version")
+                if actual is None:
+                    breaks.append({"file": rel_path, "break": "schema_version_absent",
+                                   "expected_one_of": accepts, "pinned_at": contract.get("pinned_at")})
+                elif str(actual) not in accepts:
+                    breaks.append({"file": rel_path, "break": "schema_version_unrecognised",
+                                   "actual": actual, "expected_one_of": accepts,
+                                   "pinned_at": contract.get("pinned_at")})
+
             missing_keys = [k for k in (contract.get("required_keys") or []) if k not in payload]
             if missing_keys:
                 breaks.append({"file": rel_path, "break": "required_keys_missing",
                                "missing_keys": missing_keys, "pinned_at": contract.get("pinned_at")})
+
+            envelope = contract.get("envelope")
+            if isinstance(envelope, dict):
+                breaks.extend(
+                    _check_envelope(rel_path, payload, envelope, contract.get("pinned_at"))
+                )
 
         # W5A-6 (amended-R2 condition b): LEDGER-EMBEDDED sub-schema contracts.
         # The W5A measurement blocks (implementation_shortfall.v1, mae_mfe.v1)
@@ -1120,6 +1332,12 @@ class ExterminatorSentinel:
                     breaks.append({"file": f"closed_trade.{field}", "break": "required_keys_missing",
                                    "missing_keys": miss, "pinned_at": contract.get("pinned_at")})
 
+        # W6B-3: real unpinned coverage, computed rather than curated.
+        unpinned_classes = cfg.get("unpinned_classes") or {}
+        coverage = _classify_unpinned(
+            self.repo_root / "runtime", unpinned_known, unpinned_classes, enforced,
+        )
+
         evidence = {
             "enforced_contracts": len(enforced),
             "files_checked": checked,
@@ -1129,6 +1347,7 @@ class ExterminatorSentinel:
             "break_count": len(breaks),
             "unpinned_known": unpinned_known,
             "unpinned_known_count": len(unpinned_known),
+            "unpinned_coverage": coverage,
         }
         if breaks:
             return CheckResult(
@@ -1136,17 +1355,33 @@ class ExterminatorSentinel:
                 "A runtime JSON contract violates its pinned schema_version or is missing required keys.",
                 evidence,
             )
-        if unpinned_known:
+
+        # W6B-3: the warn now describes the ACTIONABLE gap.
+        #
+        # It used to fire on `if unpinned_known:` — a hand-curated 5-entry dict
+        # that never shrinks and never grows, so the warn was permanent and
+        # described 5 of the 131 runtime files that actually lack a validatable
+        # schema. Permanent warns train operators to skim.
+        #
+        # Now it fires on files that are unpinned AND unclassified: a genuinely
+        # new artifact nobody has ruled on. Declaring a pattern class with a
+        # stated reason clears it; that is the "justified exception set" the
+        # gap was always meant to be.
+        undocumented = int(coverage.get("undocumented_count") or 0)
+        unreadable = int(coverage.get("unreadable_count") or 0)
+        if undocumented or unreadable:
             return CheckResult(
                 "EXS7", "schema_breaks", STATUS_WARN, "Runtime contracts without a pinned schema",
-                "All enforced contracts hold. Separately, some runtime contracts have no pinned "
-                "schema_version at all and cannot be validated -- a pre-existing gap, reported "
-                "rather than silently passed.",
+                "All enforced contracts hold. Separately, "
+                f"{undocumented} runtime file(s) have no pinned schema_version and are not "
+                f"covered by any declared exception class, and {unreadable} are not parseable "
+                "as JSON at all. Either pin them, or declare the class with a reason.",
                 evidence,
             )
         return CheckResult(
             "EXS7", "schema_breaks", STATUS_OK, "Runtime schema contracts hold",
-            "Every enforced runtime contract matches its pinned schema_version and required keys.",
+            "Every enforced runtime contract matches its pinned schema_version and required "
+            "keys, and every unpinned runtime file is covered by a declared exception class.",
             evidence,
         )
 
@@ -1202,6 +1437,22 @@ class ExterminatorSentinel:
         evidence["model_version_age_days"] = version_age_days
         evidence["manifest_stale_days"] = stale_days
         evidence["manifest_stale_days_source"] = cfg.get("manifest_stale_days_source")
+
+        # W6B-7 (D3): surface WHY the manifest is stale. Staleness is a symptom;
+        # the cause is that chad-xgb-train has been declining for want of trusted
+        # rows. Without this, an operator sees "manifest 74.9 days old" and has
+        # no way to tell a broken trainer from one that is correctly refusing.
+        train_state, _ = self._read_json(self.repo_root / "runtime" / "xgb_train_state.json")
+        if isinstance(train_state, dict):
+            evidence["trainability"] = {
+                "outcome": train_state.get("outcome"),
+                "reason": train_state.get("reason"),
+                "usable_rows": train_state.get("usable_rows"),
+                "required_rows": train_state.get("required_rows"),
+                "rows_short": train_state.get("rows_short"),
+                "ts_utc": train_state.get("ts_utc"),
+                "exclusions": train_state.get("exclusions"),
+            }
 
         if version is None:
             return CheckResult(

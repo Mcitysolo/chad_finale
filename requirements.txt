@@ -2,9 +2,15 @@
 # Python 3.12.3 / venv at /home/ubuntu/chad_finale/venv
 # GAP-008 remediation: full installed dependency inventory
 # GAP-007 Phase 0 (2026-05-07): added ib_async==2.1.0 (and its dep aeventkit==2.1.0) for ib_insync->ib_async migration validation. Source imports unchanged in Phase 0.
-# Package count: 86
+# Package count: 85
 # Note: requirements.backend.txt is retained as a legacy partial backend manifest.
-APScheduler==3.6.3
+# W6B-10 (2026-07-24): dropped APScheduler==3.6.3 (P2-8). It is installed in the
+#   venv but imported by nothing under chad/, ops/, or scripts/ — a dead pin. This
+#   is the file's FIRST deliberate divergence from `pip freeze`: the venv still has
+#   APScheduler, so a freeze on this box now reports 86 packages against this file's
+#   85. That is intended — this manifest declares what CHAD depends on, and a fresh
+#   `pip install -r requirements.txt` should not resurrect a dependency nothing uses.
+#   Removing it from the venv is a separate operator action, not a repo change.
 Flask==2.3.3
 Jinja2==3.1.6
 MarkupSafe==3.0.3

@@ -2,6 +2,7 @@
 Description=CHAD Pre-Market Options Chain Cache Refresh
 After=network-online.target chad-ibgateway.service
 Requires=chad-ibgateway.service
+OnFailure=chad-service-alert@%N.service
 
 [Service]
 Type=oneshot

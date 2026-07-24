@@ -303,6 +303,10 @@ def main() -> int:
         status = "GREEN" if len(mismatches) == 0 else "RED"
 
     payload: Dict[str, Any] = {
+        # W6B-2: pinned so EXS7 can validate this contract. Additive; the
+        # top-level schema here is fixed, so no reader can mistake the new
+        # key for payload data.
+        "schema_version": "reconciliation_state.v1",
         "ts_utc": ts,
         "ttl_seconds": int(DEFAULT_TTL_SECONDS),
         "status": status,

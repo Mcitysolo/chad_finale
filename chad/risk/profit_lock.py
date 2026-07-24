@@ -713,6 +713,12 @@ class ProfitLockEngine:
             explain = f"{explain} | daily_loss_limit_hit"
 
         state = {
+            # W6B-2: pinned so EXS7 can validate this contract. Note this is a
+            # DIFFERENT artifact from the pnl_state.v1 payload written at :841 —
+            # profit_lock.py publishes two files, and only that one was pinned,
+            # which is why runtime/profit_lock_state.json read as "unpinned"
+            # despite the module already using schema_version elsewhere.
+            "schema_version": "profit_lock_state.v1",
             "ts_utc": _utc_now().isoformat().replace("+00:00", "Z"),
             "ttl_seconds": int(self.config.ttl_seconds),
             "mode": decision.mode.name,

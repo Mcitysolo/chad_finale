@@ -265,6 +265,51 @@ class PortfolioSnapshot:
         return ibkr + coinbase + kraken
 
 
+# W6B-9 (P2-3): HALT_BOOST_SUPPRESSED log de-duplication.
+#
+# The halt clamp itself is not in question — a halted strategy whose
+# winner_factor exceeds 1.0 is clamped to 1.0 and the fact is recorded
+# structurally in applied_overlays["halt_clamp_applied"], which is what
+# health_monitor_rules.py:591 and the exterminator contradiction check
+# actually consume. The log line is pure narration, and it fired at WARNING
+# once per halted strategy PER CYCLE — with several strategies halted for
+# days, that is the dominant source of WARNING noise in the live journal and
+# it trains operators to skim past warnings that matter.
+#
+# Dedupe on TRANSITION, not on first-sight: a clamp engaging and a clamp
+# releasing are both worth one line. Today there is no release signal at all,
+# so this is strictly more informative than the version it replaces while
+# emitting ~2 lines per halt episode instead of ~thousands.
+#
+# Deliberately module-level, not instance state: DynamicRiskAllocator is a
+# frozen dataclass documented as "deliberately stateless", and log dedupe is
+# a logging concern rather than allocation state. Per-process, so a restart
+# re-announces the current clamp set once — which is the desired behaviour.
+_HALT_CLAMP_LOGGED: dict[str, bool] = {}
+
+
+def _log_halt_clamp_transition(strategy: str, clamped: bool) -> None:
+    """Emit one INFO line when a strategy's halt clamp engages or releases."""
+    if _HALT_CLAMP_LOGGED.get(strategy) == clamped:
+        return
+    was_known = strategy in _HALT_CLAMP_LOGGED
+    _HALT_CLAMP_LOGGED[strategy] = clamped
+    if clamped:
+        logger.info(
+            "HALT_BOOST_SUPPRESSED strategy=%s winner_factor_clamped_to=1.0 "
+            "transition=engaged (structural record: applied_overlays"
+            "[%s][halt_clamp_applied]=true)",
+            strategy,
+            strategy,
+        )
+    elif was_known:
+        logger.info(
+            "HALT_BOOST_SUPPRESSED strategy=%s transition=released "
+            "(strategy no longer halted, or winner_factor no longer >1.0)",
+            strategy,
+        )
+
+
 @dataclass(frozen=True)
 class DynamicRiskAllocator:
     """
@@ -399,11 +444,7 @@ class DynamicRiskAllocator:
                 "final_cap": cap,
                 "halt_clamp_applied": halt_clamp_applied,
             }
-            if halt_clamp_applied:
-                logger.warning(
-                    "HALT_BOOST_SUPPRESSED strategy=%s winner_factor_clamped_to=1.0",
-                    name,
-                )
+            _log_halt_clamp_transition(name.lower(), halt_clamp_applied)
 
         logger.info(
             "DynamicRiskAllocator: total_equity=%.2f daily_risk_fraction=%.3f "
