@@ -458,8 +458,18 @@ class StateBuilder:
         win_rate = float(stats.get("win_rate") or 0.0)
         sharpe = stats.get("sharpe_like")
         score = _sharpe_to_score(sharpe)
-        next_name, next_detail, next_threshold = _next_level(score)
-        progress = int(min(100, round(score * 100 / max(1, next_threshold))))
+        # TIER1-A: anchor "Next" to the current SCR STATE, not the sharpe-derived
+        # score. The score can outrun the state machine (e.g. score 53 while the
+        # governor is still WARMUP); without this clamp the card skips the real
+        # next rung — WARMUP's next is Cautious/25%, not Confident/50%. Clamp the
+        # score to just below the current state's own rung so _next_level returns
+        # the immediate successor. States with no ceiling (CONFIDENT/other) pass
+        # the raw score through unchanged.
+        _state_now = (scr.get("state") or "").upper()
+        _state_ceiling = {"WARMUP": 29, "PAUSED": 29, "CAUTIOUS": 59}.get(_state_now)
+        _next_score = min(score, _state_ceiling) if _state_ceiling is not None else score
+        next_name, next_detail, next_threshold = _next_level(_next_score)
+        progress = int(min(100, round(_next_score * 100 / max(1, next_threshold))))
         warmup_total = 100
         warmup_remaining = max(0, warmup_total - trades) if (scr.get("state") or "").upper() == "WARMUP" else 0
         warmup_progress = int(min(100, round(trades * 100 / warmup_total))) if warmup_total else 100
