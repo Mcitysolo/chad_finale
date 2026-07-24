@@ -38,6 +38,13 @@ _UNSUPPORTED_V1: frozenset[str] = frozenset(
 # Default publish universe — superset of the alpha_futures active universe so
 # that operators see roll state for symbols that may be added later. Strategy
 # config is NOT imported here to avoid any import-time side effects.
+#
+# W6A-4: SIL is deliberately NOT published here. It is a data-only symbol —
+# no strategy consumes it — and its serial months are near-dead: the Aug-2026
+# contract had a median 20-day volume of 179 contracts against MGC's 107,654
+# on 2026-07-23, roughly 600x thinner. Publishing a roll record for a symbol
+# nothing trades would have the gate covering a ghost. SIL keeps its bar data
+# (optional) and stays out of the tradable/gated universe.
 _DEFAULT_SYMBOLS: Tuple[str, ...] = (
     "MES", "MNQ", "MCL", "MGC", "MYM", "M2K", "M6E", "ZN", "ZB",
 )
@@ -83,16 +90,111 @@ def _unsupported_record() -> Dict[str, Any]:
     }
 
 
+def _shadow_record(symbol: str, today: date) -> Optional[Dict[str, Any]]:
+    """W6A-4 (D2) — SHADOW roll coverage for the non-equity-index families.
+
+    MCL/MGC/ZN/ZB/M6E have always been emitted as ``unsupported_v1``, so the
+    roll calendar carried nothing for the symbols whose expiry rules are the
+    hardest (notably MCL's delivery-month offset). This fills that in from
+    chad.market_data.futures_contract_resolver — the same rules the resolver
+    itself uses — but does so in SHADOW ONLY.
+
+    Every live-behaviour field is left exactly as it was: ``roll_supported``
+    stays False and ``block_new_entries`` stays False, so neither
+    ``chad.utils.roll_gate`` (which blocks only when block_new_entries AND
+    roll_supported) nor ``chad.market_data.futures_expiry_gate`` (which skips
+    polling on a parseable current_expiry) changes behaviour by one bit.
+
+    The computed truth lands under ``shadow_*`` keys so evidence accumulates
+    across a real roll cycle. Promoting shadow_* to the live fields — which
+    turns the blocking arm on — is its own Pending Action, per the house
+    ladder. Returns None for symbols this module does not shadow.
+    """
+    from chad.market_data.futures_contract_resolver import (
+        CONTRACT_SPECS,
+        ExpiryScheduleExhausted,
+        last_trade_date,
+        resolve_contract_month,
+    )
+
+    if symbol not in _UNSUPPORTED_V1 or symbol not in CONTRACT_SPECS:
+        return None
+
+    try:
+        month = resolve_contract_month(symbol, now=datetime(today.year, today.month, today.day, tzinfo=timezone.utc))
+    except ExpiryScheduleExhausted:
+        return None
+    if not month:
+        return None
+
+    current = last_trade_date(symbol, int(month[:4]), int(month[4:]))
+    if current is None:
+        return None
+
+    from chad.market_data.futures_contract_resolver import iter_contract_months
+
+    # Next contract on the symbol's own cycle, not a quarterly assumption.
+    nxt: Optional[date] = None
+    for year, mon in iter_contract_months(symbol, start=current + timedelta(days=1)):
+        cand = last_trade_date(symbol, year, mon)
+        if cand is not None and cand > current:
+            nxt = cand
+            break
+
+    # The FRONT contract as the exchange sees it — nearest one still trading,
+    # with no roll buffer applied. This is the number that carries roll
+    # pressure, and it is deliberately not the same as ``current`` above.
+    #
+    # Why the distinction matters: resolve_contract_month() applies a 5-day
+    # ROLL_BUFFER_DAYS, which is exactly ROLL_WARNING_DAYS. So a warning
+    # computed off the RESOLVED contract could never fire — the resolver has
+    # always stepped to the next contract before the window opens. Shipping
+    # such a flag would be evidence that is structurally incapable of being
+    # true. The warning is therefore computed off the front contract, which
+    # is what an already-open position is actually holding.
+    front: Optional[date] = None
+    for year, mon in iter_contract_months(symbol, start=today):
+        cand = last_trade_date(symbol, year, mon)
+        if cand is not None and cand >= today:
+            front = cand
+            break
+
+    days_to_expiry = (current - today).days
+    front_days = (front - today).days if front is not None else None
+    family, _cycle = CONTRACT_SPECS[symbol]
+    rec = _unsupported_record()
+    rec.update({
+        "shadow_roll_supported": True,
+        "shadow_roll_pattern": family,
+        "shadow_current_expiry": current.isoformat(),
+        "shadow_next_expiry": nxt.isoformat() if nxt else None,
+        "shadow_days_to_expiry": int(days_to_expiry),
+        "shadow_front_expiry": front.isoformat() if front else None,
+        "shadow_front_days_to_expiry": None if front_days is None else int(front_days),
+        "shadow_roll_warning": bool(front_days is not None and front_days <= ROLL_WARNING_DAYS),
+        "shadow_roll_critical": bool(front_days is not None and front_days <= ROLL_CRITICAL_DAYS),
+        "shadow_block_new_entries": bool(front_days is not None and front_days <= ROLL_WARNING_DAYS),
+        "shadow_note": (
+            "W6A-4 observation only; live fields unchanged pending blocking-arm PA. "
+            "warning/critical/block are computed off shadow_front_expiry (no roll "
+            "buffer), NOT shadow_current_expiry — see _shadow_record docstring."
+        ),
+    })
+    return rec
+
+
 def build_symbol_record(symbol: str, today: date) -> Dict[str, Any]:
     """Build the per-symbol roll record.
 
     Supported quarterly equity-index micros get a real third-Friday calendar
     with a roll-warning window. All other symbols return an informational
-    ``unsupported_v1`` record that never blocks entries.
+    ``unsupported_v1`` record that never blocks entries — now optionally
+    carrying W6A-4 ``shadow_*`` observations (see :func:`_shadow_record`).
     """
     sym = (symbol or "").strip().upper()
     if sym not in _SUPPORTED_QUARTERLY_EQUITY_INDEX:
-        return _unsupported_record()
+        shadow = _shadow_record(sym, today)
+        return shadow if shadow is not None else _unsupported_record()
 
     current = next_quarterly_expiry(today)
     nxt = _quarterly_expiry_after(current)
