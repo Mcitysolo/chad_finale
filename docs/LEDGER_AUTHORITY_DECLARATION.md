@@ -1,18 +1,49 @@
 # Ledger Authority Declaration
 
-**Status:** normative. **Landed:** 2026-07-24 (W6B-12, closing P2-11).
+**Status:** normative. **Landed:** 2026-07-24 (W6B-12, closing the remainder of P2-11).
 **Scope:** documentation only — this file declares an authority split that already
 exists in code. No behaviour changed to produce it.
 
 ---
 
+## Relationship to BOX-047 — read that first
+
+**Correction to the W6B plan.** The plan recorded P2-11 as "OPEN — genuinely undone".
+That is wrong, and the error was mine: `ops/pending_actions/BOX-047_dual_ledger_authority_policy.md`
+(2026-05-20) already dispositioned a dual-ledger authority question in depth, including a
+producers/consumers inventory, an eight-row canonical-authority table, six hard rules, and
+an operator quick-reference.
+
+**BOX-047 and this file answer different questions, and both are needed:**
+
+| | BOX-047 | This file |
+|---|---|---|
+| The pair in question | `ibkr_paper_ledger.json` (**config**) vs `ibkr_paper_ledger_state.json` (**state**) | `ibkr_paper_ledger_state.json` (**position**) vs `trade_history_*.ndjson` (**realized P&L**) |
+| The confusion it prevents | reading a config file as if it held positions | reading a position file as if it held P&L, or vice versa |
+| Verdict | "no conflicting claim found; what was missing was an operator-facing policy" | the position/P&L split was never stated, and neither was the disagreement order |
+
+BOX-047 §3 already names `data/trades/trade_history_YYYYMMDD.ndjson` as canonical for
+"append-only closed-trade history". What it does not state — and what this file adds — is
+(a) that reading it for realized P&L is only valid **through the exclusion chain**, and
+(b) what to do when the two ledgers disagree.
+
+**Where BOX-047 rules, it governs.** Nothing here overrides it. In particular its §3.1
+rules 1–6 stand unchanged, including rule 6: when `reconciliation_state.status: RED` with
+`broker_source: "unavailable:"`, the only safe current-position answer is
+**UNKNOWN / requires audit**.
+
+---
+
 ## The problem this closes
 
-CHAD keeps **two** durable records of paper trading, written by different components on
-different cadences, keyed differently, and consumed by disjoint sets of modules. Neither
-is labelled as authoritative for anything in particular. P2-11 named the resulting hazard:
-an operator or a future change can reach for whichever ledger is nearer to hand and get a
-defensible-looking answer to a question that ledger cannot actually answer.
+CHAD keeps two durable records of paper trading that are easy to confuse **because both
+look like ledgers of the same trades**: one holds current positions, the other holds
+completed round-trips. They are written by different components on different cadences,
+keyed differently, and consumed by disjoint sets of modules.
+
+The hazard is that an operator or a future change reaches for whichever is nearer to hand
+and gets a defensible-looking answer to a question that ledger cannot actually answer —
+most dangerously, deriving realized P&L from open-lot cost bases.
 
 This file states which ledger answers which question, and what to do when they disagree.
 
@@ -131,6 +162,7 @@ audited.
 
 | Claim | Source |
 |---|---|
+| Prior ruling on the config/state pair | `ops/pending_actions/BOX-047_dual_ledger_authority_policy.md` (2026-05-20) |
 | Position ledger is hash-keyed, position-shaped | `chad/validators/position_authority.py:7,250` |
 | Position ledger writer | `chad/portfolio/ibkr_paper_ledger_watcher.py:79` |
 | Closed-trade ledger writer | `chad/portfolio/ibkr_paper_trade_result_logger.py` |
