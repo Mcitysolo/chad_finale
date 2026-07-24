@@ -40,6 +40,7 @@ same-source legs claim GREEN while the independent leg disagrees.
 """
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
@@ -379,6 +380,87 @@ def _check_envelope(
             "pinned_at": pinned_at,
         })
     return breaks
+
+
+def _classify_unpinned(
+    runtime_dir: Path,
+    unpinned_known: dict[str, Any],
+    unpinned_classes: dict[str, Any],
+    enforced: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe the REAL unpinned surface, not a hand-curated sample.
+
+    W6B-3. The pre-existing `unpinned_known` is an exact-path dict with 5
+    entries. A full enumeration of runtime/ on 2026-07-24 found **127** files
+    with no `schema_version` plus 4 that are not parseable as JSON at all — so
+    the sentinel's WARN was describing 5 of 131.
+
+    Enumerating the rest is not the fix. 65 of the 127 are
+    `telegram_dedupe_*.json`, per-alert markers whose filenames are generated
+    from alert text (`telegram_dedupe_health_R13_SCRgap214rawvs67effecti.json`).
+    That namespace is UNBOUNDED — it grows one file per new alert string, so a
+    path list would be stale on arrival and would need a commit per alert.
+
+    So coverage is declared by PATTERN CLASS, each with a stated reason, and
+    the warn is driven by what remains **undocumented**. That inverts the
+    signal usefully: today the warn is permanent and describes a curated list;
+    after this it fires exactly when a genuinely new unpinned artifact appears
+    that nobody has ruled on — which is the actionable event.
+
+    Unreadable files are reported as their own class. They are currently
+    invisible to EXS7 entirely: not enforced, so never opened; not
+    schema-bearing, so never counted.
+    """
+    documented: list[dict[str, str]] = []
+    undocumented: list[str] = []
+    unreadable: list[dict[str, str]] = []
+    by_class: dict[str, int] = {}
+
+    try:
+        files = sorted(runtime_dir.glob("*.json"))
+    except Exception:
+        return {"documented_count": 0, "undocumented": [], "undocumented_count": 0,
+                "unreadable": [], "by_class": {}, "scanned": 0}
+
+    for path in files:
+        rel = f"runtime/{path.name}"
+        if rel in enforced:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            unreadable.append({"file": rel, "error": str(exc)[:100]})
+            continue
+        if isinstance(payload, dict) and payload.get("schema_version"):
+            continue  # pinned (enforced or not) — not this check's business
+
+        if rel in unpinned_known:
+            documented.append({"file": rel, "via": "exact", "reason": str(unpinned_known[rel])[:200]})
+            by_class["exact:unpinned_known"] = by_class.get("exact:unpinned_known", 0) + 1
+            continue
+
+        matched = None
+        for pattern, meta in sorted(unpinned_classes.items()):
+            if fnmatch.fnmatch(path.name, pattern):
+                matched = (pattern, meta)
+                break
+        if matched:
+            pattern, meta = matched
+            reason = meta.get("reason") if isinstance(meta, dict) else str(meta)
+            documented.append({"file": rel, "via": pattern, "reason": str(reason)[:200]})
+            by_class[pattern] = by_class.get(pattern, 0) + 1
+        else:
+            undocumented.append(rel)
+
+    return {
+        "scanned": len(files),
+        "documented_count": len(documented),
+        "by_class": by_class,
+        "undocumented": sorted(undocumented)[:25],
+        "undocumented_count": len(undocumented),
+        "unreadable": unreadable[:10],
+        "unreadable_count": len(unreadable),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1250,6 +1332,12 @@ class ExterminatorSentinel:
                     breaks.append({"file": f"closed_trade.{field}", "break": "required_keys_missing",
                                    "missing_keys": miss, "pinned_at": contract.get("pinned_at")})
 
+        # W6B-3: real unpinned coverage, computed rather than curated.
+        unpinned_classes = cfg.get("unpinned_classes") or {}
+        coverage = _classify_unpinned(
+            self.repo_root / "runtime", unpinned_known, unpinned_classes, enforced,
+        )
+
         evidence = {
             "enforced_contracts": len(enforced),
             "files_checked": checked,
@@ -1259,6 +1347,7 @@ class ExterminatorSentinel:
             "break_count": len(breaks),
             "unpinned_known": unpinned_known,
             "unpinned_known_count": len(unpinned_known),
+            "unpinned_coverage": coverage,
         }
         if breaks:
             return CheckResult(
@@ -1266,17 +1355,33 @@ class ExterminatorSentinel:
                 "A runtime JSON contract violates its pinned schema_version or is missing required keys.",
                 evidence,
             )
-        if unpinned_known:
+
+        # W6B-3: the warn now describes the ACTIONABLE gap.
+        #
+        # It used to fire on `if unpinned_known:` — a hand-curated 5-entry dict
+        # that never shrinks and never grows, so the warn was permanent and
+        # described 5 of the 131 runtime files that actually lack a validatable
+        # schema. Permanent warns train operators to skim.
+        #
+        # Now it fires on files that are unpinned AND unclassified: a genuinely
+        # new artifact nobody has ruled on. Declaring a pattern class with a
+        # stated reason clears it; that is the "justified exception set" the
+        # gap was always meant to be.
+        undocumented = int(coverage.get("undocumented_count") or 0)
+        unreadable = int(coverage.get("unreadable_count") or 0)
+        if undocumented or unreadable:
             return CheckResult(
                 "EXS7", "schema_breaks", STATUS_WARN, "Runtime contracts without a pinned schema",
-                "All enforced contracts hold. Separately, some runtime contracts have no pinned "
-                "schema_version at all and cannot be validated -- a pre-existing gap, reported "
-                "rather than silently passed.",
+                "All enforced contracts hold. Separately, "
+                f"{undocumented} runtime file(s) have no pinned schema_version and are not "
+                f"covered by any declared exception class, and {unreadable} are not parseable "
+                "as JSON at all. Either pin them, or declare the class with a reason.",
                 evidence,
             )
         return CheckResult(
             "EXS7", "schema_breaks", STATUS_OK, "Runtime schema contracts hold",
-            "Every enforced runtime contract matches its pinned schema_version and required keys.",
+            "Every enforced runtime contract matches its pinned schema_version and required "
+            "keys, and every unpinned runtime file is covered by a declared exception class.",
             evidence,
         )
 
